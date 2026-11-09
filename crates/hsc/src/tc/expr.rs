@@ -448,6 +448,7 @@ impl Checker {
                     .unwrap_or_default();
                 let n = occs.len();
                 let mut args: Vec<Pat> = (0..n).map(|_| Pat::Wild(*loc)).collect();
+                let mut order = Vec::new();
                 for (f, sub) in fields {
                     let pos = occs.iter().position(|o| *o == f.name).ok_or_else(|| super::TcError {
                         loc: *loc,
@@ -457,8 +458,14 @@ impl Checker {
                         Some(p) => p.clone(),
                         None => Pat::Var(f.name.clone(), *loc),
                     };
+                    order.push(pos);
                 }
-                self.check_pat(&Pat::Con(con.clone(), args, *loc), ty)
+                let checked = self.check_pat(&Pat::Con(con.clone(), args, *loc), ty)?;
+                // Matching follows the order in which the fields are written.
+                Ok(match checked {
+                    CPat::Con(name, subs) => CPat::Ordered(name, subs, order),
+                    other => other,
+                })
             }
             Pat::Tuple(ps, loc) => {
                 self.loc = *loc;

@@ -231,7 +231,8 @@ impl Checker {
         }
 
         for (tag, (name, occs, _, scheme)) in per_con.iter().enumerate() {
-            self.add_con(name, &tycon, tag, scheme.clone(), occs.clone(), dd.newtype);
+            let strict = strict_flags(dd, tag);
+            self.add_con(name, &tycon, tag, scheme.clone(), occs.clone(), dd.newtype, strict);
             for (pos, f) in occs.iter().enumerate() {
                 let key = format!("{}.{f}", self.module);
                 self.env.fields.entry(key).or_default().push((name.clone(), pos));
@@ -733,6 +734,18 @@ fn is_constructor_class(cls: &str) -> bool {
         "Functor" | "Applicative" | "Monad" | "Foldable" | "Traversable" | "Alternative" | "MonadIO"
             | "MonadFail" | "MonadPlus" | "MonadFix"
     )
+}
+
+/// The strictness of each field of the constructor with the given position.
+fn strict_flags(dd: &DataDecl, tag: usize) -> Vec<bool> {
+    match dd.cons.get(tag).map(|c| &c.fields) {
+        Some(ConFields::Positional(fs)) => fs.iter().map(|f| f.strict).collect(),
+        Some(ConFields::Record(groups)) => groups
+            .iter()
+            .flat_map(|(ns, f)| std::iter::repeat_n(f.strict, ns.len()))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Splits an instance head `C t1 .. tn` into the class and argument types.

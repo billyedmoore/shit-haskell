@@ -354,6 +354,8 @@ pub struct ConDecl {
     pub fields: ConFields,
     /// Result type of a GADT-style constructor.
     pub gadt_result: Option<Type>,
+    /// Declared infix (`a :+: b`); used by derived `Show`.
+    pub infix: bool,
     pub loc: Loc,
 }
 

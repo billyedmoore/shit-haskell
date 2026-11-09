@@ -448,6 +448,7 @@ impl Parser {
                 context,
                 fields: ConFields::Positional(fields),
                 gadt_result: None,
+                infix: false,
                 loc,
             });
         }
@@ -470,6 +471,7 @@ impl Parser {
                 context,
                 fields: ConFields::Positional(vec![left, right]),
                 gadt_result: None,
+                infix: true,
                 loc,
             });
         }
@@ -488,6 +490,7 @@ impl Parser {
             context,
             fields: ConFields::Positional(fields),
             gadt_result: None,
+            infix: false,
             loc,
         })
     }
@@ -534,6 +537,7 @@ impl Parser {
             context,
             fields: ConFields::Record(fields),
             gadt_result: None,
+            infix: false,
             loc,
         })
     }
@@ -685,6 +689,7 @@ impl Parser {
                 context: context.clone(),
                 fields: ConFields::Positional(fields.clone()),
                 gadt_result: Some(ty.clone()),
+                infix: false,
                 loc,
             })
             .collect())

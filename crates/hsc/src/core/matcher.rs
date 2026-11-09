@@ -14,6 +14,9 @@ pub enum CPat {
     Var(String),
     As(String, Box<CPat>),
     Con(String, Vec<CPat>),
+    /// A constructor whose fields are matched in the given order (record patterns match
+    /// the fields in the order they are written).
+    Ordered(String, Vec<CPat>, Vec<usize>),
     /// A predicate function applied to the scrutinee; the match succeeds when it is True.
     /// Used for literal patterns, which need `==` from an `Eq` dictionary.
     Test(Core),
@@ -129,9 +132,19 @@ fn match_one(s: &str, p: &CPat, success: Core, fail: &Core, fresh: Fresh) -> Cor
             let inner = match_one(s, sub, success, fail, fresh);
             Core::Let(vec![(v.clone(), Core::Var(s.to_string()))], Box::new(inner))
         }
-        CPat::Con(c, subs) => {
+        CPat::Con(c, subs) | CPat::Ordered(c, subs, _) => {
             let vars: Vec<String> = subs.iter().map(|_| fresh("p")).collect();
-            let pairs: Vec<(String, CPat)> = vars.iter().cloned().zip(subs.iter().cloned()).collect();
+            let mut order: Vec<usize> = match p {
+                CPat::Ordered(_, _, order) => order.clone(),
+                _ => Vec::new(),
+            };
+            // Fields not named in the order are matched afterwards, in position order.
+            for i in 0..subs.len() {
+                if !order.contains(&i) {
+                    order.push(i);
+                }
+            }
+            let pairs: Vec<(String, CPat)> = order.iter().map(|&i| (vars[i].clone(), subs[i].clone())).collect();
             let inner = match_all(&pairs, success, fail, fresh);
             let b = fresh("cb");
             Core::Case(
@@ -187,7 +200,7 @@ pub fn cpat_vars(p: &CPat, out: &mut Vec<String>) {
             out.push(v.clone());
             cpat_vars(sub, out);
         }
-        CPat::Con(_, subs) => subs.iter().for_each(|s| cpat_vars(s, out)),
+        CPat::Con(_, subs) | CPat::Ordered(_, subs, _) => subs.iter().for_each(|s| cpat_vars(s, out)),
         CPat::Bang(sub) | CPat::Lazy(sub) | CPat::View(_, sub) => cpat_vars(sub, out),
     }
 }

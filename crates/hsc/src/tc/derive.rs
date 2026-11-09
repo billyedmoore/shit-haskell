@@ -366,7 +366,7 @@ fn derive_show(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         let body = if n == 0 {
             let name = display_name(&c.name);
             shows_str(&name)
-        } else if is_operator(&c.name) && n == 2 && field_names(c).is_empty() {
+        } else if c.infix && n == 2 && field_names(c).is_empty() {
             // Infix constructor at the default precedence 9.
             let prec = 9;
             let parts = vec![

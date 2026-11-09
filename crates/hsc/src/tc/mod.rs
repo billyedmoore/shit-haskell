@@ -227,6 +227,7 @@ impl Checker {
             },
             vec![],
             false,
+            vec![],
         );
         self.add_con(
             "Builtin.:",
@@ -240,6 +241,7 @@ impl Checker {
             },
             vec![],
             false,
+            vec![],
         );
         // Unit and tuples.
         // Arity 1 has no tuple; `tuple_con(1)` would clash with unit.
@@ -267,6 +269,7 @@ impl Checker {
                 },
                 vec![],
                 false,
+                vec![],
             );
         }
         // The function arrow.
@@ -289,6 +292,7 @@ impl Checker {
         scheme: Scheme,
         fields: Vec<String>,
         newtype: bool,
+        strict: Vec<bool>,
     ) {
         let arity = count_args(&scheme.ty);
         let ndicts = scheme.preds.len();
@@ -303,6 +307,7 @@ impl Checker {
                 scheme,
                 fields,
                 newtype,
+                strict: strict.clone(),
             },
         );
         let total = ndicts + arity;
@@ -314,6 +319,17 @@ impl Checker {
             let params: Vec<String> = (0..total).map(|i| format!("c{i}%")).collect();
             let args: Vec<Core> = params.iter().map(|p| Core::Var(p.clone())).collect();
             let mut core = Core::Con(name.to_string(), args);
+            // Strict fields are evaluated before the constructor is built.
+            for (i, is_strict) in strict.iter().enumerate().rev() {
+                if *is_strict {
+                    let b = format!("sb{i}%");
+                    core = Core::Case(
+                        Box::new(Core::Var(params[ndicts + i].clone())),
+                        b,
+                        vec![Alt::Default(core)],
+                    );
+                }
+            }
             for p in params.iter().rev() {
                 core = Core::Lam(p.clone(), Box::new(core));
             }

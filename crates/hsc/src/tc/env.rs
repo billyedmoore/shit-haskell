@@ -24,6 +24,8 @@ pub struct DataCon {
     pub fields: Vec<String>,
     /// Newtype constructors are erased at run time: they are the identity.
     pub newtype: bool,
+    /// Strictness of each field: strict fields are forced when the constructor is applied.
+    pub strict: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
