@@ -14,8 +14,8 @@ Parse-only dev mode: `target/debug/hsc [-X<ext>] [--dump-ast] file.hs`.
 | # | Milestone | Status |
 |---|-----------|--------|
 | 1 | Differential harness and seed corpus | done: harness agrees with GHC 59/59 (`--hsc ghc` self-check) |
-| 2 | Front end, Haskell 2010 (lexer, layout, parser, fixity, renamer) | in progress: lexer, layout, parser done; fixity and renamer pending |
-| 3 | Types and Core | not started |
+| 2 | Front end, Haskell 2010 (lexer, layout, parser, fixity, renamer) | done: lexer, layout, parser, fixity, renamer, interfaces |
+| 3 | Types and Core | in progress: HM with levels, classes via dictionaries, defaulting, deriving (Eq, Ord, Show, Enum, Bounded), Core, matcher, lazy interpreter, mini Base library |
 | 4 | Real `base` | not started |
 | 5 | Native back end and RTS | not started |
 | 6 | Driver and packages | not started |
@@ -33,6 +33,19 @@ Parse-only dev mode: `target/debug/hsc [-X<ext>] [--dump-ast] file.hs`.
   Remaining failures are mostly outside milestone 2: TypeFamilies and associated types, MagicHash and
   unboxed syntax, TemplateHaskell and quasi-quotes, DataKinds promotion (`'`), implicit parameters,
   RecursiveDo, TransformListComp, view patterns, and standalone kind signatures' users.
+
+## Differential results (`tests/`)
+
+- Clone, current: 44 of 59 (run 26/40, fail 18/19). Oracle: GHC 9.12.2.
+- Known gaps, by cause:
+  - Missing library modules: Data.Bits, Control.Exception, Control.Concurrent, Data.Function, Text.Printf.
+  - Runtime error text: GHC 9.12 prints `Uncaught exception` blocks with `HasCallStack backtrace`
+    lines naming `ghc-internal` source locations; exact parity needs the real base sources (milestone 4).
+  - `Float` is an alias of `Double`; GHC shows single precision values.
+  - Derived `Read` is not implemented.
+  - GADT type refinement is not implemented (`gadt_implicit`).
+  - No kind checking (`kind_error`).
+  - Interpreter speed: variables are looked up by name in a linked environment; large loops are slow.
 
 ## Corpus
 

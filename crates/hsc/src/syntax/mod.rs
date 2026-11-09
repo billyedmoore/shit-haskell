@@ -17,7 +17,7 @@ pub struct SyntaxError {
 
 /// Parses one module. `flags` are compiler flags such as `-XLambdaCase`; pragmas
 /// in the source are applied on top of them.
-pub fn parse_module_source(src: &str, flags: &[String]) -> Result<ast::Module, SyntaxError> {
+pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, Extensions), SyntaxError> {
     let lexed = lexer::lex(src).map_err(|e| SyntaxError {
         line: e.line,
         col: e.col,
@@ -51,9 +51,10 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<ast::Module, S
             })?;
         }
     }
-    parser::parse_module(lexed.tokens, exts).map_err(|e| SyntaxError {
+    let module = parser::parse_module(lexed.tokens, exts.clone()).map_err(|e| SyntaxError {
         line: e.line,
         col: e.col,
         msg: e.msg,
-    })
+    })?;
+    Ok((module, exts))
 }
