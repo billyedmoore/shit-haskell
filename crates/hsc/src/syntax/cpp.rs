@@ -102,10 +102,19 @@ impl Preprocessor {
             // Lines ending in a backslash continue the directive or line.
             let mut line = lines[i].to_string();
             let mut extra = 0;
-            while line.ends_with('\\') && i + extra + 1 < lines.len() {
-                line.pop();
+            let is_directive = line.trim_start().starts_with('#');
+            // A macro call may continue on the following lines, until its parentheses close.
+            while i + extra + 1 < lines.len()
+                && (line.ends_with('\\') || (!is_directive && self.open_macro_call(&line)))
+            {
+                if line.ends_with('\\') {
+                    line.pop();
+                } else {
+                    line.push(' ');
+                }
                 extra += 1;
-                line.push_str(lines[i + extra]);
+                // A line comment would swallow the rest of the joined line.
+                line.push_str(strip_line_comment(lines[i + extra]));
             }
             let active = conds.last().map_or(true, |c| c.0);
             let trimmed = line.trim_start();
@@ -217,6 +226,30 @@ impl Preprocessor {
                 .insert(name.to_string(), Macro::Object(after.trim().to_string()));
         }
         Ok(())
+    }
+
+    /// Whether a line calls a function-like macro whose argument list is still open.
+    fn open_macro_call(&self, line: &str) -> bool {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                if matches!(self.defs.get(&word), Some(Macro::Function(..))) && i < chars.len() && chars[i] == '(' {
+                    let rest: String = chars[i..].iter().collect();
+                    if paren_depth(&rest) > 0 {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Expands macros in one source line, leaving string and character literals alone.
@@ -429,6 +462,45 @@ fn substitute(params: &[String], body: &str, args: &[String], name: &str) -> Res
         i += 1;
     }
     Ok(out)
+}
+
+/// A line without its `--` comment (a `--` followed by a space or the end of the line).
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'-' && (i + 2 == bytes.len() || bytes[i + 2] == b' ') {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
+/// The number of parentheses left open by a line, ignoring string and character literals.
+fn paren_depth(line: &str) -> i64 {
+    let chars: Vec<char> = line.chars().collect();
+    let mut depth = 0i64;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            '\'' if i + 2 < chars.len() && chars[i + 2] == '\'' => i += 2,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
 }
 
 /// Removes C-style `/* ... */` comments, which may span lines (`in_comment` carries over),

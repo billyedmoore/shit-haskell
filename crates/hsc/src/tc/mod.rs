@@ -88,6 +88,29 @@ pub const BUILTIN: &str = "Builtin";
 /// The module whose names the desugarings refer to (`>>=`, `fromInteger`, ...).
 pub const PRELUDE_MODULE: &str = "Base";
 
+/// Modules of the real base layer that define names the checker refers to as `Base.x`.
+pub const WIRED_MODULES: &[&str] = &[
+    "GHC.Internal.Base",
+    "GHC.Internal.Num",
+    "GHC.Internal.Real",
+    "GHC.Internal.Enum",
+    "GHC.Internal.Show",
+    "GHC.Internal.Err",
+    "GHC.Internal.List",
+    "GHC.Internal.Data.Maybe",
+    "GHC.Internal.Float",
+    "GHC.Internal.Control.Monad.Fail",
+    "GHC.Internal.Data.Foldable",
+    "GHC.Internal.Data.Traversable",
+    "GHC.Internal.Read",
+    "GHC.Internal.Exception",
+    "GHC.Internal.Stack",
+    "GHC.Internal.Unicode",
+    "GHC.Internal.Data.OldList",
+    "GHC.Internal.Data.Tuple",
+    "GHC.Internal.Data.Typeable",
+];
+
 impl Checker {
     pub fn new() -> Checker {
         let mut c = Checker {
@@ -142,6 +165,49 @@ impl Checker {
 
     /// Looks up the scheme of a variable: locals and this module's top-level bindings
     /// first, then the global environment.
+    /// The real defining module of a wired-in name written `Base.x`: the module being checked
+    /// (for a definition in progress), or the first library module that defines it.
+    pub fn resolve_key(&self, key: &str) -> String {
+        if self.vars.contains_key(key) || self.env.values.contains_key(key) {
+            return key.to_string();
+        }
+        let Some(occ) = key.strip_prefix("Base.") else {
+            return key.to_string();
+        };
+        let own = format!("{}.{occ}", self.module);
+        if self.vars.contains_key(&own) {
+            return own;
+        }
+        for m in WIRED_MODULES {
+            let candidate = format!("{m}.{occ}");
+            if self.env.values.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+        key.to_string()
+    }
+
+    /// The real defining module of a wired-in type name written `Base.T`.
+    pub fn resolve_type(&self, key: &str) -> String {
+        if self.env.tycons.contains_key(key) {
+            return key.to_string();
+        }
+        let Some(occ) = key.strip_prefix("Base.") else {
+            return key.to_string();
+        };
+        let own = format!("{}.{occ}", self.module);
+        if self.env.tycons.contains_key(&own) {
+            return own;
+        }
+        for m in WIRED_MODULES {
+            let candidate = format!("{m}.{occ}");
+            if self.env.tycons.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+        key.to_string()
+    }
+
     pub fn lookup_var(&self, name: &str) -> Option<Scheme> {
         self.vars
             .get(name)
@@ -155,15 +221,33 @@ impl Checker {
         if self.env.families.is_empty() {
             return self.unify_at_raw(actual, expected);
         }
+        self.unify_fam(actual, expected)
+    }
+
+    /// Structural unification with families: applications are decomposed, so only the
+    /// equalities whose head is a stuck family application are deferred.
+    fn unify_fam(&mut self, actual: &Ty, expected: &Ty) -> TR<()> {
         let a = self.normalize(actual);
         let e = self.normalize(expected);
         let a_meta = matches!(self.metas.prune(&a), Ty::Meta(_));
         let e_meta = matches!(self.metas.prune(&e), Ty::Meta(_));
-        if !(a_meta || e_meta) && (self.has_family(&a) || self.has_family(&e)) {
+        if a_meta || e_meta || !(self.has_family(&a) || self.has_family(&e)) {
+            return self.unify_at_raw(&a, &e);
+        }
+        if self.family_app(&a).is_some() || self.family_app(&e).is_some() {
             self.deferred_eqs.push((a, e, self.loc));
             return Ok(());
         }
-        self.unify_at_raw(&a, &e)
+        match (self.metas.prune(&a), self.metas.prune(&e)) {
+            (Ty::App(f1, x1), Ty::App(f2, x2)) => {
+                self.unify_fam(&f1, &f2)?;
+                self.unify_fam(&x1, &x2)
+            }
+            _ => {
+                self.deferred_eqs.push((a, e, self.loc));
+                Ok(())
+            }
+        }
     }
 
     fn unify_at_raw(&mut self, actual: &Ty, expected: &Ty) -> TR<()> {
@@ -254,7 +338,7 @@ impl Checker {
         );
         // Unit and tuples.
         // Arity 1 has no tuple; `tuple_con(1)` would clash with unit.
-        for n in (0..=12usize).filter(|n| *n != 1) {
+        for n in (0..=15usize).filter(|n| *n != 1) {
             let name = Ty::tuple_con(n);
             let vars: Vec<Ty> = (0..n as u32).map(Ty::Gen).collect();
             let res = Ty::apps(Ty::Con(name.clone()), vars.clone());
@@ -280,6 +364,30 @@ impl Checker {
                 false,
                 vec![],
             );
+        }
+        // Unboxed sums `(# a | b #)`: one constructor per alternative, each holding one value.
+        for n in 2..=6usize {
+            let name = format!("Builtin.(#|{n}#)");
+            let vars: Vec<Ty> = (0..n as u32).map(Ty::Gen).collect();
+            let res = Ty::apps(Ty::Con(name.clone()), vars.clone());
+            let cons: Vec<String> = (0..n).map(|i| format!("Builtin.(#_{i}|{n}#)")).collect();
+            self.env.tycons.insert(name.clone(), TyConInfo { arity: n, cons: cons.clone() });
+            for (i, con) in cons.iter().enumerate() {
+                self.add_con(
+                    con,
+                    &name,
+                    i,
+                    Scheme {
+                        nvars: n as u32,
+                        names: (0..n).map(|k| format!("t{k}")).collect(),
+                        preds: vec![],
+                        ty: Ty::fun(vars[i].clone(), res.clone()),
+                    },
+                    vec![],
+                    false,
+                    vec![],
+                );
+            }
         }
         // The function arrow.
         self.env.tycons.insert(

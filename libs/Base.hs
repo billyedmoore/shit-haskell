@@ -3,12 +3,14 @@
 -- implemented by the runtime; `Prelude` re-exports the standard names from here.
 module Base (
     module Base, module GHC.Prim, module GHC.Classes,
-    Bool(..), Char(..), Int(..), Word(..), Float(..), Double(..), Ordering(..), IO(..), isTrue#
+    Bool(..), Char(..), Int(..), Word(..), Float(..), Double(..), Ordering(..), IO(..), isTrue#,
+    Integer
   ) where
 
 import GHC.Prim
 import GHC.Types
 import GHC.Classes
+import GHC.Num.Integer
 
 infixr 9  .
 infixr 8  ^
@@ -26,7 +28,6 @@ infixl 4  <*>, *>, <*
 
 -- ----- primitive types ------------------------------------------------------
 
-data Integer
 
 -- The state token of IO, as in GHC.
 type World = State# RealWorld
@@ -166,16 +167,6 @@ bool f _ False = f
 bool _ t True = t
 
 -- ----- Eq and Ord ------------------------------------------------------------------
-
-instance Eq Integer where
-  x == y = primIntegerEq x y
-
-instance Ord Integer where
-  x < y = primIntegerLt x y
-  x <= y = primIntegerLe x y
-  x > y = primIntegerLt y x
-  x >= y = primIntegerLe y x
-  compare x y = if primIntegerEq x y then EQ else if primIntegerLt x y then LT else GT
 
 instance Eq a => Eq (Maybe a) where
   Nothing == Nothing = True

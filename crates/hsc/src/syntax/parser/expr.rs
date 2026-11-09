@@ -33,6 +33,25 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             if self.at_varsym("-") {
+                // A minus directly before a primitive literal is part of the literal (`-1#`).
+                if !self.raw().space_after {
+                    if let Tok::Prim(p) = self.peek_raw(1).clone() {
+                        let loc = self.loc();
+                        self.bump();
+                        self.bump();
+                        items.push(OpItem::Operand(Expr::Lit(Lit::Prim(negate_prim(p)), loc)));
+                        match self.operator() {
+                            Some((op, oloc)) => {
+                                if self.at_special(')') {
+                                    return Ok((collapse(items, loc), Some((op, oloc))));
+                                }
+                                items.push(OpItem::Op(op, oloc));
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+                }
                 items.push(OpItem::Neg(self.loc()));
                 self.bump();
                 continue;
@@ -99,6 +118,21 @@ impl Parser {
 
     /// GHC's rule: a prefix occurrence has whitespace (or an opening bracket) before
     /// the token and none after it.
+    /// `?x` (ImplicitParams): a `?` directly followed by a variable.
+    fn at_implicit_param(&self) -> Option<String> {
+        if !self.real() || !self.exts.is_on("ImplicitParams") || !self.at_varsym("?") {
+            return None;
+        }
+        let t = self.raw();
+        if t.space_after {
+            return None;
+        }
+        match self.peek_raw(1) {
+            Tok::VarId(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
     fn is_prefix_occurrence(&self) -> bool {
         let t = self.raw();
         t.space_before && !t.space_after
@@ -169,6 +203,12 @@ impl Parser {
                 let stmts = self.block(|p| p.stmt())?;
                 Ok(Expr::Do(stmts, loc))
             }
+            _ if self.at_implicit_param().is_some() => {
+                let name = self.at_implicit_param().unwrap_or_default();
+                self.bump();
+                self.bump();
+                Ok(Expr::IPVar(name, loc))
+            }
             Tok::VarId(s) if s == "mdo" && self.real() && self.exts.is_on("RecursiveDo") => {
                 self.bump();
                 let mut stmts = self.block(|p| p.stmt())?;
@@ -205,6 +245,11 @@ impl Parser {
             if self.starts_aexp() {
                 let a = self.aexp_postfix()?;
                 e = Expr::App(Box::new(e), Box::new(a));
+            } else if self.real() && self.exts.is_on("BlockArguments") && self.starts_block_argument() {
+                // BlockArguments: a do block, lambda, case, if or let can be an argument.
+                let a = self.lexp()?;
+                e = Expr::App(Box::new(e), Box::new(a));
+                break;
             } else if self.at_res(ROp::At) && self.raw().space_before && !self.raw().space_after {
                 let loc = self.loc();
                 self.bump();
@@ -215,6 +260,13 @@ impl Parser {
             }
         }
         Ok(e)
+    }
+
+    fn starts_block_argument(&self) -> bool {
+        matches!(
+            self.tok(),
+            Tok::Kw(Kw::Do | Kw::Case | Kw::If | Kw::Let) | Tok::Res(ROp::Backslash)
+        )
     }
 
     fn starts_aexp(&self) -> bool {
@@ -233,7 +285,7 @@ impl Parser {
             | Tok::Prim(_)
             | Tok::Special('(' | '[')
             | Tok::Kw(Kw::Underscore) => true,
-            Tok::VarSym(s) => s == "!" && self.is_prefix_occurrence(),
+            Tok::VarSym(s) => (s == "!" && self.is_prefix_occurrence()) || (s == "?" && self.at_implicit_param().is_some()),
             Tok::Res(ROp::Tilde) => self.is_prefix_occurrence(),
             _ => false,
         }
@@ -322,6 +374,11 @@ impl Parser {
         if !self.real() {
             return self.unexpected();
         }
+        if let Some(name) = self.at_implicit_param() {
+            self.bump();
+            self.bump();
+            return Ok(Expr::IPVar(name, loc));
+        }
         match self.tok().clone() {
             Tok::VarId(s) => {
                 self.bump();
@@ -399,6 +456,12 @@ impl Parser {
     /// Parenthesised expressions: unit, operators, sections, tuples, plain parens.
     fn paren_expr(&mut self, loc: Loc) -> PResult<Expr> {
         self.bump();
+        // UnboxedTuples: `(##)` is the unboxed unit, lexed as one symbol.
+        if self.at_varsym("##") && *self.peek_raw(1) == Tok::Special(')') {
+            self.bump();
+            self.bump();
+            return Ok(Expr::Con(QName::unqual("()"), loc));
+        }
         // UnboxedTuples: `(# a, b #)` is an ordinary tuple here.
         if self.at_varsym("#") && self.raw().space_after {
             self.bump();
@@ -407,7 +470,27 @@ impl Parser {
                 self.expect_special(')')?;
                 return Ok(Expr::Con(QName::unqual("()"), loc));
             }
+            // UnboxedSums: `(# | e | #)` is alternative 1 of 3, built as a constructor.
+            let mut lead = 0usize;
+            while self.at_res(ROp::Bar) {
+                self.bump();
+                lead += 1;
+            }
             let first = self.expr()?;
+            let mut trail = 0usize;
+            while self.at_res(ROp::Bar) {
+                self.bump();
+                trail += 1;
+            }
+            if lead + trail > 0 {
+                if !self.at_varsym("#") {
+                    return self.unexpected();
+                }
+                self.bump();
+                self.expect_special(')')?;
+                let con = QName::unqual(format!("(#_{lead}|{}#)", lead + trail + 1));
+                return Ok(Expr::App(Box::new(Expr::Con(con, loc)), Box::new(first)));
+            }
             if self.at_varsym("#") {
                 self.bump();
                 self.expect_special(')')?;
@@ -756,5 +839,18 @@ fn rec_stmt(stmts: Vec<Stmt>, loc: Loc) -> Stmt {
         pat,
         expr: Expr::App(Box::new(base("mfix")), Box::new(lam)),
         loc,
+    }
+}
+
+/// The negation of a primitive literal.
+fn negate_prim(p: crate::syntax::token::PrimLit) -> crate::syntax::token::PrimLit {
+    use crate::syntax::token::PrimLit;
+    let neg = |s: String| format!("-{s}");
+    match p {
+        PrimLit::Int(s) => PrimLit::Int(neg(s)),
+        PrimLit::Word(s) => PrimLit::Word(neg(s)),
+        PrimLit::Float(s) => PrimLit::Float(neg(s)),
+        PrimLit::Double(s) => PrimLit::Double(neg(s)),
+        other => other,
     }
 }

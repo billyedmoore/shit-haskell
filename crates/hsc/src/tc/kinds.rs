@@ -249,26 +249,86 @@ impl Checker {
         }
     }
 
+    /// A kind written in a signature. Kind variables get one unification variable each, shared
+    /// through `kvars`, so that a standalone kind signature `k -> Type` is polymorphic in `k`.
+    fn kind_from_type_vars(&mut self, t: &Type, kvars: &mut HashMap<String, Kind>) -> Kind {
+        match t {
+            Type::Fun(a, b) => {
+                let a = self.kind_from_type_vars(a, kvars);
+                let b = self.kind_from_type_vars(b, kvars);
+                arr(a, b)
+            }
+            Type::Var(n, _) => {
+                if let Some(k) = kvars.get(n) {
+                    return k.clone();
+                }
+                let k = self.kinds.fresh();
+                kvars.insert(n.clone(), k.clone());
+                k
+            }
+            Type::Forall(_, body) => self.kind_from_type_vars(body, kvars),
+            _ => Kind::Star,
+        }
+    }
+
     /// Infers kinds for the type constructors declared in a module, then checks signatures.
     pub fn check_kinds(&mut self, decls: &[Decl]) -> TR<()> {
         // Data declarations first, then classes; these may refer to each other.
         let mut pending: Vec<(&Decl, Kind)> = Vec::new();
+        // StandaloneKindSignatures: `type T :: kind` gives the kind of `data T`, and so the kinds
+        // of its parameters.
+        let mut sigs: HashMap<String, &Type> = HashMap::new();
+        for d in decls {
+            if let Decl::KindSig { name, kind, .. } = d {
+                sigs.insert(name.clone(), kind);
+            }
+        }
         for d in decls {
             match d {
                 Decl::Data(dd) => {
                     let name = format!("{}.{}", self.module, dd.name);
                     let mut vars: TyVars = HashMap::new();
+                    let mut kvars: HashMap<String, Kind> = HashMap::new();
+                    let sig_kind = match sigs.get(&dd.name) {
+                        Some(sig) => Some(self.kind_from_type_vars(sig, &mut kvars)),
+                        None => None,
+                    };
+                    let mut rest = sig_kind.clone();
                     let mut params = Vec::new();
                     for tv in &dd.tyvars {
-                        let k = match &tv.kind {
-                            Some(k) => self.kind_from_type(k),
-                            None => self.kinds.fresh(),
+                        let from_sig = match rest.take() {
+                            Some(Kind::Arr(a, r)) => {
+                                rest = Some(*r);
+                                Some(*a)
+                            }
+                            _ => None,
+                        };
+                        let k = match (&tv.kind, from_sig) {
+                            (Some(k), _) => self.kind_from_type_vars(k, &mut kvars),
+                            (None, Some(k)) => k,
+                            (None, None) => self.kinds.fresh(),
                         };
                         vars.insert(tv.name.clone(), k.clone());
                         params.push(k);
                     }
-                    let kind = params.into_iter().rev().fold(Kind::Star, |acc, p| arr(p, acc));
-                    self.kinds.tycons.insert(name.clone(), kind.clone());
+                    let has_sig = sig_kind.is_some();
+                    let kind = match sig_kind {
+                        Some(k) => k,
+                        None => params.into_iter().rev().fold(Kind::Star, |acc, p| arr(p, acc)),
+                    };
+                    if has_sig {
+                        // A declared kind is polymorphic: its variables are generalised before the
+                        // body is checked, and each constructor sees its own copy of the parameters.
+                        let mut map = Vec::new();
+                        let general = self.kinds.generalise(&kind, &mut map);
+                        self.kinds.tycons.insert(name.clone(), general);
+                        for tv in &dd.tyvars {
+                            let k = self.kinds.fresh();
+                            vars.insert(tv.name.clone(), k);
+                        }
+                    } else {
+                        self.kinds.tycons.insert(name.clone(), kind.clone());
+                    }
                     pending.push((d, kind));
                     self.check_data_fields(dd, &mut vars)?;
                 }

@@ -560,8 +560,13 @@ impl Parser {
             return Ok(IEItem::Module(self.modid()?));
         }
         if self.at_kw(Kw::Type) {
-            // ExplicitNamespaces: `type (op)` or `type T`.
+            // ExplicitNamespaces: `type (op)` or `type T`. A parenthesised operator after `type`
+            // names a type-level operator, not a value.
             self.bump();
+            if self.at_special('(') {
+                let name = self.paren_op()?;
+                return Ok(IEItem::Thing { name, subs: Subs::None });
+            }
         }
         if self.at_varid("pattern") && matches!(self.peek_raw(1), Tok::ConId(_) | Tok::QConId(..)) {
             self.bump();
@@ -591,6 +596,22 @@ impl Parser {
         self.bump();
         if self.at_res(ROp::DotDot) {
             self.bump();
+            if self.at_special(',') {
+                // Bundled names after `..`: pattern synonyms exported with the type.
+                let mut extra = Vec::new();
+                while self.at_special(',') {
+                    self.bump();
+                    match self.tok().clone() {
+                        Tok::ConId(s) | Tok::VarId(s) => {
+                            self.bump();
+                            extra.push(s);
+                        }
+                        _ => return self.unexpected(),
+                    }
+                }
+                self.expect_special(')')?;
+                return Ok(Subs::AllPlus(extra));
+            }
             self.expect_special(')')?;
             return Ok(Subs::All);
         }

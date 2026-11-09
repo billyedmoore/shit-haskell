@@ -302,11 +302,13 @@ impl Checker {
         self.loc = loc;
         let outer_level = self.level;
         self.level += 1;
+        // Kind variables (`k`, `k1`, `rep`, ...) are not tracked by kind inference, so they are
+        // flexible here rather than rigid: a kind-polymorphic signature is then not refused.
         let skolems: Vec<Ty> = scheme
             .names
             .iter()
             .take(scheme.nvars as usize)
-            .map(|n| self.metas.fresh_skolem(n))
+            .map(|n| if is_kind_var_name(n) { self.metas.fresh(self.level) } else { self.metas.fresh_skolem(n) })
             .collect();
         let ty = subst_gen(&scheme.ty, &skolems);
         let preds: Vec<Pred> = scheme
@@ -320,7 +322,7 @@ impl Checker {
         let dparams: Vec<String> = preds.iter().map(|_| self.fresh_name("dg")).collect();
         let givens_len = self.givens.len();
         for (p, d) in preds.iter().zip(&dparams) {
-            self.givens.push(Given {
+            self.add_given(Given {
                 pred: p.clone(),
                 ev: Core::Var(d.clone()),
             });
@@ -592,6 +594,7 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
         Expr::Var(q, _) => {
             out.insert(qkey(q));
         }
+        Expr::IPVar(..) => {}
         Expr::Con(..) | Expr::Lit(..) | Expr::Wild(_) => {}
         Expr::App(f, a) => {
             collect_expr(f, out);
@@ -685,3 +688,12 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
     }
 }
 
+/// Names conventionally given to kind and representation variables in the libraries.
+fn is_kind_var_name(n: &str) -> bool {
+    let digits = |rest: &str| rest.chars().all(|c| c.is_ascii_digit());
+    match n.chars().next() {
+        Some('k') => digits(&n[1..]),
+        Some('r') => n == "rep" || n == "rr" || (n.len() > 1 && digits(&n[1..])),
+        _ => false,
+    }
+}

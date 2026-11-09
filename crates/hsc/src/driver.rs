@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::TopBind;
 use crate::rename::iface::Iface;
-use crate::syntax::ast::Module;
+use crate::syntax::ast::{Decl, Module};
 use crate::syntax::extensions::Extensions;
 use crate::tc::Checker;
 
@@ -38,6 +38,7 @@ impl Driver {
                 default_lib_dir(),
                 default_lib_dir().join("ghc-prim"),
                 default_lib_dir().join("ghc-internal").join("src"),
+                default_lib_dir().join("ghc-bignum").join("src"),
             ],
             ifaces: BTreeMap::new(),
             checker: Checker::new(),
@@ -70,11 +71,17 @@ impl Driver {
             .ok_or_else(|| format!("Could not find module ‘{module}’ (no .hs-boot file for a SOURCE import)"))?;
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &self.flags)?;
-        let (parsed, exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
+        let (mut parsed, exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
+        strip_boot_bodies(&mut parsed);
+        let source = Self::source_imports(&src);
         for imp in parsed.imports.clone() {
-            self.load(&imp.module)?;
+            if source.contains(&imp.module) {
+                self.load_boot(&imp.module)?;
+            } else {
+                self.load(&imp.module)?;
+            }
         }
         self.checker.boot = true;
         let result = self.compile_module(parsed, exts, &path);
@@ -107,13 +114,14 @@ impl Driver {
             let Some(rest) = rest.strip_prefix("{-#") else { continue };
             let Some(rest) = rest.trim_start().strip_prefix("SOURCE") else { continue };
             let Some(rest) = rest.trim_start().strip_prefix("#-}") else { continue };
-            let mut words = rest.split_whitespace();
-            let mut name = words.next();
-            if name == Some("qualified") {
-                name = words.next();
+            let mut rest = rest.trim_start();
+            if let Some(r) = rest.strip_prefix("qualified") {
+                rest = r.trim_start();
             }
-            if let Some(m) = name {
-                out.insert(m.to_string());
+            // The module name is what follows; an import list may come directly after it.
+            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '.' || *c == '_').collect();
+            if !name.is_empty() {
+                out.insert(name);
             }
         }
         out
@@ -232,4 +240,16 @@ pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Resul
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mut pp = crate::syntax::cpp::Preprocessor::new(vec![default_lib_dir().join("include")]);
     pp.run(&src, &dir).map_err(|e| format!("{}: error: {e}", path.display()))
+}
+
+/// A boot file declares; it does not define. Method definitions and instance bodies are removed.
+fn strip_boot_bodies(m: &mut Module) {
+    for d in &mut m.decls {
+        match d {
+            Decl::Class(cd) => cd.decls.retain(|x| !matches!(x, Decl::Fun { .. } | Decl::PatBind { .. })),
+            Decl::Instance(id) => id.decls.clear(),
+            _ => {}
+        }
+    }
+    m.decls.retain(|d| !matches!(d, Decl::Fun { .. } | Decl::PatBind { .. }));
 }

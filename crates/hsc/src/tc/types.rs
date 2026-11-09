@@ -161,10 +161,18 @@ pub fn subst_bound_pred(p: &Pred, ids: &[u32], tys: &[Ty]) -> Pred {
 }
 
 pub fn subst_gen_pred(p: &Pred, args: &[Ty]) -> Pred {
-    Pred {
+    let out = Pred {
         class: p.class.clone(),
         args: p.args.iter().map(|t| subst_gen(t, args)).collect(),
+    };
+    // A constraint variable instantiated with a class application is that class's predicate.
+    if out.class == super::convert::CONSTRAINT_VAR && out.args.len() == 1 {
+        let (head, cargs) = out.args[0].split_apps();
+        if let Ty::Con(c) = head {
+            return Pred { class: c.clone(), args: cargs.into_iter().cloned().collect() };
+        }
     }
+    out
 }
 
 /// The unification variables of the checker, with their levels. Rigid variables can
@@ -175,6 +183,8 @@ pub struct Metas {
     pub levels: Vec<u32>,
     pub skolems: u32,
     pub skol_binds: HashMap<u32, Ty>,
+    /// The global names of the type families in scope (see `unify_refine`).
+    pub families: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -309,6 +319,10 @@ impl Metas {
     pub fn unify_refine(&mut self, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         let a = self.prune(a);
         let b = self.prune(b);
+        // An irreducible family application cannot be refined; its equality is not used.
+        if self.is_family_app(&a) || self.is_family_app(&b) {
+            return Ok(());
+        }
         match (&a, &b) {
             (Ty::Skol(x, _), Ty::Skol(y, _)) if x == y => Ok(()),
             (Ty::Skol(x, _), t) | (t, Ty::Skol(x, _)) => {
@@ -321,6 +335,10 @@ impl Metas {
             }
             _ => self.unify(&a, &b),
         }
+    }
+
+    fn is_family_app(&self, t: &Ty) -> bool {
+        matches!(t.split_apps().0, Ty::Con(c) if self.families.contains(c))
     }
 
     fn bind(&mut self, i: u32, t: &Ty) -> Result<(), UnifyError> {

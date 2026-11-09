@@ -51,6 +51,8 @@ pub enum Value {
     Vec(Rc<RefCell<Vec<Cell>>>),
     /// An `Addr#`: a byte buffer and an offset into it.
     Addr(Rc<Vec<u8>>, usize),
+    /// A mutable byte array (`MutableByteArray#`, and `ByteArray#` once frozen).
+    Bytes(Rc<RefCell<Vec<u8>>>),
     /// An `MVar`: empty, or holding a cell.
     MVar(Rc<RefCell<Option<Cell>>>),
 }
@@ -188,7 +190,7 @@ impl Runtime {
         match code {
             Code::Var(acc) => self.access(*acc, frame),
             Code::Char(c) => new_cell(Thunk::Done(Value::Char(*c))),
-            Code::Integer(b) => new_cell(Thunk::Done(Value::Integer(b.clone()))),
+            Code::Integer(b) => new_cell(Thunk::Done(prims::integer_con((**b).clone()))),
             Code::Int(i) => new_cell(Thunk::Done(Value::Int(*i))),
             _ => new_cell(Thunk::Pending(code, frame.clone())),
         }
@@ -212,7 +214,7 @@ impl Runtime {
                     let cell = self.access(*acc, &frame);
                     return self.force(&cell);
                 }
-                Code::Integer(b) => return Ok(Value::Integer(b.clone())),
+                Code::Integer(b) => return Ok(prims::integer_con((**b).clone())),
                 Code::Int(i) => return Ok(Value::Int(*i)),
                 Code::Double(d) => return Ok(Value::Double(*d)),
                 Code::Frac(s) => return Ok(Value::Double(s.parse().unwrap_or(0.0))),
@@ -276,7 +278,7 @@ impl Runtime {
                                 }
                             }
                             CAlt::Lit(l, body) => {
-                                if lit_matches(&v, l) {
+                                if lit_matches(self, &v, l)? {
                                     code = body;
                                     continue 'outer;
                                 }
@@ -348,7 +350,7 @@ impl Runtime {
 
 pub fn lit_value(l: &Lit) -> RR {
     Ok(match l {
-        Lit::Integer(s) => Value::Integer(Rc::new(BigInt::parse(s).ok_or_else(|| RtError::Fail("bad integer literal".into()))?)),
+        Lit::Integer(s) => prims::integer_con(BigInt::parse(s).ok_or_else(|| RtError::Fail("bad integer literal".into()))?),
         Lit::Frac(s) => Value::Double(s.parse().unwrap_or(0.0)),
         Lit::Int(i) => Value::Int(*i),
         Lit::Double(d) => Value::Double(*d),
@@ -373,14 +375,17 @@ pub fn string_value(s: &str) -> Value {
     v
 }
 
-fn lit_matches(v: &Value, l: &Lit) -> bool {
-    match (v, l) {
+fn lit_matches(rt: &Runtime, v: &Value, l: &Lit) -> Result<bool, RtError> {
+    Ok(match (v, l) {
         (Value::Char(a), Lit::Char(b)) => a == b,
         (Value::Int(a), Lit::Int(b)) => a == b,
         (Value::Int(a), Lit::Integer(s)) => s.parse::<i64>().ok() == Some(*a),
-        (Value::Integer(a), Lit::Integer(s)) => BigInt::parse(s).is_some_and(|b| **a == b),
+        (v, Lit::Integer(s)) => match prims::integer_from_value(rt, v)? {
+            Some(a) => BigInt::parse(s).is_some_and(|b| a == b),
+            None => false,
+        },
         _ => false,
-    }
+    })
 }
 
 /// Runs `Main.main`, returning the process exit code.

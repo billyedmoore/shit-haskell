@@ -17,9 +17,103 @@ const NUMERIC_CLASSES: &[&str] = &[
 ];
 
 /// Candidate types for defaulting, in order.
-const DEFAULT_CANDIDATES: &[&str] = &["Base.Integer", "GHC.Types.Double"];
+const DEFAULT_CANDIDATES: &[&str] = &["GHC.Num.Integer.Integer", "GHC.Types.Double"];
+
+/// The class of equality constraints `a ~ b` (the builtin type operator `~`). Their evidence is
+/// a unit value; a wanted one is solved by unification and a given one refines rigid variables.
+pub const EQ_CLASS: &str = "Builtin.~";
+
+/// Whether a predicate class is an equality constraint (`~` or the heterogeneous `~~`).
+pub fn is_eq_class(class: &str) -> bool {
+    class == EQ_CLASS || class == "Builtin.~~"
+}
+
+/// The class of `withDict`: `WithDict cls meth`, solved by the compiler (GHC.Magic.Dict).
+pub const WITH_DICT_CLASS: &str = "GHC.Magic.Dict.WithDict";
+
+/// The class `Typeable`, whose instances the compiler builds.
+pub const TYPEABLE_CLASS: &str = "GHC.Internal.Data.Typeable.Internal.Typeable";
 
 impl Checker {
+    /// The evidence for `Typeable t` from the structure of `t`: a constructor's representation
+    /// comes from its name, and an application's from its parts (whose evidence is wanted).
+    /// Returns `None` when `t` is not yet known (a unification variable) or a given applies.
+    fn typeable_evidence(&mut self, pred: &Pred, work: &mut Vec<Wanted>, loc: crate::syntax::ast::Loc) -> TR<Option<Core>> {
+        let class = match self.class(TYPEABLE_CLASS) {
+            Some(c) => c.dict_con.clone(),
+            None => return Ok(None),
+        };
+        let t = pred.args[0].clone();
+        let rep = match self.metas.prune(&t) {
+            Ty::App(f, x) => {
+                let (ef, ex) = (self.fresh_name("tyf"), self.fresh_name("tyx"));
+                work.push(Wanted { pred: Pred { class: TYPEABLE_CLASS.into(), args: vec![*f] }, ev: ef.clone(), loc });
+                work.push(Wanted { pred: Pred { class: TYPEABLE_CLASS.into(), args: vec![*x] }, ev: ex.clone(), loc });
+                let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrApp".into());
+                let rf = self.typeable_rep_of(&ef, &class);
+                let rx = self.typeable_rep_of(&ex, &class);
+                Core::App(Box::new(Core::App(Box::new(mk), Box::new(rf))), Box::new(rx))
+            }
+            Ty::Con(c) => {
+                let (modl, name) = match c.rfind('.') {
+                    Some(i) if i > 0 && i + 1 < c.len() => (c[..i].to_string(), c[i + 1..].to_string()),
+                    _ => ("Builtin".to_string(), c.clone()),
+                };
+                let (m, _) = self.infer(&crate::syntax::ast::Expr::Lit(crate::syntax::ast::Lit::Str(modl), loc))?;
+                let (n, _) = self.infer(&crate::syntax::ast::Expr::Lit(crate::syntax::ast::Lit::Str(name), loc))?;
+                let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTypeableCon#".into());
+                Core::App(Box::new(Core::App(Box::new(mk), Box::new(m))), Box::new(n))
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Core::Con(class, vec![rep])))
+    }
+
+    /// The `typeRep#` field of a Typeable dictionary variable.
+    fn typeable_rep_of(&mut self, dict: &str, class: &str) -> Core {
+        super::select_field(Core::Var(dict.to_string()), class, 1, 0, &mut || self.fresh_name("trv"))
+    }
+
+    /// The evidence for `WithDict cls meth`: a dictionary whose method takes a value of the
+    /// class's single method and a continuation expecting the class dictionary.
+    fn with_dict_evidence(&mut self, pred: &Pred) -> TR<Core> {
+        let (head, cargs) = pred.args[0].split_apps();
+        let cname = match head {
+            Ty::Con(c) => c.clone(),
+            _ => return self.err("withDict: the constraint must be a class"),
+        };
+        let cargs: Vec<Ty> = cargs.into_iter().cloned().collect();
+        let info = match self.class(&cname).cloned() {
+            Some(info) => info,
+            None => return self.err(format!("withDict: ‘{cname}’ is not a class")),
+        };
+        if !info.supers.is_empty() || info.methods.len() != 1 || info.methods[0].1.nvars as usize != info.nparams as usize {
+            return self.err(format!("withDict: ‘{cname}’ must have a single method and no superclasses"));
+        }
+        let meth_ty = super::types::subst_gen(&info.methods[0].1.ty, &cargs);
+        self.unify_at(&pred.args[1], &meth_ty)?;
+        let m = self.fresh_name("wdm");
+        let k = self.fresh_name("wdk");
+        let dict = Core::Con(info.dict_con.clone(), vec![Core::Var(m.clone())]);
+        let body = Core::App(Box::new(Core::Var(k.clone())), Box::new(dict));
+        let fun = Core::Lam(m, Box::new(Core::Lam(k, Box::new(body))));
+        let wd = match self.class(WITH_DICT_CLASS) {
+            Some(c) => c.dict_con.clone(),
+            None => return self.err("withDict: GHC.Magic.Dict is not loaded"),
+        };
+        Ok(Core::Con(wd, vec![fun]))
+    }
+
+    /// Adds a given constraint. An equality given `a ~ b` refines the rigid variables it
+    /// mentions, for the rest of the enclosing scope.
+    pub fn add_given(&mut self, g: Given) {
+        if is_eq_class(&g.pred.class) && g.pred.args.len() == 2 {
+            let (a, b) = (g.pred.args[0].clone(), g.pred.args[1].clone());
+            let _ = self.metas.unify_refine(&a, &b);
+        }
+        self.givens.push(g);
+    }
+
     /// Solves what can be solved. Returns evidence bindings and the residual wanteds
     /// that still mention unsolved unification variables.
     pub fn solve(&mut self, wanteds: Vec<Wanted>) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
@@ -30,6 +124,46 @@ impl Checker {
         while let Some(w) = work.pop() {
             self.improve(&w.pred)?;
             let pred = self.metas_zonk_pred(&w.pred);
+            if is_eq_class(&pred.class) && pred.args.len() == 2 {
+                self.unify_at(&pred.args[0], &pred.args[1])?;
+                binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
+                continue;
+            }
+            // Typeable is solved by the compiler: a representation built from the type's structure.
+            if pred.class == TYPEABLE_CLASS && pred.args.len() == 1 {
+                if let Some(ev) = self.typeable_evidence(&pred, &mut work, w.loc)? {
+                    binds.push((w.ev.clone(), ev));
+                    continue;
+                }
+            }
+            // `withDict @C m k`: the compiler solves `WithDict C meth` for a single-method class.
+            if pred.class == WITH_DICT_CLASS && pred.args.len() == 2 {
+                let ev = self.with_dict_evidence(&pred)?;
+                binds.push((w.ev.clone(), ev));
+                continue;
+            }
+            // Representational equality is not checked (coercions are erased), so it always holds.
+            if pred.class == "GHC.Types.Coercible" {
+                binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
+                continue;
+            }
+            if pred.class.starts_with('?') {
+                // An implicit parameter is solved by the innermost binding of that name.
+                let given = self.givens.iter().rev().find(|g| g.pred.class == pred.class).cloned();
+                match given {
+                    Some(g) => {
+                        self.unify_at(&g.pred.args[0], &pred.args[0])?;
+                        binds.push((w.ev.clone(), g.ev.clone()));
+                    }
+                    None if pred.class == "?callStack" && self.env.values.contains_key("GHC.Internal.Stack.Types.emptyCallStack") => {
+                        // Without an enclosing call stack, a call starts an empty one.
+                        self.unify_at(&Ty::con("GHC.Internal.Stack.Types.CallStack"), &pred.args[0])?;
+                        binds.push((w.ev.clone(), Core::Var("GHC.Internal.Stack.Types.emptyCallStack".into())));
+                    }
+                    None => residual.push(Wanted { pred, ..w }),
+                }
+                continue;
+            }
             if let Some(ev) = self.find_given(&pred) {
                 binds.push((w.ev.clone(), ev));
                 continue;
@@ -286,6 +420,6 @@ impl Checker {
 
     /// A given with no Core evidence available yet, used for skolemised signatures.
     pub fn given(&mut self, pred: Pred, ev: Core) {
-        self.givens.push(Given { pred, ev });
+        self.add_given(Given { pred, ev });
     }
 }

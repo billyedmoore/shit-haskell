@@ -41,6 +41,10 @@ impl Checker {
                     arg_tys.push(self.convert_type(a, tvs)?);
                 }
                 match head {
+                    // GHC's arrow `FUN m a b` is the built-in arrow: its multiplicity is dropped.
+                    Type::Con(q, _) if global_tycon_name(q) == "GHC.Prim.FUN" && (1..=3).contains(&arg_tys.len()) => {
+                        Ty::apps(Ty::con(super::types::ARROW), arg_tys[1..].to_vec())
+                    }
                     Type::Con(q, _) => self.apply_synonym(&global_tycon_name(q), &arg_tys, tvs)?,
                     other => {
                         let h = self.convert_type(other, tvs)?;
@@ -89,7 +93,7 @@ impl Checker {
             Type::Qual(ctx, body) => {
                 let mut preds = Vec::with_capacity(ctx.len());
                 for c in ctx {
-                    preds.push(self.convert_pred(c, tvs)?);
+                    preds.extend(self.convert_context_item(c, tvs)?);
                 }
                 let body = self.convert_type(body, tvs)?;
                 if preds.is_empty() {
@@ -104,6 +108,10 @@ impl Checker {
 
     /// Expands a type synonym when fully applied; otherwise builds the application.
     fn apply_synonym(&mut self, name: &str, args: &[Ty], _tvs: &mut Vec<String>) -> TR<Ty> {
+        // GHC.Types defines `(->)` as `FUN 'Many`; here it is the built-in arrow.
+        if name == "GHC.Types.->" {
+            return Ok(Ty::apps(Ty::con(super::types::ARROW), args.to_vec()));
+        }
         if let Some(syn) = self.env.synonyms.get(name).cloned() {
             let n = syn.nparams as usize;
             if args.len() >= n {
@@ -112,6 +120,28 @@ impl Checker {
             }
         }
         Ok(Ty::apps(Ty::Con(name.to_string()), args.to_vec()))
+    }
+
+    /// Converts one item of a context into predicates: a class constraint, an implicit
+    /// parameter, or a constraint synonym, which may stand for several.
+    pub fn convert_context_item(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Vec<Pred>> {
+        // QuantifiedConstraints are not supported: `forall x. C x` in a context is dropped.
+        if let Type::Forall(_, body) = t {
+            let _ = body;
+            return Ok(Vec::new());
+        }
+        let mut head = t;
+        while let Type::App(f, _) = head {
+            head = f;
+        }
+        if let Type::Con(q, _) = head {
+            let name = global_tycon_name(q);
+            if !q.name.starts_with('?') && self.env.synonyms.contains_key(&name) {
+                let ty = self.convert_type(t, tvs)?;
+                return Ok(ty_to_preds(&ty));
+            }
+        }
+        Ok(vec![self.convert_pred(t, tvs)?])
     }
 
     /// Converts a context item such as `Show a` into a predicate.
@@ -124,6 +154,8 @@ impl Checker {
         }
         args.reverse();
         let class = match head {
+            // ImplicitParams: `?x t` is the constraint named by the parameter.
+            Type::Con(q, _) if q.name.starts_with('?') => q.name.clone(),
             Type::Con(q, _) => global_tycon_name(q),
             // ConstraintKinds: a constraint variable `c` (or `c a`) is a predicate on its type.
             Type::Var(..) => {
@@ -153,7 +185,7 @@ impl Checker {
                 }
                 Type::Qual(ctx, body) => {
                     for c in ctx {
-                        preds.push(self.convert_pred(c, tvs)?);
+                        preds.extend(self.convert_context_item(c, tvs)?);
                     }
                     cur = body;
                 }
@@ -185,6 +217,20 @@ pub fn tvar_index(tvs: &mut Vec<String>, name: &str) -> u32 {
     }
     tvs.push(name.to_string());
     (tvs.len() - 1) as u32
+}
+
+/// The predicates of a converted constraint type: a class application, a tuple of
+/// constraints, or nothing for `()`.
+pub fn ty_to_preds(t: &Ty) -> Vec<Pred> {
+    let (head, args) = t.split_apps();
+    match head {
+        Ty::Con(c) if c == "()" => Vec::new(),
+        Ty::Con(c) if super::types::tuple_arity(c) == Some(args.len()) && args.len() >= 2 => {
+            args.iter().flat_map(|a| ty_to_preds(a)).collect()
+        }
+        Ty::Con(c) => vec![Pred { class: c.clone(), args: args.into_iter().cloned().collect() }],
+        _ => Vec::new(),
+    }
 }
 
 /// The class name of a predicate that is a constraint variable (see `convert_pred`).

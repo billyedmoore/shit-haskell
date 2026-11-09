@@ -39,9 +39,149 @@ fn lam1(p: Pat, body: Expr, loc: Loc) -> Expr {
 impl Checker {
     /// Checks an expression against a known type.
     pub fn check(&mut self, e: &Expr, ty: &Ty) -> TR<Core> {
-        let (c, t) = self.infer(e)?;
-        self.unify_at(&t, ty)?;
-        Ok(c)
+        // The expected type reaches the alternatives, so that a GADT match can refine it there.
+        match e {
+            Expr::Case(scrut, alts, loc) => {
+                self.loc = *loc;
+                let (cs, ts) = self.infer(scrut)?;
+                let s = self.fresh_name("scrut");
+                let rows = self.alt_rows(alts, &ts, ty)?;
+                let mut fresh = |b: &str| self.fresh_name(b);
+                let matched = compile_rows(
+                    std::slice::from_ref(&s),
+                    &rows,
+                    Core::Fail("Non-exhaustive patterns in case".into()),
+                    &mut fresh,
+                );
+                Ok(Core::Let(vec![(s, cs)], Box::new(matched)))
+            }
+            Expr::Let(decls, body, loc) if !decls.iter().any(|d| matches!(d, Decl::IPBind { .. })) => {
+                self.loc = *loc;
+                let binds = self.infer_local(decls)?;
+                let cb = self.check(body, ty)?;
+                Ok(wrap_let(binds, cb))
+            }
+            Expr::App(..) => Ok(self.infer_spine(e, Some(ty))?.0),
+            Expr::Lam(pats, body, loc) => Ok(self.lambda(pats, body, *loc, Some(ty))?.0),
+            _ => {
+                let (c, t) = self.infer(e)?;
+                self.unify_at(&t, ty)?;
+                Ok(c)
+            }
+        }
+    }
+
+    /// A lambda. With an expected type its parameters and body are checked against the parts of
+    /// that type, so that a GADT pattern refines the known types rather than fixing new ones.
+    fn lambda(&mut self, pats: &[Pat], body: &Expr, loc: Loc, expected: Option<&Ty>) -> TR<(Core, Ty)> {
+        self.loc = loc;
+        let mark = self.alt_begin();
+        let mut arg_tys: Vec<Ty> = Vec::with_capacity(pats.len());
+        let mut rest: Option<Ty> = expected.cloned();
+        for _ in pats {
+            let split = rest.as_ref().and_then(|t| self.metas.prune(t).as_fun().map(|(x, y)| (x.clone(), y.clone())));
+            let (a, r) = match split {
+                Some(p) => p,
+                None => {
+                    let x = self.meta();
+                    let y = self.meta();
+                    if let Some(t) = &rest {
+                        self.unify_at(t, &Ty::fun(x.clone(), y.clone()))?;
+                    }
+                    (x, y)
+                }
+            };
+            arg_tys.push(a);
+            rest = Some(r);
+        }
+        let cpats = self.check_pats(pats, &arg_tys)?;
+        let (cbody, tbody) = match &rest {
+            Some(r) => (self.check(body, r)?, r.clone()),
+            None => self.infer(body)?,
+        };
+        let cbody = match self.alt_end(mark, CBody::Expr(cbody))? {
+            CBody::Expr(c) => c,
+            other => {
+                let mut fresh = |b: &str| self.fresh_name(b);
+                compile_body(&other, Core::Fail("guard".into()), &mut fresh)
+            }
+        };
+        let scruts: Vec<String> = pats.iter().map(|_| self.fresh_name("arg")).collect();
+        let rows = vec![Row {
+            pats: cpats,
+            body: CBody::Expr(cbody),
+        }];
+        let fail = Core::Fail("Non-exhaustive patterns in lambda".into());
+        let mut fresh = |b: &str| self.fresh_name(b);
+        let matched = compile_rows(&scruts, &rows, fail, &mut fresh);
+        let mut core = matched;
+        for s in scruts.iter().rev() {
+            core = Core::Lam(s.clone(), Box::new(core));
+        }
+        Ok((core, Ty::funs(arg_tys, tbody)))
+    }
+
+    /// An application spine `f a1 .. an`: the head is inferred and each argument is checked
+    /// against its parameter type. With an expected type, the result is unified with it before
+    /// the arguments are checked, so that their constraints are solved at the known type.
+    /// Returns the Core and the result type.
+    fn infer_spine(&mut self, e: &Expr, expected: Option<&Ty>) -> TR<(Core, Ty)> {
+        let mut spine: Vec<&Expr> = Vec::new();
+        let mut head = e;
+        while let Expr::App(f, a) = head {
+            spine.push(a.as_ref());
+            head = f.as_ref();
+        }
+        spine.reverse();
+        let (mut core, mut tf) = self.infer(head)?;
+        let mut params = Vec::with_capacity(spine.len());
+        for _ in &spine {
+            let (arg, res) = match self.metas.prune(&tf).as_fun() {
+                Some((x, y)) => (x.clone(), y.clone()),
+                None => {
+                    let x = self.meta();
+                    let y = self.meta();
+                    self.unify_at(&tf, &Ty::fun(x.clone(), y.clone()))?;
+                    (x, y)
+                }
+            };
+            params.push(arg);
+            tf = res;
+        }
+        if let Some(ty) = expected {
+            self.unify_at(&tf, ty)?;
+        }
+        // Lambdas are checked after the other arguments: their parameter types are often fixed
+        // by those, and a GADT pattern in a lambda must not fix them first.
+        let mut checked: Vec<Option<Core>> = (0..spine.len()).map(|_| None).collect();
+        for lambdas in [false, true] {
+            for (i, (a, p)) in spine.iter().zip(&params).enumerate() {
+                if matches!(a, Expr::Lam(..)) == lambdas {
+                    checked[i] = Some(self.check_arg(a, p)?);
+                }
+            }
+        }
+        for c in checked.into_iter().flatten() {
+            core = Core::App(Box::new(core), Box::new(c));
+        }
+        Ok((core, tf))
+    }
+
+    /// Checks an argument against its parameter type. A polymorphic or constrained parameter
+    /// is checked under its rigid variables and dictionaries.
+    fn check_arg(&mut self, a: &Expr, arg: &Ty) -> TR<Core> {
+        if let Ty::Forall(ids, preds, body) = self.metas.prune(arg) {
+            // A polymorphic argument: its variables are rigid while it is checked.
+            let sk: Vec<Ty> = ids.iter().map(|_| self.metas.fresh_skolem("r")).collect();
+            let preds: Vec<Pred> = preds.iter().map(|p| super::types::subst_bound_pred(p, &ids, &sk)).collect();
+            let body = super::types::subst_bound(&body, &ids, &sk);
+            return self.check_qual_arg(a, &preds, &body);
+        }
+        if let Ty::Qual(preds, body) = self.metas.prune(arg) {
+            // A rank-N argument: checked under the dictionaries it takes.
+            return self.check_qual_arg(a, &preds, &body);
+        }
+        self.check(a, arg)
     }
 
     /// Infers the type of an expression, producing Core.
@@ -50,7 +190,7 @@ impl Checker {
         match e {
             Expr::Var(q, loc) => {
                 self.loc = *loc;
-                let key = qkey(q);
+                let key = self.resolve_key(&qkey(q));
                 let scheme = self
                     .lookup_var(&key)
                     .ok_or_else(|| super::TcError {
@@ -80,7 +220,7 @@ impl Checker {
             }
             Expr::Con(q, loc) => {
                 self.loc = *loc;
-                let key = qkey(q);
+                let key = self.resolve_key(&qkey(q));
                 if let Some((prim, boxed)) = boxing_types(&key) {
                     // I#, D#, C#: boxing is the identity on the runtime representation.
                     let f = Core::Lam("box%".into(), Box::new(Core::Var("box%".into())));
@@ -96,34 +236,7 @@ impl Checker {
                 self.loc = *loc;
                 self.infer_lit(l)
             }
-            Expr::App(f, a) => {
-                let (cf, tf) = self.infer(f)?;
-                let (arg, res) = match self.metas.prune(&tf).as_fun() {
-                    Some((x, y)) => (x.clone(), y.clone()),
-                    None => {
-                        let x = self.meta();
-                        let y = self.meta();
-                        self.unify_at(&tf, &Ty::fun(x.clone(), y.clone()))?;
-                        (x, y)
-                    }
-                };
-                if let Ty::Forall(ids, preds, body) = self.metas.prune(&arg) {
-                    // A polymorphic argument: its variables are rigid while it is checked.
-                    let sk: Vec<Ty> = ids.iter().map(|_| self.metas.fresh_skolem("r")).collect();
-                    let preds: Vec<Pred> = preds.iter().map(|p| super::types::subst_bound_pred(p, &ids, &sk)).collect();
-                    let body = super::types::subst_bound(&body, &ids, &sk);
-                    let ca = self.check_qual_arg(a, &preds, &body)?;
-                    return Ok((Core::App(Box::new(cf), Box::new(ca)), res));
-                }
-                if let Ty::Qual(preds, body) = self.metas.prune(&arg) {
-                    // A rank-N argument: checked under the dictionaries it takes.
-                    let ca = self.check_qual_arg(a, &preds, &body)?;
-                    return Ok((Core::App(Box::new(cf), Box::new(ca)), res));
-                }
-                let (ca, ta) = self.infer(a)?;
-                self.unify_at(&ta, &arg)?;
-                Ok((Core::App(Box::new(cf), Box::new(ca)), res))
-            }
+            Expr::App(..) => self.infer_spine(e, None),
             Expr::TyApp(..) => {
                 // `f @T1 @T2`: the explicit types instantiate the leading quantified variables.
                 let mut tys: Vec<&Type> = Vec::new();
@@ -140,7 +253,7 @@ impl Checker {
                     }
                 };
                 self.loc = loc;
-                let key = qkey(q);
+                let key = self.resolve_key(&qkey(q));
                 let scheme = self.lookup_var(&key).ok_or_else(|| super::TcError {
                     loc,
                     msg: format!("Variable not in scope: {key}"),
@@ -171,32 +284,52 @@ impl Checker {
                 self.loc = *loc;
                 self.err("internal: unresolved operator chain")
             }
-            Expr::Lam(pats, body, loc) => {
+            Expr::Lam(pats, body, loc) => self.lambda(pats, body, *loc, None),
+            Expr::IPVar(name, loc) => {
+                // An implicit parameter is a wanted constraint whose evidence is its value.
                 self.loc = *loc;
-                let mark = self.alt_begin();
-                let arg_tys: Vec<Ty> = pats.iter().map(|_| self.meta()).collect();
-                let cpats = self.check_pats(pats, &arg_tys)?;
-                let (cbody, tbody) = self.infer(body)?;
-                let cbody = match self.alt_end(mark, CBody::Expr(cbody))? {
-                    CBody::Expr(c) => c,
-                    other => {
-                        let mut fresh = |b: &str| self.fresh_name(b);
-                        compile_body(&other, Core::Fail("guard".into()), &mut fresh)
+                let t = self.meta();
+                let ev = self.fresh_name("ip");
+                self.wanted.push(super::Wanted {
+                    pred: super::types::Pred { class: format!("?{name}"), args: vec![t.clone()] },
+                    ev: ev.clone(),
+                    loc: *loc,
+                });
+                Ok((Core::Var(ev), t))
+            }
+            Expr::Let(decls, body, loc) if decls.iter().any(|d| matches!(d, Decl::IPBind { .. })) => {
+                // `let ?x = e in body`: the bindings are givens for the body.
+                self.loc = *loc;
+                let mut bindings: Vec<(String, Core)> = Vec::new();
+                let mut givens: Vec<super::Given> = Vec::new();
+                for d in decls {
+                    if let Decl::IPBind { name, expr, loc } = d {
+                        self.loc = *loc;
+                        let (ce, te) = self.infer(expr)?;
+                        let ev = self.fresh_name("ip");
+                        bindings.push((ev.clone(), ce));
+                        givens.push(super::Given {
+                            pred: super::types::Pred { class: format!("?{name}"), args: vec![te] },
+                            ev: Core::Var(ev),
+                        });
+                    }
+                }
+                let givens_len = self.givens.len();
+                self.givens.extend(givens);
+                let outer = std::mem::take(&mut self.wanted);
+                let r = self.infer(body);
+                let inner = std::mem::replace(&mut self.wanted, outer);
+                let (cb, tb) = match r {
+                    Ok(x) => x,
+                    Err(e) => {
+                        self.givens.truncate(givens_len);
+                        return Err(e);
                     }
                 };
-                let scruts: Vec<String> = pats.iter().map(|_| self.fresh_name("arg")).collect();
-                let rows = vec![Row {
-                    pats: cpats,
-                    body: CBody::Expr(cbody),
-                }];
-                let fail = Core::Fail("Non-exhaustive patterns in lambda".into());
-                let mut fresh = |b: &str| self.fresh_name(b);
-                let matched = compile_rows(&scruts, &rows, fail, &mut fresh);
-                let mut core = matched;
-                for s in scruts.iter().rev() {
-                    core = Core::Lam(s.clone(), Box::new(core));
-                }
-                Ok((core, Ty::funs(arg_tys, tbody)))
+                let (ev_binds, residual) = self.solve(inner)?;
+                self.wanted.extend(residual);
+                self.givens.truncate(givens_len);
+                Ok((wrap_let(bindings, wrap_let(ev_binds, cb)), tb))
             }
             Expr::Let(decls, body, loc) => {
                 self.loc = *loc;
@@ -405,7 +538,7 @@ impl Checker {
         let dparams: Vec<String> = preds.iter().map(|_| self.fresh_name("dq")).collect();
         let givens_len = self.givens.len();
         for (p, d) in preds.iter().zip(&dparams) {
-            self.givens.push(super::Given { pred: p.clone(), ev: Core::Var(d.clone()) });
+            self.add_given(super::Given { pred: p.clone(), ev: Core::Var(d.clone()) });
         }
         let outer = std::mem::take(&mut self.wanted);
         let result = (|| -> TR<Core> {
@@ -482,7 +615,7 @@ impl Checker {
     }
 
     fn infer_op(&mut self, op: &QName, loc: Loc) -> TR<(Core, Ty)> {
-        let key = qkey(op);
+        let key = self.resolve_key(&qkey(op));
         let scheme = self.lookup_var(&key).ok_or_else(|| super::TcError {
             loc,
             msg: format!("Variable not in scope: {key}"),
@@ -495,13 +628,13 @@ impl Checker {
             Lit::Int(s) => {
                 let (fi, fty) = self.lookup_inst("Base.fromInteger")?;
                 let (arg, res) = split_fun_ty(&fty);
-                self.unify_at(&arg, &Ty::con("Base.Integer"))?;
+                self.unify_at(&arg, &Ty::con("GHC.Num.Integer.Integer"))?;
                 Ok((Core::App(Box::new(fi), Box::new(Core::Lit(CLit::Integer(s.clone())))), res))
             }
             Lit::Frac(s) => {
                 let (fr, fty) = self.lookup_inst("Base.fromRational")?;
                 let (arg, res) = split_fun_ty(&fty);
-                self.unify_at(&arg, &Ty::apps(Ty::con("Base.Ratio"), vec![Ty::con("Base.Integer")]))?;
+                self.unify_at(&arg, &Ty::apps(Ty::Con(self.resolve_type("Base.Ratio")), vec![Ty::con("GHC.Num.Integer.Integer")]))?;
                 let lit = Core::Prim("ratioLit".into(), vec![Core::Lit(CLit::Frac(s.clone()))]);
                 Ok((Core::App(Box::new(fr), Box::new(lit)), res))
             }
@@ -516,6 +649,8 @@ impl Checker {
 
     /// Looks up a Prelude function and instantiates it (the caller adds the wanteds).
     fn lookup_inst(&mut self, name: &str) -> TR<(Core, Ty)> {
+        let name = self.resolve_key(name);
+        let name = name.as_str();
         let scheme = self.lookup_var(name).ok_or_else(|| super::TcError {
             loc: self.loc,
             msg: format!("internal: {name} is not defined in the Prelude"),
@@ -534,6 +669,16 @@ impl Checker {
 
     /// Checks a pattern against a type, binding its variables with monomorphic types.
     pub fn check_pat(&mut self, p: &Pat, ty: &Ty) -> TR<CPat> {
+        // A structured pattern against a polymorphic type instantiates it (`runST (ST s) = ..`).
+        if !matches!(p, Pat::Var(..) | Pat::Wild(_)) {
+            if let Ty::Forall(ids, preds, body) = self.metas.prune(ty) {
+                if preds.is_empty() {
+                    let args: Vec<Ty> = ids.iter().map(|_| self.meta()).collect();
+                    let inst = super::types::subst_bound(&body, &ids, &args);
+                    return self.check_pat(p, &inst);
+                }
+            }
+        }
         match p {
             Pat::Var(name, _) => {
                 self.vars.insert(name.clone(), Scheme::mono(ty.clone()));
@@ -550,7 +695,7 @@ impl Checker {
             }
             Pat::Con(q, args, loc) => {
                 self.loc = *loc;
-                let key = qkey(q);
+                let key = self.resolve_key(&qkey(q));
                 if let (Some((prim, boxed)), 1) = (boxing_types(&key), args.len()) {
                     self.unify_at(ty, &Ty::con(boxed))?;
                     return self.check_pat(&args[0], &Ty::con(prim));
@@ -630,6 +775,15 @@ impl Checker {
             Pat::Bang(sub, _) => Ok(CPat::Bang(Box::new(self.check_pat(sub, ty)?))),
             Pat::Sig(sub, t, loc) => {
                 self.loc = *loc;
+                // ScopedTypeVariables: a type variable the pattern signature mentions for the
+                // first time is bound by it, to a fresh type, for the rest of the binding.
+                let free = self.sig_scheme(t, &[])?.names;
+                for name in free {
+                    if !self.scoped.iter().any(|(n, _)| *n == name) {
+                        let m = self.meta();
+                        self.scoped.push((name, m));
+                    }
+                }
                 let scheme = self.sig_scheme(t, &[])?;
                 let (sty, _, _) = self.metas.instantiate(&scheme, self.level);
                 self.unify_at(&sty, ty)?;
@@ -675,8 +829,11 @@ impl Checker {
                 None => return self.err("internal: constructor type is not a function"),
             }
         }
-        // Refinement: the result type may be more specific than the scrutinee (GADTs).
-        match self.metas.unify_refine(&cur, ty) {
+        // Refinement: the result type may be more specific than the scrutinee (GADTs). Families
+        // are reduced first, so that a reducible family application refines like its value.
+        let cur_n = self.normalize(&cur);
+        let ty_n = self.normalize(ty);
+        match self.metas.unify_refine(&cur_n, &ty_n) {
             Ok(()) => {}
             Err(_) => {
                 let (r, t) = (self.show(&cur), self.show(ty));
@@ -698,7 +855,7 @@ impl Checker {
         let mut dict_pats = Vec::with_capacity(preds.len());
         for p in preds {
             let dv = self.fresh_name("dx");
-            self.givens.push(super::Given {
+            self.add_given(super::Given {
                 pred: p,
                 ev: Core::Var(dv.clone()),
             });
@@ -724,7 +881,7 @@ impl Checker {
                 let s = if negative { format!("-{s}") } else { s.clone() };
                 let (fi, fty) = self.lookup_inst("Base.fromInteger")?;
                 let (arg, res) = split_fun_ty(&fty);
-                self.unify_at(&arg, &Ty::con("Base.Integer"))?;
+                self.unify_at(&arg, &Ty::con("GHC.Num.Integer.Integer"))?;
                 self.unify_at(&res, ty)?;
                 (Core::App(Box::new(fi), Box::new(Core::Lit(CLit::Integer(s)))), ty.clone(), true)
             }
@@ -732,7 +889,7 @@ impl Checker {
                 let s = if negative { format!("-{s}") } else { s.clone() };
                 let (fr, fty) = self.lookup_inst("Base.fromRational")?;
                 let (arg, res) = split_fun_ty(&fty);
-                self.unify_at(&arg, &Ty::apps(Ty::con("Base.Ratio"), vec![Ty::con("Base.Integer")]))?;
+                self.unify_at(&arg, &Ty::apps(Ty::Con(self.resolve_type("Base.Ratio")), vec![Ty::con("GHC.Num.Integer.Integer")]))?;
                 self.unify_at(&res, ty)?;
                 let lit = Core::Prim("ratioLit".into(), vec![Core::Lit(CLit::Frac(s))]);
                 (Core::App(Box::new(fr), Box::new(lit)), ty.clone(), true)
@@ -933,7 +1090,18 @@ impl Checker {
                     ],
                     *l,
                 );
-                app(app(prelude("concatMap", *l), lam1(Pat::Var(x, *l), case, *l)), expr.clone())
+                // foldr (\x acc -> case .. ++ acc) [] xs: built from foldr and (++), which every
+                // base module defines (concatMap lives in a later module).
+                let acc = "lc%acc";
+                let step = Expr::Lam(
+                    vec![Pat::Var(x, *l), Pat::Var(acc.into(), *l)],
+                    Box::new(app(
+                        app(prelude("++", *l), case),
+                        Expr::Var(QName::unqual(acc), *l),
+                    )),
+                    *l,
+                );
+                app(app(app(prelude("foldr", *l), step), Expr::List(vec![], *l)), expr.clone())
             }
         }
     }

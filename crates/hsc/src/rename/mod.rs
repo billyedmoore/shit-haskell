@@ -49,11 +49,11 @@ enum BindMode {
 }
 
 pub fn is_builtin_con(name: &str) -> bool {
-    name == "()" || name == "[]" || name == ":" || name.starts_with("(,")
+    name == "()" || name == "[]" || name == ":" || name.starts_with("(,") || name.starts_with("(#_")
 }
 
 pub fn is_builtin_tycon(name: &str) -> bool {
-    name == "()" || name == "[]" || name == "->" || name == "~" || name == "~~" || name.starts_with("(,")
+    name == "()" || name == "[]" || name == "->" || name == "~" || name == "~~" || name.starts_with("(,") || name.starts_with("(#|")
 }
 
 /// Constructor-like names (constructors, `:`, built-in syntax).
@@ -183,7 +183,22 @@ impl<'a> Renamer<'a> {
         for d in &m.decls {
             if let Decl::PatSyn { name, args, pat, dir, loc } = d {
                 self.patsyn_definition(name, args, pat, dir, *loc)?;
-                builders.extend(builder_decls(name, args, pat, dir, *loc)?);
+                let defs = builder_decls(name, args, pat, dir, *loc)?;
+                // A builder has the synonym's signature, with both of its contexts required.
+                if !defs.is_empty() {
+                    for d in &m.decls {
+                        if let Decl::PatSynSig { names, ty, loc } = d {
+                            if names.iter().any(|n| n == name) {
+                                builders.push(Decl::Sig {
+                                    names: vec![builder_name(name)],
+                                    ty: merge_contexts(ty),
+                                    loc: *loc,
+                                });
+                            }
+                        }
+                    }
+                }
+                builders.extend(defs);
             }
         }
 
@@ -233,9 +248,9 @@ impl<'a> Renamer<'a> {
         if matches!(name, "->" | "~" | "~~") {
             return true;
         }
+        // Type-level operators (type families, synonyms, classes) may also carry a fixity.
         self.own.iter().any(|e| {
-            (e.kind.is_value() && e.occ() == name)
-                || e.subs.iter().any(|s| s.kind.is_value() && s.occ() == name)
+            e.occ() == name || e.subs.iter().any(|s| s.kind.is_value() && s.occ() == name)
         })
     }
 
@@ -278,6 +293,10 @@ impl<'a> Renamer<'a> {
             Some(items) if !imp.hiding => {
                 let mut out = Vec::new();
                 for item in items {
+                    // Built-in type operators (`type (~)`) are always in scope; nothing to import.
+                    if is_builtin_tycon(&item_name(item)) {
+                        continue;
+                    }
                     let found = select_item(&iface.exports, item);
                     match found {
                         Some(list) => out.extend(list),
@@ -530,10 +549,18 @@ impl<'a> Renamer<'a> {
         if q.qual.is_none() && is_builtin_tycon(&q.name) {
             return Ok(builtin(&q.name, loc));
         }
+        // Implicit-parameter constraints `?x t` are named by the parameter.
+        if q.name.starts_with('?') {
+            return Ok(q.clone());
+        }
         // A promoted data constructor (DataKinds) is looked up among the values; its global
         // name keeps the tick so that it is distinct from a type of the same name.
         if let Some(bare) = q.name.strip_prefix('\'') {
-            if bare.starts_with(|c: char| c.is_uppercase()) {
+            // The built-in promoted constructors (list cons and nil, tuples) are always in scope.
+            if q.qual.is_none() && (bare == ":" || bare == "[]" || bare == "()" || bare.starts_with("(,")) {
+                return Ok(QName { qual: Some(BUILTIN.to_string()), name: format!("'{bare}") });
+            }
+            if bare.starts_with(|c: char| c.is_uppercase() || c == ':') {
                 let vq = QName { qual: q.qual.clone(), name: bare.to_string() };
                 return match self.lookup_global(&vq, Ns::Value) {
                     Ok(e) => Ok(QName {
@@ -658,13 +685,21 @@ impl<'a> Renamer<'a> {
 
     fn top_decl(&mut self, d: Decl) -> RR<Decl> {
         Ok(match d {
+            Decl::IPBind { loc, .. } => {
+                return Err(RnError { loc, msg: "Implicit-parameter bindings are only allowed in a let or where".into() })
+            }
+            Decl::DefaultSig { loc, .. } => {
+                return Err(RnError { loc, msg: "A default signature outside a class".into() })
+            }
             // Pattern synonyms are resolved away before declarations are renamed.
             Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } => {
                 return Err(RnError { loc, msg: "internal: pattern synonym reached the declaration pass".into() })
             }
             Decl::Sig { names, ty, loc } => {
                 for n in &names {
-                    if !self.boot && !self.own.iter().any(|e| e.kind == EntKind::Var && e.occ() == n) {
+                    // Pattern synonym builders (`$bP`) are generated with their own signatures.
+                    let generated = n.starts_with("$b");
+                    if !self.boot && !generated && !self.own.iter().any(|e| e.kind == EntKind::Var && e.occ() == n) {
                         return Err(RnError {
                             loc,
                             msg: format!("The type signature for ‘{n}’ lacks an accompanying binding"),
@@ -737,6 +772,11 @@ impl<'a> Renamer<'a> {
                 for d in std::mem::take(&mut cd.decls) {
                     decls.push(match d {
                         Decl::Sig { names, ty, loc } => Decl::Sig {
+                            names,
+                            ty: self.ty(ty)?,
+                            loc,
+                        },
+                        Decl::DefaultSig { names, ty, loc } => Decl::DefaultSig {
                             names,
                             ty: self.ty(ty)?,
                             loc,
@@ -965,6 +1005,7 @@ impl<'a> Renamer<'a> {
         let mut out = Vec::with_capacity(decls.len());
         for d in decls {
             out.push(match d {
+                Decl::IPBind { name, expr, loc } => Decl::IPBind { name, expr: self.expr(expr)?, loc },
                 Decl::Fun { name, clauses, loc } => {
                     check_arities(&name, &clauses, loc)?;
                     let u = self.lookup_local(&name).expect("bound above");
@@ -1070,6 +1111,7 @@ impl<'a> Renamer<'a> {
 
     fn expr(&mut self, e: Expr) -> RR<Expr> {
         Ok(match e {
+            Expr::IPVar(name, loc) => Expr::IPVar(name, loc),
             Expr::Var(q, loc) => Expr::Var(self.value_ref(&q, loc, false)?, loc),
             Expr::Con(q, loc) => {
                 let cq = self.value_ref(&q, loc, true)?;
@@ -1523,6 +1565,15 @@ impl<'a> Renamer<'a> {
                     with_subs.subs = match subs {
                         Subs::None => Vec::new(),
                         Subs::All => e.subs.clone(),
+                        Subs::AllPlus(extra) => {
+                            let mut all = e.subs.clone();
+                            for n in extra {
+                                if let Ok(s) = self.lookup_global(&QName::unqual(n.clone()), Ns::Value) {
+                                    all.push(s);
+                                }
+                            }
+                            all
+                        }
                         Subs::Some(names) => e
                             .subs
                             .iter()
@@ -1536,10 +1587,17 @@ impl<'a> Renamer<'a> {
                     if *m == self.module {
                         out.extend(self.own.iter().cloned());
                     } else {
-                        for map in [&self.qvals, &self.qtypes] {
+                        // `module M` exports the entities in scope both unqualified and as `M.x`.
+                        for (map, unqual) in [(&self.qvals, &self.vals), (&self.qtypes, &self.types)] {
                             for ((q, _occ), list) in map {
                                 if q == m {
                                     for e in list {
+                                        let unqualified = unqual
+                                            .get(e.occ())
+                                            .is_some_and(|l| l.iter().any(|x| x.global == e.global));
+                                        if !unqualified {
+                                            continue;
+                                        }
                                         // A type and a constructor can share a global name; they
                                         // are different entities.
                                         if !out.iter().any(|x| x.global == e.global && x.kind.is_value() == e.kind.is_value()) {
@@ -1639,6 +1697,7 @@ fn select_item(exports: &[Entity], item: &IEItem) -> Option<Vec<Entity>> {
             match subs {
                 Subs::None => {}
                 Subs::All => out.extend(t.subs.iter().cloned()),
+                Subs::AllPlus(_) => out.extend(t.subs.iter().cloned()),
                 Subs::Some(names) => out.extend(
                     t.subs
                         .iter()
@@ -1709,7 +1768,7 @@ fn collect_pat_vars(p: &Pat, out: &mut Vec<(String, Loc)>) {
 
 fn decl_loc(d: &Decl) -> Loc {
     match d {
-        Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } => *loc,
+        Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } | Decl::IPBind { loc, .. } | Decl::DefaultSig { loc, .. } => *loc,
         Decl::Sig { loc, .. }
         | Decl::Fixity { loc, .. }
         | Decl::Fun { loc, .. }
@@ -1740,6 +1799,34 @@ fn instance_class(head: &Type) -> Option<QName> {
 }
 
 /// The global name of a pattern synonym's builder function.
+/// The type of a pattern synonym's builder: `forall vs. req => forall ws. prov => t` becomes
+/// `forall vs ws. (req, prov) => t`, dropping empty contexts.
+fn merge_contexts(t: &Type) -> Type {
+    let mut binds: Vec<TyVarBind> = Vec::new();
+    let mut ctx: Vec<Type> = Vec::new();
+    let mut cur = t;
+    loop {
+        match cur {
+            Type::Forall(bs, body) => {
+                binds.extend(bs.iter().cloned());
+                cur = body;
+            }
+            Type::Qual(cs, body) => {
+                ctx.extend(cs.iter().cloned());
+                cur = body;
+            }
+            _ => break,
+        }
+    }
+    ctx.retain(|c| !matches!(c, Type::Con(q, _) if q.name == "()") && !matches!(c, Type::Tuple(v, _) if v.is_empty()));
+    let body = if ctx.is_empty() { cur.clone() } else { Type::Qual(ctx, Box::new(cur.clone())) };
+    if binds.is_empty() {
+        body
+    } else {
+        Type::Forall(binds, Box::new(body))
+    }
+}
+
 pub fn builder_name(synonym: &str) -> String {
     format!("$b{synonym}")
 }

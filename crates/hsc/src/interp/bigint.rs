@@ -380,6 +380,93 @@ pub fn shift_left(a: &BigInt, n: usize) -> BigInt {
     BigInt::from_parts(a.neg, shl_mag(&a.mag, n))
 }
 
+/// Two's-complement limbs of `a`, `len` limbs long (sign-extended).
+fn twos(a: &BigInt, len: usize) -> Vec<u32> {
+    let mut v: Vec<u32> = a.mag.clone();
+    v.resize(len, 0);
+    if a.neg {
+        // -x = !(x - 1) for the magnitude x.
+        let mut borrow = true;
+        for limb in v.iter_mut() {
+            if borrow {
+                let (r, b) = limb.overflowing_sub(1);
+                *limb = r;
+                borrow = b;
+            }
+        }
+        for limb in v.iter_mut() {
+            *limb = !*limb;
+        }
+    }
+    v
+}
+
+/// The value of two's-complement limbs.
+fn from_twos(mut v: Vec<u32>) -> BigInt {
+    let neg = v.last().is_some_and(|top| top & 0x8000_0000 != 0);
+    if neg {
+        for limb in v.iter_mut() {
+            *limb = !*limb;
+        }
+        let mut carry = true;
+        for limb in v.iter_mut() {
+            if carry {
+                let (r, c) = limb.overflowing_add(1);
+                *limb = r;
+                carry = c;
+            }
+        }
+    }
+    trim(&mut v);
+    BigInt::from_parts(neg && !v.is_empty(), v)
+}
+
+/// Bitwise and, or, xor on arbitrary integers (two's complement, as GHC defines them).
+pub fn bitwise(a: &BigInt, b: &BigInt, op: fn(u32, u32) -> u32) -> BigInt {
+    let len = a.mag.len().max(b.mag.len()) + 1;
+    let x = twos(a, len);
+    let y = twos(b, len);
+    from_twos(x.iter().zip(&y).map(|(p, q)| op(*p, *q)).collect())
+}
+
+/// Arithmetic shift right: floor division by 2^n.
+pub fn shift_right(a: &BigInt, n: usize) -> BigInt {
+    let divisor = shift_left(&BigInt::from_i64(1), n);
+    a.div_mod(&divisor).0
+}
+
+/// The number of bits of the magnitude (0 for zero).
+pub fn bit_length(a: &BigInt) -> usize {
+    match a.mag.last() {
+        None => 0,
+        Some(top) => (a.mag.len() - 1) * 32 + (32 - top.leading_zeros() as usize),
+    }
+}
+
+/// The number of 64-bit words of the magnitude.
+pub fn limb64_count(a: &BigInt) -> usize {
+    a.mag.len().div_ceil(2)
+}
+
+/// The i-th 64-bit word of the magnitude (0 beyond its end).
+pub fn limb64(a: &BigInt, i: usize) -> u64 {
+    let lo = a.mag.get(2 * i).copied().unwrap_or(0) as u64;
+    let hi = a.mag.get(2 * i + 1).copied().unwrap_or(0) as u64;
+    lo | (hi << 32)
+}
+
+/// The number of one bits of the magnitude.
+pub fn popcount(a: &BigInt) -> usize {
+    a.mag.iter().map(|l| l.count_ones() as usize).sum()
+}
+
+/// Whether bit `n` of the two's-complement value is set.
+pub fn test_bit(a: &BigInt, n: usize) -> bool {
+    let len = (n / 32 + 1).max(a.mag.len()) + 1;
+    let limbs = twos(a, len);
+    limbs[n / 32] & (1 << (n % 32)) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +486,32 @@ mod tests {
         assert_eq!(q.mul(&b).add(&r), a);
         let (dq, dr) = BigInt::from_i64(-7).div_mod(&BigInt::from_i64(2));
         assert_eq!((dq.to_i64(), dr.to_i64()), (Some(-4), Some(1)));
+    }
+}
+
+#[cfg(test)]
+mod bit_tests {
+    use super::*;
+
+    #[test]
+    fn bitwise_matches_i64() {
+        for &(x, y) in &[(12i64, 10i64), (-12, 10), (-7, -3), (5, -1)] {
+            let a = BigInt::from_i64(x);
+            let b = BigInt::from_i64(y);
+            assert_eq!(bitwise(&a, &b, |p, q| p & q).to_i64(), Some(x & y));
+            assert_eq!(bitwise(&a, &b, |p, q| p | q).to_i64(), Some(x | y));
+            assert_eq!(bitwise(&a, &b, |p, q| p ^ q).to_i64(), Some(x ^ y));
+        }
+    }
+
+    #[test]
+    fn shifts_and_bits() {
+        assert_eq!(shift_right(&BigInt::from_i64(-5), 1).to_i64(), Some(-3));
+        assert_eq!(shift_right(&BigInt::from_i64(40), 3).to_i64(), Some(5));
+        assert_eq!(bit_length(&BigInt::from_i64(1024)), 11);
+        assert_eq!(popcount(&BigInt::from_i64(255)), 8);
+        assert!(test_bit(&BigInt::from_i64(-1), 100));
+        assert!(!test_bit(&BigInt::from_i64(4), 0));
+        assert!(test_bit(&BigInt::from_i64(4), 2));
     }
 }

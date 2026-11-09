@@ -9,6 +9,26 @@ import sys
 
 SKIP_TYPES = set()
 
+# (name, primitive type, size in bytes, kind) of the element types of byte arrays.
+ELEMENTS = [
+    ("Char", "Char#", 1, "char8"),
+    ("WideChar", "Char#", 4, "char32"),
+    ("Int", "Int#", 8, "int"),
+    ("Word", "Word#", 8, "word"),
+    ("Int8", "Int8#", 1, "int"),
+    ("Int16", "Int16#", 2, "int"),
+    ("Int32", "Int32#", 4, "int"),
+    ("Int64", "Int64#", 8, "int"),
+    ("Word8", "Word8#", 1, "word"),
+    ("Word16", "Word16#", 2, "word"),
+    ("Word32", "Word32#", 4, "word"),
+    ("Word64", "Word64#", 8, "word"),
+    ("Double", "Double#", 8, "double"),
+    ("Float", "Float#", 4, "float"),
+    ("Addr", "Addr#", 8, "addr"),
+    ("StablePtr", "StablePtr# a", 8, "addr"),
+]
+
 
 def parse(text):
     lines = text.split("\n")
@@ -23,10 +43,12 @@ def parse(text):
             types.append((head, params))
             i += 1
             continue
-        m = re.match(r'^primop\s+(\w+)\s+"([^"]+)"\s+(\w+)', line)
+        m = re.match(r'^primop\s+(\w+)\s+"([^"]+)"', line)
         if m:
-            name, sym = m.group(2), m.group(2)
+            sym = m.group(2)
             rest = line[m.end():].strip()
+            # The kind word (GenPrimOp, Compare, ...) may follow the symbol on this line or the next.
+            rest = rest
             body = [rest] if rest and "->" in rest else []
             i += 1
             while i < len(lines):
@@ -37,6 +59,10 @@ def parse(text):
                 body.append(t)
                 i += 1
             ty = " ".join(body).strip()
+            # The kind word (GenPrimOp, Compare, ...) precedes the type: drop it.
+            toks = ty.split(None, 1)
+            if len(toks) == 2 and re.match(r'^[A-Z][A-Za-z]*$', toks[0]) and "->" in toks[1]:
+                ty = toks[1]
             if ty.startswith("->") or "{" in ty or "}" in ty:
                 ty = ""
             # SIMD primops use VECTOR/SCALAR/VECTUPLE, which GHC expands itself; not supported.
@@ -69,7 +95,17 @@ def main():
     out.append('foreign import prim "nullAddr#" nullAddr# :: Addr#')
     out.append('foreign import prim "proxy#" proxy# :: Proxy# a')
     out.append('foreign import prim "seq" seq :: a -> b -> b')
-    out.append('foreign import prim "indexCharOffAddr#" indexCharOffAddr# :: Addr# -> Int# -> Char#')
+    # Coercions are the identity at run time; the Coercible constraint is not checked.
+    out.append('foreign import prim "unsafeCoerce" coerce :: a -> b')
+    # Element access on byte arrays and on Addr#, for each element type (GHC generates these
+    # from a template; the sizes and types follow the element's primitive type).
+    for name, prim, _size, _kind in ELEMENTS:
+        out.append(f'foreign import prim "index{name}Array#" index{name}Array# :: ByteArray# -> Int# -> {prim}')
+        out.append(f'foreign import prim "read{name}Array#" read{name}Array# :: MutableByteArray# s -> Int# -> State# s -> (# State# s, {prim} #)')
+        out.append(f'foreign import prim "write{name}Array#" write{name}Array# :: MutableByteArray# s -> Int# -> {prim} -> State# s -> State# s')
+        out.append(f'foreign import prim "index{name}OffAddr#" index{name}OffAddr# :: Addr# -> Int# -> {prim}')
+        out.append(f'foreign import prim "read{name}OffAddr#" read{name}OffAddr# :: Addr# -> Int# -> State# s -> (# State# s, {prim} #)')
+        out.append(f'foreign import prim "write{name}OffAddr#" write{name}OffAddr# :: Addr# -> Int# -> {prim} -> State# s -> State# s')
     out.append("data TYPE r")
     out.append("data CONSTRAINT r")
     out.append("")

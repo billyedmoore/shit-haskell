@@ -67,6 +67,7 @@ fn main() -> ExitCode {
     let mut output: Option<String> = None;
     let mut run = false;
     let mut dump_ast = false;
+    let mut preprocess_only = false;
     let mut dump_core = false;
     let mut i = 0;
     while i < args.len() {
@@ -74,6 +75,7 @@ fn main() -> ExitCode {
         match a {
             "--run" => run = true,
             "--dump-ast" => dump_ast = true,
+            "-E" => preprocess_only = true,
             "--dump-core" => dump_core = true,
             "-o" => {
                 output = args.get(i + 1).cloned();
@@ -90,6 +92,22 @@ fn main() -> ExitCode {
         eprintln!("hsc: no input files");
         return ExitCode::from(1);
     };
+
+    if preprocess_only {
+        let path = std::path::Path::new(&file);
+        return match driver::read_source(path).and_then(|s| {
+            driver::preprocess_if_needed(s, path, &flags).map_err(std::io::Error::other)
+        }) {
+            Ok(s) => {
+                print!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("hsc: {file}: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
 
     if dump_ast {
         let path = std::path::Path::new(&file);

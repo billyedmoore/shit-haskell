@@ -352,9 +352,15 @@ impl Lexer {
         let mut quals: Vec<String> = Vec::new();
         loop {
             let mut word = self.take_while(is_ident_char);
-            // MagicHash: names may end in one or more '#'.
-            while self.peek(0) == Some('#') && !self.peek(1).is_some_and(is_symbol) {
-                word.push(self.bump());
+            // MagicHash: names may end in one or more '#', unless a symbol follows the run.
+            let mut run = 0;
+            while self.peek(run) == Some('#') {
+                run += 1;
+            }
+            if run > 0 && !self.peek(run).is_some_and(|c| is_symbol(c) && c != '#') {
+                for _ in 0..run {
+                    word.push(self.bump());
+                }
             }
             let upper = word.chars().next().is_some_and(|c| c.is_uppercase());
             if upper && self.peek(0) == Some('.') {
@@ -439,12 +445,18 @@ impl Lexer {
 
     /// Counts and consumes the MagicHash suffix of a literal (`3#` is 1, `3##` is 2).
     fn take_hashes(&mut self) -> usize {
-        let mut n = 0;
-        while self.peek(0) == Some('#') && !self.peek(1).is_some_and(is_symbol) {
-            self.bump();
-            n += 1;
+        // The run of `#` characters (at most two) ends at a non-symbol character.
+        let mut run = 0;
+        while self.peek(run) == Some('#') {
+            run += 1;
         }
-        n
+        if run == 0 || run > 2 || self.peek(run).is_some_and(|c| is_symbol(c) && c != '#') {
+            return 0;
+        }
+        for _ in 0..run {
+            self.bump();
+        }
+        run
     }
 
     /// Skips the MagicHash suffix of a literal (`3#`, `3##`, `'c'#`, `"s"#`).

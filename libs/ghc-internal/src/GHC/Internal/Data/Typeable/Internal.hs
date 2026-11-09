@@ -402,6 +402,11 @@ typeRepFingerprint (TrFun {trFunFingerprint = fpr}) = fpr
 mkTrType :: TypeRep Type
 mkTrType = TrType
 
+-- | Compiler support: the representation of a type constructor, built by hsc's Typeable
+-- solver from the constructor's module and name. Its kind is approximated as Type.
+mkTypeableCon# :: [Char] -> [Char] -> TypeRep a
+mkTypeableCon# modl name = mkTrCon (mkTyCon "main" modl name 0 (KindRepTYPE (BoxedRep Lifted))) []
+
 -- | Construct a representation for a type constructor
 -- applied at a monomorphic kind.
 --

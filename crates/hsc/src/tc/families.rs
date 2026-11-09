@@ -59,7 +59,7 @@ fn match_pat(pat: &Ty, t: &Ty, sub: &mut Vec<Option<Ty>>) -> Match {
 
 impl Checker {
     /// The family at the head of a type application, if it is saturated.
-    fn family_app(&self, t: &Ty) -> Option<(String, Vec<Ty>)> {
+    pub(super) fn family_app(&self, t: &Ty) -> Option<(String, Vec<Ty>)> {
         let (head, args) = t.split_apps();
         let Ty::Con(name) = head else {
             return None;
@@ -160,6 +160,7 @@ impl Checker {
 
     /// Registers a family from its declaration.
     pub fn register_family(&mut self, name: &str, arity: usize, closed: bool) {
+        self.metas.families.insert(name.to_string());
         self.env.families.insert(
             name.to_string(),
             FamilyInfo {

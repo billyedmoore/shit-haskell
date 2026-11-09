@@ -47,6 +47,17 @@ impl Parser {
 
     /// A declaration in a `let`, `where`, class or instance body.
     pub(super) fn local_decl(&mut self) -> PResult<Decl> {
+        // ImplicitParams: `?x = e`.
+        if self.real() && self.exts.is_on("ImplicitParams") && self.at_varsym("?") {
+            if let Tok::VarId(name) = self.peek_raw(1).clone() {
+                let loc = self.loc();
+                self.bump();
+                self.bump();
+                self.expect_res(ROp::Eq)?;
+                let expr = self.expr()?;
+                return Ok(Decl::IPBind { name, expr, loc });
+            }
+        }
         self.value_decl()
     }
 
@@ -372,7 +383,13 @@ impl Parser {
             return self.type_instance(loc);
         }
         if self.at_varid("role") {
-            return self.err("role annotations are not supported yet");
+            // RoleAnnotations constrain coercions, which are not checked: the declaration is
+            // skipped, up to the end of its line.
+            self.bump();
+            while self.real() {
+                self.bump();
+            }
+            return Ok(Decl::Fixity { assoc: Assoc::None, prec: 9, ops: Vec::new(), loc });
         }
         let head = self.btype()?;
         if self.at_res(ROp::DColon) {
@@ -400,6 +417,17 @@ impl Parser {
         if self.at_res(ROp::DColon) {
             self.bump();
             self.sigtype()?;
+        }
+        // TypeFamilyDependencies: `= r | r -> a` names the result and an injectivity clause.
+        // Injectivity is not checked, so the clause is skipped.
+        if self.at_res(ROp::Eq) {
+            self.bump();
+            self.atype()?;
+            if self.at_res(ROp::Bar) {
+                while self.real() && !self.at_kw(Kw::Where) {
+                    self.bump();
+                }
+            }
         }
         let equations = if top && self.at_kw(Kw::Where) {
             self.bump();
@@ -436,16 +464,30 @@ impl Parser {
     fn equation_from(&mut self, lhs: Type, loc: Loc) -> PResult<(QName, TypeEquation)> {
         self.expect_res(ROp::Eq)?;
         let rhs = self.sigtype()?;
-        let mut args = Vec::new();
-        let mut t = lhs;
-        while let Type::App(f, a) = t {
-            args.push(*a);
-            t = *f;
-        }
-        args.reverse();
-        let name = match t {
-            Type::Con(q, _) => q,
-            _ => return self.err("malformed type family equation"),
+        // An infix head `a == b` (one operator) is the family applied to both operands.
+        let (name, args) = match lhs {
+            Type::OpChain(items, _) if items.len() == 3 => {
+                let mut it = items.into_iter();
+                match (it.next(), it.next(), it.next()) {
+                    (Some(TypeOpItem::Operand(l)), Some(TypeOpItem::Op(q, _)), Some(TypeOpItem::Operand(r))) => {
+                        (q, vec![l, r])
+                    }
+                    _ => return self.err("malformed type family equation"),
+                }
+            }
+            lhs => {
+                let mut args = Vec::new();
+                let mut t = lhs;
+                while let Type::App(f, a) = t {
+                    args.push(*a);
+                    t = *f;
+                }
+                args.reverse();
+                match t {
+                    Type::Con(q, _) => (q, args),
+                    _ => return self.err("malformed type family equation"),
+                }
+            }
         };
         Ok((name, TypeEquation { args, rhs, loc }))
     }
@@ -731,6 +773,68 @@ impl Parser {
             }
         }
         self.expect_res(ROp::DColon)?;
+        // GADT record syntax: `C :: [forall vs.] { f :: t, .. } -> result`.
+        let mut record_exist = Vec::new();
+        if self.at_varid("forall") {
+            let saved = self.pos_state();
+            self.bump();
+            let mut vars = Vec::new();
+            while !self.at_varsym(".") && self.real() {
+                vars.push(self.tyvar_binder()?);
+            }
+            if self.at_varsym(".") && self.peek_raw(1) == &Tok::Special('{') {
+                self.bump();
+                record_exist = vars;
+            } else {
+                self.restore_pos_state(saved);
+            }
+        }
+        if self.at_special('{') {
+            self.bump();
+            let mut groups: Vec<(Vec<String>, Field)> = Vec::new();
+            while !self.at_special('}') {
+                let mut fnames = Vec::new();
+                loop {
+                    match self.tok().clone() {
+                        Tok::VarId(f) if self.real() => {
+                            self.bump();
+                            fnames.push(f);
+                        }
+                        _ => return self.unexpected(),
+                    }
+                    if self.at_special(',') {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect_res(ROp::DColon)?;
+                let strict = self.at_varsym("!");
+                if strict {
+                    self.bump();
+                }
+                let fty = self.sigtype()?;
+                groups.push((fnames, Field { ty: fty, strict }));
+                if self.at_special(',') {
+                    self.bump();
+                }
+            }
+            self.bump();
+            self.expect_res(ROp::RArrow)?;
+            let result = self.sigtype()?;
+            return Ok(names
+                .into_iter()
+                .map(|name| ConDecl {
+                    name,
+                    exist: record_exist.clone(),
+                    context: Vec::new(),
+                    fields: ConFields::Record(groups.clone()),
+                    gadt_result: Some(result.clone()),
+                    infix: false,
+                    loc,
+                })
+                .collect());
+        }
         let mut ty = self.sigtype()?;
         let mut exist = Vec::new();
         if let Type::Forall(vars, body) = ty {
@@ -902,8 +1006,15 @@ impl Parser {
                 loc,
             });
         }
-        if self.at_kw(Kw::Default) || self.at_kw(Kw::Data) {
-            return self.err("default signatures and associated data families are not supported yet");
+        if self.at_kw(Kw::Default) {
+            self.bump();
+            return match self.value_decl()? {
+                Decl::Sig { names, ty, loc } => Ok(Decl::DefaultSig { names, ty, loc }),
+                _ => self.err("a default signature must be a type signature"),
+            };
+        }
+        if self.at_kw(Kw::Data) {
+            return self.err("associated data families are not supported yet");
         }
         self.value_decl()
     }

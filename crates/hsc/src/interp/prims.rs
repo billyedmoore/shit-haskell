@@ -5,7 +5,7 @@ use std::io::{BufRead, Read, Write};
 use std::time::Duration;
 use std::rc::Rc;
 
-use super::bigint::BigInt;
+use super::bigint::{bit_length, bitwise, popcount, shift_right, test_bit, BigInt};
 use super::{bool_value, con_value, string_value, unit_value, Cell, RR, RtError, Runtime, Thunk, Value};
 use std::cell::RefCell;
 
@@ -17,9 +17,40 @@ fn int(rt: &Runtime, c: &Cell) -> Result<i64, RtError> {
 }
 
 fn integer(rt: &Runtime, c: &Cell) -> Result<Rc<BigInt>, RtError> {
-    match rt.force(c)? {
-        Value::Integer(i) => Ok(i),
-        _ => Err(RtError::Fail("internal: expected Integer".into())),
+    let v = rt.force(c)?;
+    match integer_from_value(rt, &v)? {
+        Some(b) => Ok(Rc::new(b)),
+        None => Err(RtError::Fail("internal: expected Integer".into())),
+    }
+}
+
+/// The value of an `Integer`, in either representation: the constructors of GHC's
+/// `data Integer = IS Int# | IP BigNat# | IN BigNat#` (BigNat# being a native bignum), or a
+/// native bignum directly (literals before they are built).
+pub fn integer_from_value(rt: &Runtime, v: &Value) -> Result<Option<BigInt>, RtError> {
+    Ok(match v {
+        Value::Integer(i) => Some((**i).clone()),
+        Value::Con(c) => match (c.name, c.args.first()) {
+            ("GHC.Num.Integer.IS", Some(cell)) => match rt.force(cell)? {
+                Value::Int(i) => Some(BigInt::from_i64(i)),
+                _ => None,
+            },
+            ("GHC.Num.Integer.IP" | "GHC.Num.Integer.IN", Some(cell)) => match rt.force(cell)? {
+                Value::Integer(b) => Some(if c.name == "GHC.Num.Integer.IN" { b.neg() } else { (*b).clone() }),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// An `Integer` value in GHC's representation: `IS` when it fits an `Int`, else `IP`/`IN`.
+pub fn integer_con(b: BigInt) -> Value {
+    match b.to_i64() {
+        Some(i) => con_value("GHC.Num.Integer.IS", vec![Value::Int(i)]),
+        None if b.is_neg() => con_value("GHC.Num.Integer.IN", vec![Value::Integer(Rc::new(b.abs()))]),
+        None => con_value("GHC.Num.Integer.IP", vec![Value::Integer(Rc::new(b))]),
     }
 }
 
@@ -42,7 +73,7 @@ fn int_v(i: i64) -> RR {
 }
 
 fn integer_v(b: BigInt) -> RR {
-    Ok(Value::Integer(Rc::new(b)))
+    Ok(integer_con(b))
 }
 
 fn divide_by_zero<T>() -> Result<T, RtError> {
@@ -572,6 +603,55 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             }
         }
 
+        "integerAnd" => integer_v(bitwise(&*integer(rt, &args[0])?, &*integer(rt, &args[1])?, |p, q| p & q)),
+        "integerOr" => integer_v(bitwise(&*integer(rt, &args[0])?, &*integer(rt, &args[1])?, |p, q| p | q)),
+        "integerXor" => integer_v(bitwise(&*integer(rt, &args[0])?, &*integer(rt, &args[1])?, |p, q| p ^ q)),
+        "integerShiftR" => {
+            let n = int(rt, &args[1])?.max(0) as usize;
+            integer_v(shift_right(&*integer(rt, &args[0])?, n))
+        }
+        "integerTestBit" => {
+            let n = int(rt, &args[1])?.max(0) as usize;
+            Ok(bool_value(test_bit(&*integer(rt, &args[0])?, n)))
+        }
+        "integerPopCount" => int_v(popcount(&*integer(rt, &args[0])?) as i64),
+        "integerLog2" => int_v(bit_length(&*integer(rt, &args[0])?) as i64 - 1),
+        "integerGcd" => integer_v(integer(rt, &args[0])?.gcd(&*integer(rt, &args[1])?)),
+        // (mantissa, exponent) with value mantissa * 2^exponent, the mantissa having 53 bits.
+        "integerDecodeDouble" => {
+            let d = double(rt, &args[0])?;
+            let (m, e) = if d == 0.0 || !d.is_finite() {
+                (0i64, 0i64)
+            } else {
+                let bits = d.to_bits();
+                let sign = if bits >> 63 == 1 { -1 } else { 1 };
+                let exp = ((bits >> 52) & 0x7ff) as i64;
+                let frac = (bits & ((1u64 << 52) - 1)) as i64;
+                let (mant, e) = if exp == 0 { (frac, -1074) } else { (frac | (1 << 52), exp - 1075) };
+                (sign * mant, e)
+            };
+            Ok(con_value("Builtin.(,)", vec![integer_con(BigInt::from_i64(m)), Value::Int(e)]))
+        }
+        "integerEncodeDouble" => {
+            let m = integer(rt, &args[0])?.to_f64();
+            let e = int(rt, &args[1])?;
+            Ok(Value::Double(m * 2f64.powi(e.clamp(-2000, 2000) as i32)))
+        }
+        "bigNatIndex" => {
+            let b = integer(rt, &args[0])?;
+            let i = int(rt, &args[1])?.max(0) as usize;
+            int_v(super::bigint::limb64(&b, i) as i64)
+        }
+        "bigNatSize" => {
+            let b = integer(rt, &args[0])?;
+            int_v(super::bigint::limb64_count(&b) as i64)
+        }
+        // A BigNat# is the magnitude of an Integer, as a native bignum.
+        "integerBigNat" => Ok(Value::Integer(Rc::new(integer(rt, &args[0])?.abs()))),
+        "integerFromBigNat" => match rt.force(&args[0])? {
+            Value::Integer(b) => integer_v((*b).clone()),
+            _ => Err(RtError::Fail("internal: expected a BigNat".into())),
+        },
         // GHC's primops over unboxed types. Unboxed values share the boxed representation, so
         // these are the same operations as the boxed ones, with Int# results for comparisons.
         "+#" | "plusWord#" => int_v(int(rt, &args[0])?.wrapping_add(int(rt, &args[1])?)),
@@ -630,6 +710,79 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             Value::Con(c) => int_v(con_tag(&c.name)),
             _ => int_v(0),
         },
+        // Conversions between the sized integer types and Int#/Word# (GHC.Prim). Each sized
+        // value is held as an Int, narrowed to its width where the conversion narrows.
+        "indexCharOffAddr#" | "indexWideCharOffAddr#" | "indexWord8OffAddr#" | "indexInt8OffAddr#"
+        | "indexIntOffAddr#" | "indexWordOffAddr#" => {
+            let (bytes, off) = match rt.force(&args[0])? {
+                Value::Addr(b, o) => (b, o),
+                _ => return Err(RtError::Fail("internal: indexing a non-address".into())),
+            };
+            let i = int(rt, &args[1])?;
+            let at = |k: usize| bytes.get(k).copied().unwrap_or(0) as i64;
+            let base = off as i64 + i;
+            match name {
+                "indexCharOffAddr#" | "indexWideCharOffAddr#" => Ok(Value::Char(char::from_u32(at(base as usize) as u32).unwrap_or('\0'))),
+                "indexWord8OffAddr#" => int_v(at(base as usize)),
+                "indexInt8OffAddr#" => int_v(at(base as usize) as u8 as i8 as i64),
+                _ => {
+                    let start = base as usize;
+                    let mut v: u64 = 0;
+                    for k in (0..8).rev() {
+                        v = (v << 8) | (bytes.get(start + k).copied().unwrap_or(0) as u64);
+                    }
+                    int_v(v as i64)
+                }
+            }
+        }
+        "newByteArray#" | "newPinnedByteArray#" => {
+            let n = int(rt, &args[0])?.max(0) as usize;
+            Ok(io_result(Value::Bytes(Rc::new(RefCell::new(vec![0u8; n])))))
+        }
+        "unsafeFreezeByteArray#" | "unsafeThawByteArray#" => Ok(io_result(rt.force(&args[0])?)),
+        "sizeofByteArray#" | "sizeofMutableByteArray#" => match rt.force(&args[0])? {
+            Value::Bytes(b) => int_v(b.borrow().len() as i64),
+            _ => Err(RtError::Fail("internal: size of a non-array".into())),
+        },
+        "getSizeofMutableByteArray#" => match rt.force(&args[0])? {
+            Value::Bytes(b) => Ok(io_result(Value::Int(b.borrow().len() as i64))),
+            _ => Err(RtError::Fail("internal: size of a non-array".into())),
+        },
+        _ if element_access(name).is_some() => {
+            let (access, elem) = element_access(name).unwrap_or(("", ""));
+            let (size, kind) = element_spec(elem).unwrap_or((8, "int"));
+            let at = int(rt, &args[1])?;
+            let off = (at * size as i64).max(0) as usize;
+            match (access, rt.force(&args[0])?) {
+                ("index", Value::Addr(bytes, o)) => Ok(read_element(&bytes, o + off, size, kind)),
+                ("read", Value::Addr(bytes, o)) => Ok(io_result(read_element(&bytes, o + off, size, kind))),
+                ("index", Value::Bytes(b)) => Ok(read_element(&b.borrow(), off, size, kind)),
+                ("read", Value::Bytes(b)) => Ok(io_result(read_element(&b.borrow(), off, size, kind))),
+                ("write", Value::Bytes(b)) => {
+                    let v = rt.force(&args[2])?;
+                    write_element(&mut b.borrow_mut(), off, size, kind, &v);
+                    Ok(unit_value())
+                }
+                ("write", Value::Addr(..)) => Err(RtError::Error("writing to an immutable address is not supported".into())),
+                _ => Err(RtError::Fail(format!("internal: {name} on an unsupported value"))),
+            }
+        }
+        "plusAddr#" => match rt.force(&args[0])? {
+            Value::Addr(b, o) => Ok(Value::Addr(b, (o as i64 + int(rt, &args[1])?) as usize)),
+            _ => Err(RtError::Fail("internal: plusAddr# of a non-address".into())),
+        },
+        "minusAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
+            (Value::Addr(_, a), Value::Addr(_, b)) => int_v(a as i64 - b as i64),
+            _ => Err(RtError::Fail("internal: minusAddr# of non-addresses".into())),
+        },
+        "eqAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
+            (Value::Addr(_, a), Value::Addr(_, b)) => int_v((a == b) as i64),
+            _ => int_v(0),
+        },
+        _ if sized_conversion(name).is_some() => {
+            let f = sized_conversion(name).unwrap_or(|x| x);
+            int_v(f(int(rt, &args[0])?))
+        }
         _ => Err(RtError::Fail(format!("internal: unknown primitive {name}"))),
     }
 }
@@ -808,7 +961,7 @@ pub fn show_double(x: f64) -> String {
 /// The exact value of a finite double as a reduced `Ratio Integer` (`toRational`).
 pub fn double_to_ratio(x: f64) -> Value {
     if !x.is_finite() {
-        return con_value("Base.:%", vec![Value::Integer(Rc::new(BigInt::zero())), Value::Integer(Rc::new(BigInt::from_i64(1)))]);
+        return con_value("Base.:%", vec![integer_con(BigInt::zero()), integer_con(BigInt::from_i64(1))]);
     }
     let bits = x.to_bits();
     let exp_bits = ((bits >> 52) & 0x7ff) as i64;
@@ -829,7 +982,7 @@ pub fn double_to_ratio(x: f64) -> Value {
         num = num.quot_rem(&g).0;
         den = den.quot_rem(&g).0;
     }
-    con_value("Base.:%", vec![Value::Integer(Rc::new(num)), Value::Integer(Rc::new(den))])
+    con_value("Base.:%", vec![integer_con(num), integer_con(den)])
 }
 
 /// `ratioLit` for a fractional literal: the exact value as a reduced `Ratio Integer`.
@@ -865,7 +1018,7 @@ pub fn ratio_literal(text: &str) -> Value {
     }
     con_value(
         "Base.:%",
-        vec![Value::Integer(Rc::new(num)), Value::Integer(Rc::new(den))],
+        vec![integer_con(num), integer_con(den)],
     )
 }
 
@@ -887,5 +1040,98 @@ fn con_tag(name: &str) -> i64 {
         "GHC.Types.False" | "Base.False" => 0,
         "GHC.Types.True" | "Base.True" => 1,
         _ => 0,
+    }
+}
+
+
+/// The value conversion of a sized-integer primop such as `wordToWord8#` or `int8ToInt#`.
+fn sized_conversion(name: &str) -> Option<fn(i64) -> i64> {
+    fn w8(x: i64) -> i64 { x as u8 as i64 }
+    fn w16(x: i64) -> i64 { x as u16 as i64 }
+    fn w32(x: i64) -> i64 { x as u32 as i64 }
+    fn i8_(x: i64) -> i64 { x as i8 as i64 }
+    fn i16_(x: i64) -> i64 { x as i16 as i64 }
+    fn i32_(x: i64) -> i64 { x as i32 as i64 }
+    fn id(x: i64) -> i64 { x }
+    Some(match name {
+        "wordToWord8#" | "int8ToWord8#" | "word8ToWord8#" => w8,
+        "wordToWord16#" | "int16ToWord16#" | "word16ToWord16#" => w16,
+        "wordToWord32#" | "int32ToWord32#" | "word32ToWord32#" => w32,
+        "intToInt8#" | "word8ToInt8#" | "int8ToInt8#" => i8_,
+        "intToInt16#" | "word16ToInt16#" | "int16ToInt16#" => i16_,
+        "intToInt32#" | "word32ToInt32#" | "int32ToInt32#" => i32_,
+        "wordToWord64#" | "word64ToWord#" | "int64ToWord64#" | "word64ToInt64#" | "intToInt64#"
+        | "int64ToInt#" | "word8ToWord#" | "word16ToWord#" | "word32ToWord#" | "int8ToInt#"
+        | "int16ToInt#" | "int32ToInt#" | "word8ToInt#" | "word16ToInt#" | "word32ToInt#"
+        | "word64ToInt#" | "int64ToWord#" | "word64ToWord64#" | "int64ToInt64#" => id,
+        _ => return None,
+    })
+}
+
+/// The access (index, read or write) and element type named by an element primop such as
+/// `readWord8Array#` or `indexIntOffAddr#`.
+fn element_access(name: &str) -> Option<(&str, &str)> {
+    let access = ["index", "read", "write"].into_iter().find(|a| name.starts_with(a))?;
+    let rest = &name[access.len()..];
+    let elem = rest.strip_suffix("Array#").or_else(|| rest.strip_suffix("OffAddr#"))?;
+    element_spec(elem).map(|_| (access, elem))
+}
+
+/// The width in bytes and the representation kind of an element type.
+fn element_spec(elem: &str) -> Option<(usize, &'static str)> {
+    Some(match elem {
+        "Char" => (1, "char8"),
+        "WideChar" => (4, "char32"),
+        "Int" | "Int64" => (8, "int"),
+        "Int8" => (1, "int"),
+        "Int16" => (2, "int"),
+        "Int32" => (4, "int"),
+        "Word" | "Word64" => (8, "word"),
+        "Word8" => (1, "word"),
+        "Word16" => (2, "word"),
+        "Word32" => (4, "word"),
+        "Double" => (8, "double"),
+        "Float" => (4, "float"),
+        // Addresses stored in memory: no memory is modelled yet, so a stored address reads back
+        // as the empty address.
+        "Addr" | "StablePtr" => (8, "addr"),
+        _ => return None,
+    })
+}
+
+/// The element at byte offset `at` of a byte buffer.
+fn read_element(bytes: &[u8], at: usize, size: usize, kind: &str) -> Value {
+    let mut v: u64 = 0;
+    for k in (0..size).rev() {
+        v = (v << 8) | bytes.get(at + k).copied().unwrap_or(0) as u64;
+    }
+    match kind {
+        "char8" => Value::Char(v as u8 as char),
+        "char32" => Value::Char(char::from_u32(v as u32).unwrap_or('\u{fffd}')),
+        "int" => {
+            let shift = 64 - 8 * size as u32;
+            Value::Int(((v << shift) as i64) >> shift)
+        }
+        "word" => Value::Int(v as i64),
+        "double" => Value::Double(f64::from_bits(v)),
+        "addr" => Value::Addr(Rc::new(Vec::new()), 0),
+        _ => Value::Double(f32::from_bits(v as u32) as f64),
+    }
+}
+
+/// Stores an element at byte offset `at` of a byte buffer.
+fn write_element(bytes: &mut [u8], at: usize, size: usize, kind: &str, v: &Value) {
+    let bits: u64 = match (kind, v) {
+        ("double", Value::Double(d)) => d.to_bits(),
+        ("float", Value::Double(d)) => (*d as f32).to_bits() as u64,
+        (_, Value::Char(c)) => *c as u64,
+        (_, Value::Int(i)) => *i as u64,
+        (_, Value::Double(d)) => *d as i64 as u64,
+        _ => 0,
+    };
+    for k in 0..size {
+        if let Some(slot) = bytes.get_mut(at + k) {
+            *slot = (bits >> (8 * k)) as u8;
+        }
     }
 }

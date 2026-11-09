@@ -241,8 +241,31 @@ fn derive_eq(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         let pa = con_pat(&module, &c.name, a.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc);
         let pb = con_pat(&module, &c.name, b.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc);
         let mut body: Option<Expr> = None;
-        for (x, y) in a.iter().zip(&b).rev() {
-            let eq = app(base_var("==", loc), vec![local(x, loc), local(y, loc)]);
+        let tys = field_types(c);
+        for (k, (x, y)) in a.iter().zip(&b).enumerate().rev() {
+            // Unboxed fields compare with the primitive operations, as GHC derives them.
+            let prim = tys.get(k).and_then(|t| match t {
+                Type::Con(q, _) => match q.name.as_str() {
+                    "Int#" => Some("==#"),
+                    "Word#" => Some("eqWord#"),
+                    "Char#" => Some("eqChar#"),
+                    "Addr#" => Some("eqAddr#"),
+                    "Double#" => Some("==##"),
+                    "Float#" => Some("eqFloat#"),
+                    _ => None,
+                },
+                _ => None,
+            });
+            let eq = match prim {
+                Some(p) => app(
+                    Expr::Var(QName { qual: Some("GHC.Types".into()), name: "isTrue#".into() }, loc),
+                    vec![app(
+                        Expr::Var(QName { qual: Some("GHC.Prim".into()), name: p.into() }, loc),
+                        vec![local(x, loc), local(y, loc)],
+                    )],
+                ),
+                None => app(base_var("==", loc), vec![local(x, loc), local(y, loc)]),
+            };
             body = Some(match body {
                 None => eq,
                 Some(rest) => app(base_var("&&", loc), vec![eq, rest]),
@@ -304,10 +327,35 @@ fn derive_ord(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         let inner = if n == 0 {
             base_con("EQ", loc)
         } else {
+            let ftys = field_types(c);
             let mut cmps: Vec<Expr> = a
                 .iter()
                 .zip(&b)
-                .map(|(p, q)| app(base_var("compare", loc), vec![local(p, loc), local(q, loc)]))
+                .enumerate()
+                .map(|(k, (p, q))| match ftys.get(k).and_then(prim_ops) {
+                    Some((eq, lt)) => {
+                        // Unboxed fields: equal, less or greater by the primitive operations.
+                        let prim = |name: &str| Expr::Var(QName { qual: Some("GHC.Prim".into()), name: name.into() }, loc);
+                        let test = |op: &str| {
+                            app(
+                                Expr::Var(QName { qual: Some("GHC.Types".into()), name: "isTrue#".into() }, loc),
+                                vec![app(prim(op), vec![local(p, loc), local(q, loc)])],
+                            )
+                        };
+                        Expr::If(
+                            Box::new(test(eq)),
+                            Box::new(con_expr("GHC.Types", "EQ", loc)),
+                            Box::new(Expr::If(
+                                Box::new(test(lt)),
+                                Box::new(con_expr("GHC.Types", "LT", loc)),
+                                Box::new(con_expr("GHC.Types", "GT", loc)),
+                                loc,
+                            )),
+                            loc,
+                        )
+                    }
+                    None => app(base_var("compare", loc), vec![local(p, loc), local(q, loc)]),
+                })
                 .collect();
             let mut acc = cmps.pop().expect("at least one field");
             while let Some(prev) = cmps.pop() {
@@ -715,6 +763,22 @@ fn read_value(
 }
 
 // ----- constructor classes: Functor, Foldable, Traversable --------------------------
+
+/// The equality and less-than primitives of an unboxed field type.
+fn prim_ops(t: &Type) -> Option<(&'static str, &'static str)> {
+    match t {
+        Type::Con(q, _) => match q.name.as_str() {
+            "Int#" => Some(("==#", "<#")),
+            "Word#" => Some(("eqWord#", "ltWord#")),
+            "Char#" => Some(("eqChar#", "ltChar#")),
+            "Addr#" => Some(("eqAddr#", "ltAddr#")),
+            "Double#" => Some(("==##", "<##")),
+            "Float#" => Some(("eqFloat#", "ltFloat#")),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 /// The field types of a constructor, in order.
 fn field_types(c: &ConDecl) -> Vec<Type> {

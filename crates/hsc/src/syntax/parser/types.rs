@@ -30,6 +30,15 @@ impl Parser {
     /// `btype [-> type]`
     pub(super) fn type_expr(&mut self) -> PResult<Type> {
         let t = self.btype()?;
+        // LinearTypes: a multiplicity arrow `%1 ->` or `%m ->` is an ordinary arrow here.
+        if self.real() && self.at_varsym("%") && !self.raw().space_after {
+            let saved = self.pos_state();
+            self.bump();
+            self.atype()?;
+            if !self.at_res(ROp::RArrow) {
+                self.restore_pos_state(saved);
+            }
+        }
         if self.at_res(ROp::RArrow) {
             self.bump();
             let r = if self.at_varid("forall") {
@@ -61,9 +70,17 @@ impl Parser {
 
     fn app_type(&mut self) -> PResult<Type> {
         let mut t = self.atype()?;
-        while self.starts_atype() {
-            let a = self.atype()?;
-            t = Type::App(Box::new(t), Box::new(a));
+        loop {
+            if self.starts_atype() {
+                let a = self.atype()?;
+                t = Type::App(Box::new(t), Box::new(a));
+            } else if self.real() && self.at_res(ROp::At) && self.raw().space_before && !self.raw().space_after {
+                // A visible kind argument `T @k`: kinds are not checked, so it is dropped.
+                self.bump();
+                self.atype()?;
+            } else {
+                break;
+            }
         }
         Ok(t)
     }
@@ -76,10 +93,12 @@ impl Parser {
             Tok::VarId(s) => s.as_str() != "forall",
             Tok::ConId(_)
             | Tok::QConId(..)
-            | Tok::Special('(' | '[' | '\'')
+            | Tok::Special('(' | '[')
             | Tok::Kw(Kw::Underscore)
             | Tok::Int(_)
             | Tok::Str(_) => true,
+            // A tick before a constructor operator is an infix promoted operator, not an argument.
+            Tok::Special('\'') => !matches!(self.peek_raw(1), Tok::ConSym(_)),
             _ => false,
         }
     }
@@ -94,8 +113,18 @@ impl Parser {
                 qual: Some(m),
                 name: s,
             },
-            Tok::VarSym(s) if s != "!" && s != "." && s != "*" && s != "#" => QName::unqual(s),
+            Tok::VarSym(s)
+                if s != "!" && s != "." && s != "#" && s != "%" && (s != "*" || !self.exts.is_on("StarIsType")) =>
+            {
+                QName::unqual(s)
+            }
             Tok::Res(ROp::Tilde) => QName::unqual("~"),
+            // DataKinds: a promoted infix constructor `':+:`.
+            Tok::Special('\'') if matches!(self.peek_raw(1), Tok::ConSym(_)) => {
+                let Tok::ConSym(s) = self.peek_raw(1).clone() else { return None };
+                self.bump();
+                QName::unqual(format!("'{s}"))
+            }
             Tok::Special('`') => {
                 let name = match self.peek_raw(1).clone() {
                     Tok::ConId(s) | Tok::VarId(s) if *self.peek_raw(2) == Tok::Special('`') => {
@@ -132,6 +161,23 @@ impl Parser {
                 self.bump();
                 Ok(Type::Wild(loc))
             }
+            // A strictness mark on a field type (`!t`); strictness is not recorded for GADT fields.
+            Tok::VarSym(s) if s == "!" && self.real() => {
+                self.bump();
+                self.atype()
+            }
+            // ImplicitParams: `?x :: t` is the constraint `?x t`.
+            Tok::VarSym(s) if s == "?" && self.real() && self.exts.is_on("ImplicitParams") => {
+                self.bump();
+                let name = match self.tok().clone() {
+                    Tok::VarId(v) if self.real() => v,
+                    _ => return self.unexpected(),
+                };
+                self.bump();
+                self.expect_res(ROp::DColon)?;
+                let ty = self.sigtype()?;
+                Ok(Type::App(Box::new(Type::Con(QName::unqual(format!("?{name}")), loc)), Box::new(ty)))
+            }
             // DataKinds: `'Con` names a promoted data constructor; `'[]` the promoted empty list.
             Tok::Special('\'') => {
                 self.bump();
@@ -153,12 +199,16 @@ impl Parser {
                         self.expect_special(']')?;
                         Ok(promoted_list(elems, loc))
                     }
-                    Tok::Special('(') => self.atype(),
+                    // `'(:)` and `'(,)`: a parenthesised constructor, promoted.
+                    Tok::Special('(') => match self.atype()? {
+                        Type::Con(q, l) => Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, l)),
+                        other => Ok(other),
+                    },
                     _ => self.unexpected(),
                 }
             }
             // StarIsType: `*` is the kind of types.
-            Tok::VarSym(s) if s == "*" => {
+            Tok::VarSym(s) if s == "*" && self.exts.is_on("StarIsType") => {
                 self.bump();
                 Ok(Type::Con(QName::unqual("Type"), loc))
             }
@@ -172,6 +222,12 @@ impl Parser {
             }
             Tok::Special('(') => {
                 self.bump();
+                // UnboxedTuples: `(##)` is the unboxed unit type, lexed as one symbol.
+                if self.at_varsym("##") && *self.peek_raw(1) == Tok::Special(')') {
+                    self.bump();
+                    self.bump();
+                    return Ok(Type::Con(QName::unqual("()"), loc));
+                }
                 // UnboxedTuples: `(# t1, t2 #)` is an ordinary tuple type here.
                 if self.at_varsym("#") && self.raw().space_after {
                     self.bump();
@@ -181,6 +237,23 @@ impl Parser {
                         return Ok(Type::Con(QName::unqual("()"), loc));
                     }
                     let mut elems = vec![self.sigtype()?];
+                    // UnboxedSums: `(# a | b #)` is the sum type constructor applied to its parts.
+                    if self.at_res(ROp::Bar) {
+                        while self.at_res(ROp::Bar) {
+                            self.bump();
+                            elems.push(self.sigtype()?);
+                        }
+                        if !self.at_varsym("#") {
+                            return self.unexpected();
+                        }
+                        self.bump();
+                        self.expect_special(')')?;
+                        let mut t = Type::Con(QName::unqual(format!("(#|{}#)", elems.len())), loc);
+                        for e in elems {
+                            t = Type::App(Box::new(t), Box::new(e));
+                        }
+                        return Ok(t);
+                    }
                     while self.at_special(',') {
                         self.bump();
                         elems.push(self.sigtype()?);
@@ -196,12 +269,18 @@ impl Parser {
                         Type::Tuple(elems, loc)
                     });
                 }
-                // `(:+:)` names a type constructor operator.
-                if let Tok::ConSym(s) = self.tok().clone() {
+                // `(:+:)` and `(==)` name a type constructor operator.
+                let op_name = match self.tok().clone() {
+                    Tok::ConSym(s) | Tok::VarSym(s) if self.real() => Some(QName::unqual(s)),
+                    Tok::QConSym(m, s) if self.real() => Some(QName { qual: Some(m), name: s }),
+                    Tok::Res(ROp::Tilde) if self.real() => Some(QName::unqual("~")),
+                    _ => None,
+                };
+                if let Some(q) = op_name {
                     if *self.peek_raw(1) == Tok::Special(')') {
                         self.bump();
                         self.bump();
-                        return Ok(Type::Con(QName::unqual(s), loc));
+                        return Ok(Type::Con(q, loc));
                     }
                 }
                 if self.at_special(')') {

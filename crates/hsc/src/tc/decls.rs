@@ -161,14 +161,14 @@ impl Checker {
             }
         }
 
-        // 7. Class default methods.
-        for cd in &class_decls {
-            self.class_defaults(cd)?;
-        }
-
-        // 8. Instance bodies.
-        for id in &all_insts {
-            self.instance_body(id)?;
+        // 7. Class default methods and 8. instance bodies: a boot file has none.
+        if !self.boot {
+            for cd in &class_decls {
+                self.class_defaults(cd)?;
+            }
+            for id in &all_insts {
+                self.instance_body(id)?;
+            }
         }
 
         // 9. Remaining constraints at top level: defaulting, then error.
@@ -240,7 +240,7 @@ impl Checker {
             };
             let mut preds = Vec::new();
             for ctx in &c.context {
-                preds.push(self.convert_pred(ctx, &mut vars)?);
+                preds.extend(self.convert_context_item(ctx, &mut vars)?);
             }
             let name = format!("{}.{}", self.module, c.name);
             let scheme = Scheme {
@@ -324,7 +324,7 @@ impl Checker {
         let mut tvs = class_vars.clone();
         let mut supers = Vec::new();
         for c in &cd.context {
-            supers.push(self.convert_pred(c, &mut tvs)?);
+            supers.extend(self.convert_context_item(c, &mut tvs)?);
         }
         let class_pred = Pred {
             class: class_key.clone(),
@@ -399,12 +399,30 @@ impl Checker {
                 )
             })
             .collect();
+        // Default signatures, each as a scheme over the class parameters.
+        let mut default_schemes: HashMap<String, Scheme> = HashMap::new();
+        for d in &cd.decls {
+            if let Decl::DefaultSig { names, ty, loc } = d {
+                self.loc = *loc;
+                for name in names {
+                    let mut mtvs = class_vars.clone();
+                    let (own_preds, mty) = self.sig_parts(ty, &mut mtvs)?;
+                    let mut preds = vec![class_pred.clone()];
+                    preds.extend(own_preds);
+                    default_schemes.insert(
+                        format!("{}.{name}", self.module),
+                        Scheme { nvars: mtvs.len() as u32, names: mtvs, preds, ty: mty },
+                    );
+                }
+            }
+        }
         let info = ClassInfo {
             name: class_key.clone(),
             nparams,
             supers,
             methods,
             defaults,
+            default_schemes,
             dict_con,
             fundeps,
         };
@@ -420,16 +438,21 @@ impl Checker {
             if let Decl::Fun { name, clauses, loc } = d {
                 self.loc = *loc;
                 let mkey = format!("{}.{name}", self.module);
-                let scheme = info
-                    .methods
-                    .iter()
-                    .find(|(k, _)| *k == mkey)
-                    .map(|(_, s)| s.clone())
-                    .ok_or_else(|| TcError {
-                        loc: *loc,
-                        msg: format!("‘{name}’ is not a method of class ‘{}’", cd.name),
-                    })?;
+                let scheme = match info.default_schemes.get(&mkey) {
+                    Some(s) => s.clone(),
+                    None => info
+                        .methods
+                        .iter()
+                        .find(|(k, _)| *k == mkey)
+                        .map(|(_, s)| s.clone())
+                        .ok_or_else(|| TcError {
+                            loc: *loc,
+                            msg: format!("‘{name}’ is not a method of class ‘{}’", cd.name),
+                        })?,
+                };
                 let dm = format!("{}.$dm{name}", self.module);
+                // The class's variables scope over its default methods.
+                self.explicit_sigs.insert(dm.clone());
                 let core = self.check_method(clauses, &scheme, &dm, *loc)?;
                 self.out.push(TopBind { name: dm, body: core });
             }
@@ -493,7 +516,7 @@ impl Checker {
         }
         let mut ctx = Vec::new();
         for c in &id.context {
-            ctx.push(self.convert_pred(c, &mut tvs)?);
+            ctx.extend(self.convert_context_item(c, &mut tvs)?);
         }
         let dict = format!(
             "{}.$f{}{}_{}",
@@ -560,8 +583,13 @@ impl Checker {
             .collect();
         let dparams: Vec<String> = ctx.iter().map(|_| self.fresh_name("di")).collect();
         let givens_len = self.givens.len();
+        // The instance head's variables scope over its methods.
+        let scope_len = self.scoped.len();
+        for (n, sk) in tvs.iter().zip(&skolems) {
+            self.scoped.push((n.clone(), sk.clone()));
+        }
         for (p, d) in ctx.iter().zip(&dparams) {
-            self.givens.push(Given {
+            self.add_given(Given {
                 pred: p.clone(),
                 ev: Core::Var(d.clone()),
             });
@@ -615,7 +643,23 @@ impl Checker {
                     Core::Var(name)
                 }
                 None => match info.defaults.get(mkey) {
-                    Some(dm) => Core::App(Box::new(Core::Var(dm.clone())), Box::new(Core::Var(this.clone()))),
+                    Some(dm) => {
+                        // A default with its own context gets those dictionaries at this instance.
+                        let mut core = Core::App(Box::new(Core::Var(dm.clone())), Box::new(Core::Var(this.clone())));
+                        if let Some(ds) = info.default_schemes.get(mkey) {
+                            let mut args: Vec<Ty> = head.clone();
+                            while args.len() < ds.nvars as usize {
+                                args.push(self.metas.fresh(self.level));
+                            }
+                            for p in ds.preds.iter().skip(1) {
+                                let pred = super::types::subst_gen_pred(p, &args);
+                                let ev = self.fresh_name("dd");
+                                self.wanted.push(super::Wanted { pred, ev: ev.clone(), loc: id.loc });
+                                core = Core::App(Box::new(core), Box::new(Core::Var(ev)));
+                            }
+                        }
+                        core
+                    }
                     // Exception types are identified by their type name, which stands in for Typeable.
                     None if occ == "exceptionTypeTag" => {
                         let name = inst.head.first().map(head_name).unwrap_or_default();
@@ -631,6 +675,7 @@ impl Checker {
             };
             fields.push(field);
         }
+        self.scoped.truncate(scope_len);
         self.givens.truncate(givens_len);
 
         if dparams.is_empty() {
@@ -765,13 +810,49 @@ impl Checker {
                 Some(m) => format!("{m}.{}", q.name),
                 None => format!("{}.{}", self.module, q.name),
             },
-            // Tuples and lists are built in, with their instances in Base.
-            Type::Tuple(..) | Type::List(..) => return Ok(Vec::new()),
+            Type::Tuple(elems, _) => format!("Builtin.({})", ",".repeat(elems.len().saturating_sub(1))),
+            // Lists are built in, with their instances in Base.
+            Type::List(..) => return Ok(Vec::new()),
             _ => return self.err("Malformed standalone deriving declaration"),
         };
-        // Built-in types (unit, tuples, lists) have their instances in Base.
-        if tycon.starts_with("Builtin.") {
-            return Ok(Vec::new());
+        // Unit and tuples are built in: their declaration is written here, so the stock
+        // instance is generated for them as for any type. Lists keep their instances in Base.
+        if let Some(occ) = tycon.strip_prefix("Builtin.") {
+            if !(occ == "()" || occ.starts_with("(,")) {
+                return Ok(Vec::new());
+            }
+            use crate::syntax::ast::{ConDecl, ConFields, Field, Loc, TyVarBind};
+            let arity = if occ == "()" { 0 } else { occ.matches(',').count() + 1 };
+            let tyvars: Vec<TyVarBind> = (0..arity)
+                .map(|i| TyVarBind { name: format!("t{i}"), kind: None })
+                .collect();
+            let field_types: Vec<Field> = (0..arity)
+                .map(|i| Field {
+                    ty: crate::syntax::ast::Type::Var(format!("t{i}"), Loc { line: 0, col: 0 }),
+                    strict: false,
+                })
+                .collect();
+            let synthetic = DataDecl {
+                newtype: false,
+                context: Vec::new(),
+                name: occ.to_string(),
+                tyvars,
+                cons: vec![ConDecl {
+                    name: occ.to_string(),
+                    exist: Vec::new(),
+                    context: Vec::new(),
+                    fields: ConFields::Positional(field_types),
+                    gadt_result: None,
+                    infix: false,
+                    loc: Loc { line: 0, col: 0 },
+                }],
+                deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
+                loc: sd.loc,
+            };
+            let here = std::mem::replace(&mut self.module, "Builtin".to_string());
+            let derived = self.derive_instances(&synthetic);
+            self.module = here;
+            return derived;
         }
         let Some((defining, dd)) = self.env.data_decls.get(&tycon).cloned() else {
             return self.err(format!("Cannot derive an instance for ‘{}’: its declaration is not known", super::types::unqualify(&tycon)));
@@ -784,7 +865,19 @@ impl Checker {
         let here = std::mem::replace(&mut self.module, defining);
         let derived = self.derive_instances(&synthetic);
         self.module = here;
-        derived
+        // A standalone deriving declaration states its own context and head; the inferred ones
+        // of a stock deriving clause do not apply.
+        Ok(derived?
+            .into_iter()
+            .map(|d| match d {
+                Decl::Instance(mut id) => {
+                    id.context = sd.context.clone();
+                    id.head = sd.head.clone();
+                    Decl::Instance(id)
+                }
+                other => other,
+            })
+            .collect())
     }
 }
 

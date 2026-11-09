@@ -46,6 +46,9 @@ pub struct ClassInfo {
     pub methods: Vec<(String, Scheme)>,
     /// Methods that have a default implementation, as `$dm` global names.
     pub defaults: HashMap<String, String>,
+    /// Default signatures (DefaultSignatures): the scheme of each default, class predicate
+    /// first, then the predicates the default needs beyond the class.
+    pub default_schemes: HashMap<String, Scheme>,
     /// Constructor of the dictionary record.
     pub dict_con: String,
     /// Functional dependencies, as parameter positions: determining and determined.

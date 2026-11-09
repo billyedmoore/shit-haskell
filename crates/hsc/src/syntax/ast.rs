@@ -67,6 +67,8 @@ pub enum Subs {
     None,
     All,
     Some(Vec<String>),
+    /// `T(.., P, Q)`: every constructor and field, and these bundled names too.
+    AllPlus(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +91,18 @@ pub enum PatSynDir {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decl {
+    /// A default signature in a class: `default m :: ctx => t` (DefaultSignatures).
+    DefaultSig {
+        names: Vec<String>,
+        ty: Type,
+        loc: Loc,
+    },
+    /// An implicit-parameter binding `?x = e` (in a `let`).
+    IPBind {
+        name: String,
+        expr: Expr,
+        loc: Loc,
+    },
     /// A pattern synonym `pattern P x1 .. xn = pat`, `pattern P xs <- pat [where ..]`.
     PatSyn {
         name: String,
@@ -219,6 +233,8 @@ pub enum OpItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
+    /// An implicit parameter `?x`.
+    IPVar(String, Loc),
     Var(QName, Loc),
     Con(QName, Loc),
     Lit(Lit, Loc),
@@ -271,7 +287,8 @@ pub enum Expr {
 impl Expr {
     pub fn loc(&self) -> Loc {
         match self {
-            Expr::Var(_, l)
+            Expr::IPVar(_, l)
+            | Expr::Var(_, l)
             | Expr::Con(_, l)
             | Expr::Lit(_, l)
             | Expr::TyApp(_, _, l)
