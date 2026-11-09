@@ -69,6 +69,10 @@ pub struct Checker {
     pub source_name: String,
     /// Checking a `.hs-boot` file: its signatures are the module's values, without bindings.
     pub boot: bool,
+    /// Variables bound by nested `forall`s in the type being converted (innermost last).
+    pub bound_scope: Vec<(String, u32)>,
+    /// The next id for a variable bound by a nested `forall`.
+    pub bound_counter: u32,
     /// Kinds of type constructors.
     pub kinds: kinds::KindEnv,
     /// Type variables in scope from enclosing signatures with an explicit `forall`.
@@ -100,6 +104,8 @@ impl Checker {
             out: Vec::new(),
             user_module: false,
             boot: false,
+            bound_scope: Vec::new(),
+            bound_counter: 0,
             source_name: String::new(),
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),

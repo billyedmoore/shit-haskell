@@ -18,6 +18,9 @@ impl Checker {
     pub fn convert_type(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Ty> {
         Ok(match t {
             Type::Var(name, _) => {
+                if let Some((_, id)) = self.bound_scope.iter().rev().find(|(n, _)| n == name) {
+                    return Ok(Ty::Bound(*id));
+                }
                 if let Some((_, t)) = self.scoped.iter().rev().find(|(n, _)| n == name) {
                     return Ok(t.clone());
                 }
@@ -67,13 +70,33 @@ impl Checker {
             // enclosing signature. This accepts rank-N programs whose uses are
             // instantiation-compatible, such as `runST`, without checking them rank-N.
             Type::Forall(binders, body) => {
+                // A nested polymorphic type: its variables are bound here, not by the signature.
+                let mut ids = Vec::with_capacity(binders.len());
+                let mark = self.bound_scope.len();
                 for b in binders {
-                    tvar_index(tvs, &b.name);
+                    self.bound_counter += 1;
+                    ids.push(self.bound_counter);
+                    self.bound_scope.push((b.name.clone(), self.bound_counter));
                 }
-                self.convert_type(body, tvs)?
+                let inner = self.convert_type(body, tvs);
+                self.bound_scope.truncate(mark);
+                match inner? {
+                    Ty::Qual(preds, t) => Ty::Forall(ids, preds, t),
+                    other => Ty::Forall(ids, Vec::new(), Box::new(other)),
+                }
             }
-            Type::Qual(..) => {
-                return self.err("Higher-rank types with class constraints are not supported yet")
+            // A constrained type nested in a signature (rank-N): see `Ty::Qual`.
+            Type::Qual(ctx, body) => {
+                let mut preds = Vec::with_capacity(ctx.len());
+                for c in ctx {
+                    preds.push(self.convert_pred(c, tvs)?);
+                }
+                let body = self.convert_type(body, tvs)?;
+                if preds.is_empty() {
+                    body
+                } else {
+                    Ty::Qual(preds, Box::new(body))
+                }
             }
             Type::OpChain(..) => return self.err("internal: unresolved type operator"),
         })

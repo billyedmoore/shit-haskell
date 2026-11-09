@@ -17,6 +17,14 @@ pub enum Ty {
     Skol(u32, String),
     /// A quantified variable of a scheme, by index.
     Gen(u32),
+    /// A constrained type in argument position, `C a => t` (rank-N): a value of it is a
+    /// function of the dictionaries of its predicates.
+    Qual(Vec<Pred>, Box<Ty>),
+    /// A variable bound by a nested `forall` (rank-N), by a unique id.
+    Bound(u32),
+    /// A nested `forall ids. preds => t`: a polymorphic type, instantiated where it is used
+    /// and skolemised where it is checked against.
+    Forall(Vec<u32>, Vec<Pred>, Box<Ty>),
 }
 
 impl Ty {
@@ -86,6 +94,7 @@ impl Ty {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[derive(Eq, Hash)]
 pub struct Pred {
     pub class: String,
     pub args: Vec<Ty>,
@@ -116,7 +125,38 @@ pub fn subst_gen(t: &Ty, args: &[Ty]) -> Ty {
     match t {
         Ty::Gen(i) => args.get(*i as usize).cloned().unwrap_or(Ty::Gen(*i)),
         Ty::App(f, a) => Ty::app(subst_gen(f, args), subst_gen(a, args)),
+        Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_gen_pred(p, args)).collect(), Box::new(subst_gen(b, args))),
+        Ty::Forall(ids, ps, b) => Ty::Forall(
+            ids.clone(),
+            ps.iter().map(|p| subst_gen_pred(p, args)).collect(),
+            Box::new(subst_gen(b, args)),
+        ),
         other => other.clone(),
+    }
+}
+
+/// Replaces the bound variables `ids` of a nested `forall` by `tys`.
+pub fn subst_bound(t: &Ty, ids: &[u32], tys: &[Ty]) -> Ty {
+    match t {
+        Ty::Bound(i) => match ids.iter().position(|x| x == i) {
+            Some(k) => tys[k].clone(),
+            None => t.clone(),
+        },
+        Ty::App(f, a) => Ty::app(subst_bound(f, ids, tys), subst_bound(a, ids, tys)),
+        Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(), Box::new(subst_bound(b, ids, tys))),
+        Ty::Forall(is, ps, b) => Ty::Forall(
+            is.clone(),
+            ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(),
+            Box::new(subst_bound(b, ids, tys)),
+        ),
+        other => other.clone(),
+    }
+}
+
+pub fn subst_bound_pred(p: &Pred, ids: &[u32], tys: &[Ty]) -> Pred {
+    Pred {
+        class: p.class.clone(),
+        args: p.args.iter().map(|a| subst_bound(a, ids, tys)).collect(),
     }
 }
 
@@ -186,6 +226,12 @@ impl Metas {
                 None => t.clone(),
             },
             Ty::App(f, a) => Ty::app(self.zonk(f), self.zonk(a)),
+            Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| self.zonk_pred(p)).collect(), Box::new(self.zonk(b))),
+            Ty::Forall(ids, ps, b) => Ty::Forall(
+                ids.clone(),
+                ps.iter().map(|p| self.zonk_pred(p)).collect(),
+                Box::new(self.zonk(b)),
+            ),
             other => other.clone(),
         }
     }
@@ -212,6 +258,14 @@ impl Metas {
                 self.free_metas(f, out);
                 self.free_metas(a, out);
             }
+            Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => {
+                for p in ps {
+                    for a in &p.args {
+                        self.free_metas(a, out);
+                    }
+                }
+                self.free_metas(b, out);
+            }
             _ => {}
         }
     }
@@ -227,6 +281,24 @@ impl Metas {
             (Ty::App(f1, a1), Ty::App(f2, a2)) => {
                 self.unify(f1, f2)?;
                 self.unify(a1, a2)
+            }
+            (Ty::Forall(i1, p1, b1), Ty::Forall(i2, p2, b2)) if i1.len() == i2.len() && p1.len() == p2.len() => {
+                // Alpha-equivalence: both bodies over the same fresh rigid variables.
+                let sk: Vec<Ty> = (0..i1.len()).map(|k| self.fresh_skolem(&format!("r{k}"))).collect();
+                let x = subst_bound(b1, i1, &sk);
+                let y = subst_bound(b2, i2, &sk);
+                self.unify(&x, &y)
+            }
+            (Ty::Qual(p1, b1), Ty::Qual(p2, b2)) if p1.len() == p2.len() => {
+                for (x, y) in p1.iter().zip(p2) {
+                    if x.class != y.class || x.args.len() != y.args.len() {
+                        return Err(UnifyError::Mismatch);
+                    }
+                    for (u, v) in x.args.iter().zip(&y.args) {
+                        self.unify(u, v)?;
+                    }
+                }
+                self.unify(b1, b2)
             }
             _ => Err(UnifyError::Mismatch),
         }
@@ -297,6 +369,10 @@ pub fn show_ty(m: &Metas, t: &Ty) -> String {
                     Ty::Meta(i) => format!("t{i}"),
                     Ty::Skol(_, n) => n.clone(),
                     Ty::Gen(i) => gen_name(*i),
+                    Ty::Bound(i) => format!("b{i}"),
+                    Ty::Forall(..) => "(forall)".to_string(),
+                    Ty::Qual(..) => "(constrained)".to_string(),
+                    Ty::Qual(..) => "(qualified)".to_string(),
                     Ty::App(..) => unreachable!("split_apps returns a non-application head"),
                 };
                 for a in &args {

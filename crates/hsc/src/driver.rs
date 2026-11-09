@@ -37,6 +37,7 @@ impl Driver {
                 main_dir.to_path_buf(),
                 default_lib_dir(),
                 default_lib_dir().join("ghc-prim"),
+                default_lib_dir().join("ghc-internal").join("src"),
             ],
             ifaces: BTreeMap::new(),
             checker: Checker::new(),

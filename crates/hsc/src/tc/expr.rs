@@ -98,7 +98,6 @@ impl Checker {
             }
             Expr::App(f, a) => {
                 let (cf, tf) = self.infer(f)?;
-                let (ca, ta) = self.infer(a)?;
                 let (arg, res) = match self.metas.prune(&tf).as_fun() {
                     Some((x, y)) => (x.clone(), y.clone()),
                     None => {
@@ -108,6 +107,20 @@ impl Checker {
                         (x, y)
                     }
                 };
+                if let Ty::Forall(ids, preds, body) = self.metas.prune(&arg) {
+                    // A polymorphic argument: its variables are rigid while it is checked.
+                    let sk: Vec<Ty> = ids.iter().map(|_| self.metas.fresh_skolem("r")).collect();
+                    let preds: Vec<Pred> = preds.iter().map(|p| super::types::subst_bound_pred(p, &ids, &sk)).collect();
+                    let body = super::types::subst_bound(&body, &ids, &sk);
+                    let ca = self.check_qual_arg(a, &preds, &body)?;
+                    return Ok((Core::App(Box::new(cf), Box::new(ca)), res));
+                }
+                if let Ty::Qual(preds, body) = self.metas.prune(&arg) {
+                    // A rank-N argument: checked under the dictionaries it takes.
+                    let ca = self.check_qual_arg(a, &preds, &body)?;
+                    return Ok((Core::App(Box::new(cf), Box::new(ca)), res));
+                }
+                let (ca, ta) = self.infer(a)?;
                 self.unify_at(&ta, &arg)?;
                 Ok((Core::App(Box::new(cf), Box::new(ca)), res))
             }
@@ -386,6 +399,38 @@ impl Checker {
 
     /// Instantiates a variable's scheme; the leading quantified variables take the explicit
     /// types given by visible type application, the rest are fresh unification variables.
+    /// Checks an argument of a constrained (rank-N) parameter type: its predicates are
+    /// givens, and the argument becomes a function of their dictionaries.
+    fn check_qual_arg(&mut self, a: &Expr, preds: &[Pred], body: &Ty) -> TR<Core> {
+        let dparams: Vec<String> = preds.iter().map(|_| self.fresh_name("dq")).collect();
+        let givens_len = self.givens.len();
+        for (p, d) in preds.iter().zip(&dparams) {
+            self.givens.push(super::Given { pred: p.clone(), ev: Core::Var(d.clone()) });
+        }
+        let outer = std::mem::take(&mut self.wanted);
+        let result = (|| -> TR<Core> {
+            let (ca, ta) = self.infer(a)?;
+            self.unify_at(&ta, body)?;
+            Ok(ca)
+        })();
+        let inner = std::mem::replace(&mut self.wanted, outer);
+        let ca = match result {
+            Ok(ca) => ca,
+            Err(e) => {
+                self.givens.truncate(givens_len);
+                return Err(e);
+            }
+        };
+        let (binds, residual) = self.solve(inner)?;
+        self.wanted.extend(residual);
+        self.givens.truncate(givens_len);
+        let mut core = wrap_let(binds, ca);
+        for d in dparams.into_iter().rev() {
+            core = Core::Lam(d, Box::new(core));
+        }
+        Ok(core)
+    }
+
     pub fn inst_var_explicit(&mut self, name: &str, scheme: &Scheme, loc: Loc, explicit: &[Ty]) -> (Core, Ty) {
         let args: Vec<Ty> = (0..scheme.nvars as usize)
             .map(|i| match explicit.get(i) {
@@ -405,7 +450,35 @@ impl Checker {
             });
             core = Core::App(Box::new(core), Box::new(Core::Var(ev)));
         }
+        // A variable whose type is constrained (a rank-N parameter) takes the dictionaries now.
+        let mut ty = ty;
+        loop {
+            match self.metas.prune(&ty) {
+                Ty::Qual(ps, body) => {
+                    core = self.apply_dicts(core, ps, loc);
+                    ty = *body;
+                }
+                Ty::Forall(ids, ps, body) => {
+                    // A polymorphic variable: instantiated at every use.
+                    let args: Vec<Ty> = ids.iter().map(|_| self.meta()).collect();
+                    let ps: Vec<Pred> = ps.iter().map(|p| super::types::subst_bound_pred(p, &ids, &args)).collect();
+                    core = self.apply_dicts(core, ps, loc);
+                    ty = super::types::subst_bound(&body, &ids, &args);
+                }
+                _ => break,
+            }
+        }
         (core, ty)
+    }
+
+    /// Applies a Core expression to the dictionaries of predicates, requesting them as wanted.
+    fn apply_dicts(&mut self, mut core: Core, preds: Vec<Pred>, loc: Loc) -> Core {
+        for p in preds {
+            let ev = self.fresh_name("d");
+            self.wanted.push(Wanted { pred: p, ev: ev.clone(), loc });
+            core = Core::App(Box::new(core), Box::new(Core::Var(ev)));
+        }
+        core
     }
 
     fn infer_op(&mut self, op: &QName, loc: Loc) -> TR<(Core, Ty)> {
