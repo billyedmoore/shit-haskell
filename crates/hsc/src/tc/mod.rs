@@ -11,6 +11,7 @@ pub mod convert;
 pub mod decls;
 pub mod derive;
 pub mod env;
+pub mod families;
 pub mod expr;
 pub mod kinds;
 pub mod solve;
@@ -72,6 +73,8 @@ pub struct Checker {
     pub scoped: Vec<(String, Ty)>,
     /// Bindings whose signature has an explicit `forall` (their variables scope over the body).
     pub explicit_sigs: std::collections::HashSet<String>,
+    /// Equalities involving type families that cannot be decided yet.
+    pub deferred_eqs: Vec<(Ty, Ty, Loc)>,
 }
 
 /// The module name of built-in syntax.
@@ -98,6 +101,7 @@ impl Checker {
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),
             explicit_sigs: std::collections::HashSet::new(),
+            deferred_eqs: Vec::new(),
         };
         c.install_builtins();
         c
@@ -136,8 +140,24 @@ impl Checker {
             .or_else(|| self.env.values.get(name).cloned())
     }
 
-    /// Unifies `actual` with `expected`, reporting GHC-style errors.
+    /// Unifies `actual` with `expected`, reporting GHC-style errors. Type families are reduced
+    /// first; an equality stuck on a family application is deferred.
     pub fn unify_at(&mut self, actual: &Ty, expected: &Ty) -> TR<()> {
+        if self.env.families.is_empty() {
+            return self.unify_at_raw(actual, expected);
+        }
+        let a = self.normalize(actual);
+        let e = self.normalize(expected);
+        let a_meta = matches!(self.metas.prune(&a), Ty::Meta(_));
+        let e_meta = matches!(self.metas.prune(&e), Ty::Meta(_));
+        if !(a_meta || e_meta) && (self.has_family(&a) || self.has_family(&e)) {
+            self.deferred_eqs.push((a, e, self.loc));
+            return Ok(());
+        }
+        self.unify_at_raw(&a, &e)
+    }
+
+    fn unify_at_raw(&mut self, actual: &Ty, expected: &Ty) -> TR<()> {
         match self.metas.unify(actual, expected) {
             Ok(()) => Ok(()),
             Err(types::UnifyError::Occurs) => {

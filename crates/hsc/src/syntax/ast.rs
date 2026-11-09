@@ -118,6 +118,19 @@ pub enum Decl {
         kind: Type,
         loc: Loc,
     },
+    /// A type family: open (`equations` is `None`) or closed.
+    TypeFamily {
+        name: String,
+        params: Vec<TyVarBind>,
+        equations: Option<Vec<TypeEquation>>,
+        loc: Loc,
+    },
+    /// An equation of an open family: `type instance F t1 .. tn = rhs`.
+    TypeInstance {
+        name: QName,
+        equation: TypeEquation,
+        loc: Loc,
+    },
     Foreign {
         import: bool,
         entity: Option<String>,
@@ -125,6 +138,14 @@ pub enum Decl {
         ty: Type,
         loc: Loc,
     },
+}
+
+/// One equation `F t1 .. tn = rhs` of a type family.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeEquation {
+    pub args: Vec<Type>,
+    pub rhs: Type,
+    pub loc: Loc,
 }
 
 #[derive(Clone, Debug, PartialEq)]

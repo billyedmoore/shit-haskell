@@ -23,6 +23,7 @@ impl Checker {
     /// Solves what can be solved. Returns evidence bindings and the residual wanteds
     /// that still mention unsolved unification variables.
     pub fn solve(&mut self, wanteds: Vec<Wanted>) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
+        self.retry_deferred()?;
         let mut work = wanteds;
         let mut binds = Vec::new();
         let mut residual = Vec::new();
@@ -93,8 +94,15 @@ impl Checker {
         Ok(())
     }
 
+    /// A predicate with solved variables substituted and type families reduced.
     pub fn metas_zonk_pred(&self, p: &Pred) -> Pred {
-        self.metas.zonk_pred(p)
+        if self.env.families.is_empty() {
+            return self.metas.zonk_pred(p);
+        }
+        Pred {
+            class: p.class.clone(),
+            args: p.args.iter().map(|t| self.normalize(t)).collect(),
+        }
     }
 
     pub fn pred_has_metas(&self, p: &Pred) -> bool {

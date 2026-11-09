@@ -69,8 +69,26 @@ pub struct InstInfo {
     pub dict: String,
 }
 
+/// One equation of a type family: patterns over `Gen(0..nvars)`, and the right-hand side.
+#[derive(Clone, Debug)]
+pub struct FamEqn {
+    pub nvars: u32,
+    pub args: Vec<Ty>,
+    pub rhs: Ty,
+}
+
+#[derive(Clone, Debug)]
+pub struct FamilyInfo {
+    pub arity: usize,
+    /// Closed families try their equations in order.
+    pub closed: bool,
+    pub equations: Vec<FamEqn>,
+}
+
 #[derive(Default)]
 pub struct Env {
+    /// Type families by global name.
+    pub families: HashMap<String, FamilyInfo>,
     pub tycons: HashMap<String, TyConInfo>,
     pub synonyms: HashMap<String, Synonym>,
     pub datacons: HashMap<String, DataCon>,

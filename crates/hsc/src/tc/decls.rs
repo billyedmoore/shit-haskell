@@ -19,6 +19,22 @@ impl Checker {
         // 0. Kinds of this module's type constructors.
         self.check_kinds(decls)?;
 
+        // Type families: declared first, so that equations and uses can refer to them.
+        let mut family_decls: Vec<&Decl> = Vec::new();
+        for d in decls {
+            match d {
+                Decl::TypeFamily { .. } => family_decls.push(d),
+                Decl::Class(cd) => family_decls.extend(cd.decls.iter().filter(|x| matches!(x, Decl::TypeFamily { .. }))),
+                _ => {}
+            }
+        }
+        for d in &family_decls {
+            if let Decl::TypeFamily { name, params, equations, .. } = d {
+                let key = format!("{}.{name}", self.module);
+                self.register_family(&key, params.len(), equations.is_some());
+            }
+        }
+
         // 1. Type synonyms and type constructors.
         for d in decls {
             if let Decl::TypeSyn { name, tyvars, rhs, loc } = d {
@@ -44,6 +60,32 @@ impl Checker {
                         cons,
                     },
                 );
+            }
+        }
+
+        // Equations: closed families in order, then the instances of open families.
+        for d in &family_decls {
+            if let Decl::TypeFamily { name, equations: Some(eqs), .. } = d {
+                let key = format!("{}.{name}", self.module);
+                for e in eqs {
+                    // A closed family's equations are written with its own name.
+                    let _ = name;
+                    self.add_family_equation(&key, &e.args, &e.rhs, e.loc)?;
+                }
+            }
+        }
+        let mut instance_eqs: Vec<&Decl> = Vec::new();
+        for d in decls {
+            match d {
+                Decl::TypeInstance { .. } => instance_eqs.push(d),
+                Decl::Instance(id) => instance_eqs.extend(id.decls.iter().filter(|x| matches!(x, Decl::TypeInstance { .. }))),
+                Decl::Class(cd) => instance_eqs.extend(cd.decls.iter().filter(|x| matches!(x, Decl::TypeInstance { .. }))),
+                _ => {}
+            }
+        }
+        for d in instance_eqs {
+            if let Decl::TypeInstance { name, equation, .. } = d {
+                self.add_family_equation(&global_tycon_name(name), &equation.args, &equation.rhs, equation.loc)?;
             }
         }
 

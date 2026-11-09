@@ -3,6 +3,7 @@
 use super::{group_binds, Ctx, PResult, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
+use crate::syntax::ast::TypeEquation;
 
 impl Parser {
     pub(super) fn topdecl(&mut self) -> PResult<Decl> {
@@ -293,8 +294,16 @@ impl Parser {
 
     fn type_decl(&mut self, loc: Loc) -> PResult<Decl> {
         self.expect_kw(Kw::Type)?;
-        if self.at_varid("family") || self.at_kw(Kw::Instance) || self.at_varid("role") {
-            return self.err("type families and role annotations are not supported yet");
+        if self.at_varid("family") {
+            self.bump();
+            return self.type_family(loc, true);
+        }
+        if self.at_kw(Kw::Instance) {
+            self.bump();
+            return self.type_instance(loc);
+        }
+        if self.at_varid("role") {
+            return self.err("role annotations are not supported yet");
         }
         let head = self.btype()?;
         if self.at_res(ROp::DColon) {
@@ -313,6 +322,63 @@ impl Parser {
             rhs,
             loc,
         })
+    }
+
+    /// `F a b [:: kind] [where equations]`, after `type family` (or `type` in a class).
+    fn type_family(&mut self, loc: Loc, top: bool) -> PResult<Decl> {
+        let head = self.btype()?;
+        let (name, params) = self.decl_head(head)?;
+        if self.at_res(ROp::DColon) {
+            self.bump();
+            self.sigtype()?;
+        }
+        let equations = if top && self.at_kw(Kw::Where) {
+            self.bump();
+            Some(self.block(|p| p.type_equation().map(|(_, e)| e))?)
+        } else {
+            None
+        };
+        Ok(Decl::TypeFamily {
+            name,
+            params,
+            equations,
+            loc,
+        })
+    }
+
+    /// `type instance F t1 .. tn = rhs`, after `type instance`.
+    fn type_instance(&mut self, loc: Loc) -> PResult<Decl> {
+        let (name, equation) = self.type_equation()?;
+        Ok(Decl::TypeInstance {
+            name,
+            equation,
+            loc,
+        })
+    }
+
+    /// `F t1 .. tn = rhs`: the family name and the equation.
+    fn type_equation(&mut self) -> PResult<(QName, TypeEquation)> {
+        let loc = self.loc();
+        let lhs = self.btype()?;
+        self.equation_from(lhs, loc)
+    }
+
+    /// The rest of an equation whose left-hand side has been parsed.
+    fn equation_from(&mut self, lhs: Type, loc: Loc) -> PResult<(QName, TypeEquation)> {
+        self.expect_res(ROp::Eq)?;
+        let rhs = self.sigtype()?;
+        let mut args = Vec::new();
+        let mut t = lhs;
+        while let Type::App(f, a) = t {
+            args.push(*a);
+            t = *f;
+        }
+        args.reverse();
+        let name = match t {
+            Type::Con(q, _) => q,
+            _ => return self.err("malformed type family equation"),
+        };
+        Ok((name, TypeEquation { args, rhs, loc }))
     }
 
     /// Splits a declaration head `T a (b :: k)` or `a :+: b` into its name and binders.
@@ -729,8 +795,41 @@ impl Parser {
     }
 
     fn class_body_decl(&mut self) -> PResult<Decl> {
-        if self.at_kw(Kw::Default) || self.at_kw(Kw::Type) || self.at_kw(Kw::Data) {
-            return self.err("associated types and default signatures are not supported yet");
+        if self.at_kw(Kw::Type) {
+            // An associated type: `type F a [:: k]` declares it; `type F T = t` is an equation
+            // (an instance's definition, or a class default, which is accepted and ignored).
+            let loc = self.loc();
+            self.bump();
+            if self.at_kw(Kw::Instance) {
+                self.bump();
+                return self.type_instance(loc);
+            }
+            if self.at_varid("family") {
+                self.bump();
+            }
+            let head = self.btype()?;
+            if self.at_res(ROp::Eq) {
+                let (name, equation) = self.equation_from(head, loc)?;
+                return Ok(Decl::TypeInstance {
+                    name,
+                    equation,
+                    loc,
+                });
+            }
+            let (name, params) = self.decl_head(head)?;
+            if self.at_res(ROp::DColon) {
+                self.bump();
+                self.sigtype()?;
+            }
+            return Ok(Decl::TypeFamily {
+                name,
+                params,
+                equations: None,
+                loc,
+            });
+        }
+        if self.at_kw(Kw::Default) || self.at_kw(Kw::Data) {
+            return self.err("default signatures and associated data families are not supported yet");
         }
         self.value_decl()
     }

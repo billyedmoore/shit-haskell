@@ -364,8 +364,19 @@ impl<'a> Renamer<'a> {
                     add_type(&mut seen_types, name, *loc)?;
                     own.push(entity(EntKind::TyCon, &module, name, vec![], vec![]));
                 }
+                Decl::TypeFamily { name, loc, .. } => {
+                    add_type(&mut seen_types, name, *loc)?;
+                    own.push(entity(EntKind::TyCon, &module, name, vec![], vec![]));
+                }
                 Decl::Class(cd) => {
                     add_type(&mut seen_types, &cd.name, cd.loc)?;
+                    // Associated families are top-level type constructors of the module.
+                    for cdecl in &cd.decls {
+                        if let Decl::TypeFamily { name, loc, .. } = cdecl {
+                            add_type(&mut seen_types, name, *loc)?;
+                            own.push(entity(EntKind::TyCon, &module, name, vec![], vec![]));
+                        }
+                    }
                     let mut subs = Vec::new();
                     for cdecl in &cd.decls {
                         if let Decl::Sig { names, loc, .. } = cdecl {
@@ -676,6 +687,43 @@ impl<'a> Renamer<'a> {
                 kind: self.ty(kind)?,
                 loc,
             },
+            Decl::TypeFamily {
+                name,
+                params,
+                equations,
+                loc,
+            } => {
+                let equations = match equations {
+                    Some(eqs) => Some(
+                        eqs.into_iter()
+                            .map(|e| self.type_equation(e))
+                            .collect::<RR<Vec<_>>>()?,
+                    ),
+                    None => None,
+                };
+                Decl::TypeFamily {
+                    name,
+                    params,
+                    equations,
+                    loc,
+                }
+            }
+            Decl::TypeInstance { name, equation, loc } => {
+                let qname = self.tycon_ref(&name, loc)?;
+                Decl::TypeInstance {
+                    name: qname,
+                    equation: self.type_equation(equation)?,
+                    loc,
+                }
+            }
+        })
+    }
+
+    fn type_equation(&mut self, e: TypeEquation) -> RR<TypeEquation> {
+        Ok(TypeEquation {
+            args: self.types(e.args)?,
+            rhs: self.ty(e.rhs)?,
+            loc: e.loc,
         })
     }
 
@@ -1498,7 +1546,9 @@ fn decl_loc(d: &Decl) -> Loc {
         | Decl::TypeSyn { loc, .. }
         | Decl::Default { loc, .. }
         | Decl::Foreign { loc, .. }
-        | Decl::KindSig { loc, .. } => *loc,
+        | Decl::KindSig { loc, .. }
+        | Decl::TypeFamily { loc, .. }
+        | Decl::TypeInstance { loc, .. } => *loc,
         Decl::Data(dd) => dd.loc,
         Decl::Class(cd) => cd.loc,
         Decl::Instance(id) => id.loc,
