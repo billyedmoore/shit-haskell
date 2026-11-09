@@ -17,7 +17,7 @@ const NUMERIC_CLASSES: &[&str] = &[
 ];
 
 /// Candidate types for defaulting, in order.
-const DEFAULT_CANDIDATES: &[&str] = &["Base.Integer", "Base.Double"];
+const DEFAULT_CANDIDATES: &[&str] = &["Base.Integer", "GHC.Types.Double"];
 
 impl Checker {
     /// Solves what can be solved. Returns evidence bindings and the residual wanteds

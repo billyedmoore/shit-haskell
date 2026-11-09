@@ -60,6 +60,7 @@ impl Checker {
                 Lit::Str(s) => format!("#{s:?}"),
                 Lit::Char(c) => format!("#{c:?}"),
                 Lit::Frac(s) => format!("#{s}"),
+                Lit::Prim(p) => format!("#{p:?}"),
             }),
             Type::Wild(_) => self.meta(),
             // A nested forall is approximated by quantifying its variables at the
@@ -101,6 +102,11 @@ impl Checker {
         args.reverse();
         let class = match head {
             Type::Con(q, _) => global_tycon_name(q),
+            // ConstraintKinds: a constraint variable `c` (or `c a`) is a predicate on its type.
+            Type::Var(..) => {
+                let ty = self.convert_type(t, tvs)?;
+                return Ok(Pred { class: CONSTRAINT_VAR.to_string(), args: vec![ty] });
+            }
             _ => return self.err("Malformed class constraint"),
         };
         let mut tys = Vec::with_capacity(args.len());
@@ -157,3 +163,6 @@ pub fn tvar_index(tvs: &mut Vec<String>, name: &str) -> u32 {
     tvs.push(name.to_string());
     (tvs.len() - 1) as u32
 }
+
+/// The class name of a predicate that is a constraint variable (see `convert_pred`).
+pub const CONSTRAINT_VAR: &str = "%constraint";

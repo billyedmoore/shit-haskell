@@ -2,10 +2,10 @@
 //! `Case` and `Let`. Rows are tried in order; each row's failure continuation is a
 //! let-bound thunk, which avoids duplicating code.
 
-use super::{Alt, Core};
+use super::{Alt, Core, Lit};
 
 /// The Bool constructors, used for guards and predicate tests.
-pub const TRUE: &str = "Base.True";
+pub const TRUE: &str = "GHC.Types.True";
 
 /// A typed, elaborated pattern.
 #[derive(Clone, Debug)]
@@ -20,6 +20,8 @@ pub enum CPat {
     /// A predicate function applied to the scrutinee; the match succeeds when it is True.
     /// Used for literal patterns, which need `==` from an `Eq` dictionary.
     Test(Core),
+    /// A primitive literal, compared directly (see `Alt::Lit`).
+    Lit(Lit),
     Bang(Box<CPat>),
     Lazy(Box<CPat>),
     View(Core, Box<CPat>),
@@ -168,6 +170,14 @@ fn match_one(s: &str, p: &CPat, success: Core, fail: &Core, fresh: Fresh) -> Cor
                 vec![Alt::Con(TRUE.into(), vec![], success), Alt::Default(fail.clone())],
             )
         }
+        CPat::Lit(l) => {
+            let b = fresh("lb");
+            Core::Case(
+                Box::new(Core::Var(s.to_string())),
+                b,
+                vec![Alt::Lit(l.clone(), success), Alt::Default(fail.clone())],
+            )
+        }
         CPat::Bang(sub) => {
             let inner = match_one(s, sub, success, fail, fresh);
             let b = fresh("bb");
@@ -201,7 +211,7 @@ fn match_one(s: &str, p: &CPat, success: Core, fail: &Core, fresh: Fresh) -> Cor
 /// Variables bound by a pattern.
 pub fn cpat_vars(p: &CPat, out: &mut Vec<String>) {
     match p {
-        CPat::Wild | CPat::Test(_) => {}
+        CPat::Wild | CPat::Test(_) | CPat::Lit(_) => {}
         CPat::Var(v) => out.push(v.clone()),
         CPat::As(v, sub) => {
             out.push(v.clone());

@@ -5,11 +5,11 @@ import Base
 data MVar a
 data MVarBox a = MVarBox (MVar a)
 
-foreign import prim "newMVar" primNewMVar :: World -> IORes (MVar a)
-foreign import prim "takeMVar" primTakeMVar :: MVar a -> World -> IORes a
-foreign import prim "readMVar" primReadMVar :: MVar a -> World -> IORes a
-foreign import prim "putMVar" primPutMVar :: MVar a -> a -> World -> IORes ()
-foreign import prim "tryTakeMVar" primTryTakeMVar :: MVar a -> World -> IORes (Maybe a)
+foreign import prim "newMVar" primNewMVar :: World -> (# World, (MVar a) #)
+foreign import prim "takeMVar" primTakeMVar :: MVar a -> World -> (# World, a #)
+foreign import prim "readMVar" primReadMVar :: MVar a -> World -> (# World, a #)
+foreign import prim "putMVar" primPutMVar :: MVar a -> a -> World -> (# World, () #)
+foreign import prim "tryTakeMVar" primTryTakeMVar :: MVar a -> World -> (# World, (Maybe a) #)
 
 newEmptyMVar :: IO (MVar a)
 newEmptyMVar = IO primNewMVar

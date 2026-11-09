@@ -427,7 +427,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             };
             let res = rt.apply(run, Rc::new(RefCell::new(super::Thunk::Done(unit_value()))))?;
             match res {
-                Value::Con(c) if c.name == "Base.IORes" => rt.force(&c.args[0]),
+                Value::Con(c) if c.name == "Builtin.(,)" => rt.force(&c.args[1]),
                 _ => Err(RtError::Fail("internal: IO result".into())),
             }
         }
@@ -572,6 +572,64 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             }
         }
 
+        // GHC's primops over unboxed types. Unboxed values share the boxed representation, so
+        // these are the same operations as the boxed ones, with Int# results for comparisons.
+        "+#" | "plusWord#" => int_v(int(rt, &args[0])?.wrapping_add(int(rt, &args[1])?)),
+        "-#" | "minusWord#" => int_v(int(rt, &args[0])?.wrapping_sub(int(rt, &args[1])?)),
+        "*#" | "timesWord#" => int_v(int(rt, &args[0])?.wrapping_mul(int(rt, &args[1])?)),
+        "negateInt#" => int_v(int(rt, &args[0])?.wrapping_neg()),
+        "quotInt#" => {
+            let d = int(rt, &args[1])?;
+            if d == 0 {
+                return Err(RtError::Error("divide by zero".into()));
+            }
+            int_v(int(rt, &args[0])?.wrapping_div(d))
+        }
+        "remInt#" => {
+            let d = int(rt, &args[1])?;
+            if d == 0 {
+                return Err(RtError::Error("divide by zero".into()));
+            }
+            int_v(int(rt, &args[0])?.wrapping_rem(d))
+        }
+        "==#" | "eqWord#" | "eqChar#" => int_v((int_or_char(rt, &args[0])? == int_or_char(rt, &args[1])?) as i64),
+        "/=#" | "neWord#" | "neChar#" => int_v((int_or_char(rt, &args[0])? != int_or_char(rt, &args[1])?) as i64),
+        "<#" | "ltWord#" | "ltChar#" => int_v((int_or_char(rt, &args[0])? < int_or_char(rt, &args[1])?) as i64),
+        "<=#" | "leWord#" | "leChar#" => int_v((int_or_char(rt, &args[0])? <= int_or_char(rt, &args[1])?) as i64),
+        ">#" | "gtWord#" | "gtChar#" => int_v((int_or_char(rt, &args[0])? > int_or_char(rt, &args[1])?) as i64),
+        ">=#" | "geWord#" | "geChar#" => int_v((int_or_char(rt, &args[0])? >= int_or_char(rt, &args[1])?) as i64),
+        "andI#" => int_v(int(rt, &args[0])? & int(rt, &args[1])?),
+        "orI#" => int_v(int(rt, &args[0])? | int(rt, &args[1])?),
+        "xorI#" => int_v(int(rt, &args[0])? ^ int(rt, &args[1])?),
+        "notI#" => int_v(!int(rt, &args[0])?),
+        "uncheckedIShiftL#" => int_v(int(rt, &args[0])?.wrapping_shl(int(rt, &args[1])? as u32)),
+        "uncheckedIShiftRA#" => int_v(int(rt, &args[0])?.wrapping_shr(int(rt, &args[1])? as u32)),
+        "uncheckedIShiftRL#" => int_v(((int(rt, &args[0])? as u64) >> (int(rt, &args[1])? as u32 & 63)) as i64),
+        "int2Word#" | "word2Int#" => int_v(int(rt, &args[0])?),
+        "int2Double#" => Ok(Value::Double(int(rt, &args[0])? as f64)),
+        "double2Int#" => int_v(double(rt, &args[0])? as i64),
+        "chr#" => Ok(Value::Char(char::from_u32(int(rt, &args[0])? as u32).unwrap_or('\u{fffd}'))),
+        "ord#" => int_v(match rt.force(&args[0])? {
+            Value::Char(c) => c as i64,
+            _ => return Err(RtError::Fail("internal: ord# of a non-character".into())),
+        }),
+        "+##" => Ok(Value::Double(double(rt, &args[0])? + double(rt, &args[1])?)),
+        "-##" => Ok(Value::Double(double(rt, &args[0])? - double(rt, &args[1])?)),
+        "*##" => Ok(Value::Double(double(rt, &args[0])? * double(rt, &args[1])?)),
+        "/##" => Ok(Value::Double(double(rt, &args[0])? / double(rt, &args[1])?)),
+        "==##" => int_v((double(rt, &args[0])? == double(rt, &args[1])?) as i64),
+        "<##" => int_v((double(rt, &args[0])? < double(rt, &args[1])?) as i64),
+        "<=##" => int_v((double(rt, &args[0])? <= double(rt, &args[1])?) as i64),
+        ">##" => int_v((double(rt, &args[0])? > double(rt, &args[1])?) as i64),
+        ">=##" => int_v((double(rt, &args[0])? >= double(rt, &args[1])?) as i64),
+        "negateDouble#" => Ok(Value::Double(-double(rt, &args[0])?)),
+        "sqrtDouble#" => Ok(Value::Double(double(rt, &args[0])?.sqrt())),
+        // tagToEnum# is type-directed in GHC. The libraries use it at Bool only (isTrue#).
+        "tagToEnum#" => Ok(bool_value(int(rt, &args[0])? != 0)),
+        "dataToTag#" => match rt.force(&args[0])? {
+            Value::Con(c) => int_v(con_tag(&c.name)),
+            _ => int_v(0),
+        },
         _ => Err(RtError::Fail(format!("internal: unknown primitive {name}"))),
     }
 }
@@ -640,9 +698,9 @@ fn general_category_index(c: char) -> i64 {
     }
 }
 
-/// `IORes a`: the result of running an IO action.
+/// `(# State# RealWorld, a #)`: the result of running an IO action.
 pub fn io_result(v: Value) -> Value {
-    con_value("Base.IORes", vec![v])
+    con_value("Builtin.(,)", vec![unit_value(), v])
 }
 
 fn io_message(e: &std::io::Error) -> String {
@@ -813,3 +871,21 @@ pub fn ratio_literal(text: &str) -> Value {
 
 #[allow(dead_code)]
 fn unused(_: &RefCell<Thunk>) {}
+
+/// An `Int#`, or a `Char#` as its code point (comparisons accept both).
+fn int_or_char(rt: &Runtime, c: &Cell) -> Result<i64, RtError> {
+    match rt.force(c)? {
+        Value::Char(ch) => Ok(ch as i64),
+        Value::Int(i) => Ok(i),
+        _ => Err(RtError::Fail("internal: comparison of a non-integer".into())),
+    }
+}
+
+/// The position of a constructor in its type, for `dataToTag#` (Bool only for now).
+fn con_tag(name: &str) -> i64 {
+    match name {
+        "GHC.Types.False" | "Base.False" => 0,
+        "GHC.Types.True" | "Base.True" => 1,
+        _ => 0,
+    }
+}

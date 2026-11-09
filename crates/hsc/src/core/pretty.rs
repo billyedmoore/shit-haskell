@@ -10,6 +10,7 @@ pub fn show_lit(l: &Lit) -> String {
         Lit::Double(d) => format!("{d}##"),
         Lit::Char(c) => format!("{c:?}"),
         Lit::Str(s) => format!("{s:?}"),
+        Lit::Addr(s) => format!("{s:?}#"),
     }
 }
 

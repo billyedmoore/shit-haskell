@@ -287,6 +287,27 @@ impl Parser {
             self.bump();
             // GHC.Types declares the unboxed tuple types as `data T# a b = (# a, b #)`. Unboxed
             // tuples are built in here, so the declaration adds nothing.
+            if self.is_builtin_tuple_body() {
+                // GHC.Tuple declares `data Tuple2 a b = (a, b)`; tuples are built in here.
+                self.bump();
+                if self.at_special(')') {
+                    self.bump();
+                } else {
+                    while !self.at_special(')') {
+                        self.bump();
+                    }
+                    self.bump();
+                }
+                return Ok(Decl::Data(DataDecl {
+                    newtype: false,
+                    context,
+                    name,
+                    tyvars,
+                    cons: Vec::new(),
+                    deriving: Vec::new(),
+                    loc,
+                }));
+            }
             if self.at_special('(') && self.peek_raw(1) == &Tok::VarSym("#".into()) {
                 // Each alternative is one parenthesised group `(# ... #)`.
                 let mut depth = 0;
@@ -1026,5 +1047,31 @@ impl Parser {
             return self.unexpected();
         };
         Ok(Decl::PatSyn { name, args, pat, dir, loc })
+    }
+}
+
+impl Parser {
+    /// `(a, b, ..)` or `()` as a whole constructor body (the built-in tuple types).
+    fn is_builtin_tuple_body(&self) -> bool {
+        if !self.at_special('(') {
+            return false;
+        }
+        if *self.peek_raw(1) == Tok::Special(')') {
+            return true;
+        }
+        let mut k = 1;
+        let mut vars = 0;
+        loop {
+            match self.peek_raw(k) {
+                Tok::VarId(_) => vars += 1,
+                _ => return false,
+            }
+            k += 1;
+            match self.peek_raw(k) {
+                Tok::Special(',') => k += 1,
+                Tok::Special(')') => return vars >= 2,
+                _ => return false,
+            }
+        }
     }
 }

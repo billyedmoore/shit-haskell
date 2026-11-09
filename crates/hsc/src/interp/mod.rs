@@ -49,6 +49,8 @@ pub enum Value {
     Ref(Rc<RefCell<Cell>>),
     /// An immutable boxed vector (the cells are never reassigned after construction).
     Vec(Rc<RefCell<Vec<Cell>>>),
+    /// An `Addr#`: a byte buffer and an offset into it.
+    Addr(Rc<Vec<u8>>, usize),
     /// An `MVar`: empty, or holding a cell.
     MVar(Rc<RefCell<Option<Cell>>>),
 }
@@ -216,6 +218,7 @@ impl Runtime {
                 Code::Frac(s) => return Ok(Value::Double(s.parse().unwrap_or(0.0))),
                 Code::Char(c) => return Ok(Value::Char(*c)),
                 Code::Str(s) => return Ok(string_value(s)),
+                Code::Addr(bytes) => return Ok(Value::Addr(bytes.clone(), 0)),
                 Code::App(f, a) => {
                     let fv = self.eval(f, &frame)?;
                     let arg = self.delay(a, &frame);
@@ -351,6 +354,7 @@ pub fn lit_value(l: &Lit) -> RR {
         Lit::Double(d) => Value::Double(*d),
         Lit::Char(c) => Value::Char(*c),
         Lit::Str(s) => string_value(s),
+        Lit::Addr(s) => Value::Addr(Rc::new(s.chars().map(|c| c as u32 as u8).chain(std::iter::once(0)).collect()), 0),
     })
 }
 
@@ -388,7 +392,7 @@ pub fn run_main(rt: &Runtime) -> i32 {
     };
     let result = (|| -> Result<(), RtError> {
         let io = rt.force(&main_cell)?;
-        // `main :: IO ()` is `IO (World -> IORes ())`.
+        // `main :: IO ()` is `IO (State# RealWorld -> (# State# RealWorld, () #))`.
         let run = match io {
             other_io @ Value::Con(_) | other_io @ Value::Fun(_) => other_io,
             _ => return Err(RtError::Fail("internal: main is not an IO action".into())),
@@ -429,7 +433,7 @@ pub fn run_main(rt: &Runtime) -> i32 {
 
 pub fn bool_value(b: bool) -> Value {
     Value::Con(Rc::new(ConVal {
-        name: if b { "Base.True" } else { "Base.False" },
+        name: if b { "GHC.Types.True" } else { "GHC.Types.False" },
         args: vec![],
     }))
 }

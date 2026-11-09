@@ -24,6 +24,8 @@ pub enum Lit {
     Char(char),
     /// A string literal, which evaluates to a list of characters.
     Str(String),
+    /// An `Addr#` literal: the bytes of the string, with a terminating NUL added at run time.
+    Addr(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]

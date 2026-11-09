@@ -29,6 +29,8 @@ pub enum Code {
     Int(i64),
     Double(f64),
     Frac(String),
+    /// An `Addr#` literal: its bytes, NUL-terminated.
+    Addr(std::rc::Rc<Vec<u8>>),
     Char(char),
     Str(String),
     App(Box<Code>, Box<Code>),
@@ -141,6 +143,11 @@ impl Compiler<'_> {
             Lit::Frac(s) => Code::Frac(s.clone()),
             Lit::Char(c) => Code::Char(*c),
             Lit::Str(s) => Code::Str(s.clone()),
+            Lit::Addr(s) => {
+                let mut bytes: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
+                bytes.push(0);
+                Code::Addr(std::rc::Rc::new(bytes))
+            }
         }
     }
 

@@ -2,8 +2,8 @@ module System.Environment (getArgs, getProgName, lookupEnv, getEnvironment) wher
 
 import Base
 
-foreign import prim "getArgs" primGetArgs :: World -> IORes [String]
-foreign import prim "getProgName" primGetProgName :: World -> IORes String
+foreign import prim "getArgs" primGetArgs :: World -> (# World, [String] #)
+foreign import prim "getProgName" primGetProgName :: World -> (# World, String #)
 
 getArgs :: IO [String]
 getArgs = IO primGetArgs

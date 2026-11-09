@@ -53,7 +53,7 @@ pub fn is_builtin_con(name: &str) -> bool {
 }
 
 pub fn is_builtin_tycon(name: &str) -> bool {
-    name == "()" || name == "[]" || name == "->" || name.starts_with("(,")
+    name == "()" || name == "[]" || name == "->" || name == "~" || name == "~~" || name.starts_with("(,")
 }
 
 /// Constructor-like names (constructors, `:`, built-in syntax).
@@ -225,6 +225,10 @@ impl<'a> Renamer<'a> {
     /// Whether a fixity declaration can refer to this name: a value, a constructor,
     /// a field or a method defined by this module.
     fn defines_value_or_method(&self, name: &str) -> bool {
+        // Type-level operators (`->`, `~`) are built in; their fixity is fixed by GHC.
+        if matches!(name, "->" | "~" | "~~") {
+            return true;
+        }
         self.own.iter().any(|e| {
             (e.kind.is_value() && e.occ() == name)
                 || e.subs.iter().any(|s| s.kind.is_value() && s.occ() == name)
@@ -1481,6 +1485,7 @@ impl<'a> Renamer<'a> {
         let mut out: Vec<Entity> = Vec::new();
         for item in items {
             match item {
+                IEItem::Var(q) if q.qual.is_none() && is_builtin_tycon(&q.name) => {}
                 IEItem::Var(q) | IEItem::Pattern(q) => {
                     let e = self.lookup_global(q, Ns::Value).map_err(|c| RnError {
                         loc,
@@ -1491,6 +1496,9 @@ impl<'a> Renamer<'a> {
                         },
                     })?;
                     out.push(e);
+                }
+                IEItem::Thing { name, .. } if name.qual.is_none() && is_builtin_tycon(&name.name) => {
+                    // Built-in syntax and operators have no defining entity to export.
                 }
                 IEItem::Thing { name, subs } => {
                     let e = self.lookup_global(name, Ns::Type).map_err(|c| RnError {
@@ -1518,11 +1526,15 @@ impl<'a> Renamer<'a> {
                     if *m == self.module {
                         out.extend(self.own.iter().cloned());
                     } else {
-                        for ((q, _occ), list) in &self.qvals {
-                            if q == m {
-                                for e in list {
-                                    if !out.iter().any(|x| x.global == e.global) {
-                                        out.push(e.clone());
+                        for map in [&self.qvals, &self.qtypes] {
+                            for ((q, _occ), list) in map {
+                                if q == m {
+                                    for e in list {
+                                        // A type and a constructor can share a global name; they
+                                        // are different entities.
+                                        if !out.iter().any(|x| x.global == e.global && x.kind.is_value() == e.kind.is_value()) {
+                                            out.push(e.clone());
+                                        }
                                     }
                                 }
                             }
@@ -1606,9 +1618,13 @@ fn select_item(exports: &[Entity], item: &IEItem) -> Option<Vec<Entity>> {
             }
         }
         IEItem::Thing { name, subs } => {
-            let t = exports
+            let Some(t) = exports
                 .iter()
-                .find(|e| !e.kind.is_value() && e.occ() == name.name)?;
+                .find(|e| !e.kind.is_value() && e.occ() == name.name)
+            else {
+                // No type of this name: a constructor (possibly inside an exported type).
+                return select_item(exports, &IEItem::Var(name.clone()));
+            };
             let mut out = vec![t.clone()];
             match subs {
                 Subs::None => {}

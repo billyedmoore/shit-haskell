@@ -89,6 +89,23 @@ impl ROp {
     }
 }
 
+/// A primitive literal, with the type its MagicHash suffix gives it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PrimLit {
+    /// `3#`: `Int#`.
+    Int(String),
+    /// `3##`: `Word#`.
+    Word(String),
+    /// `1.5#`: `Float#`.
+    Float(String),
+    /// `1.5##`: `Double#`.
+    Double(String),
+    /// `'c'#`: `Char#`.
+    Char(char),
+    /// `"s"#`: `Addr#`, a byte string.
+    Str(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     VarId(String),
@@ -106,6 +123,8 @@ pub enum Tok {
     Float(String),
     Char(char),
     Str(String),
+    /// A MagicHash literal (`3#`, `3##`, `2.0#`, `'c'#`, `"s"#`), of a primitive type.
+    Prim(PrimLit),
     Kw(Kw),
     Res(ROp),
     /// One of `( ) , ; [ ] ` { }`.
@@ -124,6 +143,7 @@ impl Tok {
             Tok::Int(s) | Tok::Float(s) => s.clone(),
             Tok::Char(c) => format!("{c:?}"),
             Tok::Str(s) => format!("{s:?}"),
+            Tok::Prim(p) => format!("{p:?}"),
             Tok::Kw(k) => k.text().to_string(),
             Tok::Res(r) => r.text().to_string(),
             Tok::Special(c) => c.to_string(),

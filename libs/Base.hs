@@ -1,7 +1,13 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 -- The defining module of the Prelude's names. Written against the primitive operations
 -- implemented by the runtime; `Prelude` re-exports the standard names from here.
-module Base where
+module Base (
+    module Base, module GHC.Prim,
+    Bool(..), Char(..), Int(..), Word(..), Float(..), Double(..), Ordering(..), IO(..), isTrue#
+  ) where
+
+import GHC.Prim
+import GHC.Types
 
 infixr 9  .
 infixr 8  ^
@@ -22,30 +28,24 @@ infixl 4  <*>, *>, <*
 
 -- ----- primitive types ------------------------------------------------------
 
-data Int
 data Integer
-data Double
-data Char
-data World
+
+-- The state token of IO, as in GHC.
+type World = State# RealWorld
 
 -- A mutable reference cell (the runtime value behind IORef).
 data Ref a
 
-data Float
 type String = [Char]
 type FilePath = String
 type ShowS = String -> String
 type ReadS a = String -> [(a, String)]
 type Rational = Ratio Integer
 
-data Bool = False | True
-data Ordering = LT | EQ | GT
 data Maybe a = Nothing | Just a
 data Either a b = Left a | Right b
 data Ratio a = !a :% !a
 
-newtype IO a = IO (World -> IORes a)
-data IORes a = IORes a
 
 -- ----- primitives -------------------------------------------------------------
 
@@ -107,15 +107,14 @@ foreign import prim "charEq" primCharEq :: Char -> Char -> Bool
 foreign import prim "charLt" primCharLt :: Char -> Char -> Bool
 foreign import prim "charLe" primCharLe :: Char -> Char -> Bool
 
-foreign import prim "seq" seq :: a -> b -> b
 foreign import prim "error" primError :: String -> a
-foreign import prim "putStr" primPutStr :: String -> World -> IORes ()
-foreign import prim "putErr" primPutErr :: String -> World -> IORes ()
-foreign import prim "getLine" primGetLine :: World -> IORes String
-foreign import prim "getContents" primGetContents :: World -> IORes String
-foreign import prim "isEOF" primIsEOF :: World -> IORes Bool
-foreign import prim "readFile" primReadFile :: String -> World -> IORes String
-foreign import prim "exitWith" primExitWith :: Int -> World -> IORes ()
+foreign import prim "putStr" primPutStr :: String -> World -> (# World, () #)
+foreign import prim "putErr" primPutErr :: String -> World -> (# World, () #)
+foreign import prim "getLine" primGetLine :: World -> (# World, String #)
+foreign import prim "getContents" primGetContents :: World -> (# World, String #)
+foreign import prim "isEOF" primIsEOF :: World -> (# World, Bool #)
+foreign import prim "readFile" primReadFile :: String -> World -> (# World, String #)
+foreign import prim "exitWith" primExitWith :: Int -> World -> (# World, () #)
 
 -- ----- basic combinators --------------------------------------------------------
 
@@ -827,20 +826,20 @@ class Monad m => MonadFail m where
 class Monad m => MonadFix m where
   mfix :: (a -> m a) -> m a
 
-foreign import prim "newRef" primFixNewRef :: a -> World -> IORes (Ref a)
-foreign import prim "readRef" primFixReadRef :: Ref a -> World -> IORes a
-foreign import prim "writeRef" primFixWriteRef :: Ref a -> a -> World -> IORes ()
+foreign import prim "newRef" primFixNewRef :: a -> World -> (# World, (Ref a) #)
+foreign import prim "readRef" primFixReadRef :: Ref a -> World -> (# World, a #)
+foreign import prim "writeRef" primFixWriteRef :: Ref a -> a -> World -> (# World, () #)
 foreign import prim "unsafeRunIO" primFixRunIO :: IO a -> a
 
 -- The result is read lazily from a cell that is filled once the action has finished.
 fixIO :: (a -> IO a) -> IO a
 fixIO k = IO (\w -> case primFixNewRef (error "cyclic evaluation in fixIO") w of
-  IORes ref ->
+  (# w1, ref #) ->
     let ans = primFixRunIO (IO (primFixReadRef ref))
     in case k ans of
-         IO m -> case m w of
-           IORes result -> case primFixWriteRef ref result w of
-             IORes _ -> IORes result)
+         IO m -> case m w1 of
+           (# w2, result #) -> case primFixWriteRef ref result w2 of
+             (# w3, _ #) -> (# w3, result #))
 
 instance MonadFix IO where
   mfix = fixIO
@@ -919,19 +918,19 @@ instance Monad (Either e) where
   Right x >>= k = k x
 
 instance Functor IO where
-  fmap f (IO m) = IO (\w -> case m w of IORes a -> IORes (f a))
+  fmap f (IO m) = IO (\w -> case m w of (# w1, a #) -> (# w1, f a #))
 
 instance Applicative IO where
-  pure x = IO (\_ -> IORes x)
-  IO mf <*> IO mx = IO (\w -> case mf w of IORes f -> case mx w of IORes x -> IORes (f x))
+  pure x = IO (\w -> (# w, x #))
+  IO mf <*> IO mx = IO (\w -> case mf w of (# w1, f #) -> case mx w1 of (# w2, x #) -> (# w2, f x #))
 
 instance Monad IO where
-  IO m >>= k = IO (\w -> case m w of IORes a -> unIO (k a) w)
+  IO m >>= k = IO (\w -> case m w of (# w1, a #) -> unIO (k a) w1)
 
 instance MonadFail IO where
   fail s = ioError (userError s)
 
-unIO :: IO a -> World -> IORes a
+unIO :: IO a -> World -> (# World, a #)
 unIO (IO m) = m
 
 -- ----- Semigroup and Monoid ---------------------------------------------------------
@@ -1350,7 +1349,7 @@ getContents :: IO String
 getContents = IO primGetContents
 
 getChar :: IO Char
-getChar = IO (\w -> case primGetLine w of IORes (c : _) -> IORes c; IORes [] -> primError "Prelude.getChar: end of file")
+getChar = IO (\w -> case primGetLine w of (# w1, (c : _) #) -> (# w1, c #); (# _, [] #) -> primError "Prelude.getChar: end of file")
 
 readFile :: FilePath -> IO String
 readFile path = IO (primReadFile path)

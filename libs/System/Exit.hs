@@ -14,8 +14,8 @@ instance Show ExitCode where
   showsPrec d (ExitFailure n) = showParen (d > 10) (showString "ExitFailure " . showsPrec 11 n)
 
 exitWith :: ExitCode -> IO a
-exitWith ExitSuccess = IO (\w -> case primExitWith 0 w of IORes _ -> primError "unreachable")
-exitWith (ExitFailure n) = IO (\w -> case primExitWith n w of IORes _ -> primError "unreachable")
+exitWith ExitSuccess = IO (\w -> case primExitWith 0 w of (# _, _ #) -> primError "unreachable")
+exitWith (ExitFailure n) = IO (\w -> case primExitWith n w of (# _, _ #) -> primError "unreachable")
 
 exitSuccess :: IO a
 exitSuccess = exitWith ExitSuccess

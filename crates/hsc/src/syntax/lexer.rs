@@ -1,6 +1,6 @@
 //! Haskell lexer. Produces tokens with positions; layout is applied by the parser.
 
-use super::token::{Kw, ROp, Tok, Token};
+use super::token::{Kw, PrimLit, ROp, Tok, Token};
 
 #[derive(Debug, Clone)]
 pub struct LexError {
@@ -437,6 +437,16 @@ impl Lexer {
         self.take_while(|c| c.is_ascii_digit() || c == '_')
     }
 
+    /// Counts and consumes the MagicHash suffix of a literal (`3#` is 1, `3##` is 2).
+    fn take_hashes(&mut self) -> usize {
+        let mut n = 0;
+        while self.peek(0) == Some('#') && !self.peek(1).is_some_and(is_symbol) {
+            self.bump();
+            n += 1;
+        }
+        n
+    }
+
     /// Skips the MagicHash suffix of a literal (`3#`, `3##`, `'c'#`, `"s"#`).
     fn skip_hashes(&mut self) {
         while self.peek(0) == Some('#') && !self.peek(1).is_some_and(is_symbol) {
@@ -456,8 +466,13 @@ impl Lexer {
                 self.bump();
                 self.bump();
                 let digits = self.take_while(|c| c == '_' || c.is_digit(r));
-                self.skip_hashes();
-                return Ok(Tok::Int(to_decimal(&digits, r)));
+                let hashes = self.take_hashes();
+                let value = to_decimal(&digits, r);
+                return Ok(match hashes {
+                    0 => Tok::Int(value),
+                    1 => Tok::Prim(PrimLit::Int(value)),
+                    _ => Tok::Prim(PrimLit::Word(value)),
+                });
             }
         }
         let mut text = self.take_digits();
@@ -484,12 +499,15 @@ impl Lexer {
                 is_float = true;
             }
         }
-        self.skip_hashes();
+        let hashes = self.take_hashes();
         let clean: String = text.chars().filter(|c| *c != '_').collect();
-        Ok(if is_float {
-            Tok::Float(clean)
-        } else {
-            Tok::Int(clean)
+        Ok(match (is_float, hashes) {
+            (false, 0) => Tok::Int(clean),
+            (false, 1) => Tok::Prim(PrimLit::Int(clean)),
+            (false, _) => Tok::Prim(PrimLit::Word(clean)),
+            (true, 0) => Tok::Float(clean),
+            (true, 1) => Tok::Prim(PrimLit::Float(clean)),
+            (true, _) => Tok::Prim(PrimLit::Double(clean)),
         })
     }
 
@@ -524,7 +542,9 @@ impl Lexer {
                 Some(_) => out.push(self.bump()),
             }
         }
-        self.skip_hashes();
+        if self.take_hashes() > 0 {
+            return Ok(Tok::Prim(PrimLit::Str(out)));
+        }
         Ok(Tok::Str(out))
     }
 
@@ -543,7 +563,9 @@ impl Lexer {
         };
         if self.peek(0) == Some('\'') {
             self.bump();
-            self.skip_hashes();
+            if self.take_hashes() > 0 {
+                return Ok(Tok::Prim(PrimLit::Char(c)));
+            }
             Ok(Tok::Char(c))
         } else {
             Err(self.error("lexical error in character literal"))

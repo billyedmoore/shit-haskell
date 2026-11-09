@@ -432,8 +432,12 @@ impl Checker {
                 let lit = Core::Prim("ratioLit".into(), vec![Core::Lit(CLit::Frac(s.clone()))]);
                 Ok((Core::App(Box::new(fr), Box::new(lit)), res))
             }
-            Lit::Char(c) => Ok((Core::Lit(CLit::Char(*c)), Ty::con("Base.Char"))),
-            Lit::Str(s) => Ok((Core::Lit(CLit::Str(s.clone())), Ty::list(Ty::con("Base.Char")))),
+            Lit::Char(c) => Ok((Core::Lit(CLit::Char(*c)), Ty::con("GHC.Types.Char"))),
+            Lit::Str(s) => Ok((Core::Lit(CLit::Str(s.clone())), Ty::list(Ty::con("GHC.Types.Char")))),
+            Lit::Prim(p) => {
+                let (core, ty) = prim_lit(p, false);
+                Ok((core, Ty::con(ty)))
+            }
         }
     }
 
@@ -632,8 +636,16 @@ impl Checker {
     /// A literal pattern: a predicate `\x -> x == lit` used as a test.
     fn lit_pat(&mut self, l: &Lit, negative: bool, ty: &Ty) -> TR<CPat> {
         let loc = self.loc;
+        if let Lit::Prim(p) = l {
+            // A primitive literal is compared directly: its type has no `Eq` instance.
+            let (core, tyname) = prim_lit(p, negative);
+            self.unify_at(&Ty::con(tyname), ty)?;
+            let Core::Lit(l) = core else { unreachable!("prim_lit yields a literal") };
+            return Ok(CPat::Lit(l));
+        }
         let x = self.fresh_name("lx");
         let (lit_core, eq_ty, num_needed) = match l {
+            Lit::Prim(_) => unreachable!("handled above"),
             Lit::Int(s) => {
                 let s = if negative { format!("-{s}") } else { s.clone() };
                 let (fi, fty) = self.lookup_inst("Base.fromInteger")?;
@@ -652,11 +664,11 @@ impl Checker {
                 (Core::App(Box::new(fr), Box::new(lit)), ty.clone(), true)
             }
             Lit::Char(c) => {
-                self.unify_at(&Ty::con("Base.Char"), ty)?;
+                self.unify_at(&Ty::con("GHC.Types.Char"), ty)?;
                 (Core::Lit(CLit::Char(*c)), ty.clone(), false)
             }
             Lit::Str(s) => {
-                let str_ty = Ty::list(Ty::con("Base.Char"));
+                let str_ty = Ty::list(Ty::con("GHC.Types.Char"));
                 self.unify_at(&str_ty, ty)?;
                 (Core::Lit(CLit::Str(s.clone())), str_ty, false)
             }
@@ -985,7 +997,11 @@ impl Checker {
 
 /// The boxing constructors of unboxed types (`I#` and friends), which are identities here.
 pub fn is_boxing_con(key: &str) -> bool {
-    matches!(key, "GHC.Exts.I#" | "GHC.Exts.D#" | "GHC.Exts.C#" | "GHC.Exts.W#")
+    matches!(
+        key,
+        "GHC.Exts.I#" | "GHC.Exts.D#" | "GHC.Exts.C#" | "GHC.Exts.W#" | "GHC.Exts.F#"
+            | "GHC.Types.I#" | "GHC.Types.D#" | "GHC.Types.C#" | "GHC.Types.W#" | "GHC.Types.F#"
+    )
 }
 
 /// Splits a function type, assuming it is one.
@@ -1025,3 +1041,16 @@ pub fn wrap_let(binds: Vec<(String, Core)>, body: Core) -> Core {
     }
 }
 
+/// A MagicHash literal as Core, with the name of its primitive type (from GHC.Prim).
+pub fn prim_lit(p: &crate::syntax::token::PrimLit, negative: bool) -> (Core, &'static str) {
+    use crate::syntax::token::PrimLit;
+    let sign = if negative { "-" } else { "" };
+    match p {
+        PrimLit::Int(s) => (Core::Lit(CLit::Int(format!("{sign}{s}").parse().unwrap_or(0))), "GHC.Prim.Int#"),
+        PrimLit::Word(s) => (Core::Lit(CLit::Int(s.parse::<u64>().unwrap_or(0) as i64)), "GHC.Prim.Word#"),
+        PrimLit::Float(s) => (Core::Lit(CLit::Double(format!("{sign}{s}").parse().unwrap_or(0.0))), "GHC.Prim.Float#"),
+        PrimLit::Double(s) => (Core::Lit(CLit::Double(format!("{sign}{s}").parse().unwrap_or(0.0))), "GHC.Prim.Double#"),
+        PrimLit::Char(c) => (Core::Lit(CLit::Char(*c)), "GHC.Prim.Char#"),
+        PrimLit::Str(s) => (Core::Lit(CLit::Addr(s.clone())), "GHC.Prim.Addr#"),
+    }
+}

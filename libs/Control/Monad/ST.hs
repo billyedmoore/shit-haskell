@@ -1,12 +1,12 @@
 module Control.Monad.ST (ST, runST, stToIO, RealWorld, stFromIO) where
 
 import Base
+import GHC.Prim (RealWorld)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- ST is IO with a phantom state thread. Rank-2 `runST` is approximated (see the checker).
 newtype ST s a = ST (IO a)
 
-data RealWorld
 
 unST :: ST s a -> IO a
 unST (ST m) = m

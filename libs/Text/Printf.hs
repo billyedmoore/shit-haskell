@@ -26,7 +26,7 @@ class PrintfType r where
   spr :: String -> [UPrintf] -> r
 
 instance PrintfType (IO a) where
-  spr fmt args = IO (\w -> case primPutStr (uprintf fmt (reverse args)) w of IORes _ -> IORes (primError "printf: unit result"))
+  spr fmt args = IO (\w -> case primPutStr (uprintf fmt (reverse args)) w of (# w1, _ #) -> (# w1, primError "printf: unit result" #))
 
 instance IsChar c => PrintfType [c] where
   spr fmt args = map fromChar (uprintf fmt (reverse args))

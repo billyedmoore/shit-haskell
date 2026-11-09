@@ -4,12 +4,12 @@ import Base
 
 data IORef a = IORef (Ref a)
 
-foreign import prim "newRef" primNewRef :: a -> World -> IORes (Ref a)
-foreign import prim "readRef" primReadRef :: Ref a -> World -> IORes a
-foreign import prim "writeRef" primWriteRef :: Ref a -> a -> World -> IORes ()
+foreign import prim "newRef" primNewRef :: a -> World -> (# World, (Ref a) #)
+foreign import prim "readRef" primReadRef :: Ref a -> World -> (# World, a #)
+foreign import prim "writeRef" primWriteRef :: Ref a -> a -> World -> (# World, () #)
 
 newIORef :: a -> IO (IORef a)
-newIORef x = IO (\w -> case primNewRef x w of IORes r -> IORes (IORef r))
+newIORef x = IO (\w -> case primNewRef x w of (# w1, r #) -> (# w1, IORef r #))
 
 readIORef :: IORef a -> IO a
 readIORef (IORef r) = IO (primReadRef r)

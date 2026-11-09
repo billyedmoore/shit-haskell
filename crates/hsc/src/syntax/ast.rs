@@ -24,6 +24,8 @@ impl QName {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lit {
+    /// A MagicHash literal of a primitive type; not overloaded.
+    Prim(crate::syntax::token::PrimLit),
     /// Decimal digits.
     Int(String),
     /// Literal text such as `1.5e-3`.

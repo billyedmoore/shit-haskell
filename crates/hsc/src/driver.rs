@@ -31,7 +31,11 @@ pub fn default_lib_dir() -> PathBuf {
 impl Driver {
     pub fn new(main_dir: &Path, flags: Vec<String>) -> Driver {
         Driver {
-            search: vec![main_dir.to_path_buf(), default_lib_dir()],
+            search: vec![
+                main_dir.to_path_buf(),
+                default_lib_dir(),
+                default_lib_dir().join("ghc-prim"),
+            ],
             ifaces: BTreeMap::new(),
             checker: Checker::new(),
             binds: Vec::new(),

@@ -11,8 +11,8 @@ data Any
 
 foreign import prim "unsafeCoerce" unsafeCoerce :: a -> b
 foreign import prim "throwExc" primThrow :: SomeException -> a
-foreign import prim "catchExc" primCatch :: IO a -> (String -> SomeException) -> (SomeException -> IO a) -> World -> IORes a
-foreign import prim "throwIOExc" primThrowIO :: SomeException -> World -> IORes a
+foreign import prim "catchExc" primCatch :: IO a -> (String -> SomeException) -> (SomeException -> IO a) -> World -> (# World, a #)
+foreign import prim "throwIOExc" primThrowIO :: SomeException -> World -> (# World, a #)
 
 -- The type tag, the payload, and the text shown for the exception.
 data SomeException = SomeException String Any String
@@ -113,7 +113,7 @@ try :: Exception e => IO a -> IO (Either e a)
 try act = catch (act >>= \v -> return (Right v)) (\e -> return (Left e))
 
 evaluate :: a -> IO a
-evaluate x = IO (\_ -> x `seq` IORes x)
+evaluate x = IO (\w -> x `seq` (# w, x #))
 
 onException :: IO a -> IO b -> IO a
 onException io what = catch io (\e -> what >> throwIO (e :: SomeException))

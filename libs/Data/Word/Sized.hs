@@ -1,7 +1,7 @@
 -- Generated: sized integral types as wrapped Integer values.
 module Data.Word.Sized where
 
-import Base
+import Base hiding (Word)
 import Data.Bits
 
 newtype Word8 = W8 Integer

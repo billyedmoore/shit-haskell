@@ -10,10 +10,20 @@ use crate::syntax::ast::{
 
 const BASE: &str = "Base";
 
+/// The module that defines a Prelude name: the wired-in types of GHC.Types, or Base.
+fn defining_module(name: &str) -> &'static str {
+    match name {
+        "True" | "False" | "Bool" | "Char" | "Int" | "Word" | "Float" | "Double" | "Ordering" | "LT" | "EQ" | "GT" => {
+            "GHC.Types"
+        }
+        _ => BASE,
+    }
+}
+
 fn base_var(name: &str, loc: Loc) -> Expr {
     Expr::Var(
         QName {
-            qual: Some(BASE.into()),
+            qual: Some(defining_module(name).into()),
             name: name.into(),
         },
         loc,
@@ -23,7 +33,7 @@ fn base_var(name: &str, loc: Loc) -> Expr {
 fn base_con(name: &str, loc: Loc) -> Expr {
     Expr::Con(
         QName {
-            qual: Some(BASE.into()),
+            qual: Some(defining_module(name).into()),
             name: name.into(),
         },
         loc,
@@ -293,7 +303,7 @@ fn derive_ord(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
                     Box::new(prev),
                     vec![
                         Alt {
-                            pat: Pat::Con(QName { qual: Some(BASE.into()), name: "EQ".into() }, vec![], loc),
+                            pat: Pat::Con(QName { qual: Some(defining_module("EQ").into()), name: "EQ".into() }, vec![], loc),
                             rhs: Rhs { body: Body::Plain(acc), wheres: Vec::new() },
                             loc,
                         },

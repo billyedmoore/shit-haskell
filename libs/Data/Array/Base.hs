@@ -12,10 +12,10 @@ import Control.Monad.ST
 -- Mutable vectors: slots hold lazy elements; writes replace the slot.
 data MVec e
 
-foreign import prim "vecNewIO" primVecNew :: Int -> e -> World -> IORes (MVec e)
-foreign import prim "vecReadIO" primVecRead :: MVec e -> Int -> World -> IORes e
-foreign import prim "vecWriteIO" primVecWrite :: MVec e -> Int -> e -> World -> IORes ()
-foreign import prim "vecCopyIO" primVecCopy :: MVec e -> World -> IORes (MVec e)
+foreign import prim "vecNewIO" primVecNew :: Int -> e -> World -> (# World, (MVec e) #)
+foreign import prim "vecReadIO" primVecRead :: MVec e -> Int -> World -> (# World, e #)
+foreign import prim "vecWriteIO" primVecWrite :: MVec e -> Int -> e -> World -> (# World, () #)
+foreign import prim "vecCopyIO" primVecCopy :: MVec e -> World -> (# World, (MVec e) #)
 
 data IOArray i e = IOArray (i, i) Int (MVec e)
 

@@ -230,6 +230,7 @@ impl Parser {
             | Tok::Float(_)
             | Tok::Char(_)
             | Tok::Str(_)
+            | Tok::Prim(_)
             | Tok::Special('(' | '[')
             | Tok::Kw(Kw::Underscore) => true,
             Tok::VarSym(s) => s == "!" && self.is_prefix_occurrence(),
@@ -370,6 +371,10 @@ impl Parser {
             Tok::Str(s) => {
                 self.bump();
                 Ok(Expr::Lit(Lit::Str(s), loc))
+            }
+            Tok::Prim(p) => {
+                self.bump();
+                Ok(Expr::Lit(Lit::Prim(p), loc))
             }
             Tok::Kw(Kw::Underscore) => {
                 self.bump();

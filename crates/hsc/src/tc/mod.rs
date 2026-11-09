@@ -181,7 +181,7 @@ impl Checker {
     }
 
     pub fn bool_ty(&self) -> Ty {
-        Ty::con("Base.Bool")
+        Ty::con("GHC.Types.Bool")
     }
 
     /// Registers the built-in type constructors, syntax and their Core wrappers.
