@@ -876,6 +876,7 @@ instance Semigroup a => Monoid (Maybe a) where
 -- ----- Foldable and Traversable ------------------------------------------------------
 
 class Foldable t where
+  foldMap :: Monoid m => (a -> m) -> t a -> m
   foldr :: (a -> b -> b) -> b -> t a -> b
   foldl :: (b -> a -> b) -> b -> t a -> b
   foldl' :: (b -> a -> b) -> b -> t a -> b
@@ -889,6 +890,7 @@ class Foldable t where
   minimum :: Ord a => t a -> a
   sum :: Num a => t a -> a
   product :: Num a => t a -> a
+  foldMap f t = foldr (\x acc -> f x <> acc) mempty t
   foldl f z t = listFoldl f z (toList t)
   foldl' f z t = listFoldl' f z (toList t)
   foldr1 f t = listFoldr1 f (toList t)

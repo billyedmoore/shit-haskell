@@ -22,7 +22,7 @@ module Prelude (
     Functor(fmap, (<$)), (<$>),
     Applicative(pure, (<*>), (*>), (<*)),
     Monad((>>=), (>>), return), MonadFail(fail),
-    Foldable(foldr, foldl, foldl', foldr1, foldl1, null, length, elem, maximum, minimum, sum, product),
+    Foldable(foldMap, foldr, foldl, foldl', foldr1, foldl1, null, length, elem, maximum, minimum, sum, product),
     Traversable(traverse, sequenceA, mapM, sequence),
     mapM_, sequence_, (=<<),
     Show(showsPrec, show, showList), shows, ShowS, showChar, showString, showParen,
