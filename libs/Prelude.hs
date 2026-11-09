@@ -17,6 +17,7 @@ module Prelude (
     Fractional((/), recip, fromRational),
     Floating(pi, exp, log, sqrt, (**), sin, cos, tan),
     RealFrac(properFraction, truncate, round, ceiling, floor),
+    RealFloat(atan2, isNaN, isInfinite, isNegativeZero, floatDigits, floatRadix),
     subtract, even, odd, gcd, lcm, (^), (^^), fromIntegral, realToFrac,
     Semigroup((<>)), Monoid(mempty, mappend, mconcat),
     Functor(fmap, (<$)), (<$>),

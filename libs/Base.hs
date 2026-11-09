@@ -566,6 +566,33 @@ instance Floating Double where
   tan x = primDoubleTan x
   x ** y = primDoublePow x y
 
+class (RealFrac a, Floating a) => RealFloat a where
+  atan2 :: a -> a -> a
+  isNaN :: a -> Bool
+  isInfinite :: a -> Bool
+  isNegativeZero :: a -> Bool
+  floatDigits :: a -> Int
+  floatRadix :: a -> Integer
+  floatRadix _ = 2
+
+instance RealFloat Double where
+  atan2 y x = primDoubleAtan2 y x
+  isNaN x = primDoubleIsNaN x
+  isInfinite x = primDoubleIsInfinite x
+  isNegativeZero x = x == 0 && primDoubleShow x == "-0.0"
+  floatDigits _ = 53
+
+instance RealFloat Float where
+  atan2 y x = primFloatFromDouble (primDoubleAtan2 (primFloatToDouble y) (primFloatToDouble x))
+  isNaN x = primDoubleIsNaN (primFloatToDouble x)
+  isInfinite x = primDoubleIsInfinite (primFloatToDouble x)
+  isNegativeZero x = primFloatShow x == "-0.0"
+  floatDigits _ = 24
+
+foreign import prim "doubleAtan2" primDoubleAtan2 :: Double -> Double -> Double
+foreign import prim "doubleIsNaN" primDoubleIsNaN :: Double -> Bool
+foreign import prim "doubleIsInfinite" primDoubleIsInfinite :: Double -> Bool
+
 -- Ratio and Rational.
 
 instance Eq a => Eq (Ratio a) where
@@ -589,6 +616,20 @@ instance Integral a => Fractional (Ratio a) where
 
 instance Integral a => Real (Ratio a) where
   toRational (a :% b) = toInteger a :% toInteger b
+
+instance Integral a => RealFrac (Ratio a) where
+  properFraction (a :% b) = let (q, r) = quotRem a b in (fromIntegral q, r :% b)
+  truncate (a :% b) = fromIntegral (quot a b)
+  floor (a :% b) = fromIntegral (div a b)
+  ceiling (a :% b) = fromIntegral (negate (div (negate a) b))
+  round x =
+    let (n, r) = properFraction x
+        m = if r < fromInteger 0 then n - 1 else n + 1
+        half = fromInteger 1 / fromInteger 2
+        d = abs r - half
+    in if d < fromInteger 0 then n
+       else if d == fromInteger 0 then (if even n then n else m)
+       else m
 
 reduce :: Integral a => a -> a -> Ratio a
 reduce x y = let g = gcd x y in (x `quot` g) :% (y `quot` g)
@@ -681,8 +722,7 @@ instance Show Double where
     else primDoubleShow n ++ r
   show n = primDoubleShow n
 
-isNegativeZero :: Double -> Bool
-isNegativeZero x = x == 0 && primDoubleShow x == "-0.0"
+
 
 instance Show Bool where
   showsPrec _ True = showString "True"
