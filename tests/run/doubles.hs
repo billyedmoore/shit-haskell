@@ -1,0 +1,12 @@
+main :: IO ()
+main = do
+  print (0.1 + 0.2 :: Double)
+  print (1 / 0 :: Double, -1 / 0 :: Double)
+  print (sqrt 2 :: Double)
+  print (1.0e-2 :: Double, 12345678.9 :: Double, 1.0e7 :: Double)
+  print (fromIntegral (3 :: Int) / 4 :: Double)
+  print (truncate (-2.5 :: Double) :: Int, round (2.5 :: Double) :: Int, round (3.5 :: Double) :: Int)
+  print (floor (-2.1 :: Double) :: Int, ceiling (2.1 :: Double) :: Int)
+  print (pi :: Float)
+  print (show (0 / 0 :: Double))
+  print (3.0 :: Float, 1.5e-3 :: Float)

@@ -1,0 +1,10 @@
+main :: IO ()
+main = do
+  print (read "42" :: Int)
+  print (read "-17" :: Integer)
+  print (read "[1,2,3]" :: [Int])
+  print (read "3.25e2" :: Double)
+  print (reads "12 rest" :: [(Int, String)])
+  print (reads "nope" :: [(Int, String)])
+  print (read "(True,'c')" :: (Bool, Char))
+  print (read "Just 5" :: Maybe Int)

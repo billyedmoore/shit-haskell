@@ -1,0 +1,18 @@
+main :: IO ()
+main = do
+  print (map (* 2) [1 .. 10 :: Int])
+  print (filter even [1 .. 20 :: Int])
+  print (foldr (:) [] "abc")
+  print (zip [1 :: Int ..] "xyz")
+  print (take 5 (iterate (* 3) (1 :: Integer)))
+  print (takeWhile (< 10) [1, 3 ..] :: [Int])
+  print [(x, y) | x <- [1 .. 3 :: Int], y <- "ab", odd x]
+  print (drop 2 [1, 2, 3 :: Int], splitAt 1 "hello", span even [2, 4, 5, 6 :: Int])
+  print (reverse [1 .. 5 :: Int], last [1, 2, 3 :: Int], init "abc", null [], length "four")
+  print ([[1], [2, 3]] :: [[Int]], [] :: [Int], [Just 'x', Nothing])
+  print (lookup 2 [(1, "one"), (2, "two")])
+  print (unzip [(1 :: Int, 'a'), (2, 'b')])
+  print (replicate 3 'z', concat [[1], [2, 3 :: Int]], concatMap show [1, 2, 3 :: Int])
+  print (and [True, False], or [True, False], any odd [2, 4 :: Int], all even [2, 4 :: Int])
+  print (elem 3 [1, 2, 3 :: Int], notElem 'q' "abc", maximum [3, 1, 4 :: Int], minimum "hello")
+  print (scanl (+) 0 [1, 2, 3 :: Int], scanr (+) 0 [1, 2, 3 :: Int], scanl1 max [3, 1, 4 :: Int])

@@ -1,0 +1,15 @@
+import Data.List (foldl', sortBy, groupBy, nub, sort, partition, isPrefixOf, isSuffixOf, isInfixOf, intercalate, transpose)
+import Data.Ord (comparing)
+import Data.Function (on)
+
+main :: IO ()
+main = do
+  print (foldl' (+) 0 [1 .. 1000000 :: Int])
+  print (foldl (flip (:)) [] [1, 2, 3 :: Int])
+  print (sortBy (comparing snd) [(1 :: Int, 'c'), (2, 'a'), (3, 'b')])
+  print (map (map fst) (groupBy ((==) `on` snd) [(1 :: Int, 'a'), (2, 'a'), (3, 'b')]))
+  print (nub [1, 1, 2, 3, 2 :: Int], sort "banana")
+  print (partition even [1 .. 10 :: Int])
+  print ("ab" `isPrefixOf` "abc", "bc" `isSuffixOf` "abc", "x" `isInfixOf` "abc")
+  putStrLn (intercalate ", " ["a", "b", "c"])
+  print (transpose ["abc", "de", "f"])

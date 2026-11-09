@@ -1,0 +1,12 @@
+main :: IO ()
+main = do
+  print (7 `div` 2, 7 `mod` 2)
+  print ((-7) `div` 2, (-7) `mod` 2)
+  print ((-7) `quot` 2, (-7) `rem` 2)
+  print (2 ^ 64 :: Integer)
+  print (product [1 .. 30 :: Integer])
+  print (maxBound :: Int, minBound :: Int)
+  print ((maxBound :: Int) + 1)
+  print (negate 5 :: Int, abs (-3) :: Int, signum (-9) :: Int)
+  print (gcd 12 18 :: Int, lcm 4 6 :: Int)
+  print (divMod (-17) 5 :: (Integer, Integer), quotRem (-17) 5 :: (Integer, Integer))

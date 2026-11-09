@@ -1,0 +1,10 @@
+[package]
+name = "hsc"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "hsc"
+path = "src/main.rs"
