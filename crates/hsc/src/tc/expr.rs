@@ -1,10 +1,10 @@
 //! Expression and pattern checking, with elaboration to Core.
 
-use super::types::{Scheme, Ty};
+use super::types::{subst_gen, subst_gen_pred, Pred, Scheme, Ty};
 use super::{Checker, TR, Wanted};
 use crate::core::matcher::{compile_body, compile_rows, CBody, CGuard, CPat, Row};
 use crate::core::{Alt, Core, Lit as CLit};
-use crate::syntax::ast::{Alt as AstAlt, Body, Clause, Decl, Expr, Lit, Loc, Pat, QName, Rhs, Stmt};
+use crate::syntax::ast::{Alt as AstAlt, Body, Clause, Decl, Expr, Lit, Loc, Pat, QName, Rhs, Stmt, Type};
 
 /// The qualified key of a renamed name: `M.x` for globals, the unique name for locals.
 pub fn qkey(q: &QName) -> String {
@@ -111,9 +111,48 @@ impl Checker {
                 self.unify_at(&ta, &arg)?;
                 Ok((Core::App(Box::new(cf), Box::new(ca)), res))
             }
-            Expr::TyApp(_, _, loc) => {
-                self.loc = *loc;
-                self.err("Visible type application is not supported yet")
+            Expr::TyApp(..) => {
+                // `f @T1 @T2`: the explicit types instantiate the leading quantified variables.
+                let mut tys: Vec<&Type> = Vec::new();
+                let mut head = e;
+                while let Expr::TyApp(f, t, _) = head {
+                    tys.push(t);
+                    head = f;
+                }
+                tys.reverse();
+                let (q, loc) = match head {
+                    Expr::Var(q, loc) | Expr::Con(q, loc) => (q, *loc),
+                    _ => {
+                        return self.err("Visible type application is supported only on variables and constructors")
+                    }
+                };
+                self.loc = loc;
+                let key = qkey(q);
+                let scheme = self.lookup_var(&key).ok_or_else(|| super::TcError {
+                    loc,
+                    msg: format!("Variable not in scope: {key}"),
+                })?;
+                let mut explicit = Vec::with_capacity(tys.len());
+                for t in tys {
+                    if matches!(t, Type::Wild(_)) {
+                        explicit.push(self.metas.fresh(self.level));
+                        continue;
+                    }
+                    let mut tvs = Vec::new();
+                    let ty = self.convert_type(t, &mut tvs)?;
+                    if !tvs.is_empty() {
+                        return self.err(format!("Not in scope: type variable ‘{}’", tvs[0]));
+                    }
+                    explicit.push(ty);
+                }
+                if explicit.len() > scheme.nvars as usize {
+                    return self.err(format!(
+                        "Cannot apply expression of type ‘{}’ to {} visible type argument(s)",
+                        key,
+                        explicit.len()
+                    ));
+                }
+                Ok(self.inst_var_explicit(&key, &scheme, loc, &explicit))
             }
             Expr::OpChain(_, loc) => {
                 self.loc = *loc;
@@ -342,7 +381,20 @@ impl Checker {
 
     /// Instantiates a variable's scheme, creating wanted evidence for its predicates.
     pub fn inst_var(&mut self, name: &str, scheme: &Scheme, loc: Loc) -> (Core, Ty) {
-        let (ty, preds, _) = self.metas.instantiate(scheme, self.level);
+        self.inst_var_explicit(name, scheme, loc, &[])
+    }
+
+    /// Instantiates a variable's scheme; the leading quantified variables take the explicit
+    /// types given by visible type application, the rest are fresh unification variables.
+    pub fn inst_var_explicit(&mut self, name: &str, scheme: &Scheme, loc: Loc, explicit: &[Ty]) -> (Core, Ty) {
+        let args: Vec<Ty> = (0..scheme.nvars as usize)
+            .map(|i| match explicit.get(i) {
+                Some(t) => t.clone(),
+                None => self.metas.fresh(self.level),
+            })
+            .collect();
+        let ty = subst_gen(&scheme.ty, &args);
+        let preds: Vec<Pred> = scheme.preds.iter().map(|p| subst_gen_pred(p, &args)).collect();
         let mut core = Core::Var(name.to_string());
         for p in preds {
             let ev = self.fresh_name("d");
