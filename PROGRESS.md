@@ -13,46 +13,55 @@ Parse-only dev mode: `target/debug/hsc [-X<ext>] [--dump-ast] file.hs`.
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| 1 | Differential harness and seed corpus | done: harness agrees with GHC 59/59 (`--hsc ghc` self-check) |
-| 2 | Front end, Haskell 2010 (lexer, layout, parser, fixity, renamer) | done: lexer, layout, parser, fixity, renamer, interfaces |
-| 3 | Types and Core | in progress: HM with levels, classes via dictionaries, defaulting, deriving (Eq, Ord, Show, Enum, Bounded), Core, matcher, lazy interpreter, mini Base library |
-| 4 | Real `base` | not started |
-| 5 | Native back end and RTS | not started |
-| 6 | Driver and packages | not started |
-| 7 | Boot libraries | not started |
-| 8 | Remaining extension surface | not started |
+| 1 | Differential harness and seed corpus | done |
+| 2 | Front end (lexer, layout, parser, fixity, renamer, interfaces) | done for Haskell 2010 + GHC2021 surface syntax |
+| 3 | Types and Core (type checker, Core, matcher, interpreter, mini Base) | working; see "What works" |
+| 4 | Real `base` (compile GHC's own library sources) | not started; blocked on CPP, MagicHash, unboxed types, type families, Typeable |
+| 5 | Native back end and RTS | not started; the interpreter and the lock-based threads are the interim runtime |
+| 6 | Driver and packages (cabal, package DBs, interface files) | partial: `-o`, `-i` via search path, `--run`; no package DB, no recompilation avoidance |
+| 7 | Boot libraries (containers, bytestring, text, mtl, ...) | partial: own Data.Map/Set, State monad, Printf, Array |
+| 8 | Remaining extension surface | partial: GADTs, existentials, newtype deriving, kind checking; missing type families, RankN, fundeps, TH |
 | 9 | Large projects | not started |
-| 10 | Diagnostics parity | not started |
+| 10 | Diagnostics parity | partial: some GHC-format messages, call-site backtraces for error/undefined |
 
-## Front-end measurements
+## What works
 
-- Corpus `tests/run` (40 programs): all parse.
-- Corpus `tests/fail` (19 programs): 5 are rejected by the parser (matching GHC); the other 14 are
-  renamer or type errors, which later milestones must catch.
-- GHC 9.12 testsuite (`should_run` and `should_compile`, excluding CPP files): 2742 of 4315 parse.
-  Remaining failures are mostly outside milestone 2: TypeFamilies and associated types, MagicHash and
-  unboxed syntax, TemplateHaskell and quasi-quotes, DataKinds promotion (`'`), implicit parameters,
-  RecursiveDo, TransformListComp, view patterns, and standalone kind signatures' users.
+- Syntax: layout, operators and fixity, sections, records (construction, update, puns, wildcards),
+  guards, where, let, case, do, comprehensions, arithmetic sequences, GADT and existential syntax,
+  deriving clauses with strategies, typeclass declarations with defaults, standalone deriving.
+- Types: Hindley-Milner with levels; multi-parameter classes; superclasses; defaulting; the
+  monomorphism restriction; GADT refinement and existentials (scoped givens); kind inference.
+- Deriving: Eq, Ord, Show (GHC format), Read, Enum, Bounded, Functor, Foldable, Traversable,
+  newtype deriving (dictionary alias), DeriveAnyClass (empty instance).
+- Runtime: lazy interpreter over resolved code with tail calls; exceptions (catch, throw, try,
+  bracket, finally); IORef; arrays; MVar and forkIO under a global lock; uncaught error output
+  in GHC 9.12 format for `error` and `undefined` in user code.
+- Libraries (in `libs/`): Base (defining module), Prelude (GHC names), Data.List, Data.Char,
+  Data.Maybe, Data.Either, Data.Ord, Data.Function, Data.Bits, Data.Word, Data.Int, Data.Ratio,
+  Data.IORef, Data.STRef, Data.Array, Data.Map, Data.Set, Data.Monoid, Data.Functor, Data.Foldable,
+  Data.Traversable, Data.Functor.Identity, Control.Monad, Control.Applicative, Control.Exception,
+  Control.Concurrent(.MVar), Control.Monad.ST, Control.Monad.State, System.IO, System.Exit,
+  System.Environment, System.IO.Unsafe, Text.Printf, Text.Read, Numeric, Debug.Trace.
 
 ## Differential results (`tests/`)
 
-- Clone, current: 50 of 59 (run 32/40, fail 18/19). Oracle: GHC 9.12.2.
-- Wider sweep over GHC's own `should_run` programs (stored `.stdout` files, 899 with output):
-  143 pass, 652 fail to compile, 77 print different output. The stored outputs are old
-  (for example `numeric/arith003` assumes a 32-bit `Int`), so prefer real GHC as the oracle
-  for broad sweeps.
-- Compile failures by cause (sweep): missing modules (Control.Concurrent, Foreign, Control.Exception,
-  GHC.Exts, Data.Array, Data.Typeable, ...), MagicHash and unboxed syntax, Arrows (`proc`),
-  TransformListComp, ImplicitParams, type families, higher-rank types.
-- Known gaps, by cause:
-  - Missing library modules: Data.Bits, Control.Exception, Control.Concurrent, Data.Function, Text.Printf.
-  - Runtime error text: GHC 9.12 prints `Uncaught exception` blocks with `HasCallStack backtrace`
-    lines naming `ghc-internal` source locations; exact parity needs the real base sources (milestone 4).
-  - `Float` is an alias of `Double`; GHC shows single precision values.
-  - Derived `Read` is not implemented.
-  - GADT type refinement is not implemented (`gadt_implicit`).
-  - No kind checking (`kind_error`).
-  - Interpreter speed: variables are looked up by name in a linked environment; large loops are slow.
+- Clone, current: 57 of 59 (run 38/40, fail 19/19). Oracle: GHC 9.12.2.
+- The two failures compare stderr for uncaught `head []` and pattern-match failures. GHC prints
+  library-internal call stacks (ghc-internal source locations) that need the real base sources.
+
+## Known gaps (priority order)
+
+1. Real base library: compile GHC's `ghc-prim`, `ghc-internal`, `base` (needs CPP, MagicHash,
+   unboxed tuples/types, Typeable, type families, rank-N types).
+2. Higher-rank types: nested `forall` is approximated by outer quantification; constrained rank-N
+   arguments are rejected.
+3. Type families, functional dependencies (no improvement), default signatures, associated types.
+4. MagicHash, UnboxedTuples, Arrows, TransformListComp, ImplicitParams, TemplateHaskell.
+5. Foreign function interface (needs the native back end).
+6. Performance: the interpreter is a few hundred times slower than GHC -O0 on tight loops.
+7. Wide sweep over GHC's testsuite (`should_run`, 899 programs with output): 171 pass; compile
+   failures are dominated by missing modules (Foreign, GHC.Exts, Data.Typeable, GHC.Conc) and
+   the unsupported extensions above.
 
 ## Corpus
 
