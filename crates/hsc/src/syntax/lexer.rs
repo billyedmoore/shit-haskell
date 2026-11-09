@@ -315,7 +315,16 @@ impl Lexer {
         }
         match c {
             '"' => return self.lex_string(),
-            '\'' => return self.lex_char(),
+            '\'' => {
+                // A quote that cannot open a character literal is a promotion tick (DataKinds).
+                let promoted = self.peek(1).is_some_and(|c| c.is_alphabetic() || c == '[' || c == '(' || c == ':')
+                    && self.peek(2) != Some('\'');
+                if promoted {
+                    self.bump();
+                    return Ok(Tok::Special('\''));
+                }
+                return self.lex_char();
+            }
             '(' | ')' | ',' | ';' | '[' | ']' | '`' | '{' | '}' => {
                 self.bump();
                 return Ok(Tok::Special(c));
@@ -447,6 +456,7 @@ impl Lexer {
                 self.bump();
                 self.bump();
                 let digits = self.take_while(|c| c == '_' || c.is_digit(r));
+                self.skip_hashes();
                 return Ok(Tok::Int(to_decimal(&digits, r)));
             }
         }

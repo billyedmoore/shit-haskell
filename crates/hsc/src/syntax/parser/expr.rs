@@ -474,7 +474,11 @@ impl Parser {
             return self.tuple_rest(vec![Some(first)], loc);
         }
         if self.at_res(ROp::RArrow) {
-            return self.err("view patterns are not supported yet");
+            // ViewPatterns: `(f -> p)`, converted to a pattern by `expr_to_pat`.
+            self.bump();
+            let pat = self.expr()?;
+            self.expect_special(')')?;
+            return Ok(Expr::ViewPat(Box::new(first), Box::new(pat), loc));
         }
         self.expect_special(')')?;
         Ok(first)

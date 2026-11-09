@@ -76,7 +76,7 @@ impl Parser {
             Tok::VarId(s) => s.as_str() != "forall",
             Tok::ConId(_)
             | Tok::QConId(..)
-            | Tok::Special('(' | '[')
+            | Tok::Special('(' | '[' | '\'')
             | Tok::Kw(Kw::Underscore)
             | Tok::Int(_)
             | Tok::Str(_) => true,
@@ -131,6 +131,31 @@ impl Parser {
             Tok::Kw(Kw::Underscore) => {
                 self.bump();
                 Ok(Type::Wild(loc))
+            }
+            // DataKinds: `'Con` names a promoted data constructor; `'[]` the promoted empty list.
+            Tok::Special('\'') => {
+                self.bump();
+                match self.tok().clone() {
+                    Tok::ConId(_) | Tok::QConId(..) => {
+                        let q = self.qcon()?;
+                        Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, loc))
+                    }
+                    Tok::Special('[') => {
+                        self.bump();
+                        let mut elems = Vec::new();
+                        if !self.at_special(']') {
+                            elems.push(self.sigtype()?);
+                            while self.at_special(',') {
+                                self.bump();
+                                elems.push(self.sigtype()?);
+                            }
+                        }
+                        self.expect_special(']')?;
+                        Ok(promoted_list(elems, loc))
+                    }
+                    Tok::Special('(') => self.atype(),
+                    _ => self.unexpected(),
+                }
             }
             // StarIsType: `*` is the kind of types.
             Tok::VarSym(s) if s == "*" => {
@@ -224,6 +249,16 @@ impl Parser {
                     return Ok(Type::Con(QName::unqual("[]"), loc));
                 }
                 let t = self.sigtype()?;
+                if self.at_special(',') {
+                    // DataKinds: a promoted list literal `[t1, t2, ...]` is `t1 ': t2 ': ... '[]`.
+                    let mut elems = vec![t];
+                    while self.at_special(',') {
+                        self.bump();
+                        elems.push(self.sigtype()?);
+                    }
+                    self.expect_special(']')?;
+                    return Ok(promoted_list(elems, loc));
+                }
                 self.expect_special(']')?;
                 Ok(Type::List(Box::new(t), loc))
             }
@@ -233,6 +268,23 @@ impl Parser {
 
     /// A type variable binder: `a` or `(a :: k)`.
     pub(super) fn tyvar_binder(&mut self) -> PResult<TyVarBind> {
+        // Inferred binders `{a}` and `{a :: k}` are accepted like ordinary ones.
+        if self.at_special('{') {
+            self.bump();
+            let name = match self.tok().clone() {
+                Tok::VarId(s) if self.real() => s,
+                _ => return self.unexpected(),
+            };
+            self.bump();
+            let kind = if self.at_res(ROp::DColon) {
+                self.bump();
+                Some(self.sigtype()?)
+            } else {
+                None
+            };
+            self.expect_special('}')?;
+            return Ok(TyVarBind { name, kind });
+        }
         if self.at_special('(') {
             self.bump();
             let name = match self.tok().clone() {
@@ -280,4 +332,16 @@ fn context_items(t: Type) -> Vec<Type> {
         Type::Con(q, _) if q.name == "()" => Vec::new(),
         other => vec![other],
     }
+}
+
+/// A promoted list `t1 ': t2 ': ... '[]` built from its elements.
+fn promoted_list(elems: Vec<Type>, loc: Loc) -> Type {
+    let mut acc = Type::Con(QName::unqual("'[]"), loc);
+    for e in elems.into_iter().rev() {
+        acc = Type::App(
+            Box::new(Type::App(Box::new(Type::Con(QName::unqual("':"), loc)), Box::new(e))),
+            Box::new(acc),
+        );
+    }
+    acc
 }

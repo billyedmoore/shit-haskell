@@ -1,6 +1,7 @@
 //! Front end: lexing, layout, parsing and the surface syntax tree.
 
 pub mod ast;
+pub mod cpp;
 pub mod extensions;
 pub mod lexer;
 pub mod parser;

@@ -21,6 +21,8 @@ impl GName {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntKind {
+    /// A pattern synonym (in the value namespace, like a constructor).
+    PatSyn,
     /// A value binding: function, variable, or foreign import.
     Var,
     /// A data constructor.
@@ -38,7 +40,7 @@ pub enum EntKind {
 impl EntKind {
     /// True for entities that live in the value namespace.
     pub fn is_value(self) -> bool {
-        matches!(self, EntKind::Var | EntKind::Con | EntKind::Field | EntKind::Method)
+        matches!(self, EntKind::Var | EntKind::Con | EntKind::Field | EntKind::Method | EntKind::PatSyn)
     }
 }
 
@@ -59,9 +61,20 @@ impl Entity {
     }
 }
 
+/// A pattern synonym after renaming: its argument variables (as bound in `pat`) and its
+/// pattern. Uses in patterns are expanded by substitution; uses in expressions call the builder
+/// `$bP` when `builder` is set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatSynDef {
+    pub params: Vec<String>,
+    pub pat: crate::syntax::ast::Pat,
+    pub builder: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Iface {
     pub module: String,
     pub exports: Vec<Entity>,
     pub fixities: BTreeMap<GName, (Assoc, u8)>,
+    pub patsyns: BTreeMap<GName, PatSynDef>,
 }

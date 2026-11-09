@@ -372,7 +372,7 @@ impl Checker {
                 self.loc = *loc;
                 self.err("Found hole: _")
             }
-            Expr::AsPat(_, _, loc) | Expr::LazyPat(_, loc) | Expr::BangPat(_, loc) => {
+            Expr::AsPat(_, _, loc) | Expr::LazyPat(_, loc) | Expr::BangPat(_, loc) | Expr::ViewPat(_, _, loc) => {
                 self.loc = *loc;
                 self.err("Pattern syntax in expression context")
             }

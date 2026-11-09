@@ -58,6 +58,7 @@ impl Driver {
             .find_source(module)
             .ok_or_else(|| format!("Could not find module ‘{module}’"))?;
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let src = preprocess_if_needed(src, &path, &self.flags)?;
         let (parsed, exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
@@ -101,6 +102,7 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
     let dir = main_file.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mut d = Driver::new(&dir, flags.clone());
     let src = read_source(main_file).map_err(|e| format!("{}: {e}", main_file.display()))?;
+    let src = preprocess_if_needed(src, main_file, &flags)?;
     let (parsed, exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
         format!("{}:{}:{}: error:\n    {}", main_file.display(), e.line, e.col, e.msg)
     })?;
@@ -137,4 +139,15 @@ pub fn read_source(path: &Path) -> std::io::Result<String> {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     })
+}
+
+/// Runs the C preprocessor on a source when its `CPP` extension is on. Includes are searched
+/// in the source's directory and then in the library's `include/` directory.
+pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Result<String, String> {
+    if !crate::syntax::cpp::wants_cpp(&src, flags) {
+        return Ok(src);
+    }
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let mut pp = crate::syntax::cpp::Preprocessor::new(vec![default_lib_dir().join("include")]);
+    pp.run(&src, &dir).map_err(|e| format!("{}: error: {e}", path.display()))
 }

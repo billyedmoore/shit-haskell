@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::syntax::ast::*;
 use fixity::{resolve, Tk};
-use iface::{EntKind, Entity, GName, Iface};
+use iface::{EntKind, Entity, GName, Iface, PatSynDef};
 
 /// The module users import implicitly.
 pub const PRELUDE: &str = "Prelude";
@@ -87,6 +87,8 @@ pub struct Renamer<'a> {
     counter: usize,
     /// Binders seen so far in the pattern group being renamed (for duplicate detection).
     pat_seen: Option<HashSet<String>>,
+    /// Pattern synonyms of every loaded module and of this one.
+    patsyns: HashMap<GName, PatSynDef>,
 }
 
 /// Renames a module against the interfaces of its imports.
@@ -115,6 +117,10 @@ pub fn rename_module(
         locals: Vec::new(),
         counter: 0,
         pat_seen: None,
+        patsyns: ifaces
+            .values()
+            .flat_map(|i| i.patsyns.iter().map(|(g, d)| (g.clone(), d.clone())))
+            .collect(),
     };
     rn.fixities.insert(GName::new(BUILTIN, ":"), (Assoc::Right, 5));
     rn.run(m, implicit_prelude)
@@ -167,9 +173,22 @@ impl<'a> Renamer<'a> {
             }
         }
 
+        // Pattern synonyms: each definition is renamed now, so that uses in patterns can expand
+        // it; implicitly bidirectional ones and explicit builders become functions `$bP`.
+        let mut builders = Vec::new();
+        for d in &m.decls {
+            if let Decl::PatSyn { name, args, pat, dir, loc } = d {
+                self.patsyn_definition(name, args, pat, dir, *loc)?;
+                builders.extend(builder_decls(name, args, pat, dir, *loc)?);
+            }
+        }
+
         // Rename declarations.
         let mut decls = Vec::with_capacity(m.decls.len());
-        for d in m.decls {
+        for d in m.decls.into_iter().filter(|d| !matches!(d, Decl::PatSyn { .. } | Decl::PatSynSig { .. })) {
+            decls.push(self.top_decl(d)?);
+        }
+        for d in builders {
             decls.push(self.top_decl(d)?);
         }
 
@@ -181,10 +200,17 @@ impl<'a> Renamer<'a> {
                 fixities.insert(g.clone(), *f);
             }
         }
+        let patsyns = self
+            .patsyns
+            .iter()
+            .filter(|(g, _)| g.module == self.module)
+            .map(|(g, d)| (g.clone(), d.clone()))
+            .collect();
         let iface = Iface {
             module: self.module.clone(),
             exports,
             fixities,
+            patsyns,
         };
         let module = Module {
             name: m.name,
@@ -336,6 +362,10 @@ impl<'a> Renamer<'a> {
                     add_val(name, *loc, &mut seen_vals)?;
                     own.push(entity(EntKind::Var, &module, name, vec![], vec![]));
                 }
+                Decl::PatSyn { name, loc, .. } => {
+                    add_val(name, *loc, &mut seen_vals)?;
+                    own.push(entity(EntKind::PatSyn, &module, name, vec![], vec![]));
+                }
                 Decl::Data(dd) => {
                     add_type(&mut seen_types, &dd.name, dd.loc)?;
                     let mut subs = Vec::new();
@@ -486,11 +516,37 @@ impl<'a> Renamer<'a> {
         if q.qual.is_none() && is_builtin_tycon(&q.name) {
             return Ok(builtin(&q.name, loc));
         }
+        // A promoted data constructor (DataKinds) is looked up among the values; its global
+        // name keeps the tick so that it is distinct from a type of the same name.
+        if let Some(bare) = q.name.strip_prefix('\'') {
+            if bare.starts_with(|c: char| c.is_uppercase()) {
+                let vq = QName { qual: q.qual.clone(), name: bare.to_string() };
+                return match self.lookup_global(&vq, Ns::Value) {
+                    Ok(e) => Ok(QName {
+                        qual: Some(e.global.module.clone()),
+                        name: format!("'{}", e.global.name),
+                    }),
+                    Err(_) => Err(RnError {
+                        loc,
+                        msg: format!("Data constructor not in scope: {}", bare),
+                    }),
+                };
+            }
+            return Ok(q.clone());
+        }
         match self.lookup_global(q, Ns::Type) {
             Ok(e) => Ok(QName {
                 qual: Some(e.global.module.clone()),
                 name: e.global.name.clone(),
             }),
+            // DataKinds: an unticked data constructor used as a type is promoted.
+            Err(c) if c.is_empty() && self.lookup_global(q, Ns::Value).is_ok() => {
+                let e = self.lookup_global(q, Ns::Value).unwrap_or_else(|_| unreachable!());
+                Ok(QName {
+                    qual: Some(e.global.module.clone()),
+                    name: format!("'{}", e.global.name),
+                })
+            }
             Err(c) if c.is_empty() => Err(RnError {
                 loc,
                 msg: format!("Not in scope: type constructor or class ‘{}’", display_qname(q)),
@@ -514,6 +570,47 @@ impl<'a> Renamer<'a> {
 
     fn push(&mut self) {
         self.locals.push(HashMap::new());
+    }
+
+    /// The definition of the pattern synonym a resolved constructor name refers to, if any.
+    fn patsyn_of(&self, q: &QName) -> Option<PatSynDef> {
+        let module = q.qual.clone()?;
+        self.patsyns.get(&GName::new(module, q.name.clone())).cloned()
+    }
+
+    /// Renames a pattern synonym's pattern with its arguments bound, and records it.
+    fn patsyn_definition(
+        &mut self,
+        name: &str,
+        args: &[String],
+        pat: &Pat,
+        dir: &PatSynDir,
+        loc: Loc,
+    ) -> RR<()> {
+        let depth = self.locals.len();
+        self.push();
+        let renamed = self.pat_group(vec![pat.clone()], BindMode::Fresh)?.remove(0);
+        let mut params = Vec::with_capacity(args.len());
+        for a in args {
+            match self.lookup_local(a) {
+                Some(u) => params.push(u),
+                None => {
+                    self.locals.truncate(depth);
+                    return Err(RnError {
+                        loc,
+                        msg: format!("Pattern synonym argument ‘{a}’ is not bound by the pattern"),
+                    });
+                }
+            }
+        }
+        self.locals.truncate(depth);
+        let def = PatSynDef {
+            params,
+            pat: renamed,
+            builder: !matches!(dir, PatSynDir::Unidirectional),
+        };
+        self.patsyns.insert(GName::new(self.module.clone(), name), def);
+        Ok(())
     }
 
     fn bind(&mut self, occ: &str, loc: Loc, mode: BindMode) -> RR<String> {
@@ -547,6 +644,10 @@ impl<'a> Renamer<'a> {
 
     fn top_decl(&mut self, d: Decl) -> RR<Decl> {
         Ok(match d {
+            // Pattern synonyms are resolved away before declarations are renamed.
+            Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } => {
+                return Err(RnError { loc, msg: "internal: pattern synonym reached the declaration pass".into() })
+            }
             Decl::Sig { names, ty, loc } => {
                 for n in &names {
                     if !self.own.iter().any(|e| e.kind == EntKind::Var && e.occ() == n) {
@@ -956,7 +1057,28 @@ impl<'a> Renamer<'a> {
     fn expr(&mut self, e: Expr) -> RR<Expr> {
         Ok(match e {
             Expr::Var(q, loc) => Expr::Var(self.value_ref(&q, loc, false)?, loc),
-            Expr::Con(q, loc) => Expr::Con(self.value_ref(&q, loc, true)?, loc),
+            Expr::Con(q, loc) => {
+                let cq = self.value_ref(&q, loc, true)?;
+                match self.patsyn_of(&cq) {
+                    Some(def) if def.builder => Expr::Var(
+                        QName {
+                            qual: cq.qual.clone(),
+                            name: builder_name(&cq.name),
+                        },
+                        loc,
+                    ),
+                    Some(_) => {
+                        return Err(RnError {
+                            loc,
+                            msg: format!(
+                                "non-bidirectional pattern synonym ‘{}’ used in an expression",
+                                cq.name
+                            ),
+                        })
+                    }
+                    None => Expr::Con(cq, loc),
+                }
+            }
             Expr::Lit(l, loc) => Expr::Lit(l, loc),
             Expr::App(f, a) => Expr::App(Box::new(self.expr(*f)?), Box::new(self.expr(*a)?)),
             Expr::TyApp(e, t, loc) => Expr::TyApp(Box::new(self.expr(*e)?), self.ty(t)?, loc),
@@ -1108,7 +1230,7 @@ impl<'a> Renamer<'a> {
                     msg: "Found hole: _".into(),
                 })
             }
-            Expr::AsPat(_, _, loc) | Expr::LazyPat(_, loc) | Expr::BangPat(_, loc) => {
+            Expr::AsPat(_, _, loc) | Expr::LazyPat(_, loc) | Expr::BangPat(_, loc) | Expr::ViewPat(_, _, loc) => {
                 return Err(RnError {
                     loc,
                     msg: "Pattern syntax in expression context".into(),
@@ -1208,6 +1330,20 @@ impl<'a> Renamer<'a> {
                 let mut out = Vec::with_capacity(args.len());
                 for a in args {
                     out.push(self.pat(a, mode)?);
+                }
+                if let Some(def) = self.patsyn_of(&cq) {
+                    if out.len() != def.params.len() {
+                        return Err(RnError {
+                            loc,
+                            msg: format!(
+                                "The pattern synonym ‘{}’ should have {} arguments, but has been given {}",
+                                cq.name,
+                                def.params.len(),
+                                out.len()
+                            ),
+                        });
+                    }
+                    return Ok(subst_pat(&def.pat, &def.params, &out));
                 }
                 Pat::Con(cq, out, loc)
             }
@@ -1547,6 +1683,7 @@ fn collect_pat_vars(p: &Pat, out: &mut Vec<(String, Loc)>) {
 
 fn decl_loc(d: &Decl) -> Loc {
     match d {
+        Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } => *loc,
         Decl::Sig { loc, .. }
         | Decl::Fixity { loc, .. }
         | Decl::Fun { loc, .. }
@@ -1573,5 +1710,109 @@ fn instance_class(head: &Type) -> Option<QName> {
             Type::Con(q, _) => return Some(q.clone()),
             _ => return None,
         }
+    }
+}
+
+/// The global name of a pattern synonym's builder function.
+pub fn builder_name(synonym: &str) -> String {
+    format!("$b{synonym}")
+}
+
+/// The functions that build a pattern synonym's values (before renaming).
+fn builder_decls(name: &str, args: &[String], pat: &Pat, dir: &PatSynDir, loc: Loc) -> RR<Vec<Decl>> {
+    let fname = builder_name(name);
+    match dir {
+        PatSynDir::Unidirectional => Ok(Vec::new()),
+        PatSynDir::Implicit => {
+            let body = pat_to_expr(pat).ok_or_else(|| RnError {
+                loc,
+                msg: format!("The right-hand side of the implicitly bidirectional pattern synonym ‘{name}’ is not invertible"),
+            })?;
+            let clause = Clause {
+                pats: args.iter().map(|a| Pat::Var(a.clone(), loc)).collect(),
+                rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() },
+                loc,
+            };
+            Ok(vec![Decl::Fun { name: fname, clauses: vec![clause], loc }])
+        }
+        PatSynDir::Explicit(decls) => {
+            let mut funs = Vec::new();
+            for d in decls {
+                match d {
+                    Decl::PatBind { pat: Pat::Con(_, pats, _), rhs, loc } => funs.push(Decl::Fun {
+                        name: fname.clone(),
+                        clauses: vec![Clause { pats: pats.clone(), rhs: rhs.clone(), loc: *loc }],
+                        loc: *loc,
+                    }),
+                    other => {
+                        return Err(RnError {
+                            loc: decl_loc(other),
+                            msg: "The builder of a pattern synonym must define it by its constructor syntax".into(),
+                        })
+                    }
+                }
+            }
+            Ok(crate::syntax::parser::group_binds(funs))
+        }
+    }
+}
+
+/// The expression that builds the value a pattern describes, if the pattern is invertible.
+fn pat_to_expr(p: &Pat) -> Option<Expr> {
+    Some(match p {
+        Pat::Var(v, loc) => Expr::Var(QName::unqual(v.clone()), *loc),
+        Pat::Lit(l, loc) => Expr::Lit(l.clone(), *loc),
+        Pat::NegLit(l, loc) => Expr::App(
+            Box::new(Expr::Var(QName { qual: Some(BASE.into()), name: "negate".into() }, *loc)),
+            Box::new(Expr::Lit(l.clone(), *loc)),
+        ),
+        Pat::Con(q, args, loc) => {
+            let mut e = Expr::Con(q.clone(), *loc);
+            for a in args {
+                e = Expr::App(Box::new(e), Box::new(pat_to_expr(a)?));
+            }
+            e
+        }
+        Pat::Tuple(ps, loc) => Expr::Tuple(ps.iter().map(|x| pat_to_expr(x).map(Some)).collect::<Option<_>>()?, *loc),
+        Pat::List(ps, loc) => Expr::List(ps.iter().map(pat_to_expr).collect::<Option<_>>()?, *loc),
+        Pat::Sig(q, t, loc) => Expr::Sig(Box::new(pat_to_expr(q)?), t.clone(), *loc),
+        Pat::Bang(q, _) | Pat::Lazy(q, _) => pat_to_expr(q)?,
+        Pat::OpChain(items, loc) => Expr::OpChain(
+            items
+                .iter()
+                .map(|it| match it {
+                    PatOpItem::Operand(x) => pat_to_expr(x).map(OpItem::Operand),
+                    PatOpItem::Op(q, l) => Some(OpItem::Op(q.clone(), *l)),
+                })
+                .collect::<Option<_>>()?,
+            *loc,
+        ),
+        Pat::Wild(_) | Pat::Rec { .. } | Pat::As(..) | Pat::View(..) => return None,
+    })
+}
+
+/// Substitutes the argument patterns of a pattern synonym use for its parameters.
+fn subst_pat(p: &Pat, params: &[String], args: &[Pat]) -> Pat {
+    let s = |q: &Pat| subst_pat(q, params, args);
+    match p {
+        Pat::Var(v, loc) => match params.iter().position(|x| x == v) {
+            Some(i) => args[i].clone(),
+            None => Pat::Var(v.clone(), *loc),
+        },
+        Pat::Wild(_) | Pat::Lit(..) | Pat::NegLit(..) | Pat::OpChain(..) => p.clone(),
+        Pat::Con(q, ps, loc) => Pat::Con(q.clone(), ps.iter().map(s).collect(), *loc),
+        Pat::Rec { con, fields, dotdot, loc } => Pat::Rec {
+            con: con.clone(),
+            fields: fields.iter().map(|(n, fp)| (n.clone(), fp.as_ref().map(s))).collect(),
+            dotdot: *dotdot,
+            loc: *loc,
+        },
+        Pat::Tuple(ps, loc) => Pat::Tuple(ps.iter().map(s).collect(), *loc),
+        Pat::List(ps, loc) => Pat::List(ps.iter().map(s).collect(), *loc),
+        Pat::As(v, q, loc) => Pat::As(v.clone(), Box::new(s(q)), *loc),
+        Pat::Lazy(q, loc) => Pat::Lazy(Box::new(s(q)), *loc),
+        Pat::Bang(q, loc) => Pat::Bang(Box::new(s(q)), *loc),
+        Pat::Sig(q, t, loc) => Pat::Sig(Box::new(s(q)), t.clone(), *loc),
+        Pat::View(e, q, loc) => Pat::View(e.clone(), Box::new(s(q)), *loc),
     }
 }

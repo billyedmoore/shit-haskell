@@ -53,6 +53,7 @@ impl Parser {
             }
             Expr::AsPat(name, inner, loc) => Pat::As(name, Box::new(self.expr_to_pat(*inner)?), loc),
             Expr::LazyPat(inner, loc) => Pat::Lazy(Box::new(self.expr_to_pat(*inner)?), loc),
+            Expr::ViewPat(f, inner, loc) => Pat::View(f, Box::new(self.expr_to_pat(*inner)?), loc),
             Expr::BangPat(inner, loc) => Pat::Bang(Box::new(self.expr_to_pat(*inner)?), loc),
             Expr::Sig(inner, ty, loc) => Pat::Sig(Box::new(self.expr_to_pat(*inner)?), ty, loc),
             Expr::RecCon {

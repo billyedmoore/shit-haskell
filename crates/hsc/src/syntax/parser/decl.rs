@@ -18,6 +18,10 @@ impl Parser {
                 self.data_decl(true, loc)
             }
             Tok::Kw(Kw::Type) if self.real() => self.type_decl(loc),
+            Tok::VarId(s) if s == "pattern" && self.real() && self.exts.is_on("PatternSynonyms") => {
+                self.bump();
+                self.pattern_decl(loc)
+            }
             Tok::Kw(Kw::Class) if self.real() => self.class_decl(loc),
             Tok::Kw(Kw::Instance) if self.real() => self.instance_decl(loc),
             Tok::Kw(Kw::Deriving) if self.real() => self.standalone_deriving(loc),
@@ -106,7 +110,12 @@ impl Parser {
         };
         self.bump();
         let mut prec = 9u8;
-        if let Tok::Int(digits) = self.tok().clone() {
+        // GHC accepts precedence -1 (below every operator, used by `->`); it is kept as 0.
+        if self.at_varsym("-") && matches!(self.peek_raw(1), Tok::Int(d) if d == "1") {
+            self.bump();
+            self.bump();
+            prec = 0;
+        } else if let Tok::Int(digits) = self.tok().clone() {
             if self.real() {
                 prec = match digits.parse::<u8>() {
                     Ok(p) if p <= 9 => p,
@@ -121,6 +130,15 @@ impl Parser {
                 Tok::VarSym(s) | Tok::ConSym(s) if self.real() => {
                     self.bump();
                     s
+                }
+                // `->` is reserved syntax but may be given a fixity (GHC.Types does).
+                Tok::Res(ROp::RArrow) if self.real() => {
+                    self.bump();
+                    "->".to_string()
+                }
+                Tok::Res(ROp::Tilde) if self.real() => {
+                    self.bump();
+                    "~".to_string()
                 }
                 Tok::Special('`') if self.real() => {
                     self.bump();
@@ -267,6 +285,36 @@ impl Parser {
         let mut cons = Vec::new();
         if self.at_res(ROp::Eq) {
             self.bump();
+            // GHC.Types declares the unboxed tuple types as `data T# a b = (# a, b #)`. Unboxed
+            // tuples are built in here, so the declaration adds nothing.
+            if self.at_special('(') && self.peek_raw(1) == &Tok::VarSym("#".into()) {
+                // Each alternative is one parenthesised group `(# ... #)`.
+                let mut depth = 0;
+                loop {
+                    if self.at_special('(') {
+                        depth += 1;
+                    } else if self.at_special(')') {
+                        depth -= 1;
+                    }
+                    self.bump();
+                    if depth == 0 {
+                        if self.at_res(ROp::Bar) {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                return Ok(Decl::Data(DataDecl {
+                    newtype: false,
+                    context,
+                    name,
+                    tyvars,
+                    cons: Vec::new(),
+                    deriving: Vec::new(),
+                    loc,
+                }));
+            }
             loop {
                 cons.push(self.constr()?);
                 if self.at_res(ROp::Bar) {
@@ -917,4 +965,66 @@ impl Parser {
 /// True for names that denote constructors (start with `:`).
 pub(super) fn is_con_op(name: &str) -> bool {
     name.starts_with(':')
+}
+
+impl Parser {
+    /// After `pattern`: a signature `P, Q :: t`, or a synonym definition.
+    fn pattern_decl(&mut self, loc: Loc) -> PResult<Decl> {
+        if matches!(self.tok(), Tok::ConId(_)) && matches!(self.peek_raw(1), Tok::Res(ROp::DColon) | Tok::Special(',')) {
+            let mut names = Vec::new();
+            loop {
+                match self.tok().clone() {
+                    Tok::ConId(s) => {
+                        self.bump();
+                        names.push(s);
+                    }
+                    _ => return self.unexpected(),
+                }
+                if self.at_special(',') {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            self.expect_res(ROp::DColon)?;
+            let ty = self.sigtype()?;
+            return Ok(Decl::PatSynSig { names, ty, loc });
+        }
+        let name = match self.tok().clone() {
+            Tok::ConId(s) if self.real() => {
+                self.bump();
+                s
+            }
+            _ => return self.unexpected(),
+        };
+        let mut args = Vec::new();
+        while self.real() {
+            match self.tok().clone() {
+                Tok::VarId(v) => {
+                    self.bump();
+                    args.push(v);
+                }
+                _ => break,
+            }
+        }
+        let (pat, dir) = if self.at_res(ROp::Eq) {
+            self.bump();
+            let e = self.expr()?;
+            (self.expr_to_pat(e)?, PatSynDir::Implicit)
+        } else if self.at_res(ROp::LArrow) {
+            self.bump();
+            let e = self.expr()?;
+            let pat = self.expr_to_pat(e)?;
+            if self.at_kw(Kw::Where) {
+                self.bump();
+                let decls = group_binds(self.block(|p| p.local_decl())?);
+                (pat, PatSynDir::Explicit(decls))
+            } else {
+                (pat, PatSynDir::Unidirectional)
+            }
+        } else {
+            return self.unexpected();
+        };
+        Ok(Decl::PatSyn { name, args, pat, dir, loc })
+    }
 }

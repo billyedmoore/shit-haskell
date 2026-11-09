@@ -600,6 +600,10 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
         Expr::TyApp(e, _, _) | Expr::Sig(e, _, _) | Expr::AsPat(_, e, _) | Expr::LazyPat(e, _) | Expr::BangPat(e, _) => {
             collect_expr(e, out)
         }
+        Expr::ViewPat(f, p, _) => {
+            collect_expr(f, out);
+            collect_expr(p, out);
+        }
         Expr::OpChain(items, _) => {
             for it in items {
                 match it {

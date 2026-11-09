@@ -74,8 +74,33 @@ pub enum Assoc {
     None,
 }
 
+/// How a pattern synonym is used in expressions.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PatSynDir {
+    /// `pattern P x = pat`: the pattern is also the expression that builds the value.
+    Implicit,
+    /// `pattern P x <- pat`: only matching is defined.
+    Unidirectional,
+    /// `pattern P x <- pat where P x = e`: the builder clauses.
+    Explicit(Vec<Decl>),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decl {
+    /// A pattern synonym `pattern P x1 .. xn = pat`, `pattern P xs <- pat [where ..]`.
+    PatSyn {
+        name: String,
+        args: Vec<String>,
+        pat: Pat,
+        dir: PatSynDir,
+        loc: Loc,
+    },
+    /// `pattern P, Q :: type`; the type is not checked against the definition.
+    PatSynSig {
+        names: Vec<String>,
+        ty: Type,
+        loc: Loc,
+    },
     Sig {
         names: Vec<String>,
         ty: Type,
@@ -199,6 +224,8 @@ pub enum Expr {
     /// Visible type application `f @T`.
     TyApp(Box<Expr>, Type, Loc),
     OpChain(Vec<OpItem>, Loc),
+    /// A view pattern `(f -> p)`; only meaningful where a pattern is expected.
+    ViewPat(Box<Expr>, Box<Expr>, Loc),
     Lam(Vec<Pat>, Box<Expr>, Loc),
     Let(Vec<Decl>, Box<Expr>, Loc),
     If(Box<Expr>, Box<Expr>, Box<Expr>, Loc),
@@ -247,6 +274,7 @@ impl Expr {
             | Expr::Lit(_, l)
             | Expr::TyApp(_, _, l)
             | Expr::OpChain(_, l)
+            | Expr::ViewPat(_, _, l)
             | Expr::Lam(_, _, l)
             | Expr::Let(_, _, l)
             | Expr::If(_, _, _, l)
