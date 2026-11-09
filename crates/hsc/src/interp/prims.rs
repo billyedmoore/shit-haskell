@@ -205,7 +205,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let run_io = |cell: &Cell| -> RR {
                 let io = rt.force(cell)?;
                 let run = match io {
-                    Value::Con(c) if c.name == "Base.IO" => rt.force(&c.args[0])?,
+                    other_io @ Value::Con(_) | other_io @ Value::Fun(_) => other_io,
                     _ => return Err(RtError::Fail("internal: catch of a non-IO action".into())),
                 };
                 rt.apply(run, args[3].clone())
@@ -225,7 +225,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let exc_cell = Rc::new(RefCell::new(super::Thunk::Done(exc)));
             let io = rt.apply(handler, exc_cell)?;
             let run = match io {
-                Value::Con(c) if c.name == "Base.IO" => rt.force(&c.args[0])?,
+                other_io @ Value::Con(_) | other_io @ Value::Fun(_) => other_io,
                 _ => return Err(RtError::Fail("internal: handler is not an IO action".into())),
             };
             rt.apply(run, args[3].clone())
@@ -361,8 +361,8 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                     let rt: &Runtime = unsafe { &*rt_ptr.0 };
                     let cell = payload.0;
                     let outcome = rt.force(&cell).and_then(|io| match io {
-                        Value::Con(c) if c.name == "Base.IO" => {
-                            let run = rt.force(&c.args[0])?;
+                        Value::Con(_) | Value::Fun(_) => {
+                            let run = io;
                             let unit = Rc::new(RefCell::new(super::Thunk::Done(unit_value())));
                             rt.apply(run, unit)
                         }
@@ -401,7 +401,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             // `unsafePerformIO io`: run the IO action (a function of the world) and take its result.
             let io = rt.force(&args[0])?;
             let run = match io {
-                Value::Con(c) if c.name == "Base.IO" => rt.force(&c.args[0])?,
+                other_io @ Value::Con(_) | other_io @ Value::Fun(_) => other_io,
                 _ => return Err(RtError::Fail("internal: unsafePerformIO of a non-IO value".into())),
             };
             let res = rt.apply(run, Rc::new(RefCell::new(super::Thunk::Done(unit_value()))))?;

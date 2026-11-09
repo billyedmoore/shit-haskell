@@ -200,6 +200,7 @@ impl Checker {
                 ty: list_a.clone(),
             },
             vec![],
+            false,
         );
         self.add_con(
             "Builtin.:",
@@ -212,6 +213,7 @@ impl Checker {
                 ty: Ty::funs(vec![a.clone(), list_a.clone()], list_a.clone()),
             },
             vec![],
+            false,
         );
         // Unit and tuples.
         // Arity 1 has no tuple; `tuple_con(1)` would clash with unit.
@@ -238,6 +240,7 @@ impl Checker {
                     ty,
                 },
                 vec![],
+                false,
             );
         }
         // The function arrow.
@@ -252,7 +255,15 @@ impl Checker {
 
     /// Registers a data constructor, its type and its Core wrapper. The wrapper takes the
     /// constructor's context dictionaries first, then its fields.
-    pub fn add_con(&mut self, name: &str, tycon: &str, tag: usize, scheme: Scheme, fields: Vec<String>) {
+    pub fn add_con(
+        &mut self,
+        name: &str,
+        tycon: &str,
+        tag: usize,
+        scheme: Scheme,
+        fields: Vec<String>,
+        newtype: bool,
+    ) {
         let arity = count_args(&scheme.ty);
         let ndicts = scheme.preds.len();
         self.env.values.insert(name.to_string(), scheme.clone());
@@ -265,10 +276,13 @@ impl Checker {
                 arity,
                 scheme,
                 fields,
+                newtype,
             },
         );
         let total = ndicts + arity;
-        let body = if total == 0 {
+        let body = if newtype {
+            Core::Lam("nt%".into(), Box::new(Core::Var("nt%".into())))
+        } else if total == 0 {
             Core::Con(name.to_string(), vec![])
         } else {
             let params: Vec<String> = (0..total).map(|i| format!("c{i}%")).collect();

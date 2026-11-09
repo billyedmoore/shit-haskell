@@ -418,9 +418,14 @@ impl Checker {
                 self.loc = *loc;
                 let key = qkey(q);
                 let (arg_tys, dict_pats) = self.con_pattern_types(&key, args.len(), ty)?;
+                let newtype = self.env.datacons.get(&key).is_some_and(|d| d.newtype);
                 let mut subs = dict_pats;
                 for (a, t) in args.iter().zip(&arg_tys) {
                     subs.push(self.check_pat(a, t)?);
+                }
+                if newtype {
+                    // Newtypes are erased: matching the constructor matches its field.
+                    return Ok(subs.pop().expect("newtype has one field"));
                 }
                 Ok(CPat::Con(key, subs))
             }
@@ -882,6 +887,12 @@ impl Checker {
                 None => var(&f.name, loc),
             };
             args[pos] = Some(self.check(&value, &arg_tys[pos])?);
+        }
+        if info.newtype {
+            let inner = args.into_iter().next().flatten().unwrap_or_else(|| {
+                Core::Fail("Missing field in record construction".into())
+            });
+            return Ok((inner, cur));
         }
         let cores: Vec<Core> = args
             .into_iter()

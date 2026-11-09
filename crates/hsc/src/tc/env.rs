@@ -22,6 +22,8 @@ pub struct DataCon {
     pub scheme: Scheme,
     /// Record field global names by position, if the constructor has labelled fields.
     pub fields: Vec<String>,
+    /// Newtype constructors are erased at run time: they are the identity.
+    pub newtype: bool,
 }
 
 #[derive(Clone, Debug)]

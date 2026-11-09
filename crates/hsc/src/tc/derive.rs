@@ -4,7 +4,8 @@
 
 use super::{Checker, TR};
 use crate::syntax::ast::{
-    Alt, Body, Clause, ConDecl, ConFields, DataDecl, Decl, Expr, InstDecl, Lit, Loc, Pat, QName, Rhs, Type,
+    Alt, Body, Clause, ConDecl, ConFields, DataDecl, Decl, Expr, InstDecl, Lit, Loc, Pat, QName, Rhs,
+    Strategy, Type,
 };
 
 const BASE: &str = "Base";
@@ -125,14 +126,19 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
     let mut out = Vec::new();
     for d in &dd.deriving {
         for cls in &d.classes {
-            let name = match cls {
-                Type::Con(q, _) => q.name.clone(),
+            let class_qname = match cls {
+                Type::Con(q, _) => q.clone(),
                 Type::App(f, _) => match f.as_ref() {
-                    Type::Con(q, _) => q.name.clone(),
+                    Type::Con(q, _) => q.clone(),
                     _ => continue,
                 },
                 _ => continue,
             };
+            let name = class_qname.name.clone();
+            // Newtype deriving is handled by the dictionary alias in the checker.
+            if d.strategy == Some(Strategy::Newtype) || (dd.newtype && !is_stock(&name) && d.strategy.is_none()) {
+                continue;
+            }
             let derived = match name.as_str() {
                 "Eq" => derive_eq(checker, dd),
                 "Ord" => derive_ord(checker, dd),
@@ -140,23 +146,49 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
                 "Enum" => derive_enum(checker, dd),
                 "Bounded" => derive_bounded(checker, dd),
                 "Read" => derive_read(checker, dd),
-                // Other classes are accepted and ignored until they are supported.
-                _ => continue,
+                "Functor" => derive_functor(checker, dd),
+                "Foldable" => derive_foldable(checker, dd),
+                "Traversable" => derive_traversable(checker, dd),
+                // DeriveAnyClass: an instance with the class's default methods. Derived
+                // instances of unknown classes are skipped when the instance is registered.
+                _ => Vec::new(),
             };
-            out.push(instance(&checker.module, dd, &name, derived));
+            // Constructor classes are derived for the type constructor without its last parameter.
+            let drop_last = matches!(name.as_str(), "Functor" | "Foldable" | "Traversable");
+            let mut inst = instance(&checker.module, dd, &class_qname, derived, drop_last);
+            if let Decl::Instance(id) = &mut inst {
+                id.overlap = Some(DERIVED_MARK.into());
+            }
+            out.push(inst);
         }
     }
     Ok(out)
 }
 
+/// Marks generated instances, so that a missing class is not an error for them.
+pub const DERIVED_MARK: &str = "derived";
+
+/// Classes with a stock derivation.
+pub fn is_stock(name: &str) -> bool {
+    matches!(
+        name,
+        "Eq" | "Ord" | "Show" | "Enum" | "Bounded" | "Read" | "Functor" | "Foldable" | "Traversable"
+    )
+}
+
 /// Builds the instance declaration: the context has the class at every type parameter.
-fn instance(module: &str, dd: &DataDecl, class: &str, decls: Vec<Decl>) -> Decl {
+fn instance(module: &str, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_last: bool) -> Decl {
     let loc = dd.loc;
+    let kept: Vec<&crate::syntax::ast::TyVarBind> = if drop_last {
+        dd.tyvars[..dd.tyvars.len().saturating_sub(1)].iter().collect()
+    } else {
+        dd.tyvars.iter().collect()
+    };
     let module_qname = |n: &str| QName {
         qual: Some(BASE.into()),
         name: n.into(),
     };
-    let head_ty = dd.tyvars.iter().fold(
+    let head_ty = kept.iter().fold(
         Type::Con(
             QName {
                 qual: Some(module.to_string()),
@@ -166,12 +198,15 @@ fn instance(module: &str, dd: &DataDecl, class: &str, decls: Vec<Decl>) -> Decl 
         ),
         |acc, tv| Type::App(Box::new(acc), Box::new(Type::Var(tv.name.clone(), loc))),
     );
-    let head = Type::App(Box::new(Type::Con(module_qname(class), loc)), Box::new(head_ty));
-    let context = dd
-        .tyvars
-        .iter()
-        .map(|tv| Type::App(Box::new(Type::Con(module_qname(class), loc)), Box::new(Type::Var(tv.name.clone(), loc))))
-        .collect();
+    let head = Type::App(Box::new(Type::Con(class.clone(), loc)), Box::new(head_ty));
+    let context = if drop_last {
+        Vec::new()
+    } else {
+        dd.tyvars
+            .iter()
+            .map(|tv| Type::App(Box::new(Type::Con(class.clone(), loc)), Box::new(Type::Var(tv.name.clone(), loc))))
+            .collect()
+    };
     Decl::Instance(InstDecl {
         overlap: None,
         context,
@@ -569,4 +604,195 @@ fn derive_read(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         vec![clause(vec![Pat::Var(d, loc), Pat::Var(s, loc)], body, loc)],
         loc,
     )]
+}
+
+// ----- constructor classes: Functor, Foldable, Traversable --------------------------
+
+/// The field types of a constructor, in order.
+fn field_types(c: &ConDecl) -> Vec<Type> {
+    match &c.fields {
+        ConFields::Positional(fs) => fs.iter().map(|f| f.ty.clone()).collect(),
+        ConFields::Record(groups) => groups
+            .iter()
+            .flat_map(|(ns, f)| ns.iter().map(move |_| f.ty.clone()))
+            .collect(),
+    }
+}
+
+/// Whether a type mentions a type variable.
+fn mentions(t: &Type, v: &str) -> bool {
+    match t {
+        Type::Var(n, _) => n == v,
+        Type::App(f, a) | Type::Fun(f, a) => mentions(f, v) || mentions(a, v),
+        Type::List(e, _) => mentions(e, v),
+        Type::Tuple(ts, _) => ts.iter().any(|x| mentions(x, v)),
+        Type::Sig(x, _) => mentions(x, v),
+        _ => false,
+    }
+}
+
+fn pat_con(module: &str, c: &ConDecl, vars: Vec<String>, loc: Loc) -> Pat {
+    con_pat(module, &c.name, vars.into_iter().map(|v| Pat::Var(v, loc)).collect(), loc)
+}
+
+/// The argument of `m` for a field of type `t`: a function mapping `t[a]` to `t[b]` through
+/// `f`, or `None` when the field does not mention the last parameter.
+fn map_fn(checker: &mut Checker, t: &Type, last: &str, f: &str, loc: Loc) -> Option<Expr> {
+    if !mentions(t, last) {
+        return None;
+    }
+    match t {
+        Type::Var(n, _) if n == last => Some(local(f, loc)),
+        Type::App(g, arg) if !mentions(g, last) => {
+            let inner = map_fn(checker, arg, last, f, loc)?;
+            Some(app(base_var("fmap", loc), vec![inner]))
+        }
+        Type::List(e, _) => {
+            let inner = map_fn(checker, e, last, f, loc)?;
+            Some(app(base_var("fmap", loc), vec![inner]))
+        }
+        Type::Tuple(ts, _) => {
+            let names = fresh_vars(checker, "t", ts.len());
+            let mut comps = Vec::new();
+            for (ty, n) in ts.iter().zip(&names) {
+                comps.push(match map_fn(checker, ty, last, f, loc) {
+                    Some(m) => app(m, vec![local(n, loc)]),
+                    None => local(n, loc),
+                });
+            }
+            let pat = Pat::Tuple(names.iter().map(|n| Pat::Var(n.clone(), loc)).collect(), loc);
+            Some(Expr::Lam(vec![pat], Box::new(Expr::Tuple(comps.into_iter().map(Some).collect(), loc)), loc))
+        }
+        Type::Fun(a, b) if !mentions(a, last) => {
+            let g = checker.fresh_name("g");
+            let x = checker.fresh_name("x");
+            let mb = map_fn(checker, b, last, f, loc);
+            let body = match mb {
+                Some(m) => app(m, vec![app(local(&g, loc), vec![local(&x, loc)])]),
+                None => app(local(&g, loc), vec![local(&x, loc)]),
+            };
+            Some(Expr::Lam(vec![Pat::Var(g, loc)], Box::new(Expr::Lam(vec![Pat::Var(x, loc)], Box::new(body), loc)), loc))
+        }
+        _ => None,
+    }
+}
+
+fn derive_functor(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
+    let loc = dd.loc;
+    let module = checker.module.clone();
+    let Some(last) = dd.tyvars.last().map(|t| t.name.clone()) else {
+        return Vec::new();
+    };
+    let mut clauses = Vec::new();
+    for c in &dd.cons {
+        let f = checker.fresh_name("f");
+        let n = field_types(c).len();
+        let xs = fresh_vars(checker, "x", n);
+        let mut args = Vec::new();
+        for (t, x) in field_types(c).iter().zip(&xs) {
+            args.push(match map_fn(checker, t, &last, &f, loc) {
+                Some(m) => app(m, vec![local(x, loc)]),
+                None => local(x, loc),
+            });
+        }
+        let body = args.into_iter().fold(con_expr(&module, &c.name, loc), |acc, a| app(acc, vec![a]));
+        clauses.push(clause(vec![Pat::Var(f, loc), pat_con(&module, c, xs, loc)], body, loc));
+    }
+    if dd.cons.is_empty() {
+        clauses.push(clause(vec![Pat::Wild(loc), Pat::Var("z%".into(), loc)], base_var("undefined", loc), loc));
+    }
+    vec![fun("fmap", clauses, loc)]
+}
+
+/// `foldr`-style folding of a field of type `t` into an accumulator.
+fn fold_expr(checker: &mut Checker, t: &Type, last: &str, f: &str, x: Expr, acc: Expr, loc: Loc) -> Expr {
+    if !mentions(t, last) {
+        return acc;
+    }
+    match t {
+        Type::Var(n, _) if n == last => app(local(f, loc), vec![x, acc]),
+        Type::App(g, arg) if !mentions(g, last) => fold_inner(checker, arg, last, f, x, acc, loc),
+        Type::List(e, _) => fold_inner(checker, e, last, f, x, acc, loc),
+        _ => acc,
+    }
+}
+
+fn fold_inner(checker: &mut Checker, arg: &Type, last: &str, f: &str, x: Expr, acc: Expr, loc: Loc) -> Expr {
+    let y = checker.fresh_name("y");
+    let a2 = checker.fresh_name("acc");
+    let step = fold_expr(checker, arg, last, f, local(&y, loc), local(&a2, loc), loc);
+    let lam = Expr::Lam(vec![Pat::Var(y, loc), Pat::Var(a2, loc)], Box::new(step), loc);
+    app(base_var("foldr", loc), vec![lam, acc, x])
+}
+
+fn derive_foldable(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
+    let loc = dd.loc;
+    let module = checker.module.clone();
+    let Some(last) = dd.tyvars.last().map(|t| t.name.clone()) else {
+        return Vec::new();
+    };
+    let mut clauses = Vec::new();
+    for c in &dd.cons {
+        let f = checker.fresh_name("f");
+        let z = checker.fresh_name("z");
+        let n = field_types(c).len();
+        let xs = fresh_vars(checker, "x", n);
+        let mut acc = local(&z, loc);
+        for (t, x) in field_types(c).iter().zip(&xs).rev() {
+            acc = fold_expr(checker, t, &last, &f, local(x, loc), acc, loc);
+        }
+        clauses.push(clause(
+            vec![Pat::Var(f, loc), Pat::Var(z, loc), pat_con(&module, c, xs, loc)],
+            acc,
+            loc,
+        ));
+    }
+    if dd.cons.is_empty() {
+        clauses.push(clause(vec![Pat::Wild(loc), Pat::Var("z%".into(), loc), Pat::Wild(loc)], local("z%", loc), loc));
+    }
+    vec![fun("foldr", clauses, loc)]
+}
+
+/// `traverse` of a field of type `t`: an applicative action producing the new field.
+fn trav_expr(checker: &mut Checker, t: &Type, last: &str, f: &str, x: Expr, loc: Loc) -> Expr {
+    if !mentions(t, last) {
+        return app(base_var("pure", loc), vec![x]);
+    }
+    match t {
+        Type::Var(n, _) if n == last => app(local(f, loc), vec![x]),
+        Type::App(g, arg) if !mentions(g, last) => trav_inner(checker, arg, last, f, x, loc),
+        Type::List(e, _) => trav_inner(checker, e, last, f, x, loc),
+        _ => app(base_var("pure", loc), vec![x]),
+    }
+}
+
+fn trav_inner(checker: &mut Checker, arg: &Type, last: &str, f: &str, x: Expr, loc: Loc) -> Expr {
+    let y = checker.fresh_name("y");
+    let step = trav_expr(checker, arg, last, f, local(&y, loc), loc);
+    let lam = Expr::Lam(vec![Pat::Var(y, loc)], Box::new(step), loc);
+    app(base_var("traverse", loc), vec![lam, x])
+}
+
+fn derive_traversable(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
+    let loc = dd.loc;
+    let module = checker.module.clone();
+    let Some(last) = dd.tyvars.last().map(|t| t.name.clone()) else {
+        return Vec::new();
+    };
+    let mut clauses = Vec::new();
+    for c in &dd.cons {
+        let f = checker.fresh_name("f");
+        let n = field_types(c).len();
+        let xs = fresh_vars(checker, "x", n);
+        let mut action = app(base_var("pure", loc), vec![con_expr(&module, &c.name, loc)]);
+        for (t, x) in field_types(c).iter().zip(&xs) {
+            let a = trav_expr(checker, t, &last, &f, local(x, loc), loc);
+            action = app(base_var("<*>", loc), vec![action, a]);
+        }
+        clauses.push(clause(vec![Pat::Var(f, loc), pat_con(&module, c, xs, loc)], action, loc));
+    }
+    if dd.cons.is_empty() {
+        clauses.push(clause(vec![Pat::Wild(loc), Pat::Wild(loc)], base_var("undefined", loc), loc));
+    }
+    vec![fun("traverse", clauses, loc)]
 }

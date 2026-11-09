@@ -353,7 +353,7 @@ pub fn run_main(rt: &Runtime) -> i32 {
         let io = rt.force(&main_cell)?;
         // `main :: IO ()` is `IO (World -> IORes ())`.
         let run = match io {
-            Value::Con(c) if c.name == "Base.IO" => rt.force(&c.args[0])?,
+            other_io @ Value::Con(_) | other_io @ Value::Fun(_) => other_io,
             _ => return Err(RtError::Fail("internal: main is not an IO action".into())),
         };
         let unit = new_cell(Thunk::Done(unit_value()));

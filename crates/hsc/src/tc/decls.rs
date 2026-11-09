@@ -53,6 +53,7 @@ impl Checker {
             if let Decl::Data(dd) = d {
                 self.data_decl(dd)?;
                 derived.extend(self.derive_instances(dd)?);
+                self.register_newtype_deriving(dd)?;
             }
         }
 
@@ -188,7 +189,7 @@ impl Checker {
         }
 
         for (tag, (name, occs, _, scheme)) in per_con.iter().enumerate() {
-            self.add_con(name, &tycon, tag, scheme.clone(), occs.clone());
+            self.add_con(name, &tycon, tag, scheme.clone(), occs.clone(), dd.newtype);
             for (pos, f) in occs.iter().enumerate() {
                 let key = format!("{}.{f}", self.module);
                 self.env.fields.entry(key).or_default().push((name.clone(), pos));
@@ -216,9 +217,15 @@ impl Checker {
                     }
                 }
                 alts.push(Alt::Default(Core::Fail(format!("No match in record selector {f}"))));
+                let body = if dd.newtype {
+                    // A newtype selector is the identity on the erased value.
+                    Core::Lam(r.clone(), Box::new(Core::Var(r)))
+                } else {
+                    Core::Lam(r.clone(), Box::new(Core::Case(Box::new(Core::Var(r)), b, alts)))
+                };
                 self.out.push(TopBind {
                     name: sel.clone(),
-                    body: Core::Lam(r.clone(), Box::new(Core::Case(Box::new(Core::Var(r)), b, alts))),
+                    body,
                 });
                 let _ = pos;
                 let field_ty = per_con
@@ -395,6 +402,10 @@ impl Checker {
             _ => return self.err("Malformed instance head"),
         };
         if !self.env.classes.contains_key(&class) {
+            if id.overlap.as_deref() == Some(super::derive::DERIVED_MARK) {
+                // A derived instance of a class this library does not provide.
+                return Ok(());
+            }
             return self.err(format!("‘{}’ is not a class", super::types::unqualify(&class)));
         }
         let mut tvs = Vec::new();
@@ -427,6 +438,15 @@ impl Checker {
     /// Builds the dictionary for an instance and checks its methods.
     fn instance_body(&mut self, id: &InstDecl) -> TR<()> {
         self.loc = id.loc;
+        if id.overlap.as_deref() == Some(super::derive::DERIVED_MARK) {
+            let known = {
+                let (class_name, _) = instance_head_parts(&id.head).expect("validated");
+                matches!(class_name, Type::Con(q, _) if self.env.classes.contains_key(&global_tycon_name(q)))
+            };
+            if !known {
+                return Ok(());
+            }
+        }
         let (class_name, args) = instance_head_parts(&id.head).expect("validated by header");
         let class = match class_name {
             Type::Con(q, _) => global_tycon_name(q),
@@ -548,10 +568,101 @@ impl Checker {
         Ok(())
     }
 
+    /// Newtype deriving: the dictionary of the derived class at the representation type
+    /// serves as the dictionary of the newtype, because newtypes are erased at run time.
+    fn register_newtype_deriving(&mut self, dd: &DataDecl) -> TR<()> {
+        use crate::syntax::ast::Strategy;
+        self.loc = dd.loc;
+        let (field_ty, rep_last) = match (dd.newtype, dd.cons.first()) {
+            (true, Some(c)) => match &c.fields {
+                ConFields::Positional(fs) if fs.len() == 1 => (fs[0].ty.clone(), true),
+                ConFields::Record(groups) if groups.len() == 1 && groups[0].0.len() == 1 => {
+                    (groups[0].1.ty.clone(), true)
+                }
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let _ = rep_last;
+        for d in &dd.deriving {
+            for cls in &d.classes {
+                let short = match cls {
+                    Type::Con(q, _) => q.name.clone(),
+                    Type::App(f, _) => match f.as_ref() {
+                        Type::Con(q, _) => q.name.clone(),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                let via_newtype = d.strategy == Some(Strategy::Newtype)
+                    || (d.strategy.is_none() && !super::derive::is_stock(&short));
+                if !via_newtype || d.strategy == Some(Strategy::Anyclass) {
+                    continue;
+                }
+                let cls_name = match cls {
+                    Type::Con(q, _) => global_tycon_name(q),
+                    _ => continue,
+                };
+                if !self.env.classes.contains_key(&cls_name) {
+                    continue;
+                }
+                // Constructor classes (Functor, Monad, ...) are derived for the type without
+                // its last parameter, so the representation loses its last argument too.
+                let last = dd.tyvars.last().map(|t| t.name.clone());
+                let eta = is_constructor_class(&cls_name);
+                let kept: Vec<String> = dd
+                    .tyvars
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .take(dd.tyvars.len().saturating_sub(if eta { 1 } else { 0 }))
+                    .collect();
+                let rep_ast = if eta {
+                    match (&field_ty, &last) {
+                        (Type::App(g, arg), Some(l)) if matches!(arg.as_ref(), Type::Var(v, _) if v == l) => {
+                            (**g).clone()
+                        }
+                        _ => continue,
+                    }
+                } else {
+                    field_ty.clone()
+                };
+                let mut tvs = kept.clone();
+                let rep = self.convert_type(&rep_ast, &mut tvs)?;
+                let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
+                let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
+                let dict = format!("{}.$fGND{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.counter);
+                self.counter += 1;
+                self.env.instances.push(InstInfo {
+                    class: cls_name.clone(),
+                    nvars: tvs.len() as u32,
+                    ctx: vec![Pred { class: cls_name.clone(), args: vec![rep] }],
+                    head: vec![head],
+                    dict: dict.clone(),
+                });
+                let d_name = self.fresh_name("gd");
+                self.out.push(TopBind {
+                    name: dict,
+                    body: Core::Lam(d_name.clone(), Box::new(Core::Var(d_name))),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Generated instances for `deriving` clauses; see `derive`.
     fn derive_instances(&mut self, dd: &DataDecl) -> TR<Vec<Decl>> {
         super::derive::derive_instances(self, dd)
     }
+}
+
+/// Classes whose parameter has kind `Type -> Type`, derived for a newtype's constructor.
+fn is_constructor_class(cls: &str) -> bool {
+    let short = super::types::unqualify(cls);
+    matches!(
+        short,
+        "Functor" | "Applicative" | "Monad" | "Foldable" | "Traversable" | "Alternative" | "MonadIO"
+            | "MonadFail" | "MonadPlus" | "MonadFix"
+    )
 }
 
 /// Splits an instance head `C t1 .. tn` into the class and argument types.
