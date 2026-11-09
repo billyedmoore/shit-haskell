@@ -4,6 +4,7 @@
 
 pub mod bigint;
 pub mod code;
+pub mod conc;
 pub mod prims;
 
 use std::cell::RefCell;
@@ -43,6 +44,8 @@ pub enum Value {
     Ref(Rc<RefCell<Cell>>),
     /// An immutable boxed vector (the cells are never reassigned after construction).
     Vec(Rc<RefCell<Vec<Cell>>>),
+    /// An `MVar`: empty, or holding a cell.
+    MVar(Rc<RefCell<Option<Cell>>>),
 }
 
 pub struct ConVal {
@@ -339,6 +342,7 @@ fn lit_matches(v: &Value, l: &Lit) -> bool {
 
 /// Runs `Main.main`, returning the process exit code.
 pub fn run_main(rt: &Runtime) -> i32 {
+    conc::gil_acquire();
     let Some(main_cell) = rt.global("Main.main") else {
         eprintln!("{}: The IO action ‘main’ is not defined in module ‘Main’", rt.prog_name);
         return 1;

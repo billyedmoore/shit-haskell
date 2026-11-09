@@ -2,6 +2,7 @@
 //! ones it needs; the Prelude wraps them with Haskell types.
 
 use std::io::{BufRead, Read, Write};
+use std::time::Duration;
 use std::rc::Rc;
 
 use super::bigint::BigInt;
@@ -292,6 +293,103 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             }
             _ => Err(RtError::Fail("internal: vecUpdate of a non-vector".into())),
         },
+        "newMVar" => Ok(io_result(Value::MVar(Rc::new(RefCell::new(None))))),
+        "takeMVar" | "readMVar" => {
+            let take = name == "takeMVar";
+            let mv = match rt.force(&args[0])? {
+                Value::MVar(m) => m,
+                _ => return Err(RtError::Fail("internal: takeMVar of a non-MVar".into())),
+            };
+            loop {
+                let current = mv.borrow().clone();
+                if let Some(cell) = current {
+                    if take {
+                        *mv.borrow_mut() = None;
+                    }
+                    let v = rt.force(&cell)?;
+                    return Ok(io_result(v));
+                }
+                if !super::conc::blocked_wait() {
+                    return Err(RtError::Error("thread blocked indefinitely in an MVar operation".into()));
+                }
+            }
+        }
+        "putMVar" => {
+            let mv = match rt.force(&args[0])? {
+                Value::MVar(m) => m,
+                _ => return Err(RtError::Fail("internal: putMVar of a non-MVar".into())),
+            };
+            loop {
+                if mv.borrow().is_none() {
+                    *mv.borrow_mut() = Some(args[1].clone());
+                    return Ok(io_result(unit_value()));
+                }
+                if !super::conc::blocked_wait() {
+                    return Err(RtError::Error("thread blocked indefinitely in an MVar operation".into()));
+                }
+            }
+        }
+        "tryTakeMVar" => {
+            let mv = match rt.force(&args[0])? {
+                Value::MVar(m) => m,
+                _ => return Err(RtError::Fail("internal: tryTakeMVar of a non-MVar".into())),
+            };
+            let current = mv.borrow_mut().take();
+            match current {
+                Some(cell) => {
+                    let v = rt.force(&cell)?;
+                    Ok(io_result(con_value("Base.Just", vec![v])))
+                }
+                None => Ok(io_result(con_value("Base.Nothing", vec![]))),
+            }
+        }
+        "forkThread" => {
+            // Runs an IO action on a new Haskell thread. The action receives the world token.
+            let action = args[0].clone();
+            let rt_ptr = super::conc::Locked(rt as *const Runtime);
+            let payload = super::conc::Locked(action);
+            let id = super::conc::next_thread_id();
+            super::conc::thread_started();
+            std::thread::Builder::new()
+                .stack_size(4 << 30)
+                .spawn(move || {
+                    let rt_ptr = rt_ptr;
+                    let payload = payload;
+                    super::conc::gil_acquire();
+                    super::conc::set_current(id);
+                    // SAFETY: the runtime is leaked and lives for the whole process.
+                    let rt: &Runtime = unsafe { &*rt_ptr.0 };
+                    let cell = payload.0;
+                    let outcome = rt.force(&cell).and_then(|io| match io {
+                        Value::Con(c) if c.name == "Base.IO" => {
+                            let run = rt.force(&c.args[0])?;
+                            let unit = Rc::new(RefCell::new(super::Thunk::Done(unit_value())));
+                            rt.apply(run, unit)
+                        }
+                        _ => Err(RtError::Fail("internal: forkIO of a non-IO action".into())),
+                    });
+                    if let Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) = outcome {
+                        flush_stdout();
+                        eprintln!("{}: {}", rt.prog_name, msg);
+                    }
+                    super::conc::thread_finished();
+                    super::conc::gil_release();
+                })
+                .expect("spawn Haskell thread");
+            Ok(io_result(Value::Int(id)))
+        }
+        "threadDelay" => {
+            let us = int(rt, &args[0])?.max(0) as u64;
+            super::conc::gil_release();
+            std::thread::sleep(Duration::from_micros(us));
+            super::conc::gil_acquire();
+            Ok(io_result(unit_value()))
+        }
+        "yieldThread" => {
+            super::conc::yield_now();
+            Ok(io_result(unit_value()))
+        }
+        "myThreadId" => Ok(io_result(Value::Int(super::conc::current_thread_id()))),
         "traceErr" => {
             let s = rt.force_string(&args[0])?;
             let _ = std::io::stderr().write_all(format!("{s}\n").as_bytes());
@@ -312,6 +410,9 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 _ => Err(RtError::Fail("internal: IO result".into())),
             }
         }
+        "floatFromDouble" => Ok(Value::Double((double(rt, &args[0])? as f32) as f64)),
+        "floatToDouble" => Ok(Value::Double(double(rt, &args[0])?)),
+        "floatShow" => Ok(string_value(&show_float(double(rt, &args[0])? as f32))),
         "doubleRead" => {
             let s = rt.force_string(&args[0])?;
             Ok(Value::Double(s.parse::<f64>().unwrap_or(0.0)))
@@ -461,6 +562,37 @@ fn bigint_from_f64(x: f64) -> BigInt {
     } else {
         v
     }
+}
+
+/// `show` for Float: the shortest digits that identify the single-precision value.
+pub fn show_float(x: f32) -> String {
+    if x.is_nan() || x.is_infinite() || x == 0.0 {
+        return show_double(x as f64);
+    }
+    // Rust prints the shortest round-trip digits for f32 in exponent form.
+    let s = format!("{:e}", x.abs());
+    let (mant, exp) = s.split_once('e').expect("exponent form");
+    let exp: i32 = exp.parse().expect("exponent");
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let sign = if x < 0.0 { "-" } else { "" };
+    let e = exp + 1;
+    let body = if (0..=7).contains(&e) && x.abs() >= 0.1 {
+        if e <= 0 {
+            format!("0.{}{}", "0".repeat((-e) as usize), digits)
+        } else {
+            let e = e as usize;
+            let (ip, fp) = if digits.len() > e {
+                (digits[..e].to_string(), digits[e..].to_string())
+            } else {
+                (format!("{}{}", digits, "0".repeat(e - digits.len())), String::new())
+            };
+            format!("{ip}.{}", if fp.is_empty() { "0".to_string() } else { fp })
+        }
+    } else {
+        let rest = if digits.len() > 1 { &digits[1..] } else { "0" };
+        format!("{}.{}e{}", &digits[..1], rest, e - 1)
+    };
+    format!("{sign}{body}")
 }
 
 /// `show` for Double, following GHC: shortest round-trip digits, fixed notation for

@@ -28,7 +28,7 @@ data Double
 data Char
 data World
 
-type Float = Double
+data Float
 type String = [Char]
 type FilePath = String
 type ShowS = String -> String
@@ -1338,6 +1338,11 @@ instance Read Double where
 
 foreign import prim "doubleRead" primDoubleRead :: String -> Double
 
+-- Single precision: values are doubles rounded to single precision after each operation.
+foreign import prim "floatFromDouble" primFloatFromDouble :: Double -> Float
+foreign import prim "floatToDouble" primFloatToDouble :: Float -> Double
+foreign import prim "floatShow" primFloatShow :: Float -> String
+
 lexDouble :: String -> [(String, String)]
 lexDouble s =
   let (sign, s1) = case s of
@@ -1417,6 +1422,69 @@ digitsPrefix :: String -> [(Integer, String)]
 digitsPrefix s = case span isDigitC s of
   ([], _) -> []
   (ds, rest) -> [(foldl (\acc d -> acc * 10 + primIntToInteger (ord d - 48)) 0 ds, rest)]
+
+-- ----- Float --------------------------------------------------------------------------
+
+floatOp :: (Double -> Double -> Double) -> Float -> Float -> Float
+floatOp f x y = primFloatFromDouble (f (primFloatToDouble x) (primFloatToDouble y))
+
+instance Eq Float where
+  x == y = primFloatToDouble x == primFloatToDouble y
+
+instance Ord Float where
+  x < y = primFloatToDouble x < primFloatToDouble y
+  x <= y = primFloatToDouble x <= primFloatToDouble y
+  x > y = primFloatToDouble y < primFloatToDouble x
+  x >= y = primFloatToDouble y <= primFloatToDouble x
+
+instance Show Float where
+  showsPrec p x r = if primFloatToDouble x < 0 && p > 6
+    then '(' : primFloatShow x ++ (')' : r)
+    else primFloatShow x ++ r
+
+instance Num Float where
+  x + y = floatOp (+) x y
+  x - y = floatOp (-) x y
+  x * y = floatOp (*) x y
+  negate x = primFloatFromDouble (negate (primFloatToDouble x))
+  abs x = primFloatFromDouble (abs (primFloatToDouble x))
+  signum x = primFloatFromDouble (signum (primFloatToDouble x))
+  fromInteger n = primFloatFromDouble (fromInteger n)
+
+instance Real Float where
+  toRational x = toRational (primFloatToDouble x)
+
+instance Fractional Float where
+  x / y = floatOp (/) x y
+  fromRational r = primFloatFromDouble (fromRational r)
+
+instance Floating Float where
+  pi = primFloatFromDouble pi
+  exp x = primFloatFromDouble (exp (primFloatToDouble x))
+  log x = primFloatFromDouble (log (primFloatToDouble x))
+  sqrt x = primFloatFromDouble (sqrt (primFloatToDouble x))
+  sin x = primFloatFromDouble (sin (primFloatToDouble x))
+  cos x = primFloatFromDouble (cos (primFloatToDouble x))
+  tan x = primFloatFromDouble (tan (primFloatToDouble x))
+  x ** y = floatOp (**) x y
+
+instance RealFrac Float where
+  properFraction x = let (n, f) = properFraction (primFloatToDouble x) in (n, primFloatFromDouble f)
+  truncate x = truncate (primFloatToDouble x)
+  round x = round (primFloatToDouble x)
+  floor x = floor (primFloatToDouble x)
+  ceiling x = ceiling (primFloatToDouble x)
+
+instance Enum Float where
+  toEnum n = primFloatFromDouble (primIntToDouble n)
+  fromEnum x = fromEnum (primFloatToDouble x)
+  enumFrom x = map primFloatFromDouble (enumFrom (primFloatToDouble x))
+  enumFromTo x y = map primFloatFromDouble (enumFromTo (primFloatToDouble x) (primFloatToDouble y))
+  enumFromThen x y = map primFloatFromDouble (enumFromThen (primFloatToDouble x) (primFloatToDouble y))
+  enumFromThenTo x y z = map primFloatFromDouble (enumFromThenTo (primFloatToDouble x) (primFloatToDouble y) (primFloatToDouble z))
+
+instance Read Float where
+  readsPrec d s = [(primFloatFromDouble x, r) | (x, r) <- readsPrec d s]
 
 -- ----- Enum Double -------------------------------------------------------------------
 
