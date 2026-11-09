@@ -16,3 +16,6 @@ instance Applicative Identity where
 
 instance Monad Identity where
   Identity x >>= k = k x
+
+instance MonadFix Identity where
+  mfix f = Identity (let a = runIdentity (f a) in a)

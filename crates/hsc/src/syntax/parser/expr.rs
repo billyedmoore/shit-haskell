@@ -169,6 +169,18 @@ impl Parser {
                 let stmts = self.block(|p| p.stmt())?;
                 Ok(Expr::Do(stmts, loc))
             }
+            Tok::VarId(s) if s == "mdo" && self.real() && self.exts.is_on("RecursiveDo") => {
+                self.bump();
+                let mut stmts = self.block(|p| p.stmt())?;
+                // `mdo { ss; e }` is `do { rec { ss }; e }`.
+                let last = stmts.pop();
+                let mut out = Vec::new();
+                if !stmts.is_empty() {
+                    out.push(rec_stmt(stmts, loc));
+                }
+                out.extend(last);
+                Ok(Expr::Do(out, loc))
+            }
             _ => self.fexp(),
         }
     }
@@ -603,6 +615,11 @@ impl Parser {
     /// A statement in `do`, a guard, or a comprehension qualifier.
     pub(super) fn stmt(&mut self) -> PResult<Stmt> {
         let loc = self.loc();
+        if self.at_varid("rec") && self.exts.is_on("RecursiveDo") {
+            self.bump();
+            let stmts = self.block(|p| p.stmt())?;
+            return Ok(rec_stmt(stmts, loc));
+        }
         if self.at_kw(Kw::Let) {
             self.bump();
             let decls = group_binds(self.block(|p| p.local_decl())?);
@@ -663,4 +680,72 @@ fn collapse(mut items: Vec<OpItem>, loc: Loc) -> Expr {
         }
     }
     Expr::OpChain(items, loc)
+}
+
+/// The variables a statement list binds, in order of first binding.
+fn stmt_binders(stmts: &[Stmt]) -> Vec<String> {
+    use crate::rename::pat_vars;
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |name: String, out: &mut Vec<String>| {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    for s in stmts {
+        match s {
+            Stmt::Bind { pat, .. } => {
+                for (n, _) in pat_vars(pat) {
+                    add(n, &mut out);
+                }
+            }
+            Stmt::Let { decls, .. } => {
+                for d in decls {
+                    match d {
+                        Decl::Fun { name, .. } => add(name.clone(), &mut out),
+                        Decl::PatBind { pat, .. } => {
+                            for (n, _) in pat_vars(pat) {
+                                add(n, &mut out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Stmt::Expr { .. } => {}
+        }
+    }
+    out
+}
+
+/// `rec { ss }` binds the variables of `ss` through a fixed point:
+/// `(v1, .., vn) <- mfix (\ ~(v1, .., vn) -> do { ss; return (v1, .., vn) })`.
+fn rec_stmt(stmts: Vec<Stmt>, loc: Loc) -> Stmt {
+    let vars = stmt_binders(&stmts);
+    if vars.is_empty() {
+        return Stmt::Expr { expr: Expr::Do(stmts, loc), loc };
+    }
+    let base = |name: &str| Expr::Var(QName { qual: Some("%Base".into()), name: name.into() }, loc);
+    let (pat, tuple) = if vars.len() == 1 {
+        (Pat::Var(vars[0].clone(), loc), Expr::Var(QName::unqual(vars[0].clone()), loc))
+    } else {
+        (
+            Pat::Tuple(vars.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc),
+            Expr::Tuple(vars.iter().map(|v| Some(Expr::Var(QName::unqual(v.clone()), loc))).collect(), loc),
+        )
+    };
+    let mut body = stmts;
+    body.push(Stmt::Expr {
+        expr: Expr::App(Box::new(base("return")), Box::new(tuple)),
+        loc,
+    });
+    let lam = Expr::Lam(
+        vec![Pat::Lazy(Box::new(pat.clone()), loc)],
+        Box::new(Expr::Do(body, loc)),
+        loc,
+    );
+    Stmt::Bind {
+        pat,
+        expr: Expr::App(Box::new(base("mfix")), Box::new(lam)),
+        loc,
+    }
 }

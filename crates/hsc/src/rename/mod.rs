@@ -437,6 +437,14 @@ impl<'a> Renamer<'a> {
 
     /// Resolves a variable or constructor in the value namespace.
     fn value_ref(&mut self, q: &QName, loc: Loc, con: bool) -> RR<QName> {
+        // `%Base.x` names a Base global directly, whatever the module imports (used by
+        // desugarings the parser introduces).
+        if q.qual.as_deref() == Some("%Base") {
+            return Ok(QName {
+                qual: Some(BASE.to_string()),
+                name: q.name.clone(),
+            });
+        }
         if q.qual.is_none() {
             if con && is_builtin_con(&q.name) {
                 return Ok(builtin(&q.name, loc));

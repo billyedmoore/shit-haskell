@@ -28,6 +28,9 @@ data Double
 data Char
 data World
 
+-- A mutable reference cell (the runtime value behind IORef).
+data Ref a
+
 data Float
 type String = [Char]
 type FilePath = String
@@ -819,6 +822,50 @@ class Applicative m => Monad m where
 
 class Monad m => MonadFail m where
   fail :: String -> m a
+
+-- Monads with a fixed point operator; `rec` blocks and `mdo` are desugared to `mfix`.
+class Monad m => MonadFix m where
+  mfix :: (a -> m a) -> m a
+
+foreign import prim "newRef" primFixNewRef :: a -> World -> IORes (Ref a)
+foreign import prim "readRef" primFixReadRef :: Ref a -> World -> IORes a
+foreign import prim "writeRef" primFixWriteRef :: Ref a -> a -> World -> IORes ()
+foreign import prim "unsafeRunIO" primFixRunIO :: IO a -> a
+
+-- The result is read lazily from a cell that is filled once the action has finished.
+fixIO :: (a -> IO a) -> IO a
+fixIO k = IO (\w -> case primFixNewRef (error "cyclic evaluation in fixIO") w of
+  IORes ref ->
+    let ans = primFixRunIO (IO (primFixReadRef ref))
+    in case k ans of
+         IO m -> case m w of
+           IORes result -> case primFixWriteRef ref result w of
+             IORes _ -> IORes result)
+
+instance MonadFix IO where
+  mfix = fixIO
+
+instance MonadFix Maybe where
+  mfix f = let a = f (unJustFix a) in a
+    where
+      unJustFix (Just x) = x
+      unJustFix Nothing = error "mfix Maybe: Nothing"
+
+instance MonadFix (Either e) where
+  mfix f = let a = f (unRightFix a) in a
+    where
+      unRightFix (Right x) = x
+      unRightFix (Left _) = error "mfix Either: Left"
+
+instance MonadFix [] where
+  mfix f = case (let r = f (headFix r) in r) of
+    [] -> []
+    (x : _) -> x : mfix (tailFix . f)
+    where
+      headFix (x : _) = x
+      headFix [] = error "mfix []: empty list"
+      tailFix (_ : xs) = xs
+      tailFix [] = []
 
 (<$>) :: Functor f => (a -> b) -> f a -> f b
 f <$> x = fmap f x

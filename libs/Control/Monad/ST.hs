@@ -29,3 +29,6 @@ stToIO (ST m) = m
 
 stFromIO :: IO a -> ST s a
 stFromIO m = ST m
+
+instance MonadFix (ST s) where
+  mfix f = ST (fixIO (\a -> unST (f a)))

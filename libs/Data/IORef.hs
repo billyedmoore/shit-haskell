@@ -3,7 +3,6 @@ module Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef, modifyIO
 import Base
 
 data IORef a = IORef (Ref a)
-data Ref a
 
 foreign import prim "newRef" primNewRef :: a -> World -> IORes (Ref a)
 foreign import prim "readRef" primReadRef :: Ref a -> World -> IORes a
