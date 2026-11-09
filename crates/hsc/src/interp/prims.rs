@@ -505,6 +505,41 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             }
             _ => Err(RtError::Fail("internal: writeRef of a non-reference".into())),
         },
+        "vecNewIO" => {
+            // A mutable vector of `n` slots, all holding the same (lazy) element.
+            let n = int(rt, &args[0])?.max(0) as usize;
+            Ok(io_result(Value::Vec(Rc::new(RefCell::new(vec![args[1].clone(); n])))))
+        }
+        "vecReadIO" => match rt.force(&args[0])? {
+            Value::Vec(v) => {
+                let i = int(rt, &args[1])?;
+                let cell = v.borrow().get(i as usize).cloned();
+                match cell {
+                    Some(c) => Ok(io_result(rt.force(&c)?)),
+                    None => Err(RtError::Error("array index out of range".into())),
+                }
+            }
+            _ => Err(RtError::Fail("internal: readArray of a non-array".into())),
+        },
+        "vecWriteIO" => match rt.force(&args[0])? {
+            Value::Vec(v) => {
+                let i = int(rt, &args[1])?;
+                let mut slots = v.borrow_mut();
+                if i < 0 || i as usize >= slots.len() {
+                    return Err(RtError::Error("array index out of range".into()));
+                }
+                slots[i as usize] = args[2].clone();
+                Ok(io_result(unit_value()))
+            }
+            _ => Err(RtError::Fail("internal: writeArray of a non-array".into())),
+        },
+        "vecCopyIO" => match rt.force(&args[0])? {
+            Value::Vec(v) => {
+                let copy = v.borrow().clone();
+                Ok(io_result(Value::Vec(Rc::new(RefCell::new(copy)))))
+            }
+            _ => Err(RtError::Fail("internal: copy of a non-array".into())),
+        },
         "flushStdout" => {
             flush_stdout();
             Ok(io_result(unit_value()))
