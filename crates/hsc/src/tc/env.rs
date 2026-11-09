@@ -46,6 +46,8 @@ pub struct ClassInfo {
     pub defaults: HashMap<String, String>,
     /// Constructor of the dictionary record.
     pub dict_con: String,
+    /// Functional dependencies, as parameter positions: determining and determined.
+    pub fundeps: Vec<(Vec<usize>, Vec<usize>)>,
 }
 
 impl ClassInfo {

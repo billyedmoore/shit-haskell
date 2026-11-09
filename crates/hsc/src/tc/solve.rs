@@ -1,5 +1,6 @@
 //! Constraint solving: givens (with superclasses), instances, and defaulting.
 
+use super::env::InstInfo;
 use super::types::{subst_gen, Pred, Ty};
 use super::{select_field, Checker, Given, Wanted, TR};
 use crate::core::Core;
@@ -26,6 +27,7 @@ impl Checker {
         let mut binds = Vec::new();
         let mut residual = Vec::new();
         while let Some(w) = work.pop() {
+            self.improve(&w.pred)?;
             let pred = self.metas_zonk_pred(&w.pred);
             if let Some(ev) = self.find_given(&pred) {
                 binds.push((w.ev.clone(), ev));
@@ -59,6 +61,36 @@ impl Checker {
             }
         }
         Ok((binds, residual))
+    }
+
+    /// Functional-dependency improvement: when the determining arguments of a predicate match an
+    /// instance, the determined arguments are unified with the instance's.
+    pub fn improve(&mut self, p: &Pred) -> TR<()> {
+        let fundeps = match self.class(&p.class) {
+            Some(info) if !info.fundeps.is_empty() => info.fundeps.clone(),
+            _ => return Ok(()),
+        };
+        for (from, to) in fundeps {
+            let insts: Vec<InstInfo> = self.env.instances.iter().filter(|i| i.class == p.class).cloned().collect();
+            for inst in insts {
+                if inst.head.len() != p.args.len() {
+                    continue;
+                }
+                let mut sub: Vec<Option<Ty>> = vec![None; inst.nvars as usize];
+                let zonked: Vec<Ty> = p.args.iter().map(|t| self.metas.zonk(t)).collect();
+                let ok = from.iter().all(|&i| self.match_ty(&inst.head[i], &zonked[i], &mut sub));
+                if !ok {
+                    continue;
+                }
+                let args: Vec<Ty> = sub.into_iter().map(|x| x.unwrap_or_else(|| self.meta())).collect();
+                for &j in &to {
+                    let target = subst_gen(&inst.head[j], &args);
+                    self.unify_at(&p.args[j], &target)?;
+                }
+                break;
+            }
+        }
+        Ok(())
     }
 
     pub fn metas_zonk_pred(&self, p: &Pred) -> Pred {

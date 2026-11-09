@@ -17,7 +17,12 @@ impl Checker {
     /// the caller decides how they are quantified.
     pub fn convert_type(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Ty> {
         Ok(match t {
-            Type::Var(name, _) => Ty::Gen(tvar_index(tvs, name)),
+            Type::Var(name, _) => {
+                if let Some((_, t)) = self.scoped.iter().rev().find(|(n, _)| n == name) {
+                    return Ok(t.clone());
+                }
+                Ty::Gen(tvar_index(tvs, name))
+            }
             Type::Con(q, _) => self.apply_synonym(&global_tycon_name(q), &[], tvs)?,
             Type::App(..) => {
                 // Collect the application spine so that synonyms see all their arguments.

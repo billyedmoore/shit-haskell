@@ -68,6 +68,10 @@ pub struct Checker {
     pub source_name: String,
     /// Kinds of type constructors.
     pub kinds: kinds::KindEnv,
+    /// Type variables in scope from enclosing signatures with an explicit `forall`.
+    pub scoped: Vec<(String, Ty)>,
+    /// Bindings whose signature has an explicit `forall` (their variables scope over the body).
+    pub explicit_sigs: std::collections::HashSet<String>,
 }
 
 /// The module name of built-in syntax.
@@ -92,6 +96,8 @@ impl Checker {
             user_module: false,
             source_name: String::new(),
             kinds: kinds::KindEnv::default(),
+            scoped: Vec::new(),
+            explicit_sigs: std::collections::HashSet::new(),
         };
         c.install_builtins();
         c

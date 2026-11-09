@@ -44,7 +44,11 @@ impl Checker {
             if let Decl::Sig { names, ty, loc } = d {
                 self.loc = *loc;
                 let scheme = self.sig_scheme(ty, &[])?;
+                let explicit = matches!(ty, crate::syntax::ast::Type::Forall(..));
                 for n in names {
+                    if explicit {
+                        self.explicit_sigs.insert(if top { format!("{module}.{n}") } else { n.clone() });
+                    }
                     sigs.insert(n.clone(), scheme.clone());
                 }
             }
@@ -321,8 +325,16 @@ impl Checker {
                 ev: Core::Var(d.clone()),
             });
         }
+        // With an explicit forall, the signature's variables scope over the body.
+        let scope_mark = self.scoped.len();
+        if self.explicit_sigs.contains(key) {
+            for (n, sk) in scheme.names.iter().zip(&skolems) {
+                self.scoped.push((n.clone(), sk.clone()));
+            }
+        }
         let outer_wanted = std::mem::take(&mut self.wanted);
         let body = self.fun_clauses(clauses, &ty, key)?;
+        self.scoped.truncate(scope_mark);
         let wanted = std::mem::replace(&mut self.wanted, outer_wanted);
         self.level = outer_level;
 

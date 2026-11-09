@@ -322,6 +322,17 @@ impl Checker {
             });
             self.env.values.insert(mkey.clone(), scheme.clone());
         }
+        let position = |n: &str| class_vars.iter().position(|v| v == n);
+        let fundeps: Vec<(Vec<usize>, Vec<usize>)> = cd
+            .fundeps
+            .iter()
+            .map(|(from, to)| {
+                (
+                    from.iter().filter_map(|n| position(n)).collect(),
+                    to.iter().filter_map(|n| position(n)).collect(),
+                )
+            })
+            .collect();
         let info = ClassInfo {
             name: class_key.clone(),
             nparams,
@@ -329,6 +340,7 @@ impl Checker {
             methods,
             defaults,
             dict_con,
+            fundeps,
         };
         self.add_class_info(info);
         Ok(())

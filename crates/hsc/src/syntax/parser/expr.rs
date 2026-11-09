@@ -221,8 +221,28 @@ impl Parser {
 
     fn aexp_postfix(&mut self) -> PResult<Expr> {
         let mut e = self.aexp()?;
-        while self.at_special('{') {
-            e = self.record_braces(e)?;
+        loop {
+            if self.at_special('{') {
+                e = self.record_braces(e)?;
+            } else if self.exts.is_on("OverloadedRecordDot")
+                && self.real()
+                && self.at_varsym(".")
+                && !self.raw().space_before
+                && !self.raw().space_after
+                && matches!(self.peek_raw(1), Tok::VarId(_))
+            {
+                // `e.field` with no spaces: the field selector applied to `e`.
+                let loc = self.loc();
+                self.bump();
+                let field = match self.tok().clone() {
+                    Tok::VarId(f) => f,
+                    _ => return self.unexpected(),
+                };
+                self.bump();
+                e = Expr::App(Box::new(Expr::Var(QName::unqual(field), loc)), Box::new(e));
+            } else {
+                break;
+            }
         }
         Ok(e)
     }
@@ -355,6 +375,22 @@ impl Parser {
     /// Parenthesised expressions: unit, operators, sections, tuples, plain parens.
     fn paren_expr(&mut self, loc: Loc) -> PResult<Expr> {
         self.bump();
+        // OverloadedRecordDot: `(.field)` is the field selector.
+        if self.exts.is_on("OverloadedRecordDot")
+            && self.at_varsym(".")
+            && !self.raw().space_after
+            && matches!(self.peek_raw(1), Tok::VarId(_))
+            && *self.peek_raw(2) == Tok::Special(')')
+        {
+            self.bump();
+            let field = match self.tok().clone() {
+                Tok::VarId(f) => f,
+                _ => return self.unexpected(),
+            };
+            self.bump();
+            self.bump();
+            return Ok(Expr::Var(QName::unqual(field), loc));
+        }
         if self.at_special(')') {
             self.bump();
             return Ok(Expr::Con(QName::unqual("()"), loc));
