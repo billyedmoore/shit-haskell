@@ -81,10 +81,10 @@ impl Checker {
             Expr::Con(q, loc) => {
                 self.loc = *loc;
                 let key = qkey(q);
-                if is_boxing_con(&key) {
+                if let Some((prim, boxed)) = boxing_types(&key) {
                     // I#, D#, C#: boxing is the identity on the runtime representation.
-                    let a = self.meta();
-                    return Ok((Core::Lam("box%".into(), Box::new(Core::Var("box%".into()))), Ty::fun(a.clone(), a)));
+                    let f = Core::Lam("box%".into(), Box::new(Core::Var("box%".into())));
+                    return Ok((f, Ty::fun(Ty::con(prim), Ty::con(boxed))));
                 }
                 let scheme = self.lookup_var(&key).ok_or_else(|| super::TcError {
                     loc: *loc,
@@ -478,8 +478,9 @@ impl Checker {
             Pat::Con(q, args, loc) => {
                 self.loc = *loc;
                 let key = qkey(q);
-                if is_boxing_con(&key) && args.len() == 1 {
-                    return self.check_pat(&args[0], ty);
+                if let (Some((prim, boxed)), 1) = (boxing_types(&key), args.len()) {
+                    self.unify_at(ty, &Ty::con(boxed))?;
+                    return self.check_pat(&args[0], &Ty::con(prim));
                 }
                 let (arg_tys, dict_pats) = self.con_pattern_types(&key, args.len(), ty)?;
                 let newtype = self.env.datacons.get(&key).is_some_and(|d| d.newtype);
@@ -674,7 +675,7 @@ impl Checker {
             }
         };
         // Equality: `==` from an Eq dictionary for the scrutinee type.
-        let (eq, eq_fty) = self.lookup_inst("Base.==")?;
+        let (eq, eq_fty) = self.lookup_inst("GHC.Classes.==")?;
         let (eq_arg, _) = split_fun_ty(&eq_fty);
         self.unify_at(&eq_arg, &eq_ty)?;
         let _ = num_needed;
@@ -996,6 +997,18 @@ impl Checker {
 }
 
 /// The boxing constructors of unboxed types (`I#` and friends), which are identities here.
+/// The unboxed and boxed types of a boxing constructor such as `I#` (`Int#`, `Int`).
+pub fn boxing_types(key: &str) -> Option<(&'static str, &'static str)> {
+    Some(match key.rsplit_once('.').map_or(key, |(_, n)| n) {
+        "I#" if key.ends_with("I#") => ("GHC.Prim.Int#", "GHC.Types.Int"),
+        "W#" if key.ends_with("W#") => ("GHC.Prim.Word#", "GHC.Types.Word"),
+        "D#" if key.ends_with("D#") => ("GHC.Prim.Double#", "GHC.Types.Double"),
+        "F#" if key.ends_with("F#") => ("GHC.Prim.Float#", "GHC.Types.Float"),
+        "C#" if key.ends_with("C#") => ("GHC.Prim.Char#", "GHC.Types.Char"),
+        _ => return None,
+    })
+}
+
 pub fn is_boxing_con(key: &str) -> bool {
     matches!(
         key,

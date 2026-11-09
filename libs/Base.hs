@@ -2,24 +2,22 @@
 -- The defining module of the Prelude's names. Written against the primitive operations
 -- implemented by the runtime; `Prelude` re-exports the standard names from here.
 module Base (
-    module Base, module GHC.Prim,
+    module Base, module GHC.Prim, module GHC.Classes,
     Bool(..), Char(..), Int(..), Word(..), Float(..), Double(..), Ordering(..), IO(..), isTrue#
   ) where
 
 import GHC.Prim
 import GHC.Types
+import GHC.Classes
 
 infixr 9  .
 infixr 8  ^
 infixl 7  *, /, `quot`, `rem`, `div`, `mod`
 infixl 6  +, -
 infixr 5  ++
-infix  4  ==, /=, <, <=, >=, >
 infixl 4  <$>, <$
 infixl 1  >>=, >>
 infixr 1  =<<
-infixr 3  &&
-infixr 2  ||
 infixl 9  !!
 infixr 0  $, $!
 infixr 6  <>
@@ -162,55 +160,12 @@ until p f x = if p x then x else until p f (f x)
 
 -- ----- Bool ----------------------------------------------------------------------
 
-(&&) :: Bool -> Bool -> Bool
-True && x = x
-False && _ = False
-
-(||) :: Bool -> Bool -> Bool
-True || _ = True
-False || x = x
-
-not :: Bool -> Bool
-not True = False
-not False = True
 
 bool :: a -> a -> Bool -> a
 bool f _ False = f
 bool _ t True = t
 
 -- ----- Eq and Ord ------------------------------------------------------------------
-
-class Eq a where
-  (==) :: a -> a -> Bool
-  (/=) :: a -> a -> Bool
-  x /= y = not (x == y)
-  x == y = not (x /= y)
-
-class Eq a => Ord a where
-  compare :: a -> a -> Ordering
-  (<) :: a -> a -> Bool
-  (<=) :: a -> a -> Bool
-  (>) :: a -> a -> Bool
-  (>=) :: a -> a -> Bool
-  max :: a -> a -> a
-  min :: a -> a -> a
-  compare x y = if x == y then EQ else if x <= y then LT else GT
-  x < y = case compare x y of { LT -> True; _ -> False }
-  x <= y = case compare x y of { GT -> False; _ -> True }
-  x > y = case compare x y of { GT -> True; _ -> False }
-  x >= y = case compare x y of { LT -> False; _ -> True }
-  max x y = if x <= y then y else x
-  min x y = if x <= y then x else y
-
-instance Eq Int where
-  x == y = primIntEq x y
-
-instance Ord Int where
-  x < y = primIntLt x y
-  x <= y = primIntLe x y
-  x > y = primIntLt y x
-  x >= y = primIntLe y x
-  compare x y = if primIntEq x y then EQ else if primIntLt x y then LT else GT
 
 instance Eq Integer where
   x == y = primIntegerEq x y
@@ -221,58 +176,6 @@ instance Ord Integer where
   x > y = primIntegerLt y x
   x >= y = primIntegerLe y x
   compare x y = if primIntegerEq x y then EQ else if primIntegerLt x y then LT else GT
-
-instance Eq Double where
-  x == y = primDoubleEq x y
-
-instance Ord Double where
-  x < y = primDoubleLt x y
-  x <= y = primDoubleLe x y
-  x > y = primDoubleLt y x
-  x >= y = primDoubleLe y x
-
-instance Eq Char where
-  x == y = primCharEq x y
-
-instance Ord Char where
-  x < y = primCharLt x y
-  x <= y = primCharLe x y
-  x > y = primCharLt y x
-  x >= y = primCharLe y x
-  compare x y = if primCharEq x y then EQ else if primCharLt x y then LT else GT
-
-instance Eq Bool where
-  True == True = True
-  False == False = True
-  _ == _ = False
-
-instance Ord Bool where
-  compare False True = LT
-  compare True False = GT
-  compare _ _ = EQ
-
-instance Eq Ordering where
-  LT == LT = True
-  EQ == EQ = True
-  GT == GT = True
-  _ == _ = False
-
-instance Ord Ordering where
-  compare x y = compareInt (ordTag x) (ordTag y)
-
-ordTag :: Ordering -> Int
-ordTag LT = 0
-ordTag EQ = 1
-ordTag GT = 2
-
-compareInt :: Int -> Int -> Ordering
-compareInt x y = if primIntEq x y then EQ else if primIntLt x y then LT else GT
-
-instance Eq () where
-  _ == _ = True
-
-instance Ord () where
-  compare _ _ = EQ
 
 instance Eq a => Eq (Maybe a) where
   Nothing == Nothing = True
@@ -401,6 +304,20 @@ instance Enum Bool where
   fromEnum True = 1
   enumFrom x = enumFromTo x True
   enumFromTo x y = map toEnum (enumFromToInt (fromEnum x) (fromEnum y))
+
+ordTag :: Ordering -> Int
+ordTag LT = 0
+ordTag EQ = 1
+ordTag GT = 2
+
+compareInt :: Int -> Int -> Ordering
+compareInt x y = if primIntEq x y then EQ else if primIntLt x y then LT else GT
+
+instance Eq () where
+  _ == _ = True
+
+instance Ord () where
+  compare _ _ = EQ
 
 instance Enum Ordering where
   toEnum n = if n == 0 then LT else if n == 1 then EQ else GT

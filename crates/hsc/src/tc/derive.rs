@@ -16,6 +16,9 @@ fn defining_module(name: &str) -> &'static str {
         "True" | "False" | "Bool" | "Char" | "Int" | "Word" | "Float" | "Double" | "Ordering" | "LT" | "EQ" | "GT" => {
             "GHC.Types"
         }
+        "Eq" | "Ord" | "==" | "/=" | "<" | "<=" | ">" | ">=" | "compare" | "max" | "min" | "&&" | "||" | "not" => {
+            "GHC.Classes"
+        }
         _ => BASE,
     }
 }
