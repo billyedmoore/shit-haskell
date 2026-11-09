@@ -262,7 +262,14 @@ fn derive_eq(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
 }
 
 /// The constructor index of an expression, as an `Int` expression.
+/// The constructor index of a value, as a boxed `Int`.
 fn tag_of(dd: &DataDecl, module: &str, e: Expr, loc: Loc) -> Expr {
+    let boxed = Expr::Con(QName { qual: Some("GHC.Types".into()), name: "I#".into() }, loc);
+    app(boxed, vec![tag_of_prim(dd, module, e, loc)])
+}
+
+/// The constructor index of a value, as an `Int#`.
+fn tag_of_prim(dd: &DataDecl, module: &str, e: Expr, loc: Loc) -> Expr {
     let alts: Vec<Alt> = dd
         .cons
         .iter()
@@ -342,8 +349,8 @@ fn derive_ord(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
                         body: Body::Plain(app(
                             base_var("compareInt#", loc),
                             vec![
-                                tag_of(dd, &module, local(&x, loc), loc),
-                                tag_of(dd, &module, local(&y, loc), loc),
+                                tag_of_prim(dd, &module, local(&x, loc), loc),
+                                tag_of_prim(dd, &module, local(&y, loc), loc),
                             ],
                         )),
                         wheres: Vec::new(),
