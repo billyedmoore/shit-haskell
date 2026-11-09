@@ -81,6 +81,11 @@ impl Checker {
             Expr::Con(q, loc) => {
                 self.loc = *loc;
                 let key = qkey(q);
+                if is_boxing_con(&key) {
+                    // I#, D#, C#: boxing is the identity on the runtime representation.
+                    let a = self.meta();
+                    return Ok((Core::Lam("box%".into(), Box::new(Core::Var("box%".into()))), Ty::fun(a.clone(), a)));
+                }
                 let scheme = self.lookup_var(&key).ok_or_else(|| super::TcError {
                     loc: *loc,
                     msg: format!("Data constructor not in scope: {key}"),
@@ -417,6 +422,9 @@ impl Checker {
             Pat::Con(q, args, loc) => {
                 self.loc = *loc;
                 let key = qkey(q);
+                if is_boxing_con(&key) && args.len() == 1 {
+                    return self.check_pat(&args[0], ty);
+                }
                 let (arg_tys, dict_pats) = self.con_pattern_types(&key, args.len(), ty)?;
                 let newtype = self.env.datacons.get(&key).is_some_and(|d| d.newtype);
                 let mut subs = dict_pats;
@@ -914,6 +922,11 @@ impl Checker {
         self.infer_binds(decls, false)
     }
 
+}
+
+/// The boxing constructors of unboxed types (`I#` and friends), which are identities here.
+pub fn is_boxing_con(key: &str) -> bool {
+    matches!(key, "GHC.Exts.I#" | "GHC.Exts.D#" | "GHC.Exts.C#" | "GHC.Exts.W#")
 }
 
 /// Splits a function type, assuming it is one.

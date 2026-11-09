@@ -342,7 +342,11 @@ impl Lexer {
     fn lex_name(&mut self) -> Result<Tok, LexError> {
         let mut quals: Vec<String> = Vec::new();
         loop {
-            let word = self.take_while(is_ident_char);
+            let mut word = self.take_while(is_ident_char);
+            // MagicHash: names may end in one or more '#'.
+            while self.peek(0) == Some('#') && !self.peek(1).is_some_and(is_symbol) {
+                word.push(self.bump());
+            }
             let upper = word.chars().next().is_some_and(|c| c.is_uppercase());
             if upper && self.peek(0) == Some('.') {
                 match self.peek(1) {
@@ -424,6 +428,13 @@ impl Lexer {
         self.take_while(|c| c.is_ascii_digit() || c == '_')
     }
 
+    /// Skips the MagicHash suffix of a literal (`3#`, `3##`, `'c'#`, `"s"#`).
+    fn skip_hashes(&mut self) {
+        while self.peek(0) == Some('#') && !self.peek(1).is_some_and(is_symbol) {
+            self.bump();
+        }
+    }
+
     fn lex_number(&mut self) -> Result<Tok, LexError> {
         if self.peek(0) == Some('0') {
             let radix = match (self.peek(1), self.peek(2)) {
@@ -463,6 +474,7 @@ impl Lexer {
                 is_float = true;
             }
         }
+        self.skip_hashes();
         let clean: String = text.chars().filter(|c| *c != '_').collect();
         Ok(if is_float {
             Tok::Float(clean)
@@ -502,6 +514,7 @@ impl Lexer {
                 Some(_) => out.push(self.bump()),
             }
         }
+        self.skip_hashes();
         Ok(Tok::Str(out))
     }
 
@@ -520,6 +533,7 @@ impl Lexer {
         };
         if self.peek(0) == Some('\'') {
             self.bump();
+            self.skip_hashes();
             Ok(Tok::Char(c))
         } else {
             Err(self.error("lexical error in character literal"))

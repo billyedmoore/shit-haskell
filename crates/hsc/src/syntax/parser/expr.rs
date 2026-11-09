@@ -62,6 +62,10 @@ impl Parser {
                 if s == "!" && self.is_prefix_occurrence() {
                     return None;
                 }
+                // `#)` closes an unboxed tuple.
+                if s == "#" && *self.peek_raw(1) == Tok::Special(')') {
+                    return None;
+                }
                 QName::unqual(s)
             }
             Tok::ConSym(s) => QName::unqual(s),
@@ -375,6 +379,22 @@ impl Parser {
     /// Parenthesised expressions: unit, operators, sections, tuples, plain parens.
     fn paren_expr(&mut self, loc: Loc) -> PResult<Expr> {
         self.bump();
+        // UnboxedTuples: `(# a, b #)` is an ordinary tuple here.
+        if self.at_varsym("#") && self.raw().space_after {
+            self.bump();
+            if self.at_varsym("#") {
+                self.bump();
+                self.expect_special(')')?;
+                return Ok(Expr::Con(QName::unqual("()"), loc));
+            }
+            let first = self.expr()?;
+            if self.at_varsym("#") {
+                self.bump();
+                self.expect_special(')')?;
+                return Ok(first);
+            }
+            return self.unboxed_tuple_rest(vec![Some(first)], loc);
+        }
         // OverloadedRecordDot: `(.field)` is the field selector.
         if self.exts.is_on("OverloadedRecordDot")
             && self.at_varsym(".")
@@ -481,6 +501,20 @@ impl Parser {
             Tok::Special('`') => 3,
             _ => 1,
         }
+    }
+
+    /// Elements of an unboxed tuple after the first, up to `#)`.
+    fn unboxed_tuple_rest(&mut self, mut elems: Vec<Option<Expr>>, loc: Loc) -> PResult<Expr> {
+        while self.at_special(',') {
+            self.bump();
+            elems.push(Some(self.expr()?));
+        }
+        if !self.at_varsym("#") {
+            return self.unexpected();
+        }
+        self.bump();
+        self.expect_special(')')?;
+        Ok(Expr::Tuple(elems, loc))
     }
 
     /// Elements of a tuple after the first; `elems` holds what has been read so far.

@@ -94,7 +94,7 @@ impl Parser {
                 qual: Some(m),
                 name: s,
             },
-            Tok::VarSym(s) if s != "!" && s != "." && s != "*" => QName::unqual(s),
+            Tok::VarSym(s) if s != "!" && s != "." && s != "*" && s != "#" => QName::unqual(s),
             Tok::Res(ROp::Tilde) => QName::unqual("~"),
             Tok::Special('`') => {
                 let name = match self.peek_raw(1).clone() {
@@ -147,6 +147,30 @@ impl Parser {
             }
             Tok::Special('(') => {
                 self.bump();
+                // UnboxedTuples: `(# t1, t2 #)` is an ordinary tuple type here.
+                if self.at_varsym("#") && self.raw().space_after {
+                    self.bump();
+                    if self.at_varsym("#") {
+                        self.bump();
+                        self.expect_special(')')?;
+                        return Ok(Type::Con(QName::unqual("()"), loc));
+                    }
+                    let mut elems = vec![self.sigtype()?];
+                    while self.at_special(',') {
+                        self.bump();
+                        elems.push(self.sigtype()?);
+                    }
+                    if !self.at_varsym("#") {
+                        return self.unexpected();
+                    }
+                    self.bump();
+                    self.expect_special(')')?;
+                    return Ok(if elems.len() == 1 {
+                        elems.pop().expect("one element")
+                    } else {
+                        Type::Tuple(elems, loc)
+                    });
+                }
                 // `(:+:)` names a type constructor operator.
                 if let Tok::ConSym(s) = self.tok().clone() {
                     if *self.peek_raw(1) == Tok::Special(')') {
