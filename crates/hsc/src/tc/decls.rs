@@ -143,9 +143,22 @@ impl Checker {
             .filter(|d| matches!(d, Decl::Fun { .. } | Decl::PatBind { .. } | Decl::Sig { .. }))
             .cloned()
             .collect();
-        let binds = self.infer_binds(&value_decls, true)?;
-        for (name, body) in binds {
-            self.out.push(TopBind { name, body });
+        if self.boot {
+            // A boot file declares types only: each signature is the value's scheme.
+            for d in &value_decls {
+                if let Decl::Sig { names, ty, loc } = d {
+                    self.loc = *loc;
+                    let scheme = self.sig_scheme(ty, &[])?;
+                    for n in names {
+                        self.env.values.insert(format!("{}.{n}", self.module), scheme.clone());
+                    }
+                }
+            }
+        } else {
+            let binds = self.infer_binds(&value_decls, true)?;
+            for (name, body) in binds {
+                self.out.push(TopBind { name, body });
+            }
         }
 
         // 7. Class default methods.

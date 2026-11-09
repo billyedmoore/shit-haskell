@@ -67,6 +67,8 @@ pub struct Checker {
     pub user_module: bool,
     /// The source file name, as shown in call stacks.
     pub source_name: String,
+    /// Checking a `.hs-boot` file: its signatures are the module's values, without bindings.
+    pub boot: bool,
     /// Kinds of type constructors.
     pub kinds: kinds::KindEnv,
     /// Type variables in scope from enclosing signatures with an explicit `forall`.
@@ -97,6 +99,7 @@ impl Checker {
             pat_bound: Vec::new(),
             out: Vec::new(),
             user_module: false,
+            boot: false,
             source_name: String::new(),
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),

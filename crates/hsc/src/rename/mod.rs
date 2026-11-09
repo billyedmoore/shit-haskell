@@ -89,6 +89,8 @@ pub struct Renamer<'a> {
     pat_seen: Option<HashSet<String>>,
     /// Pattern synonyms of every loaded module and of this one.
     patsyns: HashMap<GName, PatSynDef>,
+    /// Renaming a `.hs-boot` file: signatures declare values without bindings.
+    boot: bool,
 }
 
 /// Renames a module against the interfaces of its imports.
@@ -96,6 +98,7 @@ pub fn rename_module(
     m: Module,
     ifaces: &BTreeMap<String, Iface>,
     implicit_prelude: bool,
+    boot: bool,
 ) -> RR<(Module, Iface)> {
     // Global names are unique, so the fixities of every loaded module can be merged. This
     // matters for re-exports: `Prelude` exports operators whose fixities `Base` declares.
@@ -117,6 +120,7 @@ pub fn rename_module(
         locals: Vec::new(),
         counter: 0,
         pat_seen: None,
+        boot,
         patsyns: ifaces
             .values()
             .flat_map(|i| i.patsyns.iter().map(|(g, d)| (g.clone(), d.clone())))
@@ -369,6 +373,12 @@ impl<'a> Renamer<'a> {
                 Decl::PatSyn { name, loc, .. } => {
                     add_val(name, *loc, &mut seen_vals)?;
                     own.push(entity(EntKind::PatSyn, &module, name, vec![], vec![]));
+                }
+                Decl::Sig { names, loc, .. } if self.boot => {
+                    for n in names {
+                        add_val(n, *loc, &mut seen_vals)?;
+                        own.push(entity(EntKind::Var, &module, n, vec![], vec![]));
+                    }
                 }
                 Decl::Data(dd) => {
                     add_type(&mut seen_types, &dd.name, dd.loc)?;
@@ -654,7 +664,7 @@ impl<'a> Renamer<'a> {
             }
             Decl::Sig { names, ty, loc } => {
                 for n in &names {
-                    if !self.own.iter().any(|e| e.kind == EntKind::Var && e.occ() == n) {
+                    if !self.boot && !self.own.iter().any(|e| e.kind == EntKind::Var && e.occ() == n) {
                         return Err(RnError {
                             loc,
                             msg: format!("The type signature for ‘{n}’ lacks an accompanying binding"),

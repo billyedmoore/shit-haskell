@@ -17,6 +17,8 @@ pub struct Driver {
     pub binds: Vec<TopBind>,
     loaded: HashSet<String>,
     loading: Vec<String>,
+    /// Modules imported through `{-# SOURCE #-}`, known so far by their `.hs-boot` file.
+    booted: HashSet<String>,
     flags: Vec<String>,
 }
 
@@ -40,6 +42,7 @@ impl Driver {
             checker: Checker::new(),
             binds: Vec::new(),
             loaded: HashSet::new(),
+            booted: HashSet::new(),
             loading: Vec::new(),
             flags,
         }
@@ -48,6 +51,71 @@ impl Driver {
     fn find_source(&self, module: &str) -> Option<PathBuf> {
         let rel = format!("{}.hs", module.replace('.', "/"));
         self.search.iter().map(|d| d.join(&rel)).find(|p| p.is_file())
+    }
+
+    fn find_boot(&self, module: &str) -> Option<PathBuf> {
+        let rel = format!("{}.hs-boot", module.replace('.', "/"));
+        self.search.iter().map(|d| d.join(&rel)).find(|p| p.is_file())
+    }
+
+    /// Loads the `.hs-boot` file of a module imported through `{-# SOURCE #-}`: its signatures
+    /// stand for the module until the module itself is loaded (see `load_booted`).
+    fn load_boot(&mut self, module: &str) -> Result<(), String> {
+        if self.loaded.contains(module) || self.booted.contains(module) {
+            return Ok(());
+        }
+        let path = self
+            .find_boot(module)
+            .ok_or_else(|| format!("Could not find module ‘{module}’ (no .hs-boot file for a SOURCE import)"))?;
+        let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let src = preprocess_if_needed(src, &path, &self.flags)?;
+        let (parsed, exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
+            format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
+        })?;
+        for imp in parsed.imports.clone() {
+            self.load(&imp.module)?;
+        }
+        self.checker.boot = true;
+        let result = self.compile_module(parsed, exts, &path);
+        self.checker.boot = false;
+        result?;
+        self.booted.insert(module.to_string());
+        Ok(())
+    }
+
+    /// After the program is loaded: every module that was only known through its boot file is
+    /// loaded for real, so that its definitions are compiled.
+    fn load_booted(&mut self) -> Result<(), String> {
+        loop {
+            let pending: Vec<String> = self.booted.iter().filter(|m| !self.loaded.contains(*m)).cloned().collect();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for m in pending {
+                self.load(&m)?;
+            }
+        }
+    }
+
+    /// The modules named in `import {-# SOURCE #-} M` lines of a source file.
+    fn source_imports(src: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for line in src.lines() {
+            let Some(rest) = line.strip_prefix("import") else { continue };
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix("{-#") else { continue };
+            let Some(rest) = rest.trim_start().strip_prefix("SOURCE") else { continue };
+            let Some(rest) = rest.trim_start().strip_prefix("#-}") else { continue };
+            let mut words = rest.split_whitespace();
+            let mut name = words.next();
+            if name == Some("qualified") {
+                name = words.next();
+            }
+            if let Some(m) = name {
+                out.insert(m.to_string());
+            }
+        }
+        out
     }
 
     /// Loads a module by name, first loading its imports.
@@ -71,8 +139,10 @@ impl Driver {
         if exts.is_on("ImplicitPrelude") && module != "Prelude" && !deps.iter().any(|d| d == "Prelude") {
             deps.insert(0, "Prelude".into());
         }
+        let source = Self::source_imports(&src);
         for d in &deps {
-            if let Err(e) = self.load(d) {
+            let loaded = if source.contains(d) { self.load_boot(d) } else { self.load(d) };
+            if let Err(e) = loaded {
                 return Err(match self.find_source(d) {
                     Some(_) => e,
                     None => format!("{}:{}:{}: error:\n    {}", path.display(), parsed.loc.line, parsed.loc.col, e),
@@ -92,7 +162,8 @@ impl Driver {
         let located = |loc: crate::syntax::ast::Loc, msg: &str| {
             format!("{}:{}:{}: error:\n    {}", path.display(), loc.line, loc.col, msg)
         };
-        let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"))
+        let boot = self.checker.boot;
+        let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot)
             .map_err(|e| located(e.loc, &e.msg))?;
         let binds = self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;
         self.binds.extend(binds);
@@ -114,11 +185,17 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
     if exts.is_on("ImplicitPrelude") && !deps.iter().any(|x| x == "Prelude") {
         deps.insert(0, "Prelude".into());
     }
+    let source = Driver::source_imports(&src);
     for dep in &deps {
-        d.load(dep)?;
+        if source.contains(dep) {
+            d.load_boot(dep)?;
+        } else {
+            d.load(dep)?;
+        }
     }
     let name = parsed.name.clone();
     d.compile_module(parsed, exts, main_file)?;
+    d.load_booted()?;
     if name == "Main" && !d.checker.env.values.contains_key("Main.main") {
         return Err(format!(
             "{}:1:1: error:\n    The IO action ‘main’ is not defined in module ‘Main’",
