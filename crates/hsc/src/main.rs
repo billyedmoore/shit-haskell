@@ -37,7 +37,26 @@ const VALUE_FLAGS: &[&str] = &[
     "-x",
 ];
 
+extern "C" {
+    fn mallopt(param: i32, value: i32) -> i32;
+}
+
+/// Keeps freed heap memory in the process: the interpreter allocates and frees many small
+/// objects, and returning them to the kernel after each collection costs more than reuse.
+fn tune_allocator() {
+    const M_TRIM_THRESHOLD: i32 = -1;
+    const M_TOP_PAD: i32 = -2;
+    const M_MMAP_THRESHOLD: i32 = -3;
+    // SAFETY: mallopt only adjusts glibc's allocator parameters.
+    unsafe {
+        mallopt(M_TRIM_THRESHOLD, 1 << 30);
+        mallopt(M_TOP_PAD, 64 << 20);
+        mallopt(M_MMAP_THRESHOLD, 256 << 20);
+    }
+}
+
 fn main() -> ExitCode {
+    tune_allocator();
     if let Some(payload) = embedded_payload() {
         return run_payload(payload);
     }
