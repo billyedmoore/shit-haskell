@@ -229,6 +229,69 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             };
             rt.apply(run, args[3].clone())
         }
+        "vecFromList" => {
+            let n = int(rt, &args[0])?.max(0) as usize;
+            let mut cells = Vec::with_capacity(n);
+            let mut cur = rt.force(&args[1])?;
+            while cells.len() < n {
+                match cur {
+                    Value::Con(c) if c.name == "Builtin.:" => {
+                        cells.push(c.args[0].clone());
+                        cur = rt.force(&c.args[1])?;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(Value::Vec(Rc::new(RefCell::new(cells))))
+        }
+        "vecIndex" => match rt.force(&args[0])? {
+            Value::Vec(v) => {
+                let i = int(rt, &args[1])?;
+                let cell = v.borrow().get(i as usize).cloned();
+                match cell {
+                    Some(c) => rt.force(&c),
+                    None => Err(RtError::Error("Ix: index out of range".into())),
+                }
+            }
+            _ => Err(RtError::Fail("internal: vecIndex of a non-vector".into())),
+        },
+        "vecToList" => match rt.force(&args[0])? {
+            Value::Vec(v) => {
+                let items: Vec<Cell> = v.borrow().clone();
+                let mut list = Value::Con(Rc::new(super::ConVal { name: "Builtin.[]", args: vec![] }));
+                for c in items.into_iter().rev() {
+                    list = Value::Con(Rc::new(super::ConVal {
+                        name: "Builtin.:",
+                        args: vec![c, Rc::new(RefCell::new(super::Thunk::Done(list)))],
+                    }));
+                }
+                Ok(list)
+            }
+            _ => Err(RtError::Fail("internal: vecToList of a non-vector".into())),
+        },
+        "vecUpdate" => match rt.force(&args[0])? {
+            Value::Vec(v) => {
+                let mut cells: Vec<Cell> = v.borrow().clone();
+                let mut cur = rt.force(&args[1])?;
+                loop {
+                    match cur {
+                        Value::Con(c) if c.name == "Builtin.:" => {
+                            let pair = rt.force(&c.args[0])?;
+                            if let Value::Con(p) = pair {
+                                let i = int(rt, &p.args[0])? as usize;
+                                if i < cells.len() {
+                                    cells[i] = p.args[1].clone();
+                                }
+                            }
+                            cur = rt.force(&c.args[1])?;
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(Value::Vec(Rc::new(RefCell::new(cells))))
+            }
+            _ => Err(RtError::Fail("internal: vecUpdate of a non-vector".into())),
+        },
         "traceErr" => {
             let s = rt.force_string(&args[0])?;
             let _ = std::io::stderr().write_all(format!("{s}\n").as_bytes());

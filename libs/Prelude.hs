@@ -22,19 +22,20 @@ module Prelude (
     Functor(fmap, (<$)), (<$>),
     Applicative(pure, (<*>), (*>), (<*)),
     Monad((>>=), (>>), return), MonadFail(fail),
-    mapM_, sequence_, (=<<), mapM, sequence,
+    Foldable(foldr, foldl, foldl', foldr1, foldl1, null, length, elem, maximum, minimum, sum, product),
+    Traversable(traverse, sequenceA, mapM, sequence),
+    mapM_, sequence_, (=<<),
     Show(showsPrec, show, showList), shows, ShowS, showChar, showString, showParen,
     Read(readsPrec, readList), ReadS, reads, read,
-    Traversable(traverse), sequenceA,
+
     IO, putChar, putStr, putStrLn, print, getChar, getLine, getContents, interact,
     FilePath, readFile, readLn, ioError, userError, IOError,
     id, const, (.), flip, ($), ($!), seq, error, undefined, until, asTypeOf,
-    map, (++), filter, head, last, tail, init, (!!), null, length, reverse,
+    map, (++), filter, head, last, tail, init, (!!), reverse,
     and, or, any, all, concat, concatMap,
-    foldl, foldr, foldl1, foldr1, sum, product, maximum, minimum,
     scanl, scanl1, scanr, scanr1, iterate, repeat, replicate, cycle,
     take, drop, splitAt, takeWhile, dropWhile, span, break,
-    elem, notElem, lookup, zip, zip3, zipWith, zipWith3, unzip, unzip3,
+    notElem, lookup, zip, zip3, zipWith, zipWith3, unzip, unzip3,
     lines, words, unlines, unwords
   ) where
 

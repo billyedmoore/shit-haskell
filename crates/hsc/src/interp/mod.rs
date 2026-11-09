@@ -41,6 +41,8 @@ pub enum Value {
     Fun(Rc<FunVal>),
     /// A mutable reference (`IORef`): the cell it currently holds.
     Ref(Rc<RefCell<Cell>>),
+    /// An immutable boxed vector (the cells are never reassigned after construction).
+    Vec(Rc<RefCell<Vec<Cell>>>),
 }
 
 pub struct ConVal {

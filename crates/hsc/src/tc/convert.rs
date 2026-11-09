@@ -57,8 +57,17 @@ impl Checker {
                 Lit::Frac(s) => format!("#{s}"),
             }),
             Type::Wild(_) => self.meta(),
-            Type::Forall(..) | Type::Qual(..) => {
-                return self.err("Higher-rank types are not supported yet")
+            // A nested forall is approximated by quantifying its variables at the
+            // enclosing signature. This accepts rank-N programs whose uses are
+            // instantiation-compatible, such as `runST`, without checking them rank-N.
+            Type::Forall(binders, body) => {
+                for b in binders {
+                    tvar_index(tvs, &b.name);
+                }
+                self.convert_type(body, tvs)?
+            }
+            Type::Qual(..) => {
+                return self.err("Higher-rank types with class constraints are not supported yet")
             }
             Type::OpChain(..) => return self.err("internal: unresolved type operator"),
         })

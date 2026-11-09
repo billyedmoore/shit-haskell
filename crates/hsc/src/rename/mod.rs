@@ -268,11 +268,18 @@ impl<'a> Renamer<'a> {
                         hidden.extend(list);
                     }
                 }
+                // Hidden names are removed both from the exports and from their sub-entities,
+                // so that hiding a method does not bring in its class's other methods.
+                let hidden_globals: HashSet<GName> = hidden.iter().map(|h| h.global.clone()).collect();
                 iface
                     .exports
                     .iter()
-                    .filter(|e| !hidden.iter().any(|h| h.global == e.global))
-                    .cloned()
+                    .filter(|e| !hidden_globals.contains(&e.global))
+                    .map(|e| {
+                        let mut kept = e.clone();
+                        kept.subs.retain(|s| !hidden_globals.contains(&s.global));
+                        kept
+                    })
                     .collect()
             }
         };
@@ -1382,8 +1389,11 @@ fn add_type(seen: &mut HashSet<String>, name: &str, loc: Loc) -> RR<()> {
 fn select_item(exports: &[Entity], item: &IEItem) -> Option<Vec<Entity>> {
     match item {
         IEItem::Var(q) | IEItem::Pattern(q) => {
+            // A value may be exported on its own or as a method, field or constructor of a
+            // type or class exported with its sub-entities.
             let found: Vec<Entity> = exports
                 .iter()
+                .flat_map(|e| std::iter::once(e).chain(e.subs.iter()))
                 .filter(|e| e.kind.is_value() && e.occ() == q.name)
                 .cloned()
                 .collect();

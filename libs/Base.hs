@@ -872,6 +872,81 @@ instance Semigroup a => Semigroup (Maybe a) where
 instance Semigroup a => Monoid (Maybe a) where
   mempty = Nothing
 
+
+-- ----- Foldable and Traversable ------------------------------------------------------
+
+class Foldable t where
+  foldr :: (a -> b -> b) -> b -> t a -> b
+  foldl :: (b -> a -> b) -> b -> t a -> b
+  foldl' :: (b -> a -> b) -> b -> t a -> b
+  foldr1 :: (a -> a -> a) -> t a -> a
+  foldl1 :: (a -> a -> a) -> t a -> a
+  toList :: t a -> [a]
+  null :: t a -> Bool
+  length :: t a -> Int
+  elem :: Eq a => a -> t a -> Bool
+  maximum :: Ord a => t a -> a
+  minimum :: Ord a => t a -> a
+  sum :: Num a => t a -> a
+  product :: Num a => t a -> a
+  foldl f z t = listFoldl f z (toList t)
+  foldl' f z t = listFoldl' f z (toList t)
+  foldr1 f t = listFoldr1 f (toList t)
+  foldl1 f t = listFoldl1 f (toList t)
+  toList t = foldr (:) [] t
+  null t = listNull (toList t)
+  length t = listLength (toList t)
+  elem x t = listElem x (toList t)
+  maximum t = listMaximum (toList t)
+  minimum t = listMinimum (toList t)
+  sum t = listSum (toList t)
+  product t = listProduct (toList t)
+
+instance Foldable [] where
+  foldr = listFoldr
+  foldl = listFoldl
+  foldl' = listFoldl'
+  foldr1 = listFoldr1
+  foldl1 = listFoldl1
+  toList xs = xs
+  null = listNull
+  length = listLength
+  elem = listElem
+  maximum = listMaximum
+  minimum = listMinimum
+  sum = listSum
+  product = listProduct
+
+instance Foldable Maybe where
+  foldr _ z Nothing = z
+  foldr f z (Just x) = f x z
+  toList Nothing = []
+  toList (Just x) = [x]
+
+instance Foldable (Either e) where
+  foldr _ z (Left _) = z
+  foldr f z (Right x) = f x z
+
+class (Functor t, Foldable t) => Traversable t where
+  traverse :: Applicative f => (a -> f b) -> t a -> f (t b)
+  sequenceA :: Applicative f => t (f a) -> f (t a)
+  mapM :: Monad m => (a -> m b) -> t a -> m (t b)
+  sequence :: Monad m => t (m a) -> m (t a)
+  sequenceA xs = traverse id xs
+  mapM f xs = traverse f xs
+  sequence xs = sequenceA xs
+
+instance Traversable [] where
+  traverse f xs = listFoldr (\x acc -> liftA2 (:) (f x) acc) (pure []) xs
+
+instance Traversable Maybe where
+  traverse _ Nothing = pure Nothing
+  traverse f (Just x) = fmap Just (f x)
+
+instance Traversable (Either e) where
+  traverse _ (Left e) = pure (Left e)
+  traverse f (Right x) = fmap Right (f x)
+
 -- ----- lists ---------------------------------------------------------------------
 
 map :: (a -> b) -> [a] -> [b]
@@ -907,75 +982,84 @@ init [] = errorEmptyList "init"
 errorEmptyList :: String -> a
 errorEmptyList fun = error ("Prelude." ++ fun ++ ": empty list")
 
-null :: [a] -> Bool
-null [] = True
-null _ = False
+listNull :: [a] -> Bool
+listNull [] = True
+listNull _ = False
 
-length :: [a] -> Int
-length xs = lenAcc xs 0
+listLength :: [a] -> Int
+listLength xs = lenAcc xs 0
 
 lenAcc :: [a] -> Int -> Int
 lenAcc [] n = n
 lenAcc (_ : ys) n = let m = n + 1 in m `seq` lenAcc ys m
 
-foldl :: (b -> a -> b) -> b -> [a] -> b
-foldl f z [] = z
-foldl f z (x : xs) = foldl f (f z x) xs
+listFoldl :: (b -> a -> b) -> b -> [a] -> b
+listFoldl f z [] = z
+listFoldl f z (x : xs) = listFoldl f (f z x) xs
 
-foldl' :: (b -> a -> b) -> b -> [a] -> b
-foldl' f z [] = z
-foldl' f z (x : xs) = let z' = f z x in z' `seq` foldl' f z' xs
+listFoldl' :: (b -> a -> b) -> b -> [a] -> b
+listFoldl' f z [] = z
+listFoldl' f z (x : xs) = let z' = f z x in z' `seq` listFoldl' f z' xs
 
-foldl1 :: (a -> a -> a) -> [a] -> a
-foldl1 f (x : xs) = foldl f x xs
-foldl1 _ [] = errorEmptyList "foldl1"
+listFoldl1 :: (a -> a -> a) -> [a] -> a
+listFoldl1 f (x : xs) = listFoldl f x xs
+listFoldl1 _ [] = errorEmptyList "foldl1"
 
-foldr :: (a -> b -> b) -> b -> [a] -> b
-foldr f z [] = z
-foldr f z (x : xs) = f x (foldr f z xs)
+listFoldr :: (a -> b -> b) -> b -> [a] -> b
+listFoldr f z [] = z
+listFoldr f z (x : xs) = f x (listFoldr f z xs)
 
-foldr1 :: (a -> a -> a) -> [a] -> a
-foldr1 f [x] = x
-foldr1 f (x : xs) = f x (foldr1 f xs)
-foldr1 _ [] = errorEmptyList "foldr1"
+listFoldr1 :: (a -> a -> a) -> [a] -> a
+listFoldr1 f [x] = x
+listFoldr1 f (x : xs) = f x (listFoldr1 f xs)
+listFoldr1 _ [] = errorEmptyList "foldr1"
 
-sum :: Num a => [a] -> a
-sum xs = foldl' (+) 0 xs
+listSum :: Num a => [a] -> a
+listSum xs = listFoldl' (+) 0 xs
 
-product :: Num a => [a] -> a
-product xs = foldl' (*) 1 xs
+listProduct :: Num a => [a] -> a
+listProduct xs = listFoldl' (*) 1 xs
 
-maximum :: Ord a => [a] -> a
-maximum [] = errorEmptyList "maximum"
-maximum xs = foldl1 max xs
+listMaximum :: Ord a => [a] -> a
+listMaximum [] = errorEmptyList "maximum"
+listMaximum xs = listFoldl1 max xs
 
-minimum :: Ord a => [a] -> a
-minimum [] = errorEmptyList "minimum"
-minimum xs = foldl1 min xs
+listMinimum :: Ord a => [a] -> a
+listMinimum [] = errorEmptyList "minimum"
+listMinimum xs = listFoldl1 min xs
 
-and :: [Bool] -> Bool
+listAnd :: [Bool] -> Bool
+listAnd xs = listFoldr (&&) True xs
+
+listOr :: [Bool] -> Bool
+listOr xs = listFoldr (||) False xs
+
+any :: Foldable t => (a -> Bool) -> t a -> Bool
+any p xs = foldr (\x acc -> p x || acc) False xs
+
+all :: Foldable t => (a -> Bool) -> t a -> Bool
+all p xs = foldr (\x acc -> p x && acc) True xs
+
+listConcat :: [[a]] -> [a]
+listConcat xss = listFoldr (++) [] xss
+
+and :: Foldable t => t Bool -> Bool
 and xs = foldr (&&) True xs
 
-or :: [Bool] -> Bool
+or :: Foldable t => t Bool -> Bool
 or xs = foldr (||) False xs
 
-any :: (a -> Bool) -> [a] -> Bool
-any p xs = or (map p xs)
-
-all :: (a -> Bool) -> [a] -> Bool
-all p xs = and (map p xs)
-
-concat :: [[a]] -> [a]
+concat :: Foldable t => t [a] -> [a]
 concat xss = foldr (++) [] xss
 
-concatMap :: (a -> [b]) -> [a] -> [b]
+concatMap :: Foldable t => (a -> [b]) -> t a -> [b]
 concatMap f xs = foldr (\x acc -> f x ++ acc) [] xs
 
-elem :: Eq a => a -> [a] -> Bool
-elem _ [] = False
-elem x (y : ys) = x == y || elem x ys
+listElem :: Eq a => a -> [a] -> Bool
+listElem _ [] = False
+listElem x (y : ys) = x == y || listElem x ys
 
-notElem :: Eq a => a -> [a] -> Bool
+notElem :: (Foldable t, Eq a) => a -> t a -> Bool
 notElem x ys = not (elem x ys)
 
 (!!) :: [a] -> Int -> a
@@ -1182,18 +1266,17 @@ readLn = getLine >>= \s -> return (read s)
 isEOF :: IO Bool
 isEOF = IO primIsEOF
 
-sequence_ :: Monad m => [m a] -> m ()
+sequence_ :: (Foldable t, Monad m) => t (m a) -> m ()
 sequence_ ms = foldr (>>) (return ()) ms
 
-sequence :: Monad m => [m a] -> m [a]
-sequence [] = return []
-sequence (m : ms) = m >>= \x -> sequence ms >>= \xs -> return (x : xs)
+listSequence :: Monad m => [m a] -> m [a]
+listSequence [] = return []
+listSequence (m : ms) = m >>= \x -> listSequence ms >>= \xs -> return (x : xs)
 
-mapM_ :: Monad m => (a -> m b) -> [a] -> m ()
-mapM_ f xs = sequence_ (map f xs)
+mapM_ :: (Foldable t, Monad m) => (a -> m b) -> t a -> m ()
+mapM_ f xs = foldr (\x k -> f x >> k) (return ()) xs
 
-mapM :: Monad m => (a -> m b) -> [a] -> m [b]
-mapM f xs = sequence (map f xs)
+
 
 -- ----- Read ---------------------------------------------------------------------------
 
@@ -1360,19 +1443,6 @@ numericEnumFromThen n m = go 0
     go k = (n + k * step) : go (k + 1)
 
 -- ----- Traversable -------------------------------------------------------------------
-
-class (Functor t) => Traversable t where
-  traverse :: Applicative f => (a -> f b) -> t a -> f (t b)
-
-instance Traversable [] where
-  traverse f xs = foldr (\x acc -> liftA2 (:) (f x) acc) (pure []) xs
-
-instance Traversable Maybe where
-  traverse _ Nothing = pure Nothing
-  traverse f (Just x) = fmap Just (f x)
-
-sequenceA :: Traversable t => Applicative f => t (f a) -> f (t a)
-sequenceA xs = traverse id xs
 
 -- ----- more tuples -------------------------------------------------------------------
 
