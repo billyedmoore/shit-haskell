@@ -57,7 +57,26 @@ impl Checker {
                         loc: *loc,
                         msg: format!("Variable not in scope: {key}"),
                     })?;
-                Ok(self.inst_var(&key, &scheme, *loc))
+                let (core, ty) = self.inst_var(&key, &scheme, *loc);
+                // Call sites of `error` and `undefined` in user code carry their location,
+                // which GHC 9.12 prints in the uncaught-exception backtrace.
+                if self.user_module && (key == "Base.error" || key == "Base.undefined") {
+                    let (fun, frame) = if key == "Base.error" {
+                        ("error", "errorAt")
+                    } else {
+                        ("undefined", "undefinedAt")
+                    };
+                    let site = format!(
+                        "{fun}, called at {}:{}:{} in main:{}",
+                        self.source_name, loc.line, loc.col, self.module
+                    );
+                    let call = Core::App(
+                        Box::new(Core::Var(format!("Base.{frame}"))),
+                        Box::new(Core::Lit(CLit::Str(site))),
+                    );
+                    return Ok((call, ty));
+                }
+                Ok((core, ty))
             }
             Expr::Con(q, loc) => {
                 self.loc = *loc;

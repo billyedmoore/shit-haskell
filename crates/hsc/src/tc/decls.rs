@@ -16,6 +16,9 @@ impl Checker {
         self.module = m.name.clone();
         let decls = &m.decls;
 
+        // 0. Kinds of this module's type constructors.
+        self.check_kinds(decls)?;
+
         // 1. Type synonyms and type constructors.
         for d in decls {
             if let Decl::TypeSyn { name, tyvars, rhs, loc } = d {

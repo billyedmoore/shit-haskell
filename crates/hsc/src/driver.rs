@@ -82,6 +82,8 @@ impl Driver {
 
     fn compile_module(&mut self, m: Module, exts: Extensions, path: &Path) -> Result<(), String> {
         let name = m.name.clone();
+        self.checker.user_module = !path.starts_with(default_lib_dir());
+        self.checker.source_name = path.display().to_string();
         let located = |loc: crate::syntax::ast::Loc, msg: &str| {
             format!("{}:{}:{}: error:\n    {}", path.display(), loc.line, loc.col, msg)
         };

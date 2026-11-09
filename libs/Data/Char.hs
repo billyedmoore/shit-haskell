@@ -1,11 +1,27 @@
 module Data.Char (
-    Char, ord, chr, isDigit, isAlpha, isLetter, isSpace, isUpper, isLower,
+    Char, GeneralCategory(..), generalCategory, ord, chr, isDigit, isAlpha, isLetter, isSpace, isUpper, isLower,
     isAlphaNum, isPunctuation, isControl, isPrint, isHexDigit, isOctDigit, isAscii,
     isSymbol, isSeparator, isNumber, isMark, toUpper, toLower, digitToInt, intToDigit,
     isAsciiUpper, isAsciiLower
   ) where
 
 import Base
+
+data GeneralCategory
+  = UppercaseLetter | LowercaseLetter | TitlecaseLetter | ModifierLetter | OtherLetter
+  | NonSpacingMark | SpacingCombiningMark | EnclosingMark
+  | DecimalNumber | LetterNumber | OtherNumber
+  | ConnectorPunctuation | DashPunctuation | OpenPunctuation | ClosePunctuation
+  | InitialQuote | FinalQuote | OtherPunctuation
+  | MathSymbol | CurrencySymbol | ModifierSymbol | OtherSymbol
+  | Space | LineSeparator | ParagraphSeparator
+  | Control | Format | Surrogate | PrivateUse | NotAssigned
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
+foreign import prim "charCategory" primCharCategory :: Char -> Int
+
+generalCategory :: Char -> GeneralCategory
+generalCategory c = toEnum (primCharCategory c)
 
 isDigit :: Char -> Bool
 isDigit c = c >= '0' && c <= '9'

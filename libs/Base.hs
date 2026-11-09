@@ -143,6 +143,15 @@ error s = primError s
 undefined :: a
 undefined = error "Prelude.undefined"
 
+-- The call-site versions used in user code (see the checker).
+foreign import prim "errorLoc" primErrorLoc :: String -> String -> a
+
+errorAt :: String -> String -> a
+errorAt site msg = primErrorLoc msg site
+
+undefinedAt :: String -> a
+undefinedAt site = primErrorLoc "Prelude.undefined" site
+
 asTypeOf :: a -> a -> a
 asTypeOf x _ = x
 

@@ -64,6 +64,8 @@ pub enum RtError {
     Fail(String),
     /// `error` called by the program.
     Error(String),
+    /// `error` called by the program, with the call site (a backtrace frame).
+    ErrorLoc(String, String),
     /// Exit with a status code.
     Exit(i32),
     /// A Haskell exception, as a `SomeException` value.
@@ -361,6 +363,14 @@ pub fn run_main(rt: &Runtime) -> i32 {
     let code = match result {
         Ok(()) => 0,
         Err(RtError::Exit(code)) => code,
+        Err(RtError::ErrorLoc(msg, site)) => {
+            prims::flush_stdout();
+            eprintln!(
+                "{}: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\n{}\n\nHasCallStack backtrace:\n  {}\n",
+                rt.prog_name, msg, site
+            );
+            1
+        }
         Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) => {
             prims::flush_stdout();
             eprintln!("{}: {}", rt.prog_name, msg);

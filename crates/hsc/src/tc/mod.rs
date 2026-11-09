@@ -12,6 +12,7 @@ pub mod decls;
 pub mod derive;
 pub mod env;
 pub mod expr;
+pub mod kinds;
 pub mod solve;
 pub mod types;
 
@@ -60,6 +61,13 @@ pub struct Checker {
     pub pat_bound: Vec<(String, Ty)>,
     /// Top-level Core bindings produced for the current module.
     pub out: Vec<TopBind>,
+    /// Whether the module being checked is user code (not the library). Call sites of
+    /// `error` and `undefined` in user code record their location.
+    pub user_module: bool,
+    /// The source file name, as shown in call stacks.
+    pub source_name: String,
+    /// Kinds of type constructors.
+    pub kinds: kinds::KindEnv,
 }
 
 /// The module name of built-in syntax.
@@ -81,6 +89,9 @@ impl Checker {
             loc: Loc::default(),
             pat_bound: Vec::new(),
             out: Vec::new(),
+            user_module: false,
+            source_name: String::new(),
+            kinds: kinds::KindEnv::default(),
         };
         c.install_builtins();
         c
@@ -148,7 +159,26 @@ impl Checker {
     }
 
     /// Registers the built-in type constructors, syntax and their Core wrappers.
+    fn install_builtin_kinds(&mut self) {
+        use kinds::Kind;
+        let star = Kind::Star;
+        let arr = |a: Kind, b: Kind| Kind::Arr(Box::new(a), Box::new(b));
+        self.kinds.tycons.insert("Builtin.()".into(), star.clone());
+        self.kinds.tycons.insert(LIST.into(), arr(star.clone(), star.clone()));
+        self.kinds
+            .tycons
+            .insert(types::ARROW.into(), arr(star.clone(), arr(star.clone(), star.clone())));
+        for n in (2..=12usize).filter(|n| *n != 1) {
+            let mut k = star.clone();
+            for _ in 0..n {
+                k = arr(star.clone(), k);
+            }
+            self.kinds.tycons.insert(Ty::tuple_con(n), k);
+        }
+    }
+
     fn install_builtins(&mut self) {
+        self.install_builtin_kinds();
         let a = Ty::Gen(0);
         // Lists.
         self.env.tycons.insert(

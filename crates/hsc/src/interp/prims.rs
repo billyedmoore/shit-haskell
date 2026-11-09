@@ -214,7 +214,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let exc = match outcome {
                 Ok(v) => return Ok(v),
                 Err(RtError::Thrown(v)) => v,
-                Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) => {
+                Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) | Err(RtError::ErrorLoc(msg, _)) => {
                     let conv = rt.force(&args[1])?;
                     let cell = Rc::new(RefCell::new(super::Thunk::Done(string_value(&msg))));
                     rt.apply(conv, cell)?
@@ -430,6 +430,13 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 _ => Err(RtError::Error(format!("Base.chr: bad argument: {n}"))),
             }
         }
+        "charCategory" => {
+            // Index into Data.Char.GeneralCategory's constructors, approximated from the
+            // character's properties (exact for ASCII and common Latin-1 letters).
+            let c = chr(rt, &args[0])?;
+            let idx = general_category_index(c);
+            int_v(idx)
+        }
         "charEq" => Ok(bool_value(chr(rt, &args[0])? == chr(rt, &args[1])?)),
         "charLt" => Ok(bool_value(chr(rt, &args[0])? < chr(rt, &args[1])?)),
         "charLe" => Ok(bool_value(chr(rt, &args[0])? <= chr(rt, &args[1])?)),
@@ -440,6 +447,11 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             rt.force(&args[1])
         }
         "error" => Err(RtError::Error(rt.force_string(&args[0])?)),
+        "errorLoc" => {
+            let msg = rt.force_string(&args[0])?;
+            let site = rt.force_string(&args[1])?;
+            Err(RtError::ErrorLoc(msg, site))
+        }
         "exitWith" => {
             let code = int(rt, &args[0])?;
             Err(RtError::Exit(code as i32))
@@ -525,6 +537,51 @@ pub fn list_value(items: Vec<Value>) -> Value {
             }))
         },
     )
+}
+
+fn general_category_index(c: char) -> i64 {
+    const LU: i64 = 0; const LL: i64 = 1; const LO: i64 = 4;
+    const MN: i64 = 5; const ND: i64 = 8; const NL: i64 = 9; const NO: i64 = 10;
+    const PC: i64 = 11; const PD: i64 = 12; const PS: i64 = 13; const PE: i64 = 14;
+    const PI: i64 = 15; const PF: i64 = 16; const PO: i64 = 17;
+    const SM: i64 = 18; const SC: i64 = 19; const SK: i64 = 20; const SO: i64 = 21;
+    const ZS: i64 = 22; const ZL: i64 = 23; const ZP: i64 = 24;
+    const CC: i64 = 25; const CN: i64 = 29; const CO: i64 = 28;
+    if c.is_ascii() {
+        return match c {
+            'A'..='Z' => LU,
+            'a'..='z' => LL,
+            '0'..='9' => ND,
+            ' ' => ZS,
+            '\x00'..='\x1f' | '\x7f' => CC,
+            '_' => PC,
+            '-' => PD,
+            '(' | '[' | '{' => PS,
+            ')' | ']' | '}' => PE,
+            '+' | '<' | '=' | '>' | '|' | '~' => SM,
+            '$' => SC,
+            '^' | '`' => SK,
+            _ => PO,
+        };
+    }
+    if c.is_uppercase() {
+        LU
+    } else if c.is_lowercase() {
+        LL
+    } else if c.is_alphabetic() {
+        LO
+    } else if c.is_numeric() {
+        NO
+    } else if c.is_whitespace() {
+        ZS
+    } else if c.is_control() {
+        CC
+    } else if c == '\u{ffff}' || c == '\u{10ffff}' {
+        CN
+    } else {
+        let _ = (MN, NL, PC, PD, PS, PE, PI, PF, PO, SM, SC, SK, SO, ZL, ZP, CO);
+        SO
+    }
 }
 
 /// `IORes a`: the result of running an IO action.
