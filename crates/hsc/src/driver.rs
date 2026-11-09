@@ -57,7 +57,7 @@ impl Driver {
         let path = self
             .find_source(module)
             .ok_or_else(|| format!("Could not find module ‘{module}’"))?;
-        let src = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let (parsed, exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
@@ -100,7 +100,7 @@ impl Driver {
 pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBind>, String> {
     let dir = main_file.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mut d = Driver::new(&dir, flags.clone());
-    let src = std::fs::read_to_string(main_file).map_err(|e| format!("{}: {e}", main_file.display()))?;
+    let src = read_source(main_file).map_err(|e| format!("{}: {e}", main_file.display()))?;
     let (parsed, exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
         format!("{}:{}:{}: error:\n    {}", main_file.display(), e.line, e.col, e.msg)
     })?;
@@ -120,8 +120,21 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
         ));
     }
     let mut binds = std::mem::take(&mut d.binds);
+    if flags.iter().any(|f| f == "-dcore-lint") {
+        crate::core::lint::lint_program(&binds).map_err(|e| format!("Core lint error: {e}"))?;
+    }
     crate::core::opt::inline_prim_wrappers(&mut binds);
     crate::core::opt::specialise_literals(&mut binds);
     crate::core::opt::resolve_known_methods(&mut binds);
     Ok(binds)
+}
+
+/// Reads a source file. Bytes that are not valid UTF-8 (found in comments of some sources)
+/// are replaced rather than rejecting the file.
+pub fn read_source(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }

@@ -5,6 +5,7 @@
 //! desugared. Variables are unique strings: globals are `Module.name`, locals carry a
 //! `%N` suffix. Application and abstraction are single-argument.
 
+pub mod lint;
 pub mod matcher;
 pub mod opt;
 pub mod pretty;

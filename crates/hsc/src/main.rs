@@ -92,7 +92,7 @@ fn main() -> ExitCode {
     };
 
     if dump_ast {
-        let src = match std::fs::read_to_string(&file) {
+        let src = match driver::read_source(std::path::Path::new(&file)) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("hsc: {file}: {e}");
