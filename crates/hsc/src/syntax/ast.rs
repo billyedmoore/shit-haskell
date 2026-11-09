@@ -172,6 +172,9 @@ pub enum Decl {
         equation: TypeEquation,
         loc: Loc,
     },
+    /// Several declarations from one source declaration (a data instance is a data type and
+    /// a family equation); flattened when the module is built.
+    Many(Vec<Decl>),
     Foreign {
         import: bool,
         entity: Option<String>,

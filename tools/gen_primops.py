@@ -54,7 +54,9 @@ def parse(text):
             while i < len(lines):
                 t = lines[i].strip()
                 # The type ends at a blank line, a description block, `with`, or a directive.
-                if not t or t[0] in "{}#-" or t.startswith("with") or re.match(r'^(primop|primtype|pseudoop)\b', t):
+                # A line starting with `->` continues the type (a multi-line signature).
+                continues = t.startswith("->") or (t and t[0] not in "{}#-")
+                if not t or not continues or t.startswith("with") or re.match(r'^(primop|primtype|pseudoop)\b', t):
                     break
                 body.append(t)
                 i += 1

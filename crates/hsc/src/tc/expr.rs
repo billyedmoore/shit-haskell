@@ -39,6 +39,7 @@ fn lam1(p: Pat, body: Expr, loc: Loc) -> Expr {
 impl Checker {
     /// Checks an expression against a known type.
     pub fn check(&mut self, e: &Expr, ty: &Ty) -> TR<Core> {
+        if std::env::var("HSC_MK").is_ok() && format!("{:?}", e).contains("mkTrApp") { let t = self.show(ty); eprintln!("CHECK {} expected={}", &format!("{:?}", e).chars().take(160).collect::<String>(), t); }
         // The expected type reaches the alternatives, so that a GADT match can refine it there.
         match e {
             Expr::Case(scrut, alts, loc) => {
@@ -62,6 +63,13 @@ impl Checker {
                 Ok(wrap_let(binds, cb))
             }
             Expr::App(..) => Ok(self.infer_spine(e, Some(ty))?.0),
+            // A comprehension is checked at its expected type, so that the refinement of a generator's
+            // pattern (a GADT match) reaches the element expression.
+            Expr::ListComp(body, branches, loc) if branches.len() == 1 => {
+                self.loc = *loc;
+                let desugared = self.desugar_comp(body, &branches[0], *loc);
+                self.check(&desugared, ty)
+            }
             Expr::Lam(pats, body, loc) => Ok(self.lambda(pats, body, *loc, Some(ty))?.0),
             _ => {
                 let (c, t) = self.infer(e)?;
@@ -148,6 +156,7 @@ impl Checker {
             params.push(arg);
             tf = res;
         }
+        if std::env::var("HSC_MK").is_ok() && format!("{:?}", e).contains("SomeTypeRep") { let ps: Vec<String> = params.iter().map(|p| self.show(p)).collect(); let r = self.show(&tf); let ex = expected.map(|t| self.show(t)); eprintln!("SPINE params={:?} res={} expected={:?} head={:?}", ps, r, ex, head); }
         if let Some(ty) = expected {
             self.unify_at(&tf, ty)?;
         }
@@ -509,7 +518,27 @@ impl Checker {
                 self.loc = *loc;
                 let scheme = self.sig_scheme(t, &[])?;
                 if scheme.nvars != 0 || !scheme.preds.is_empty() {
-                    return self.err("Polymorphic type annotations on expressions are not supported yet");
+                    // `(e :: forall a. C a => t)` is `let v :: forall a. C a => t; v = e in v`.
+                    let v = self.fresh_name("sig");
+                    let binding = crate::syntax::ast::Decl::Fun {
+                        name: v.clone(),
+                        clauses: vec![crate::syntax::ast::Clause {
+                            pats: Vec::new(),
+                            rhs: crate::syntax::ast::Rhs {
+                                body: crate::syntax::ast::Body::Plain((**e).clone()),
+                                wheres: Vec::new(),
+                            },
+                            loc: *loc,
+                        }],
+                        loc: *loc,
+                    };
+                    let sig = crate::syntax::ast::Decl::Sig {
+                        names: vec![v.clone()],
+                        ty: t.clone(),
+                        loc: *loc,
+                    };
+                    let body = Expr::Var(QName::unqual(v), *loc);
+                    return self.infer(&Expr::Let(vec![sig, binding], Box::new(body), *loc));
                 }
                 let c = self.check(e, &scheme.ty)?;
                 Ok((c, scheme.ty))
@@ -565,6 +594,7 @@ impl Checker {
     }
 
     pub fn inst_var_explicit(&mut self, name: &str, scheme: &Scheme, loc: Loc, explicit: &[Ty]) -> (Core, Ty) {
+        if std::env::var("HSC_MK").is_ok() && name.ends_with("mkTrApp") { eprintln!("MKTRAPP nvars={} names={:?} ty={}", scheme.nvars, scheme.names, self.show(&scheme.ty)); }
         let args: Vec<Ty> = (0..scheme.nvars as usize)
             .map(|i| match explicit.get(i) {
                 Some(t) => t.clone(),
@@ -939,6 +969,27 @@ impl Checker {
 
     /// Checks a right-hand side. `where` bindings scope over guards and bodies.
     pub fn rhs_body(&mut self, rhs: &Rhs, ty: &Ty) -> TR<CBody> {
+        // ImplicitParams: `where ?x = e` gives the right-hand side a binding for `?x`.
+        if rhs.wheres.iter().any(|d| matches!(d, Decl::IPBind { .. })) {
+            let mark = self.alt_begin();
+            let mut binds: Vec<(String, Core)> = Vec::new();
+            for d in &rhs.wheres {
+                if let Decl::IPBind { name, expr, loc } = d {
+                    self.loc = *loc;
+                    let (ce, te) = self.infer(expr)?;
+                    let ev = self.fresh_name("ip");
+                    binds.push((ev.clone(), ce));
+                    self.add_given(super::Given {
+                        pred: super::types::Pred { class: format!("?{name}"), args: vec![te] },
+                        ev: Core::Var(ev),
+                    });
+                }
+            }
+            let others: Vec<Decl> = rhs.wheres.iter().filter(|d| !matches!(d, Decl::IPBind { .. })).cloned().collect();
+            let inner = self.rhs_body(&Rhs { body: rhs.body.clone(), wheres: others }, ty)?;
+            let body = self.alt_end(mark, inner)?;
+            return Ok(CBody::Where(binds, Box::new(body)));
+        }
         let wheres = if rhs.wheres.is_empty() {
             Vec::new()
         } else {

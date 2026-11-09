@@ -591,27 +591,27 @@ foreign import prim "atomicSwapMutVar#" atomicSwapMutVar# :: MutVar# s a_levpoly
 foreign import prim "atomicModifyMutVar2#" atomicModifyMutVar2# :: MutVar# s a -> (a -> c) -> State# s -> (# State# s, a, c #)
 foreign import prim "atomicModifyMutVar_#" atomicModifyMutVar_# :: MutVar# s a -> (a -> a) -> State# s -> (# State# s, a, a #)
 foreign import prim "casMutVar#" casMutVar# :: MutVar# s a_levpoly -> a_levpoly -> a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
-foreign import prim "catch#" catch# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #) )
+foreign import prim "catch#" catch# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #) ) -> (b_levpoly -> State# RealWorld -> (# State# RealWorld, a_reppoly #) ) -> State# RealWorld -> (# State# RealWorld, a_reppoly #)
 foreign import prim "raise#" raise# :: a_levpoly -> b_reppoly
 foreign import prim "raiseUnderflow#" raiseUnderflow# :: (# #) -> b_reppoly
 foreign import prim "raiseOverflow#" raiseOverflow# :: (# #) -> b_reppoly
 foreign import prim "raiseDivZero#" raiseDivZero# :: (# #) -> b_reppoly
 foreign import prim "raiseIO#" raiseIO# :: a_levpoly -> State# RealWorld -> (# State# RealWorld, b_reppoly #)
-foreign import prim "maskAsyncExceptions#" maskAsyncExceptions# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #))
-foreign import prim "maskUninterruptible#" maskUninterruptible# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #))
-foreign import prim "unmaskAsyncExceptions#" unmaskAsyncExceptions# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #))
+foreign import prim "maskAsyncExceptions#" maskAsyncExceptions# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #)) -> (State# RealWorld -> (# State# RealWorld, a_reppoly #))
+foreign import prim "maskUninterruptible#" maskUninterruptible# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #)) -> (State# RealWorld -> (# State# RealWorld, a_reppoly #))
+foreign import prim "unmaskAsyncExceptions#" unmaskAsyncExceptions# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #)) -> (State# RealWorld -> (# State# RealWorld, a_reppoly #))
 foreign import prim "getMaskingState#" getMaskingState# :: State# RealWorld -> (# State# RealWorld, Int# #)
 foreign import prim "newPromptTag#" newPromptTag# :: State# RealWorld -> (# State# RealWorld, PromptTag# a #)
-foreign import prim "prompt#" prompt# :: PromptTag# a
-foreign import prim "control0#" control0# :: PromptTag# a
-foreign import prim "atomically#" atomically# :: (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
+foreign import prim "prompt#" prompt# :: PromptTag# a -> (State# RealWorld -> (# State# RealWorld, a #)) -> State# RealWorld -> (# State# RealWorld, a #)
+foreign import prim "control0#" control0# :: PromptTag# a -> (((State# RealWorld -> (# State# RealWorld, b_reppoly #)) -> State# RealWorld -> (# State# RealWorld, a #)) -> State# RealWorld -> (# State# RealWorld, a #)) -> State# RealWorld -> (# State# RealWorld, b_reppoly #)
+foreign import prim "atomically#" atomically# :: (State# RealWorld -> (# State# RealWorld, a_levpoly #) ) -> State# RealWorld -> (# State# RealWorld, a_levpoly #)
 foreign import prim "retry#" retry# :: State# RealWorld -> (# State# RealWorld, a_levpoly #)
-foreign import prim "catchRetry#" catchRetry# :: (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
-foreign import prim "catchSTM#" catchSTM# :: (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
-foreign import prim "newTVar#" newTVar# :: a_levpoly
-foreign import prim "readTVar#" readTVar# :: TVar# s a_levpoly
-foreign import prim "readTVarIO#" readTVarIO# :: TVar# s a_levpoly
-foreign import prim "writeTVar#" writeTVar# :: TVar# s a_levpoly
+foreign import prim "catchRetry#" catchRetry# :: (State# RealWorld -> (# State# RealWorld, a_levpoly #) ) -> (State# RealWorld -> (# State# RealWorld, a_levpoly #) ) -> (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
+foreign import prim "catchSTM#" catchSTM# :: (State# RealWorld -> (# State# RealWorld, a_levpoly #) ) -> (b -> State# RealWorld -> (# State# RealWorld, a_levpoly #) ) -> (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
+foreign import prim "newTVar#" newTVar# :: a_levpoly -> State# s -> (# State# s, TVar# s a_levpoly #)
+foreign import prim "readTVar#" readTVar# :: TVar# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
+foreign import prim "readTVarIO#" readTVarIO# :: TVar# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
+foreign import prim "writeTVar#" writeTVar# :: TVar# s a_levpoly -> a_levpoly -> State# s -> State# s
 foreign import prim "newMVar#" newMVar# :: State# s -> (# State# s, MVar# s a_levpoly #)
 foreign import prim "takeMVar#" takeMVar# :: MVar# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
 foreign import prim "tryTakeMVar#" tryTakeMVar# :: MVar# s a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
@@ -626,8 +626,8 @@ foreign import prim "writeIOPort#" writeIOPort# :: IOPort# s a_levpoly -> a_levp
 foreign import prim "delay#" delay# :: Int# -> State# s -> State# s
 foreign import prim "waitRead#" waitRead# :: Int# -> State# s -> State# s
 foreign import prim "waitWrite#" waitWrite# :: Int# -> State# s -> State# s
-foreign import prim "fork#" fork# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #))
-foreign import prim "forkOn#" forkOn# :: Int# -> (State# RealWorld -> (# State# RealWorld, a_reppoly #))
+foreign import prim "fork#" fork# :: (State# RealWorld -> (# State# RealWorld, a_reppoly #)) -> State# RealWorld -> (# State# RealWorld, ThreadId# #)
+foreign import prim "forkOn#" forkOn# :: Int# -> (State# RealWorld -> (# State# RealWorld, a_reppoly #)) -> State# RealWorld -> (# State# RealWorld, ThreadId# #)
 foreign import prim "killThread#" killThread# :: ThreadId# -> a -> State# RealWorld -> State# RealWorld
 foreign import prim "yield#" yield# :: State# RealWorld -> State# RealWorld
 foreign import prim "myThreadId#" myThreadId# :: State# RealWorld -> (# State# RealWorld, ThreadId# #)
@@ -637,9 +637,9 @@ foreign import prim "noDuplicate#" noDuplicate# :: State# s -> State# s
 foreign import prim "threadLabel#" threadLabel# :: ThreadId# -> State# RealWorld -> (# State# RealWorld, Int#, ByteArray# #)
 foreign import prim "threadStatus#" threadStatus# :: ThreadId# -> State# RealWorld -> (# State# RealWorld, Int#, Int#, Int# #)
 foreign import prim "listThreads#" listThreads# :: State# RealWorld -> (# State# RealWorld, Array# ThreadId# #)
-foreign import prim "mkWeak#" mkWeak# :: a_levpoly -> b_levpoly -> (State# RealWorld -> (# State# RealWorld, c #))
+foreign import prim "mkWeak#" mkWeak# :: a_levpoly -> b_levpoly -> (State# RealWorld -> (# State# RealWorld, c #)) -> State# RealWorld -> (# State# RealWorld, Weak# b_levpoly #)
 foreign import prim "mkWeakNoFinalizer#" mkWeakNoFinalizer# :: a_levpoly -> b_levpoly -> State# RealWorld -> (# State# RealWorld, Weak# b_levpoly #)
-foreign import prim "addCFinalizerToWeak#" addCFinalizerToWeak# :: Addr# -> Addr# -> Int# -> Addr# -> Weak# b_levpoly
+foreign import prim "addCFinalizerToWeak#" addCFinalizerToWeak# :: Addr# -> Addr# -> Int# -> Addr# -> Weak# b_levpoly -> State# RealWorld -> (# State# RealWorld, Int# #)
 foreign import prim "deRefWeak#" deRefWeak# :: Weak# a_levpoly -> State# RealWorld -> (# State# RealWorld, Int#, a_levpoly #)
 foreign import prim "finalizeWeak#" finalizeWeak# :: Weak# a_levpoly -> State# RealWorld -> (# State# RealWorld, Int#, (State# RealWorld -> (# State# RealWorld, b #) ) #)
 foreign import prim "touch#" touch# :: a_levpoly -> State# s -> State# s

@@ -432,6 +432,14 @@ impl Checker {
 
     /// Default method implementations: `$dm<m> = \dict -> \own-dicts -> body`.
     fn class_defaults(&mut self, cd: &ClassDecl) -> TR<()> {
+        // GADT refinements made inside the declaration end with it.
+        let refinements = self.metas.skol_binds.clone();
+        let r = self.class_defaults_body(cd);
+        self.metas.skol_binds = refinements;
+        r
+    }
+
+    fn class_defaults_body(&mut self, cd: &ClassDecl) -> TR<()> {
         let class_key = format!("{}.{}", self.module, cd.name);
         let info = self.class(&class_key).cloned().expect("class registered");
         for d in &cd.decls {
@@ -538,6 +546,14 @@ impl Checker {
 
     /// Builds the dictionary for an instance and checks its methods.
     fn instance_body(&mut self, id: &InstDecl) -> TR<()> {
+        // GADT refinements made inside the declaration end with it.
+        let refinements = self.metas.skol_binds.clone();
+        let r = self.instance_body_body(id);
+        self.metas.skol_binds = refinements;
+        r
+    }
+
+    fn instance_body_body(&mut self, id: &InstDecl) -> TR<()> {
         self.loc = id.loc;
         if id.overlap.as_deref() == Some(super::derive::DERIVED_MARK) {
             let known = {
@@ -863,7 +879,9 @@ impl Checker {
         };
         // The constructors and the instance head are named in the declaring module.
         let here = std::mem::replace(&mut self.module, defining);
-        let derived = self.derive_instances(&synthetic);
+        // A newtype's class instance by newtype deriving (no generated code).
+        let via_newtype = self.register_newtype_deriving(&synthetic);
+        let derived = via_newtype.and_then(|_| self.derive_instances(&synthetic));
         self.module = here;
         // A standalone deriving declaration states its own context and head; the inferred ones
         // of a stock deriving clause do not apply.

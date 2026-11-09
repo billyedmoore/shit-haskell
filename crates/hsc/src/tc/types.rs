@@ -325,6 +325,8 @@ impl Metas {
         }
         match (&a, &b) {
             (Ty::Skol(x, _), Ty::Skol(y, _)) if x == y => Ok(()),
+            // An unknown type is determined by the other side, not refined around.
+            (Ty::Meta(_), _) | (_, Ty::Meta(_)) => self.unify(&a, &b),
             (Ty::Skol(x, _), t) | (t, Ty::Skol(x, _)) => {
                 self.skol_binds.insert(*x, t.clone());
                 Ok(())

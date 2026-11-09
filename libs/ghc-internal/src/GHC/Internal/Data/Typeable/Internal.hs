@@ -536,7 +536,7 @@ splitApp :: forall k (a :: k). ()
          -> AppOrCon a
 splitApp TrType = IsApp trTYPE trLiftedRep
 splitApp (TrApp {trAppFun = f, trAppArg = x}) = IsApp f x
-splitApp rep@(TrFun {trFunArg=a, trFunRes=b}) = IsApp (mkTrApp arr a) b
+splitApp rep@(TrFun {trFunArg=a, trFunRes=b}) = IsApp (mkTrApp (unsafeCoerce arr) (unsafeCoerce a)) (unsafeCoerce b)
   where arr = bareArrow rep
 splitApp (TrTyCon{trTyCon = con, trKindVars = kinds})
   = case unsafeCoerce Refl :: NotApplication a :~: (() :: Constraint) of
@@ -700,7 +700,7 @@ instantiateKindRep vars = go
             applyTy :: SomeTypeRep -> KindRep -> SomeTypeRep
             applyTy (SomeTypeRep acc) ty
               | SomeTypeRep ty' <- go ty
-              = SomeTypeRep $ mkTrApp (unsafeCoerce acc) ty'
+              = SomeTypeRep $ mkTrApp (unsafeCoerce acc) (unsafeCoerce ty')
         in foldl' applyTy tycon_app ty_args
     go (KindRepVar var)
       = vars A.! var

@@ -13,7 +13,8 @@ const BASE: &str = "Base";
 /// The module that defines a Prelude name: the wired-in types of GHC.Types, or Base.
 fn defining_module(name: &str) -> &'static str {
     match name {
-        "True" | "False" | "Bool" | "Char" | "Int" | "Word" | "Float" | "Double" | "Ordering" | "LT" | "EQ" | "GT" => {
+        "True" | "False" | "Bool" | "Char" | "Int" | "Word" | "Float" | "Double" | "Ordering" | "LT" | "EQ" | "GT"
+        | "I#" | "W#" | "C#" | "D#" | "F#" => {
             "GHC.Types"
         }
         "Eq" | "Ord" | "==" | "/=" | "<" | "<=" | ">" | ">=" | "compare" | "max" | "min" | "&&" | "||" | "not" | "compareInt#" => {
@@ -189,6 +190,110 @@ pub fn is_stock(name: &str) -> bool {
     )
 }
 
+/// The context of a derived instance, as GHC infers it from the fields: a field whose type is
+/// headed by a type variable (`f p`) needs the class at that type; any other field needs the class
+/// at the variables it mentions (`Tree a` needs `C a`). For constructor classes the variable
+/// applied to the last parameter is the one needed.
+fn field_context(class: &QName, dd: &DataDecl, loc: Loc, last: Option<&str>) -> Vec<Type> {
+    let mut out: Vec<Type> = Vec::new();
+    for c in &dd.cons {
+        let fields: Vec<&Type> = match &c.fields {
+            ConFields::Positional(fs) => fs.iter().map(|f| &f.ty).collect(),
+            ConFields::Record(groups) => groups.iter().map(|(_, f)| &f.ty).collect(),
+        };
+        for t in fields {
+            collect_needs(t, last, &mut |need: &Type| {
+                let item = Type::App(Box::new(Type::Con(class.clone(), loc)), Box::new(need.clone()));
+                if !out.contains(&item) {
+                    out.push(item);
+                }
+            });
+        }
+    }
+    out
+}
+
+/// The types a derived instance needs the class at, for one field type.
+fn collect_needs(t: &Type, last: Option<&str>, add: &mut dyn FnMut(&Type)) {
+    let mut vars = Vec::new();
+    type_vars(t, &mut vars);
+    if vars.is_empty() {
+        return;
+    }
+    let (head, args) = spine(t);
+    match (last, head) {
+        // Constructor classes: the head variable applied to the last parameter.
+        (Some(l), Type::Var(..)) => {
+            if let Some(last_arg) = args.last().filter(|a| mentions(a, l)) {
+                add(&strip_last(t));
+                // The argument is itself a field of the class's kind (`f (g p)` needs `g`).
+                collect_needs(last_arg, last, add);
+            }
+        }
+        (Some(l), _) => {
+            for a in args {
+                if mentions(a, l) {
+                    collect_needs(a, last, add);
+                }
+            }
+        }
+        // Ordinary classes: a variable-headed field needs the class at the field itself.
+        (None, Type::Var(v, _)) if v.is_empty() => {}
+        (None, Type::Var(..)) => add(t),
+        (None, _) => {
+            if let Type::Var(..) = t {
+                add(t);
+            } else {
+                for a in args {
+                    collect_needs(a, last, add);
+                }
+            }
+        }
+    }
+}
+
+/// The head of a type application and its arguments.
+fn spine(t: &Type) -> (&Type, Vec<&Type>) {
+    let mut args = Vec::new();
+    let mut h = t;
+    while let Type::App(f, a) = h {
+        args.push(a.as_ref());
+        h = f;
+    }
+    args.reverse();
+    (h, args)
+}
+
+/// The type applied to everything but its last argument.
+fn strip_last(t: &Type) -> Type {
+    match t {
+        Type::App(f, _) => (**f).clone(),
+        other => other.clone(),
+    }
+}
+
+/// The type variables mentioned by a type, in order of first occurrence.
+pub fn type_vars(t: &Type, out: &mut Vec<String>) {
+    match t {
+        Type::Var(v, _) => {
+            if !out.contains(v) {
+                out.push(v.clone());
+            }
+        }
+        Type::App(f, a) | Type::Fun(f, a) | Type::Sig(f, a) => {
+            type_vars(f, out);
+            type_vars(a, out);
+        }
+        Type::List(e, _) => type_vars(e, out),
+        Type::Tuple(ts, _) => ts.iter().for_each(|x| type_vars(x, out)),
+        Type::Qual(cs, b) => {
+            cs.iter().for_each(|x| type_vars(x, out));
+            type_vars(b, out);
+        }
+        _ => {}
+    }
+}
+
 /// Builds the instance declaration: the context has the class at every type parameter.
 fn instance(module: &str, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_last: bool) -> Decl {
     let loc = dd.loc;
@@ -212,14 +317,8 @@ fn instance(module: &str, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_l
         |acc, tv| Type::App(Box::new(acc), Box::new(Type::Var(tv.name.clone(), loc))),
     );
     let head = Type::App(Box::new(Type::Con(class.clone(), loc)), Box::new(head_ty));
-    let context = if drop_last {
-        Vec::new()
-    } else {
-        dd.tyvars
-            .iter()
-            .map(|tv| Type::App(Box::new(Type::Con(class.clone(), loc)), Box::new(Type::Var(tv.name.clone(), loc))))
-            .collect()
-    };
+    let last = if drop_last { dd.tyvars.last().map(|t| t.name.clone()) } else { None };
+    let context = field_context(class, dd, loc, last.as_deref());
     Decl::Instance(InstDecl {
         overlap: None,
         context,
@@ -434,6 +533,32 @@ fn derive_show(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         let a = fresh_vars(checker, "a", n);
         let pat = con_pat(&module, &c.name, a.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc);
         let show_arg = |v: &String, prec: i64| app(base_var("showsPrec", loc), vec![int(prec, loc), local(v, loc)]);
+        // An unboxed field is shown as its boxed value and a `#`, as GHC does.
+        let ftys = field_types(c);
+        let shown_field = |i: usize, prec: i64| -> Expr {
+            let v = &a[i];
+            let boxed = ftys.get(i).and_then(|t| match t {
+                Type::Con(q, _) => match q.name.as_str() {
+                    "Int#" => Some("I#"),
+                    "Word#" => Some("W#"),
+                    "Char#" => Some("C#"),
+                    "Double#" => Some("D#"),
+                    "Float#" => Some("F#"),
+                    _ => None,
+                },
+                _ => None,
+            });
+            match boxed {
+                Some(con) => compose(
+                    vec![
+                        app(base_var("showsPrec", loc), vec![int(prec, loc), app(base_con(con, loc), vec![local(v, loc)])]),
+                        app(base_var("showChar", loc), vec![ch('#', loc)]),
+                    ],
+                    loc,
+                ),
+                None => show_arg(v, prec),
+            }
+        };
         let shows_str = |s: &str| app(base_var("showString", loc), vec![text(s, loc)]);
         let body = if n == 0 {
             let name = display_name(&c.name);
@@ -442,9 +567,9 @@ fn derive_show(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
             // Infix constructor at the default precedence 9.
             let prec = 9;
             let parts = vec![
-                show_arg(&a[0], prec + 1),
+                shown_field(0, prec + 1),
                 app(base_var("showString", loc), vec![text(&format!(" {} ", infix_name(&c.name)), loc)]),
-                show_arg(&a[1], prec + 1),
+                shown_field(1, prec + 1),
             ];
             app(
                 base_var("showParen", loc),
@@ -458,22 +583,22 @@ fn derive_show(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
             let mut parts: Vec<Expr> = Vec::new();
             if names.is_empty() {
                 parts.push(shows_str(&format!("{} ", display_name(&c.name))));
-                for (i, v) in a.iter().enumerate() {
+                for i in 0..a.len() {
                     if i > 0 {
                         parts.push(app(base_var("showChar", loc), vec![ch(' ', loc)]));
                     }
-                    parts.push(show_arg(v, 11));
+                    parts.push(shown_field(i, 11));
                 }
             } else {
                 parts.push(shows_str(&format!("{} {{", display_name(&c.name))));
-                for (i, (f, v)) in names.iter().zip(&a).enumerate() {
+                for (i, f) in names.iter().enumerate() {
                     let label = if i == 0 {
                         format!("{} = ", display_name(f))
                     } else {
                         format!(", {} = ", display_name(f))
                     };
                     parts.push(shows_str(&label));
-                    parts.push(show_arg(v, 0));
+                    parts.push(shown_field(i, 0));
                 }
                 parts.push(app(base_var("showChar", loc), vec![ch('}', loc)]));
             }

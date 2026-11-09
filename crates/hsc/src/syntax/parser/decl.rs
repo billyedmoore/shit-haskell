@@ -11,10 +11,23 @@ impl Parser {
         match self.tok().clone() {
             Tok::Kw(Kw::Data) if self.real() => {
                 self.bump();
+                if self.at_varid("family") {
+                    // A data family is an open type family; its instances are data types.
+                    self.bump();
+                    return self.type_family(loc, true);
+                }
+                if self.at_kw(Kw::Instance) {
+                    self.bump();
+                    return self.data_instance(false, loc);
+                }
                 self.data_decl(false, loc)
             }
             Tok::Kw(Kw::Newtype) if self.real() => {
                 self.bump();
+                if self.at_kw(Kw::Instance) {
+                    self.bump();
+                    return self.data_instance(true, loc);
+                }
                 self.data_decl(true, loc)
             }
             Tok::Kw(Kw::Type) if self.real() => self.type_decl(loc),
@@ -288,6 +301,44 @@ impl Parser {
         let context = self.try_context();
         let head = self.btype()?;
         let (name, tyvars) = self.decl_head(head)?;
+        self.data_body(newtype, context, name, tyvars, loc)
+    }
+
+    /// `data instance F t1 .. tn = cons`, after `data instance` (or `newtype instance`). Each
+    /// instance becomes a data type of its own, named after the family and the instance's place,
+    /// over the variables of the instance head; and the family equation `F t1 .. tn = R vs`.
+    fn data_instance(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
+        let head = self.btype()?;
+        let mut args = Vec::new();
+        let mut t = head;
+        while let Type::App(f, a) = t {
+            args.push(*a);
+            t = *f;
+        }
+        args.reverse();
+        let family = match t {
+            Type::Con(q, _) => q,
+            _ => return self.err("malformed data instance head"),
+        };
+        let mut vars: Vec<String> = Vec::new();
+        for a in &args {
+            type_vars_of(a, &mut vars);
+        }
+        let name = format!("R:{}{}_{}", family.name, loc.line, loc.col);
+        let tyvars: Vec<TyVarBind> = vars.iter().map(|v| TyVarBind { name: v.clone(), kind: None }).collect();
+        let data = self.data_body(newtype, Vec::new(), name.clone(), tyvars, loc)?;
+        let rhs = vars.iter().fold(Type::Con(QName::unqual(name), loc), |acc, v| {
+            Type::App(Box::new(acc), Box::new(Type::Var(v.clone(), loc)))
+        });
+        let equation = TypeEquation { args, rhs, loc };
+        Ok(Decl::Many(vec![
+            data,
+            Decl::TypeInstance { name: family, equation, loc },
+        ]))
+    }
+
+    /// The constructors and deriving clauses of a data declaration whose head is parsed.
+    fn data_body(&mut self, newtype: bool, context: Vec<Type>, name: String, tyvars: Vec<TyVarBind>, loc: Loc) -> PResult<Decl> {
         if self.at_res(ROp::DColon) {
             // Kind signature: accepted and ignored for now.
             self.bump();
@@ -1184,5 +1235,34 @@ impl Parser {
                 _ => return false,
             }
         }
+    }
+}
+
+/// The type variables of a type, in order of first occurrence.
+fn type_vars_of(t: &Type, out: &mut Vec<String>) {
+    match t {
+        Type::Var(v, _) => {
+            if !out.contains(v) {
+                out.push(v.clone());
+            }
+        }
+        Type::App(f, a) | Type::Fun(f, a) | Type::Sig(f, a) => {
+            type_vars_of(f, out);
+            type_vars_of(a, out);
+        }
+        Type::List(e, _) => type_vars_of(e, out),
+        Type::Tuple(ts, _) => ts.iter().for_each(|x| type_vars_of(x, out)),
+        Type::Qual(cs, b) => {
+            cs.iter().for_each(|x| type_vars_of(x, out));
+            type_vars_of(b, out);
+        }
+        Type::OpChain(items, _) => {
+            for it in items {
+                if let TypeOpItem::Operand(x) = it {
+                    type_vars_of(x, out);
+                }
+            }
+        }
+        _ => {}
     }
 }

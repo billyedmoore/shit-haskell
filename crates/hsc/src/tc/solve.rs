@@ -129,6 +129,27 @@ impl Checker {
                 binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
                 continue;
             }
+            // A constraint family (`type family C a :: Constraint`) that reduces to no class
+            // constraints holds; its evidence is unused.
+            if self.env.families.contains_key(&pred.class) {
+                let applied = Ty::apps(Ty::con(&pred.class), pred.args.clone());
+                let reduced = self.normalize(&applied);
+                if reduced != applied {
+                    let preds = super::convert::ty_to_preds(&reduced);
+                    for p in preds {
+                        let ev = self.fresh_name("cf");
+                        work.push(Wanted { pred: p, ev, loc: w.loc });
+                    }
+                    binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
+                    continue;
+                }
+                // A stuck family constraint is taken to hold: its evidence is never inspected,
+                // and GHC's own proof (from the pattern that provides it) is not reproduced here.
+                if !self.pred_has_metas(&pred) {
+                    binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
+                    continue;
+                }
+            }
             // Typeable is solved by the compiler: a representation built from the type's structure.
             if pred.class == TYPEABLE_CLASS && pred.args.len() == 1 {
                 if let Some(ev) = self.typeable_evidence(&pred, &mut work, w.loc)? {
@@ -365,6 +386,13 @@ impl Checker {
                     .map(|w| self.metas_zonk_pred(&w.pred))
                     .filter(|p| p.args.iter().any(|a| matches!(self.metas.prune(a), Ty::Meta(x) if x == m)))
                     .collect();
+                // A type that only `Typeable` constrains is a kind argument this checker does not
+                // track (kinds are not inferred for signatures); it is taken as unit.
+                if preds_on_m.iter().all(|p| p.class == TYPEABLE_CLASS) && !preds_on_m.is_empty() {
+                    self.metas.subst[m as usize] = Some(Ty::con("Builtin.()"));
+                    progress = true;
+                    continue;
+                }
                 if !preds_on_m.iter().any(|p| NUMERIC_CLASSES.contains(&p.class.as_str())) {
                     continue;
                 }

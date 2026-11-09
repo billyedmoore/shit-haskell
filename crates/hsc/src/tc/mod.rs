@@ -77,6 +77,9 @@ pub struct Checker {
     pub kinds: kinds::KindEnv,
     /// Type variables in scope from enclosing signatures with an explicit `forall`.
     pub scoped: Vec<(String, Ty)>,
+    /// The flexible kind variables of the signature being checked. Each clause of its body
+    /// sees them afresh, as it would the rigid kind variables of a signature.
+    pub flex_kinds: Vec<u32>,
     /// Bindings whose signature has an explicit `forall` (their variables scope over the body).
     pub explicit_sigs: std::collections::HashSet<String>,
     /// Equalities involving type families that cannot be decided yet.
@@ -132,6 +135,7 @@ impl Checker {
             source_name: String::new(),
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),
+            flex_kinds: Vec::new(),
             explicit_sigs: std::collections::HashSet::new(),
             deferred_eqs: Vec::new(),
         };

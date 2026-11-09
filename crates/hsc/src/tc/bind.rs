@@ -299,6 +299,16 @@ impl Checker {
     /// Checks a binding with a signature: its type variables are rigid, and its
     /// predicates are givens for the body.
     pub fn check_signed(&mut self, key: &str, clauses: &[Clause], scheme: &Scheme, loc: Loc) -> TR<Vec<(String, Core)>> {
+        // GADT refinements made by the binding's patterns end with it.
+        let refinements = self.metas.skol_binds.clone();
+        let outer_flex = std::mem::take(&mut self.flex_kinds);
+        let r = self.check_signed_body(key, clauses, scheme, loc);
+        self.flex_kinds = outer_flex;
+        self.metas.skol_binds = refinements;
+        r
+    }
+
+    fn check_signed_body(&mut self, key: &str, clauses: &[Clause], scheme: &Scheme, loc: Loc) -> TR<Vec<(String, Core)>> {
         self.loc = loc;
         let outer_level = self.level;
         self.level += 1;
@@ -308,7 +318,17 @@ impl Checker {
             .names
             .iter()
             .take(scheme.nvars as usize)
-            .map(|n| if is_kind_var_name(n) { self.metas.fresh(self.level) } else { self.metas.fresh_skolem(n) })
+            .map(|n| {
+                if is_kind_var_name(n) {
+                    let m = self.metas.fresh(self.level);
+                    if let Ty::Meta(i) = m {
+                        self.flex_kinds.push(i);
+                    }
+                    m
+                } else {
+                    self.metas.fresh_skolem(n)
+                }
+            })
             .collect();
         let ty = subst_gen(&scheme.ty, &skolems);
         let preds: Vec<Pred> = scheme
@@ -403,6 +423,9 @@ impl Checker {
             let pats = self.check_pats(&c.pats, &arg_tys)?;
             let body = self.rhs_body(&c.rhs, &res)?;
             let body = self.alt_end(mark, body)?;
+            for m in self.flex_kinds.clone() {
+                self.metas.subst[m as usize] = None;
+            }
             rows.push(Row { pats, body });
         }
         let mut fresh = |b: &str| self.fresh_name(b);

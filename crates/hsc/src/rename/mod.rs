@@ -695,6 +695,7 @@ impl<'a> Renamer<'a> {
             Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } => {
                 return Err(RnError { loc, msg: "internal: pattern synonym reached the declaration pass".into() })
             }
+            Decl::Many(_) => return Err(RnError { loc: Loc::default(), msg: "internal: grouped declarations reached the renamer".into() }),
             Decl::Sig { names, ty, loc } => {
                 for n in &names {
                     // Pattern synonym builders (`$bP`) are generated with their own signatures.
@@ -1769,6 +1770,7 @@ fn collect_pat_vars(p: &Pat, out: &mut Vec<(String, Loc)>) {
 fn decl_loc(d: &Decl) -> Loc {
     match d {
         Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } | Decl::IPBind { loc, .. } | Decl::DefaultSig { loc, .. } => *loc,
+        Decl::Many(ds) => ds.first().map(decl_loc).unwrap_or_default(),
         Decl::Sig { loc, .. }
         | Decl::Fixity { loc, .. }
         | Decl::Fun { loc, .. }

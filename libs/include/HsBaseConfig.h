@@ -33,3 +33,30 @@
 #define ALIGNMENT_HSFLOAT 4
 /* The C int, as the Haskell type that represents it. */
 #define HTYPE_INT Int32
+/* The other C types the Foreign modules name, as the Haskell types that represent them
+   (x86-64 Linux: char is signed, long and pointers are 64 bits, _Bool is one byte). */
+#define HTYPE_BOOL Word8
+#define HTYPE_CHAR Int8
+#define HTYPE_CLOCK_T Int64
+#define HTYPE_DOUBLE Double
+#define HTYPE_FLOAT Float
+#define HTYPE_INTMAX_T Int64
+#define HTYPE_INTPTR_T Int64
+#define HTYPE_LONG Int64
+#define HTYPE_LONG_LONG Int64
+#define HTYPE_PTRDIFF_T Int64
+#define HTYPE_SHORT Int16
+#define HTYPE_SIG_ATOMIC_T Int32
+#define HTYPE_SIGNED_CHAR Int8
+#define HTYPE_SIZE_T Word64
+#define HTYPE_SUSECONDS_T Int64
+#define HTYPE_TIME_T Int64
+#define HTYPE_UINTMAX_T Word64
+#define HTYPE_UINTPTR_T Word64
+#define HTYPE_UNSIGNED_CHAR Word8
+#define HTYPE_UNSIGNED_INT Word32
+#define HTYPE_UNSIGNED_LONG Word64
+#define HTYPE_UNSIGNED_LONG_LONG Word64
+#define HTYPE_UNSIGNED_SHORT Word16
+#define HTYPE_USECONDS_T Word32
+#define HTYPE_WCHAR_T Int32

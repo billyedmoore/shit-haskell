@@ -466,6 +466,7 @@ impl Parser {
                     }
                     imports.push(i);
                 }
+                TopItem::Decl(Decl::Many(ds)) => decls.extend(ds),
                 TopItem::Decl(d) => decls.push(d),
             }
         }
