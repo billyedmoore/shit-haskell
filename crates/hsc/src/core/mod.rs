@@ -56,3 +56,36 @@ pub struct TopBind {
     pub name: String,
     pub body: Core,
 }
+
+/// Replaces every occurrence of the variable `from` by `to`. Names are unique, so no
+/// binder can capture the replacement.
+pub fn rename_var(c: &mut Core, from: &str, to: &str) {
+    match c {
+        Core::Var(v) => {
+            if v == from {
+                *v = to.to_string();
+            }
+        }
+        Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            rename_var(f, from, to);
+            rename_var(a, from, to);
+        }
+        Core::Lam(_, b) => rename_var(b, from, to),
+        Core::Let(binds, body) => {
+            for (_, b) in binds.iter_mut() {
+                rename_var(b, from, to);
+            }
+            rename_var(body, from, to);
+        }
+        Core::Case(s, _, alts) => {
+            rename_var(s, from, to);
+            for a in alts.iter_mut() {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => rename_var(b, from, to),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| rename_var(a, from, to)),
+    }
+}

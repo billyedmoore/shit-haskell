@@ -609,6 +609,22 @@ impl Checker {
         }
         self.givens.truncate(givens_len);
 
+        if dparams.is_empty() {
+            // A constant dictionary: its methods and superclass dictionaries are top-level
+            // bindings, so that calls through the dictionary can be resolved statically.
+            let mut fields = fields;
+            for field in fields.iter_mut() {
+                crate::core::rename_var(field, &this, &inst.dict);
+            }
+            for (name, body) in super_binds.into_iter().chain(method_binds) {
+                self.out.push(TopBind { name, body });
+            }
+            self.out.push(TopBind {
+                name: inst.dict.clone(),
+                body: Core::Con(info.dict_con.clone(), fields),
+            });
+            return Ok(());
+        }
         let dict_body = Core::Con(info.dict_con.clone(), fields);
         let mut bindings = super_binds;
         bindings.extend(method_binds);
