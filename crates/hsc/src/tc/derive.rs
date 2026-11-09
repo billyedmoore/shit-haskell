@@ -139,6 +139,7 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
                 "Show" => derive_show(checker, dd),
                 "Enum" => derive_enum(checker, dd),
                 "Bounded" => derive_bounded(checker, dd),
+                "Read" => derive_read(checker, dd),
                 // Other classes are accepted and ignored until they are supported.
                 _ => continue,
             };
@@ -508,4 +509,64 @@ fn derive_bounded(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         ];
     }
     Vec::new()
+}
+
+/// `readsPrec`: each constructor is read by a list comprehension over `lex` tokens and
+/// `readsPrec 11` for its arguments; the alternatives are concatenated.
+fn derive_read(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
+    use crate::syntax::ast::Stmt;
+    let loc = dd.loc;
+    let d = checker.fresh_name("d");
+    let s = checker.fresh_name("s");
+    let r = checker.fresh_name("r");
+    let module = checker.module.clone();
+    let mut alts: Vec<Expr> = Vec::new();
+    for c in &dd.cons {
+        if !field_names(c).is_empty() {
+            continue;
+        }
+        let n = arity(c);
+        let args = fresh_vars(checker, "a", n);
+        let mut quals: Vec<Stmt> = Vec::new();
+        let mut cur = checker.fresh_name("s");
+        let token = if is_operator(&c.name) { c.name.clone() } else { c.name.clone() };
+        quals.push(Stmt::Bind {
+            pat: Pat::Tuple(
+                vec![Pat::Lit(Lit::Str(token), loc), Pat::Var(cur.clone(), loc)],
+                loc,
+            ),
+            expr: app(base_var("lex", loc), vec![local(&r, loc)]),
+            loc,
+        });
+        for a in &args {
+            let next = checker.fresh_name("s");
+            quals.push(Stmt::Bind {
+                pat: Pat::Tuple(vec![Pat::Var(a.clone(), loc), Pat::Var(next.clone(), loc)], loc),
+                expr: app(base_var("readsPrec", loc), vec![int(11, loc), local(&cur, loc)]),
+                loc,
+            });
+            cur = next;
+        }
+        let value = args
+            .iter()
+            .fold(con_expr(&module, &c.name, loc), |acc, a| app(acc, vec![local(a, loc)]));
+        let body = Expr::Tuple(vec![Some(value), Some(local(&cur, loc))], loc);
+        alts.push(Expr::ListComp(Box::new(body), vec![quals], loc));
+    }
+    let all = alts
+        .into_iter()
+        .rev()
+        .fold(Expr::List(vec![], loc), |acc, alt| app(base_var("++", loc), vec![alt, acc]));
+    // readsPrec d s = readParen (d > 10) (\r -> all) s
+    let paren_cond = app(base_var(">", loc), vec![local(&d, loc), int(10, loc)]);
+    let lam = Expr::Lam(vec![Pat::Var(r.clone(), loc)], Box::new(all), loc);
+    let body = app(
+        base_var("readParen", loc),
+        vec![paren_cond, lam, local(&s, loc)],
+    );
+    vec![fun(
+        "readsPrec",
+        vec![clause(vec![Pat::Var(d, loc), Pat::Var(s, loc)], body, loc)],
+        loc,
+    )]
 }

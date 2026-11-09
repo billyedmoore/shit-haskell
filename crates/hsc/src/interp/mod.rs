@@ -53,7 +53,7 @@ pub struct FunVal {
     pub free: Rc<Vec<Cell>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum RtError {
     /// A pattern-match failure or other compiler-generated failure.
     Fail(String),
@@ -61,6 +61,8 @@ pub enum RtError {
     Error(String),
     /// Exit with a status code.
     Exit(i32),
+    /// A Haskell exception, as a `SomeException` value.
+    Thrown(Value),
 }
 
 pub type RR = Result<Value, RtError>;
@@ -356,6 +358,15 @@ pub fn run_main(rt: &Runtime) -> i32 {
         Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) => {
             prims::flush_stdout();
             eprintln!("{}: {}", rt.prog_name, msg);
+            1
+        }
+        Err(RtError::Thrown(exc)) => {
+            prims::flush_stdout();
+            let text = match &exc {
+                Value::Con(c) if c.args.len() == 3 => rt.force_string(&c.args[2]).unwrap_or_default(),
+                _ => String::from("uncaught exception"),
+            };
+            eprintln!("{}: {}", rt.prog_name, text);
             1
         }
     };

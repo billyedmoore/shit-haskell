@@ -36,7 +36,14 @@ Parse-only dev mode: `target/debug/hsc [-X<ext>] [--dump-ast] file.hs`.
 
 ## Differential results (`tests/`)
 
-- Clone, current: 44 of 59 (run 26/40, fail 18/19). Oracle: GHC 9.12.2.
+- Clone, current: 50 of 59 (run 32/40, fail 18/19). Oracle: GHC 9.12.2.
+- Wider sweep over GHC's own `should_run` programs (stored `.stdout` files, 899 with output):
+  143 pass, 652 fail to compile, 77 print different output. The stored outputs are old
+  (for example `numeric/arith003` assumes a 32-bit `Int`), so prefer real GHC as the oracle
+  for broad sweeps.
+- Compile failures by cause (sweep): missing modules (Control.Concurrent, Foreign, Control.Exception,
+  GHC.Exts, Data.Array, Data.Typeable, ...), MagicHash and unboxed syntax, Arrows (`proc`),
+  TransformListComp, ImplicitParams, type families, higher-rank types.
 - Known gaps, by cause:
   - Missing library modules: Data.Bits, Control.Exception, Control.Concurrent, Data.Function, Text.Printf.
   - Runtime error text: GHC 9.12 prints `Uncaught exception` blocks with `HasCallStack backtrace`

@@ -511,6 +511,14 @@ impl Checker {
                 }
                 None => match info.defaults.get(mkey) {
                     Some(dm) => Core::App(Box::new(Core::Var(dm.clone())), Box::new(Core::Var(this.clone()))),
+                    // Exception types are identified by their type name, which stands in for Typeable.
+                    None if occ == "exceptionTypeTag" => {
+                        let name = inst.head.first().map(head_name).unwrap_or_default();
+                        Core::Lam(
+                            "tag%".into(),
+                            Box::new(Core::Lit(crate::core::Lit::Str(name))),
+                        )
+                    }
                     None => Core::Fail(format!(
                         "No instance nor default method for class operation {occ}"
                     )),

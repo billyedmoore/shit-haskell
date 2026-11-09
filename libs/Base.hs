@@ -1205,6 +1205,25 @@ class Read a where
 reads :: Read a => ReadS a
 reads = readsPrec 0
 
+-- Lexical analysis for derived instances: one token, after skipping spaces.
+lex :: ReadS String
+lex s = case dropWhile isSpaceC s of
+  "" -> [("", "")]
+  (c : cs)
+    | isAlphaC c || c == '_' -> let (w, r) = span isIdentC (c : cs) in [(w, r)]
+    | isDigitC c -> let (w, r) = span isDigitC (c : cs) in [(w, r)]
+    | c `elem` "()[]{},;`\"" -> [([c], cs)]
+    | otherwise -> let (w, r) = span isSymC (c : cs) in if null w then [] else [(w, r)]
+  where
+    isIdentC x = isAlphaC x || isDigitC x || x == '_' || x == '\''
+    isSymC x = x `elem` "!#$%&*+./<=>?@\\^|-~:"
+
+readParen :: Bool -> ReadS a -> ReadS a
+readParen b g = if b then mandatory else optional
+  where
+    optional r = g r ++ mandatory r
+    mandatory r = [(x, u) | ("(", s) <- lex r, (x, t) <- optional s, (")", u) <- lex t]
+
 read :: Read a => String -> a
 read s = case [x | (x, rest) <- readsPrec 0 s, all isSpaceC rest] of
   (x : _) -> x
@@ -1224,14 +1243,13 @@ readListDefault s0 = case dropWhile isSpaceC s0 of
       _ -> []
 
 instance Read Int where
-  readsPrec _ s = [(primIntegerToInt n, r) | (n, r) <- readIntegerPrefix s]
+  readsPrec _ s = readParen False (\t -> [(primIntegerToInt n, r) | (n, r) <- readIntegerPrefix t]) s
 
 instance Read Integer where
-  readsPrec _ s = readIntegerPrefix s
+  readsPrec _ s = readParen False readIntegerPrefix s
 
 instance Read Double where
-  readsPrec _ s0 = case dropWhile isSpaceC s0 of
-    s -> [(primDoubleRead tok, r) | (tok, r) <- lexDouble s, not (null tok)]
+  readsPrec _ s0 = readParen False (\s -> [(primDoubleRead tok, r) | (tok, r) <- lexDouble (dropWhile isSpaceC s), not (null tok)]) s0
 
 foreign import prim "doubleRead" primDoubleRead :: String -> Double
 

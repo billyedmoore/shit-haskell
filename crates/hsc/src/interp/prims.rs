@@ -196,6 +196,59 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let sign = if ev < 0 { "-" } else { "+" };
             Ok(string_value(&format!("{m}e{sign}{:02}", ev.abs())))
         }
+        "unsafeCoerce" => rt.force(&args[0]),
+        "throwExc" => Err(RtError::Thrown(rt.force(&args[0])?)),
+        "throwIOExc" => Err(RtError::Thrown(rt.force(&args[0])?)),
+        "catchExc" => {
+            // catch#: args are the action, the converter for runtime errors, the handler, the world.
+            let run_io = |cell: &Cell| -> RR {
+                let io = rt.force(cell)?;
+                let run = match io {
+                    Value::Con(c) if c.name == "Base.IO" => rt.force(&c.args[0])?,
+                    _ => return Err(RtError::Fail("internal: catch of a non-IO action".into())),
+                };
+                rt.apply(run, args[3].clone())
+            };
+            let outcome = run_io(&args[0]);
+            let exc = match outcome {
+                Ok(v) => return Ok(v),
+                Err(RtError::Thrown(v)) => v,
+                Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) => {
+                    let conv = rt.force(&args[1])?;
+                    let cell = Rc::new(RefCell::new(super::Thunk::Done(string_value(&msg))));
+                    rt.apply(conv, cell)?
+                }
+                Err(other) => return Err(other),
+            };
+            let handler = rt.force(&args[2])?;
+            let exc_cell = Rc::new(RefCell::new(super::Thunk::Done(exc)));
+            let io = rt.apply(handler, exc_cell)?;
+            let run = match io {
+                Value::Con(c) if c.name == "Base.IO" => rt.force(&c.args[0])?,
+                _ => return Err(RtError::Fail("internal: handler is not an IO action".into())),
+            };
+            rt.apply(run, args[3].clone())
+        }
+        "traceErr" => {
+            let s = rt.force_string(&args[0])?;
+            let _ = std::io::stderr().write_all(format!("{s}\n").as_bytes());
+            rt.force(&args[1])
+        }
+        "getArgs" => Ok(io_result(list_value(Vec::new()))),
+        "getProgName" => Ok(io_result(string_value(&rt.prog_name))),
+        "unsafeRunIO" => {
+            // `unsafePerformIO io`: run the IO action (a function of the world) and take its result.
+            let io = rt.force(&args[0])?;
+            let run = match io {
+                Value::Con(c) if c.name == "Base.IO" => rt.force(&c.args[0])?,
+                _ => return Err(RtError::Fail("internal: unsafePerformIO of a non-IO value".into())),
+            };
+            let res = rt.apply(run, Rc::new(RefCell::new(super::Thunk::Done(unit_value()))))?;
+            match res {
+                Value::Con(c) if c.name == "Base.IORes" => rt.force(&c.args[0]),
+                _ => Err(RtError::Fail("internal: IO result".into())),
+            }
+        }
         "doubleRead" => {
             let s = rt.force_string(&args[0])?;
             Ok(Value::Double(s.parse::<f64>().unwrap_or(0.0)))
@@ -289,6 +342,25 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
 
         _ => Err(RtError::Fail(format!("internal: unknown primitive {name}"))),
     }
+}
+
+/// A Haskell list of values.
+pub fn list_value(items: Vec<Value>) -> Value {
+    items.into_iter().rev().fold(
+        Value::Con(Rc::new(super::ConVal {
+            name: "Builtin.[]",
+            args: vec![],
+        })),
+        |tail, head| {
+            Value::Con(Rc::new(super::ConVal {
+                name: "Builtin.:",
+                args: vec![
+                    Rc::new(RefCell::new(super::Thunk::Done(head))),
+                    Rc::new(RefCell::new(super::Thunk::Done(tail))),
+                ],
+            }))
+        },
+    )
 }
 
 /// `IORes a`: the result of running an IO action.
