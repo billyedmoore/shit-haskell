@@ -14,19 +14,19 @@ Parse-only dev mode: `target/release/hsc [-X<ext>] [--dump-ast] file.hs`.
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| 1 | Differential harness and seed corpus | done (`difftest`, `tests/`); GHC testsuite sweep is a scratch script |
-| 2 | Front end: lexer, layout, parser, fixity, renamer, modules | done for Haskell 2010 + GHC2021 syntax; MagicHash subset; no Arrows, TransformListComp, ImplicitParams, mdo |
-| 3 | Types and Core | working: HM with classes, defaulting, deriving, GADTs, existentials, fundeps (improvement), kinds |
-| 4 | Real `base` from GHC sources | not started; the vendored `libs/` are hand-written stand-ins |
-| 5 | Native back end and RTS | not started; the STG-like interpreter is the runtime |
+| 1 | Differential harness and seed corpus | done (`difftest`, `tests/`: 57 of 59); GHC testsuite sweep is a scratch script |
+| 2 | Front end: lexer, layout, parser, fixity, renamer, modules | done for the Haskell 2010 and GHC2021 surface, plus CPP, DataKinds promotion, view patterns, pattern synonyms, RecursiveDo, MagicHash literals, TypeApplications |
+| 3 | Types and Core | done: HM with classes, defaulting, deriving (incl. standalone), GADTs, existentials, fundeps, kinds, type families; Core lint (`-dcore-lint`) passes on the corpus and the testsuite's compiling programs |
+| 4 | Real `base` from GHC sources | in progress. Real `ghc-prim` modules type-check: GHC.Types, GHC.Classes, GHC.CString, GHC.Tuple, GHC.Magic over a generated GHC.Prim (`tools/gen_primops.py`). Our `Base` now builds on them (Bool, Char, Int, IO, Eq, Ord come from GHC). Still missing: `{-# SOURCE #-}` imports and `.hs-boot` files (GHC.Internal is cyclic through them), about 400 of the 554 primops in the runtime, CPP-heavy modules, Typeable and the rest of `ghc-internal` and `base` |
+| 5 | Native back end and RTS | not started; the interpreter and the lock-based threads are the runtime |
 | 6 | Driver and packages | partial: `-o`, `--run`, `-i` search path, output executables carry the program |
-| 7 | Boot libraries | partial: Map, Set, Array, mutable arrays (ST/IO/MArray), State, Printf, Semigroup, Bifunctor |
-| 8 | Speed parity with GHC | not started; see benchmark notes below |
-| 9 | Remaining extension surface | partial: type families (closed/open/associated), kind signatures, GADTs, fundeps; missing rank-N, data families, Typeable, TH |
+| 7 | Boot libraries | partial: Map, Set, Array, mutable arrays (ST/IO/MArray), State, Printf, Semigroup, Bifunctor, Monad.Fix |
+| 8 | Speed parity with GHC | not started. Measured: deep recursion costs seconds of system time (evaluator stack frames); `length` and list walks now run in constant stack |
+| 9 | Remaining extension surface | partial: TypeApplications, RecursiveDo, pattern synonyms, view patterns, DataKinds (promotion, promoted lists), constraint variables; missing rank-N, data families, Typeable, TH, arrows |
 | 10 | Large projects | not started |
 | 11 | Diagnostics parity | partial: GHC-format `error`/`undefined` output with call sites |
-| 12 | Runtime and build independence | partial: the compiler and runtime use only Rust std; `gcc` is not used yet (interpreter) |
-| 13 | No system toolchain | not started (native x86-64 encoder, ELF writer) |
+| 12 | Runtime and build independence | partial: the compiler uses only Rust std; the generator for GHC.Prim is a development tool whose output is vendored |
+| 13 | No system toolchain | not started (native x86-64 encoder, ELF writer); depends on milestone 5 |
 
 ## What works
 
