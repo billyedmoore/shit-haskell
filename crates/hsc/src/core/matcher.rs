@@ -56,10 +56,17 @@ pub fn compile_rows(scruts: &[String], rows: &[Row], fail: Core, fresh: Fresh) -
         None => fail,
         Some((row, [])) => row_code(scruts, row, fail, fresh),
         Some((row, rest)) => {
+            // The remaining rows are a function of a unit argument, so falling through is a
+            // tail call; a thunk here would be forced recursively for every failed row.
             let k = fresh("k");
+            let u = fresh("u");
             let rest_code = compile_rows(scruts, rest, fail, fresh);
-            let code = row_code(scruts, row, Core::Var(k.clone()), fresh);
-            Core::Let(vec![(k, rest_code)], Box::new(code))
+            let fallthrough = Core::App(
+                Box::new(Core::Var(k.clone())),
+                Box::new(Core::Con("Builtin.()".into(), vec![])),
+            );
+            let code = row_code(scruts, row, fallthrough, fresh);
+            Core::Let(vec![(k, Core::Lam(u, Box::new(rest_code)))], Box::new(code))
         }
     }
 }

@@ -253,3 +253,78 @@ fn rewrite_selection(
         _ => {}
     }
 }
+
+/// A foreign primitive is a global `\p1 .. pn -> Prim(name, [p1 .. pn])`. A saturated call
+/// becomes the primitive applied directly to its argument expressions, so that `seq a b`
+/// keeps `b` in tail position instead of returning it through a parameter variable.
+pub fn inline_prim_wrappers(binds: &mut [TopBind]) {
+    let mut wrappers: HashMap<String, (usize, String)> = HashMap::new();
+    for b in binds.iter() {
+        let mut names = Vec::new();
+        let mut body = &b.body;
+        while let Core::Lam(x, inner) = body {
+            names.push(x.clone());
+            body = inner;
+        }
+        if let Core::Prim(p, args) = body {
+            let direct = !names.is_empty()
+                && args.len() == names.len()
+                && args.iter().zip(&names).all(|(a, n)| matches!(a, Core::Var(v) if v == n));
+            if direct {
+                wrappers.insert(b.name.clone(), (names.len(), p.clone()));
+            }
+        }
+    }
+    if wrappers.is_empty() {
+        return;
+    }
+    for b in binds.iter_mut() {
+        inline_calls(&mut b.body, &wrappers);
+    }
+}
+
+fn inline_calls(c: &mut Core, wrappers: &HashMap<String, (usize, String)>) {
+    match c {
+        Core::App(f, a) => {
+            inline_calls(f, wrappers);
+            inline_calls(a, wrappers);
+        }
+        Core::Lam(_, b) => inline_calls(b, wrappers),
+        Core::Let(binds, body) => {
+            for (_, b) in binds.iter_mut() {
+                inline_calls(b, wrappers);
+            }
+            inline_calls(body, wrappers);
+        }
+        Core::Case(s, _, alts) => {
+            inline_calls(s, wrappers);
+            for a in alts.iter_mut() {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => inline_calls(b, wrappers),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| inline_calls(a, wrappers)),
+        _ => {}
+    }
+    // A saturated call of a wrapper: `w a1 .. an` with the wrapper's arity n.
+    let mut n = 0;
+    let mut head = &*c;
+    while let Core::App(f, _) = head {
+        n += 1;
+        head = f;
+    }
+    let Core::Var(name) = head else { return };
+    let Some((arity, prim)) = wrappers.get(name) else { return };
+    if *arity != n {
+        return;
+    }
+    let mut args = Vec::with_capacity(n);
+    let mut cur = std::mem::replace(c, Core::Fail(String::new()));
+    while let Core::App(f, a) = cur {
+        args.push(*a);
+        cur = *f;
+    }
+    args.reverse();
+    *c = Core::Prim(prim.clone(), args);
+}

@@ -120,6 +120,7 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
         ));
     }
     let mut binds = std::mem::take(&mut d.binds);
+    crate::core::opt::inline_prim_wrappers(&mut binds);
     crate::core::opt::specialise_literals(&mut binds);
     crate::core::opt::resolve_known_methods(&mut binds);
     Ok(binds)
