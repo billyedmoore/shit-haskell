@@ -6,6 +6,8 @@ use std::fmt::Write;
 pub fn show_lit(l: &Lit) -> String {
     match l {
         Lit::Integer(s) | Lit::Frac(s) => s.clone(),
+        Lit::Int(i) => format!("{i}#"),
+        Lit::Double(d) => format!("{d}##"),
         Lit::Char(c) => format!("{c:?}"),
         Lit::Str(s) => format!("{s:?}"),
     }

@@ -26,6 +26,14 @@ fn put_lit(out: &mut Vec<u8>, l: &Lit) {
             out.push(3);
             put_str(out, s);
         }
+        Lit::Int(i) => {
+            out.push(4);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        Lit::Double(d) => {
+            out.push(5);
+            out.extend_from_slice(&d.to_bits().to_le_bytes());
+        }
     }
 }
 
@@ -151,6 +159,16 @@ impl Reader<'_> {
             1 => Lit::Frac(self.string()?),
             2 => Lit::Char(char::from_u32(self.u32()? as u32).ok_or("bad char")?),
             3 => Lit::Str(self.string()?),
+            4 => {
+                let b = self.data.get(self.pos..self.pos + 8).ok_or("truncated program")?;
+                self.pos += 8;
+                Lit::Int(i64::from_le_bytes(b.try_into().expect("8 bytes")))
+            }
+            5 => {
+                let b = self.data.get(self.pos..self.pos + 8).ok_or("truncated program")?;
+                self.pos += 8;
+                Lit::Double(f64::from_bits(u64::from_le_bytes(b.try_into().expect("8 bytes"))))
+            }
             _ => return Err("bad literal tag".into()),
         })
     }

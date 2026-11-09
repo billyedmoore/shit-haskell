@@ -15,9 +15,9 @@ fn int(rt: &Runtime, c: &Cell) -> Result<i64, RtError> {
     }
 }
 
-fn integer(rt: &Runtime, c: &Cell) -> Result<BigInt, RtError> {
+fn integer(rt: &Runtime, c: &Cell) -> Result<Rc<BigInt>, RtError> {
     match rt.force(c)? {
-        Value::Integer(i) => Ok((*i).clone()),
+        Value::Integer(i) => Ok(i),
         _ => Err(RtError::Fail("internal: expected Integer".into())),
     }
 }
@@ -91,9 +91,18 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         "intShow" => Ok(string_value(&int(rt, &args[0])?.to_string())),
 
         // ----- Integer -----
-        "integerAdd" => integer_v(integer(rt, &args[0])?.add(&integer(rt, &args[1])?)),
-        "integerSub" => integer_v(integer(rt, &args[0])?.sub(&integer(rt, &args[1])?)),
-        "integerMul" => integer_v(integer(rt, &args[0])?.mul(&integer(rt, &args[1])?)),
+        "integerAdd" => {
+            let (a, b) = (integer(rt, &args[0])?, integer(rt, &args[1])?);
+            integer_v(a.add(&b))
+        }
+        "integerSub" => {
+            let (a, b) = (integer(rt, &args[0])?, integer(rt, &args[1])?);
+            integer_v(a.sub(&b))
+        }
+        "integerMul" => {
+            let (a, b) = (integer(rt, &args[0])?, integer(rt, &args[1])?);
+            integer_v(a.mul(&b))
+        }
         "integerNegate" => integer_v(integer(rt, &args[0])?.neg()),
         "integerAbs" => integer_v(integer(rt, &args[0])?.abs()),
         "integerSignum" => {
@@ -119,15 +128,24 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 _ => a.div_mod(&b).1,
             })
         }
-        "integerEq" => Ok(bool_value(integer(rt, &args[0])? == integer(rt, &args[1])?)),
-        "integerLt" => Ok(bool_value(integer(rt, &args[0])?.cmp_value(&integer(rt, &args[1])?) == std::cmp::Ordering::Less)),
-        "integerLe" => Ok(bool_value(integer(rt, &args[0])?.cmp_value(&integer(rt, &args[1])?) != std::cmp::Ordering::Greater)),
+        "integerEq" => {
+            let (a, b) = (integer(rt, &args[0])?, integer(rt, &args[1])?);
+            Ok(bool_value(*a == *b))
+        }
+        "integerLt" => {
+            let (a, b) = (integer(rt, &args[0])?, integer(rt, &args[1])?);
+            Ok(bool_value(a.cmp_value(&b) == std::cmp::Ordering::Less))
+        }
+        "integerLe" => {
+            let (a, b) = (integer(rt, &args[0])?, integer(rt, &args[1])?);
+            Ok(bool_value(a.cmp_value(&b) != std::cmp::Ordering::Greater))
+        }
         "integerToInt" => int_v(integer(rt, &args[0])?.to_i64_wrapping()),
         "integerToDouble" => Ok(Value::Double(integer(rt, &args[0])?.to_f64())),
         "integerShow" => Ok(string_value(&integer(rt, &args[0])?.to_decimal())),
         "integerShiftL" => {
             let n = int(rt, &args[1])?;
-            integer_v(super::bigint::shift_left(&integer(rt, &args[0])?, n as usize))
+            integer_v(super::bigint::shift_left(&*integer(rt, &args[0])?, n as usize))
         }
 
         // ----- Double -----
@@ -152,6 +170,32 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         "doubleTruncate" => integer_v(bigint_from_f64(double(rt, &args[0])?.trunc())),
         "doubleFloor" => integer_v(bigint_from_f64(double(rt, &args[0])?.floor())),
         "doubleCeiling" => integer_v(bigint_from_f64(double(rt, &args[0])?.ceil())),
+        "intAnd" => int_v(int(rt, &args[0])? & int(rt, &args[1])?),
+        "intOr" => int_v(int(rt, &args[0])? | int(rt, &args[1])?),
+        "intXor" => int_v(int(rt, &args[0])? ^ int(rt, &args[1])?),
+        "intShiftL" => {
+            let n = int(rt, &args[1])?;
+            int_v(if n >= 64 { 0 } else { int(rt, &args[0])?.wrapping_shl(n as u32) })
+        }
+        "intShiftR" => {
+            let n = int(rt, &args[1])?;
+            int_v(int(rt, &args[0])? >> n.min(63))
+        }
+        "intPopCount" => int_v(int(rt, &args[0])?.count_ones() as i64),
+        "doubleFixed" => {
+            let digits = int(rt, &args[0])?.max(0) as usize;
+            Ok(string_value(&format!("{:.*}", digits, double(rt, &args[1])?)))
+        }
+        "doubleExpFmt" => {
+            let digits = int(rt, &args[0])?.max(0) as usize;
+            let x = double(rt, &args[1])?;
+            let s = format!("{:.*e}", digits, x);
+            // Haskell-style exponent: e+05 is printed as e5 by GHC's printf? Keep C-like e+XX.
+            let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
+            let ev: i32 = e.parse().unwrap_or(0);
+            let sign = if ev < 0 { "-" } else { "+" };
+            Ok(string_value(&format!("{m}e{sign}{:02}", ev.abs())))
+        }
         "doubleRead" => {
             let s = rt.force_string(&args[0])?;
             Ok(Value::Double(s.parse::<f64>().unwrap_or(0.0)))

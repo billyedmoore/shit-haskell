@@ -1,21 +1,31 @@
-//! A lazy interpreter for Core. Thunks are shared mutable cells, global Core is leaked
-//! so that thunks can refer to it by `'static` reference, and environments are linked
-//! frames of cells.
+//! A lazy interpreter for resolved code (see `code`). Thunks and closures share cells;
+//! frames hold the slots of one function invocation, so evaluation never looks up
+//! names.
 
 pub mod bigint;
+pub mod code;
 pub mod prims;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::core::{Alt, Core, Lit, TopBind};
+use crate::core::{Lit, TopBind};
 use bigint::BigInt;
+use code::{Acc, CAlt, Code, LamInfo};
 
 pub type Cell = Rc<RefCell<Thunk>>;
 
+/// The slots of one function invocation (or top-level binding), and its captures.
+pub struct Frame {
+    pub slots: RefCell<Vec<Cell>>,
+    pub free: Rc<Vec<Cell>>,
+}
+
+pub type FrameRef = Rc<Frame>;
+
 pub enum Thunk {
-    Pending(&'static Core, Env),
+    Pending(&'static Code, FrameRef),
     Done(Value),
     /// Under evaluation; re-entering it is an infinite loop.
     Blackhole,
@@ -39,19 +49,9 @@ pub struct ConVal {
 }
 
 pub struct FunVal {
-    pub param: &'static str,
-    pub body: &'static Core,
-    pub env: Env,
+    pub info: &'static LamInfo,
+    pub free: Rc<Vec<Cell>>,
 }
-
-/// A linked environment frame.
-pub struct Frame {
-    pub name: &'static str,
-    pub cell: Cell,
-    pub next: Env,
-}
-
-pub type Env = Option<Rc<Frame>>;
 
 #[derive(Debug, Clone)]
 pub enum RtError {
@@ -66,69 +66,75 @@ pub enum RtError {
 pub type RR = Result<Value, RtError>;
 
 pub struct Runtime {
-    pub globals: HashMap<&'static str, Cell>,
+    /// Top-level cells, indexed as in `index`.
+    pub cells: Vec<Cell>,
+    pub index: HashMap<String, u32>,
     pub prog_name: String,
-}
-
-fn push(env: &Env, name: &'static str, cell: Cell) -> Env {
-    Some(Rc::new(Frame {
-        name,
-        cell,
-        next: env.clone(),
-    }))
 }
 
 fn new_cell(t: Thunk) -> Cell {
     Rc::new(RefCell::new(t))
 }
 
+fn blank_frame(nslots: u32, free: Rc<Vec<Cell>>) -> FrameRef {
+    let placeholder = new_cell(Thunk::Blackhole);
+    Rc::new(Frame {
+        slots: RefCell::new(vec![placeholder; nslots as usize]),
+        free,
+    })
+}
+
 impl Runtime {
-    /// Builds a runtime from the program's top-level bindings. Core is leaked so that it
-    /// lives for the whole run.
+    /// Compiles the program and creates a cell for each top-level binding. Top-level
+    /// code is a constant: each binding is evaluated at most once, on first use.
     pub fn new(binds: Vec<TopBind>, prog_name: String) -> Runtime {
-        let mut globals = HashMap::new();
-        for b in binds {
-            let name: &'static str = Box::leak(b.name.into_boxed_str());
-            let body: &'static Core = Box::leak(Box::new(b.body));
-            globals.insert(name, new_cell(Thunk::Pending(body, None)));
+        let prog = code::compile_program(binds);
+        let empty: Rc<Vec<Cell>> = Rc::new(Vec::new());
+        let mut cells = Vec::with_capacity(prog.bodies.len());
+        for (body, nslots) in prog.bodies {
+            let body: &'static Code = Box::leak(Box::new(body));
+            let frame = blank_frame(nslots, empty.clone());
+            cells.push(new_cell(Thunk::Pending(body, frame)));
         }
-        Runtime { globals, prog_name }
+        Runtime {
+            cells,
+            index: prog.index,
+            prog_name,
+        }
     }
 
-    fn lookup(&self, name: &str, env: &Env) -> Result<Cell, RtError> {
-        let mut cur = env;
-        while let Some(frame) = cur {
-            if frame.name == name {
-                return Ok(frame.cell.clone());
-            }
-            cur = &frame.next;
+    pub fn global(&self, name: &str) -> Option<Cell> {
+        self.index.get(name).map(|i| self.cells[*i as usize].clone())
+    }
+
+    fn access(&self, acc: Acc, frame: &FrameRef) -> Cell {
+        match acc {
+            Acc::Local(i) => frame.slots.borrow()[i as usize].clone(),
+            Acc::Free(i) => frame.free[i as usize].clone(),
+            Acc::Global(i) => self.cells[i as usize].clone(),
         }
-        self.globals
-            .get(name)
-            .cloned()
-            .ok_or_else(|| RtError::Fail(format!("internal: unbound variable {name}")))
     }
 
     pub fn force(&self, cell: &Cell) -> RR {
-        let (core, env) = {
+        let (code, frame) = {
             let mut t = cell.borrow_mut();
             match &*t {
                 Thunk::Done(v) => return Ok(v.clone()),
                 Thunk::Blackhole => return Err(RtError::Error("<<loop>>".into())),
-                Thunk::Pending(core, env) => {
-                    let (core, env) = (*core, env.clone());
+                Thunk::Pending(code, frame) => {
+                    let (code, frame) = (*code, frame.clone());
                     *t = Thunk::Blackhole;
-                    (core, env)
+                    (code, frame)
                 }
             }
         };
-        match self.eval(core, &env) {
+        match self.eval(code, &frame) {
             Ok(v) => {
                 *cell.borrow_mut() = Thunk::Done(v.clone());
                 Ok(v)
             }
             Err(e) => {
-                *cell.borrow_mut() = Thunk::Pending(core, env);
+                *cell.borrow_mut() = Thunk::Pending(code, frame);
                 Err(e)
             }
         }
@@ -136,136 +142,137 @@ impl Runtime {
 
     /// The cell for an expression: shared for variables, a value for literals, and a
     /// suspended computation otherwise.
-    fn delay(&self, core: &'static Core, env: &Env) -> Result<Cell, RtError> {
-        Ok(match core {
-            Core::Var(x) => self.lookup(x, env)?,
-            Core::Lit(Lit::Char(c)) => new_cell(Thunk::Done(Value::Char(*c))),
-            _ => new_cell(Thunk::Pending(core, env.clone())),
-        })
+    fn delay(&self, code: &'static Code, frame: &FrameRef) -> Cell {
+        match code {
+            Code::Var(acc) => self.access(*acc, frame),
+            Code::Char(c) => new_cell(Thunk::Done(Value::Char(*c))),
+            Code::Integer(b) => new_cell(Thunk::Done(Value::Integer(b.clone()))),
+            Code::Int(i) => new_cell(Thunk::Done(Value::Int(*i))),
+            _ => new_cell(Thunk::Pending(code, frame.clone())),
+        }
     }
 
-    /// Evaluates Core to weak head normal form. Calls and `let`/`case` continuations in
-    /// tail position loop rather than recurse, so tail-recursive programs run in constant
-    /// Rust stack.
-    pub fn eval(&self, core: &'static Core, env: &Env) -> RR {
-        let mut core = core;
-        let mut env = env.clone();
+    /// Evaluates code to weak head normal form. Calls and `let`/`case` continuations in
+    /// tail position loop rather than recurse, so tail-recursive programs run in
+    /// constant Rust stack.
+    pub fn eval(&self, code: &'static Code, frame: &FrameRef) -> RR {
+        let mut code = code;
+        let mut frame = frame.clone();
         'outer: loop {
-            match core {
-                Core::Var(x) => {
-                    let cell = self.lookup(x, &env)?;
+            match code {
+                Code::Var(acc) => {
+                    let cell = self.access(*acc, &frame);
                     return self.force(&cell);
                 }
-                Core::Lit(l) => return lit_value(l),
-                Core::App(f, a) => {
-                    let fv = self.eval(f, &env)?;
-                    let arg = self.delay(a, &env)?;
+                Code::Integer(b) => return Ok(Value::Integer(b.clone())),
+                Code::Int(i) => return Ok(Value::Int(*i)),
+                Code::Double(d) => return Ok(Value::Double(*d)),
+                Code::Frac(s) => return Ok(Value::Double(s.parse().unwrap_or(0.0))),
+                Code::Char(c) => return Ok(Value::Char(*c)),
+                Code::Str(s) => return Ok(string_value(s)),
+                Code::App(f, a) => {
+                    let fv = self.eval(f, &frame)?;
+                    let arg = self.delay(a, &frame);
                     match fv {
                         Value::Fun(fun) => {
-                            env = push(&fun.env, fun.param, arg);
-                            core = fun.body;
+                            let info: &'static LamInfo = fun.info;
+                            let new_frame = blank_frame(info.nslots, fun.free.clone());
+                            new_frame.slots.borrow_mut()[0] = arg;
+                            frame = new_frame;
+                            code = &info.body;
                         }
                         _ => return Err(RtError::Fail("internal: application of a non-function".into())),
                     }
                 }
-                Core::Lam(x, body) => {
+                Code::Lam(info) => {
+                    let captured: Vec<Cell> = info.captures.iter().map(|a| self.access(*a, &frame)).collect();
                     return Ok(Value::Fun(Rc::new(FunVal {
-                        param: x,
-                        body,
-                        env: env.clone(),
-                    })))
+                        info,
+                        free: Rc::new(captured),
+                    })));
                 }
-                Core::Let(binds, body) => {
-                    env = self.bind_rec(binds, &env);
-                    core = body;
+                Code::Let(binds, body) => {
+                    let mut cells = Vec::with_capacity(binds.len());
+                    {
+                        let mut slots = frame.slots.borrow_mut();
+                        for (slot, _) in binds {
+                            let cell = new_cell(Thunk::Blackhole);
+                            slots[*slot as usize] = cell.clone();
+                            cells.push(cell);
+                        }
+                    }
+                    for ((_, bound), cell) in binds.iter().zip(&cells) {
+                        *cell.borrow_mut() = Thunk::Pending(bound, frame.clone());
+                    }
+                    code = body;
                 }
-                Core::Case(scrut, b, alts) => {
-                    let v = self.eval(scrut, &env)?;
-                    let env2 = push(&env, leak_str(b), new_cell(Thunk::Done(v.clone())));
+                Code::Case(scrut, bslot, alts) => {
+                    let v = self.eval(scrut, &frame)?;
+                    if *bslot != u32::MAX {
+                        frame.slots.borrow_mut()[*bslot as usize] = new_cell(Thunk::Done(v.clone()));
+                    }
                     for alt in alts {
                         match alt {
-                            Alt::Con(name, vars, body) => {
+                            CAlt::Con(name, slots, body) => {
                                 if let Value::Con(c) = &v {
-                                    if c.name == name.as_str() {
-                                        let mut env3 = env2.clone();
-                                        for (var, cell) in vars.iter().zip(&c.args) {
-                                            env3 = push(&env3, leak_str(var), cell.clone());
+                                    if c.name == *name {
+                                        let mut fs = frame.slots.borrow_mut();
+                                        for (slot, cell) in slots.iter().zip(&c.args) {
+                                            fs[*slot as usize] = cell.clone();
                                         }
-                                        env = env3;
-                                        core = body;
+                                        drop(fs);
+                                        code = body;
                                         continue 'outer;
                                     }
                                 }
                             }
-                            Alt::Lit(l, body) => {
+                            CAlt::Lit(l, body) => {
                                 if lit_matches(&v, l) {
-                                    env = env2;
-                                    core = body;
+                                    code = body;
                                     continue 'outer;
                                 }
                             }
-                            Alt::Default(body) => {
-                                env = env2;
-                                core = body;
+                            CAlt::Default(body) => {
+                                code = body;
                                 continue 'outer;
                             }
                         }
                     }
                     return Err(RtError::Fail("Non-exhaustive patterns in case".into()));
                 }
-                Core::Con(name, args) => {
-                    let mut cells = Vec::with_capacity(args.len());
-                    for a in args {
-                        cells.push(self.delay(a, &env)?);
-                    }
-                    return Ok(Value::Con(Rc::new(ConVal {
-                        name: leak_str(name),
-                        args: cells,
-                    })));
+                Code::Con(name, args) => {
+                    let cells: Vec<Cell> = args.iter().map(|a| self.delay(a, &frame)).collect();
+                    return Ok(Value::Con(Rc::new(ConVal { name, args: cells })));
                 }
-                Core::Prim(name, args) => {
+                Code::Prim(name, args) => {
                     if name == "ratioLit" {
-                        if let [Core::Lit(Lit::Frac(s))] = args.as_slice() {
+                        if let [Code::Frac(s)] = args.as_slice() {
                             return Ok(prims::ratio_literal(s));
                         }
                     }
                     if name == "seq" {
                         // `seq a b` forces `a`, then continues with `b` in tail position.
                         if let [a, b] = args.as_slice() {
-                            self.eval(a, &env)?;
-                            core = b;
+                            self.eval(a, &frame)?;
+                            code = b;
                             continue 'outer;
                         }
                     }
-                    let mut cells = Vec::with_capacity(args.len());
-                    for a in args {
-                        cells.push(self.delay(a, &env)?);
-                    }
+                    let cells: Vec<Cell> = args.iter().map(|a| self.delay(a, &frame)).collect();
                     return prims::call(self, name, &cells);
                 }
-                Core::Fail(msg) => return Err(RtError::Fail(msg.clone())),
+                Code::Fail(msg) => return Err(RtError::Fail(msg.clone())),
             }
         }
     }
 
-    /// Binds a recursive group: every cell's environment includes the whole group.
-    fn bind_rec(&self, binds: &'static [(String, Core)], env: &Env) -> Env {
-        let cells: Vec<Cell> = binds.iter().map(|_| new_cell(Thunk::Blackhole)).collect();
-        let mut env2 = env.clone();
-        for ((name, _), cell) in binds.iter().zip(&cells) {
-            env2 = push(&env2, leak_str(name), cell.clone());
-        }
-        for ((_, body), cell) in binds.iter().zip(&cells) {
-            *cell.borrow_mut() = Thunk::Pending(body, env2.clone());
-        }
-        env2
-    }
-
     pub fn apply(&self, f: Value, arg: Cell) -> RR {
         match f {
-            Value::Fun(fv) => {
-                let env = push(&fv.env, fv.param, arg);
-                self.eval(fv.body, &env)
+            Value::Fun(fun) => {
+                let info = fun.info;
+                let frame = blank_frame(info.nslots, fun.free.clone());
+                frame.slots.borrow_mut()[0] = arg;
+                self.eval(&info.body, &frame)
             }
             _ => Err(RtError::Fail("internal: application of a non-function".into())),
         }
@@ -290,26 +297,12 @@ impl Runtime {
     }
 }
 
-/// Interned static names. Names come from Core, which lives for the whole run.
-fn leak_str(s: &str) -> &'static str {
-    thread_local! {
-        static INTERN: RefCell<HashMap<String, &'static str>> = RefCell::new(HashMap::new());
-    }
-    INTERN.with(|m| {
-        let mut m = m.borrow_mut();
-        if let Some(v) = m.get(s) {
-            return *v;
-        }
-        let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-        m.insert(s.to_string(), leaked);
-        leaked
-    })
-}
-
 pub fn lit_value(l: &Lit) -> RR {
     Ok(match l {
         Lit::Integer(s) => Value::Integer(Rc::new(BigInt::parse(s).ok_or_else(|| RtError::Fail("bad integer literal".into()))?)),
         Lit::Frac(s) => Value::Double(s.parse().unwrap_or(0.0)),
+        Lit::Int(i) => Value::Int(*i),
+        Lit::Double(d) => Value::Double(*d),
         Lit::Char(c) => Value::Char(*c),
         Lit::Str(s) => string_value(s),
     })
@@ -333,6 +326,7 @@ pub fn string_value(s: &str) -> Value {
 fn lit_matches(v: &Value, l: &Lit) -> bool {
     match (v, l) {
         (Value::Char(a), Lit::Char(b)) => a == b,
+        (Value::Int(a), Lit::Int(b)) => a == b,
         (Value::Int(a), Lit::Integer(s)) => s.parse::<i64>().ok() == Some(*a),
         (Value::Integer(a), Lit::Integer(s)) => BigInt::parse(s).is_some_and(|b| **a == b),
         _ => false,
@@ -341,7 +335,7 @@ fn lit_matches(v: &Value, l: &Lit) -> bool {
 
 /// Runs `Main.main`, returning the process exit code.
 pub fn run_main(rt: &Runtime) -> i32 {
-    let Some(main_cell) = rt.globals.get("Main.main").cloned() else {
+    let Some(main_cell) = rt.global("Main.main") else {
         eprintln!("{}: The IO action ‘main’ is not defined in module ‘Main’", rt.prog_name);
         return 1;
     };
@@ -352,33 +346,21 @@ pub fn run_main(rt: &Runtime) -> i32 {
             Value::Con(c) if c.name == "Base.IO" => rt.force(&c.args[0])?,
             _ => return Err(RtError::Fail("internal: main is not an IO action".into())),
         };
-        let unit = new_cell(Thunk::Done(Value::Con(Rc::new(ConVal {
-            name: "Builtin.()",
-            args: vec![],
-        }))));
+        let unit = new_cell(Thunk::Done(unit_value()));
         rt.apply(run, unit)?;
         Ok(())
     })();
-    match result {
-        Ok(()) => {
-            prims::flush_stdout();
-            0
-        }
-        Err(RtError::Exit(code)) => {
-            prims::flush_stdout();
-            code
-        }
-        Err(RtError::Error(msg)) => {
+    let code = match result {
+        Ok(()) => 0,
+        Err(RtError::Exit(code)) => code,
+        Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) => {
             prims::flush_stdout();
             eprintln!("{}: {}", rt.prog_name, msg);
             1
         }
-        Err(RtError::Fail(msg)) => {
-            prims::flush_stdout();
-            eprintln!("{}: {}", rt.prog_name, msg);
-            1
-        }
-    }
+    };
+    prims::flush_stdout();
+    code
 }
 
 pub fn bool_value(b: bool) -> Value {

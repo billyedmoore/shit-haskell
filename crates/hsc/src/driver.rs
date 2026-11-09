@@ -117,5 +117,7 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
             main_file.display()
         ));
     }
-    Ok(std::mem::take(&mut d.binds))
+    let mut binds = std::mem::take(&mut d.binds);
+    crate::core::opt::specialise_literals(&mut binds);
+    Ok(binds)
 }

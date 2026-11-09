@@ -6,6 +6,7 @@
 //! `%N` suffix. Application and abstraction are single-argument.
 
 pub mod matcher;
+pub mod opt;
 pub mod pretty;
 pub mod serial;
 
@@ -13,6 +14,10 @@ pub mod serial;
 pub enum Lit {
     /// Arbitrary-precision integer in decimal.
     Integer(String),
+    /// A literal already known to be an `Int`.
+    Int(i64),
+    /// A literal already known to be a `Double`.
+    Double(f64),
     /// Floating literal as written, e.g. `1.5e-3`.
     Frac(String),
     Char(char),
