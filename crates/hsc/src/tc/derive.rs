@@ -16,7 +16,7 @@ fn defining_module(name: &str) -> &'static str {
         "True" | "False" | "Bool" | "Char" | "Int" | "Word" | "Float" | "Double" | "Ordering" | "LT" | "EQ" | "GT" => {
             "GHC.Types"
         }
-        "Eq" | "Ord" | "==" | "/=" | "<" | "<=" | ">" | ">=" | "compare" | "max" | "min" | "&&" | "||" | "not" => {
+        "Eq" | "Ord" | "==" | "/=" | "<" | "<=" | ">" | ">=" | "compare" | "max" | "min" | "&&" | "||" | "not" | "compareInt#" => {
             "GHC.Classes"
         }
         _ => BASE,
@@ -270,7 +270,11 @@ fn tag_of(dd: &DataDecl, module: &str, e: Expr, loc: Loc) -> Expr {
         .map(|(i, c)| Alt {
             pat: con_pat(module, &c.name, (0..arity(c)).map(|_| Pat::Wild(loc)).collect(), loc),
             rhs: Rhs {
-                body: Body::Plain(int(i as i64, loc)),
+                // A primitive literal: the tag is compared without needing `Num`.
+                body: Body::Plain(Expr::Lit(
+                    Lit::Prim(crate::syntax::token::PrimLit::Int(i.to_string())),
+                    loc,
+                )),
                 wheres: Vec::new(),
             },
             loc,
@@ -336,7 +340,7 @@ fn derive_ord(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
                     pat: Pat::Wild(loc),
                     rhs: Rhs {
                         body: Body::Plain(app(
-                            base_var("compareInt", loc),
+                            base_var("compareInt#", loc),
                             vec![
                                 tag_of(dd, &module, local(&x, loc), loc),
                                 tag_of(dd, &module, local(&y, loc), loc),

@@ -94,8 +94,18 @@ impl Checker {
         for d in decls {
             if let Decl::Data(dd) = d {
                 self.data_decl(dd)?;
+                self.env.data_decls.insert(
+                    format!("{}.{}", self.module, dd.name),
+                    (self.module.clone(), dd.clone()),
+                );
                 derived.extend(self.derive_instances(dd)?);
                 self.register_newtype_deriving(dd)?;
+            }
+        }
+        for d in decls {
+            if let Decl::Deriving(sd) = d {
+                self.loc = sd.loc;
+                derived.extend(self.standalone_derive(sd)?);
             }
         }
 
@@ -723,6 +733,45 @@ impl Checker {
     /// Generated instances for `deriving` clauses; see `derive`.
     fn derive_instances(&mut self, dd: &DataDecl) -> TR<Vec<Decl>> {
         super::derive::derive_instances(self, dd)
+    }
+
+    /// `deriving instance C (T ..)`: the stock instance for `T`, generated from its declaration
+    /// (possibly in another module, whose names are then resolved in that module).
+    fn standalone_derive(&mut self, sd: &crate::syntax::ast::StandaloneDeriving) -> TR<Vec<Decl>> {
+        use crate::syntax::ast::{Deriving, Type};
+        let (cls, arg) = match &sd.head {
+            Type::App(c, a) => (c.as_ref().clone(), a.as_ref().clone()),
+            _ => return self.err("Malformed standalone deriving declaration"),
+        };
+        let mut head = &arg;
+        while let Type::App(f, _) = head {
+            head = f;
+        }
+        let tycon = match head {
+            Type::Con(q, _) => match &q.qual {
+                Some(m) => format!("{m}.{}", q.name),
+                None => format!("{}.{}", self.module, q.name),
+            },
+            // Tuples and lists are built in, with their instances in Base.
+            Type::Tuple(..) | Type::List(..) => return Ok(Vec::new()),
+            _ => return self.err("Malformed standalone deriving declaration"),
+        };
+        // Built-in types (unit, tuples, lists) have their instances in Base.
+        if tycon.starts_with("Builtin.") {
+            return Ok(Vec::new());
+        }
+        let Some((defining, dd)) = self.env.data_decls.get(&tycon).cloned() else {
+            return self.err(format!("Cannot derive an instance for ‘{}’: its declaration is not known", super::types::unqualify(&tycon)));
+        };
+        let synthetic = DataDecl {
+            deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
+            ..dd
+        };
+        // The constructors and the instance head are named in the declaring module.
+        let here = std::mem::replace(&mut self.module, defining);
+        let derived = self.derive_instances(&synthetic);
+        self.module = here;
+        derived
     }
 }
 

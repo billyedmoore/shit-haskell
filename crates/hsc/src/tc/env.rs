@@ -89,6 +89,9 @@ pub struct FamilyInfo {
 
 #[derive(Default)]
 pub struct Env {
+    /// Data declarations by global type name, with the module that declares them; standalone
+    /// deriving needs the constructors of types declared elsewhere.
+    pub data_decls: HashMap<String, (String, crate::syntax::ast::DataDecl)>,
     /// Type families by global name.
     pub families: HashMap<String, FamilyInfo>,
     pub tycons: HashMap<String, TyConInfo>,
