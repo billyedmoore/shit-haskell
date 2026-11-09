@@ -1,5 +1,5 @@
 module Control.Exception (
-    SomeException(..), Exception(..), ErrorCall(..), ArithException(..), IOException,
+    SomeException(..), Exception(..), ErrorCall(..), ArithException(..), AsyncException(..), IOException,
     throw, throwIO, catch, handle, try, evaluate, finally, onException, bracket, bracket_,
     catches, Handler(..), ioError, assert, mask_
   ) where
@@ -63,6 +63,19 @@ instance Eq ArithException where
   a == b = show a == show b
 
 instance Exception ArithException
+
+data AsyncException = StackOverflow | HeapOverflow | ThreadKilled | UserInterrupt
+
+instance Show AsyncException where
+  showsPrec _ StackOverflow = showString "stack overflow"
+  showsPrec _ HeapOverflow = showString "heap overflow"
+  showsPrec _ ThreadKilled = showString "thread killed"
+  showsPrec _ UserInterrupt = showString "user interrupt"
+
+instance Eq AsyncException where
+  a == b = show a == show b
+
+instance Exception AsyncException
 
 type IOException = IOError
 

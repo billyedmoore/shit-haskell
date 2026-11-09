@@ -135,8 +135,11 @@ impl Parser {
                 self.bump();
                 if self.at_res(ROp::Bar) {
                     self.require_ext("MultiWayIf")?;
+                    // The guards form a layout block opened at the first `|`: a `|` further
+                    // left than that column belongs to an enclosing construct.
+                    let bar_col = self.loc().col;
                     let mut alts = Vec::new();
-                    while self.at_res(ROp::Bar) {
+                    while self.at_res(ROp::Bar) && self.loc().col >= bar_col {
                         self.bump();
                         let conds = self.guard_stmts()?;
                         self.expect_res(ROp::RArrow)?;

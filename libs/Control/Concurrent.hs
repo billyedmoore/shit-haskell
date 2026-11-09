@@ -1,10 +1,11 @@
 module Control.Concurrent (
-    ThreadId, forkIO, myThreadId, threadDelay, yield, killThread,
+    ThreadId, forkIO, myThreadId, threadDelay, yield, killThread, throwTo,
     module Control.Concurrent.MVar
   ) where
 
 import Base
 import Control.Concurrent.MVar
+import Control.Exception (Exception(..), SomeException(..), AsyncException(..))
 
 newtype ThreadId = ThreadId Int
 
@@ -34,5 +35,10 @@ threadDelay n = IO (primThreadDelay n)
 yield :: IO ()
 yield = IO primYield
 
+foreign import prim "throwTo" primThrowTo :: Int -> SomeException -> World -> IORes ()
+
+throwTo :: Exception e => ThreadId -> e -> IO ()
+throwTo (ThreadId n) e = IO (\w -> primThrowTo n (toException e) w)
+
 killThread :: ThreadId -> IO ()
-killThread _ = return ()
+killThread t = throwTo t ThreadKilled

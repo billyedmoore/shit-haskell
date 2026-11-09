@@ -148,6 +148,7 @@ fn run_binds(binds: Vec<core::TopBind>, prog_name: String) -> ExitCode {
     let handle = std::thread::Builder::new()
         .stack_size(4 << 30)
         .spawn(move || {
+            interp::conc::set_stack_base();
             let rt = interp::Runtime::new(binds, prog_name);
             interp::run_main(&rt)
         })

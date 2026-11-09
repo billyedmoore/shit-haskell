@@ -213,7 +213,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let outcome = run_io(&args[0]);
             let exc = match outcome {
                 Ok(v) => return Ok(v),
-                Err(RtError::Thrown(v)) => v,
+                Err(RtError::Thrown(v)) | Err(RtError::Async(v)) => v,
                 Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) | Err(RtError::ErrorLoc(msg, _)) => {
                     let conv = rt.force(&args[1])?;
                     let cell = Rc::new(RefCell::new(super::Thunk::Done(string_value(&msg))));
@@ -301,6 +301,9 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 _ => return Err(RtError::Fail("internal: takeMVar of a non-MVar".into())),
             };
             loop {
+                if let Some(exc) = super::conc::take_exception() {
+                    return Err(RtError::Async(exc));
+                }
                 let current = mv.borrow().clone();
                 if let Some(cell) = current {
                     if take {
@@ -320,6 +323,9 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 _ => return Err(RtError::Fail("internal: putMVar of a non-MVar".into())),
             };
             loop {
+                if let Some(exc) = super::conc::take_exception() {
+                    return Err(RtError::Async(exc));
+                }
                 if mv.borrow().is_none() {
                     *mv.borrow_mut() = Some(args[1].clone());
                     return Ok(io_result(unit_value()));
@@ -355,6 +361,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 .spawn(move || {
                     let rt_ptr = rt_ptr;
                     let payload = payload;
+                    super::conc::set_stack_base();
                     super::conc::gil_acquire();
                     super::conc::set_current(id);
                     // SAFETY: the runtime is leaked and lives for the whole process.
@@ -383,6 +390,9 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             super::conc::gil_release();
             std::thread::sleep(Duration::from_micros(us));
             super::conc::gil_acquire();
+            if let Some(exc) = super::conc::take_exception() {
+                return Err(RtError::Async(exc));
+            }
             Ok(io_result(unit_value()))
         }
         "yieldThread" => {
@@ -390,6 +400,17 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             Ok(io_result(unit_value()))
         }
         "myThreadId" => Ok(io_result(Value::Int(super::conc::current_thread_id()))),
+        "throwTo" => {
+            // throwTo# : the target thread id, the SomeException, the world token.
+            let target = int(rt, &args[0])?;
+            let exc = rt.force(&args[1])?;
+            if target == super::conc::current_thread_id() {
+                return Err(RtError::Thrown(exc));
+            }
+            super::conc::post_exception(target, exc);
+            super::conc::yield_now();
+            Ok(io_result(unit_value()))
+        }
         "traceErr" => {
             let s = rt.force_string(&args[0])?;
             let _ = std::io::stderr().write_all(format!("{s}\n").as_bytes());

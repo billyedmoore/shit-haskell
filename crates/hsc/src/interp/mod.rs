@@ -28,8 +28,13 @@ pub type FrameRef = Rc<Frame>;
 pub enum Thunk {
     Pending(&'static Code, FrameRef),
     Done(Value),
-    /// Under evaluation; re-entering it is an infinite loop.
+    /// Not yet initialised (a recursive binding); forcing it is an infinite loop.
     Blackhole,
+    /// Evaluation raised a synchronous exception; forcing it again raises the same one.
+    Raise(Rc<RtError>),
+    /// Under evaluation by the given thread; re-entering it from that thread is an infinite
+    /// loop, while another thread waits for it.
+    Busy(i64),
 }
 
 #[derive(Clone)]
@@ -70,6 +75,8 @@ pub enum RtError {
     Exit(i32),
     /// A Haskell exception, as a `SomeException` value.
     Thrown(Value),
+    /// An asynchronous exception (from `throwTo`), delivered at a safe point.
+    Async(Value),
 }
 
 pub type RR = Result<Value, RtError>;
@@ -125,26 +132,50 @@ impl Runtime {
     }
 
     pub fn force(&self, cell: &Cell) -> RR {
-        let (code, frame) = {
-            let mut t = cell.borrow_mut();
-            match &*t {
-                Thunk::Done(v) => return Ok(v.clone()),
-                Thunk::Blackhole => return Err(RtError::Error("<<loop>>".into())),
-                Thunk::Pending(code, frame) => {
-                    let (code, frame) = (*code, frame.clone());
-                    *t = Thunk::Blackhole;
-                    (code, frame)
+        enum Step {
+            Ret(Value),
+            Run(&'static Code, FrameRef),
+            Wait,
+        }
+        loop {
+            let me = conc::current_thread_id();
+            let step = {
+                let mut t = cell.borrow_mut();
+                match &*t {
+                    Thunk::Done(v) => Step::Ret(v.clone()),
+                    Thunk::Blackhole => return Err(RtError::Error("<<loop>>".into())),
+                    Thunk::Raise(e) => return Err((**e).clone()),
+                    Thunk::Busy(owner) if *owner == me => {
+                        return Err(RtError::Error("<<loop>>".into()))
+                    }
+                    Thunk::Busy(_) => Step::Wait,
+                    Thunk::Pending(code, frame) => {
+                        let (code, frame) = (*code, frame.clone());
+                        *t = Thunk::Busy(me);
+                        Step::Run(code, frame)
+                    }
                 }
-            }
-        };
-        match self.eval(code, &frame) {
-            Ok(v) => {
-                *cell.borrow_mut() = Thunk::Done(v.clone());
-                Ok(v)
-            }
-            Err(e) => {
-                *cell.borrow_mut() = Thunk::Pending(code, frame);
-                Err(e)
+            };
+            match step {
+                Step::Ret(v) => return Ok(v),
+                Step::Wait => conc::yield_now(),
+                Step::Run(code, frame) => {
+                    return match self.eval(code, &frame) {
+                        Ok(v) => {
+                            *cell.borrow_mut() = Thunk::Done(v.clone());
+                            Ok(v)
+                        }
+                        Err(e @ (RtError::Async(_) | RtError::Exit(_))) => {
+                            // Interrupted, not failed: the thunk can be evaluated again.
+                            *cell.borrow_mut() = Thunk::Pending(code, frame);
+                            Err(e)
+                        }
+                        Err(e) => {
+                            *cell.borrow_mut() = Thunk::Raise(Rc::new(e.clone()));
+                            Err(e)
+                        }
+                    };
+                }
             }
         }
     }
@@ -165,9 +196,15 @@ impl Runtime {
     /// tail position loop rather than recurse, so tail-recursive programs run in
     /// constant Rust stack.
     pub fn eval(&self, code: &'static Code, frame: &FrameRef) -> RR {
+        if conc::stack_exhausted() {
+            return Err(RtError::Error("stack overflow".into()));
+        }
         let mut code = code;
         let mut frame = frame.clone();
         'outer: loop {
+            if let Some(exc) = conc::safe_point() {
+                return Err(RtError::Async(exc));
+            }
             match code {
                 Code::Var(acc) => {
                     let cell = self.access(*acc, &frame);
@@ -376,7 +413,7 @@ pub fn run_main(rt: &Runtime) -> i32 {
             eprintln!("{}: {}", rt.prog_name, msg);
             1
         }
-        Err(RtError::Thrown(exc)) => {
+        Err(RtError::Thrown(exc)) | Err(RtError::Async(exc)) => {
             prims::flush_stdout();
             let text = match &exc {
                 Value::Con(c) if c.args.len() == 3 => rt.force_string(&c.args[2]).unwrap_or_default(),
