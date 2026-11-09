@@ -1344,7 +1344,7 @@ lex :: ReadS String
 lex s = case dropWhile isSpaceC s of
   "" -> [("", "")]
   (c : cs)
-    | isAlphaC c || c == '_' -> let (w, r) = span isIdentC (c : cs) in [(w, r)]
+    | isAlphaC c || c == '_' -> let (w, r) = span isIdentC (c : cs) in let (hs, r2) = span (== '#') r in [(w ++ hs, r2)]
     | isDigitC c -> let (w, r) = span isDigitC (c : cs) in [(w, r)]
     | c `elem` "()[]{},;`\"" -> [([c], cs)]
     | otherwise -> let (w, r) = span isSymC (c : cs) in if null w then [] else [(w, r)]
@@ -1430,10 +1430,7 @@ readStrBody (c : rest) acc = readStrBody rest (c : acc)
 readStrBody [] _ = []
 
 instance Read Bool where
-  readsPrec _ s = case lexWord (dropWhile isSpaceC s) of
-    ("True", r) -> [(True, r)]
-    ("False", r) -> [(False, r)]
-    _ -> []
+  readsPrec _ s = readParen False (\r -> [(b, t) | (w, t) <- lex r, (b, n) <- [(True, "True"), (False, "False")], w == n]) s
 
 lexWord :: String -> (String, String)
 lexWord s = span isAlphaC s
@@ -1455,10 +1452,9 @@ instance (Read a, Read b, Read c) => Read (a, b, c) where
     _ -> []
 
 instance Read a => Read (Maybe a) where
-  readsPrec d s = case lexWord (dropWhile isSpaceC s) of
-    ("Nothing", r) -> [(Nothing, r)]
-    ("Just", r) -> [(Just x, r2) | (x, r2) <- readsPrec 11 r]
-    _ -> []
+  readsPrec d s =
+    readParen False (\r -> [(Nothing, t) | ("Nothing", t) <- lex r]) s
+      ++ readParen (d > 10) (\r -> [(Just x, t2) | ("Just", t1) <- lex r, (x, t2) <- readsPrec 11 t1]) s
 
 readIntegerPrefix :: String -> [(Integer, String)]
 readIntegerPrefix s0 =

@@ -66,7 +66,37 @@ pub fn parse_module(toks: Vec<Token>, exts: Extensions) -> PResult<Module> {
         semi_done: None,
         exts,
     };
-    p.module()
+    let mut m = p.module()?;
+    mark_gadt_infix(&mut m);
+    Ok(m)
+}
+
+/// A GADT-syntax operator constructor with two arguments is infix for `deriving Show`
+/// when the module gives it a fixity declaration (GHC's rule).
+fn mark_gadt_infix(m: &mut Module) {
+    use crate::syntax::ast::{ConFields, Decl};
+    let fixed: std::collections::HashSet<String> = m
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Fixity { ops, .. } => Some(ops.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    for d in &mut m.decls {
+        let Decl::Data(dd) = d else { continue };
+        for c in &mut dd.cons {
+            let is_op = c.name.starts_with(|ch: char| !ch.is_alphanumeric() && ch != '_');
+            if c.gadt_result.is_some()
+                && is_op
+                && matches!(&c.fields, ConFields::Positional(fs) if fs.len() == 2)
+                && fixed.contains(&c.name)
+            {
+                c.infix = true;
+            }
+        }
+    }
 }
 
 impl Parser {

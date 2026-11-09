@@ -371,7 +371,7 @@ fn derive_show(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
             let prec = 9;
             let parts = vec![
                 show_arg(&a[0], prec + 1),
-                app(base_var("showString", loc), vec![text(&format!(" {} ", c.name), loc)]),
+                app(base_var("showString", loc), vec![text(&format!(" {} ", infix_name(&c.name)), loc)]),
                 show_arg(&a[1], prec + 1),
             ];
             app(
@@ -395,7 +395,11 @@ fn derive_show(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
             } else {
                 parts.push(shows_str(&format!("{} {{", display_name(&c.name))));
                 for (i, (f, v)) in names.iter().zip(&a).enumerate() {
-                    let label = if i == 0 { format!("{} = ", f) } else { format!(", {} = ", f) };
+                    let label = if i == 0 {
+                        format!("{} = ", display_name(f))
+                    } else {
+                        format!(", {} = ", display_name(f))
+                    };
                     parts.push(shows_str(&label));
                     parts.push(show_arg(v, 0));
                 }
@@ -553,57 +557,137 @@ fn derive_read(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
     let loc = dd.loc;
     let d = checker.fresh_name("d");
     let s = checker.fresh_name("s");
-    let r = checker.fresh_name("r");
     let module = checker.module.clone();
     let mut alts: Vec<Expr> = Vec::new();
     for c in &dd.cons {
-        if !field_names(c).is_empty() {
-            continue;
-        }
         let n = arity(c);
+        let names = field_names(c);
+        let is_record = !names.is_empty();
         let args = fresh_vars(checker, "a", n);
+        // Each alternative is `readParen cond (\r -> [ (value, rest) | quals ]) s`, so that
+        // records (precedence 11) and nullary constructors get their own parenthesis rule.
+        let r = checker.fresh_name("r");
         let mut quals: Vec<Stmt> = Vec::new();
-        let mut cur = checker.fresh_name("s");
-        let token = if is_operator(&c.name) { c.name.clone() } else { c.name.clone() };
-        quals.push(Stmt::Bind {
-            pat: Pat::Tuple(
-                vec![Pat::Lit(Lit::Str(token), loc), Pat::Var(cur.clone(), loc)],
-                loc,
-            ),
-            expr: app(base_var("lex", loc), vec![local(&r, loc)]),
-            loc,
-        });
-        for a in &args {
-            let next = checker.fresh_name("s");
-            quals.push(Stmt::Bind {
-                pat: Pat::Tuple(vec![Pat::Var(a.clone(), loc), Pat::Var(next.clone(), loc)], loc),
-                expr: app(base_var("readsPrec", loc), vec![int(11, loc), local(&cur, loc)]),
-                loc,
-            });
-            cur = next;
+        let mut cur = r.clone();
+        let infix = c.infix && n == 2 && !is_record;
+        if infix {
+            // `a op b` at precedence 9: operands are read at precedence 10.
+            read_value(checker, &mut quals, &mut cur, &args[0], 10, loc);
+            if is_operator(&c.name) {
+                read_token(checker, &mut quals, &mut cur, &c.name, loc);
+            } else {
+                read_token(checker, &mut quals, &mut cur, "`", loc);
+                read_token(checker, &mut quals, &mut cur, &c.name, loc);
+                read_token(checker, &mut quals, &mut cur, "`", loc);
+            }
+            read_value(checker, &mut quals, &mut cur, &args[1], 10, loc);
+        } else if is_record {
+            read_con_name(checker, &mut quals, &mut cur, &c.name, loc);
+            read_token(checker, &mut quals, &mut cur, "{", loc);
+            for (i, (fname, a)) in names.iter().zip(&args).enumerate() {
+                if i > 0 {
+                    read_token(checker, &mut quals, &mut cur, ",", loc);
+                }
+                read_con_name(checker, &mut quals, &mut cur, fname, loc);
+                read_token(checker, &mut quals, &mut cur, "=", loc);
+                read_value(checker, &mut quals, &mut cur, a, 0, loc);
+            }
+            read_token(checker, &mut quals, &mut cur, "}", loc);
+        } else {
+            read_con_name(checker, &mut quals, &mut cur, &c.name, loc);
+            for a in &args {
+                read_value(checker, &mut quals, &mut cur, a, 11, loc);
+            }
         }
         let value = args
             .iter()
             .fold(con_expr(&module, &c.name, loc), |acc, a| app(acc, vec![local(a, loc)]));
         let body = Expr::Tuple(vec![Some(value), Some(local(&cur, loc))], loc);
-        alts.push(Expr::ListComp(Box::new(body), vec![quals], loc));
+        let lc = Expr::ListComp(Box::new(body), vec![quals], loc);
+        let cond = if infix {
+            app(base_var(">", loc), vec![local(&d, loc), int(9, loc)])
+        } else if is_record {
+            app(base_var(">", loc), vec![local(&d, loc), int(11, loc)])
+        } else if n > 0 {
+            app(base_var(">", loc), vec![local(&d, loc), int(10, loc)])
+        } else {
+            app(base_var("not", loc), vec![base_var("otherwise", loc)])
+        };
+        let lam = Expr::Lam(vec![Pat::Var(r, loc)], Box::new(lc), loc);
+        alts.push(app(
+            base_var("readParen", loc),
+            vec![cond, lam, local(&s, loc)],
+        ));
     }
     let all = alts
         .into_iter()
         .rev()
         .fold(Expr::List(vec![], loc), |acc, alt| app(base_var("++", loc), vec![alt, acc]));
-    // readsPrec d s = readParen (d > 10) (\r -> all) s
-    let paren_cond = app(base_var(">", loc), vec![local(&d, loc), int(10, loc)]);
-    let lam = Expr::Lam(vec![Pat::Var(r.clone(), loc)], Box::new(all), loc);
-    let body = app(
-        base_var("readParen", loc),
-        vec![paren_cond, lam, local(&s, loc)],
-    );
     vec![fun(
         "readsPrec",
-        vec![clause(vec![Pat::Var(d, loc), Pat::Var(s, loc)], body, loc)],
+        vec![clause(vec![Pat::Var(d, loc), Pat::Var(s, loc)], all, loc)],
         loc,
     )]
+}
+
+/// Adds a generator that consumes the lexeme `tok` from the input `cur`.
+fn read_token(checker: &mut Checker, quals: &mut Vec<crate::syntax::ast::Stmt>, cur: &mut String, tok: &str, loc: Loc) {
+    use crate::syntax::ast::Stmt;
+    let next = checker.fresh_name("s");
+    quals.push(Stmt::Bind {
+        pat: Pat::Tuple(
+            vec![Pat::Lit(Lit::Str(tok.to_string()), loc), Pat::Var(next.clone(), loc)],
+            loc,
+        ),
+        expr: app(base_var("lex", loc), vec![local(cur, loc)]),
+        loc,
+    });
+    *cur = next;
+}
+
+/// Consumes a constructor or field name as written by `show`: operators are parenthesised.
+fn read_con_name(
+    checker: &mut Checker,
+    quals: &mut Vec<crate::syntax::ast::Stmt>,
+    cur: &mut String,
+    name: &str,
+    loc: Loc,
+) {
+    if is_operator(name) {
+        read_token(checker, quals, cur, "(", loc);
+        read_token(checker, quals, cur, name, loc);
+        read_token(checker, quals, cur, ")", loc);
+    } else {
+        read_token(checker, quals, cur, name, loc);
+    }
+}
+
+/// An infix constructor as `show` writes it: operators bare, identifiers in backticks.
+fn infix_name(name: &str) -> String {
+    if is_operator(name) {
+        name.to_string()
+    } else {
+        format!("`{name}`")
+    }
+}
+
+/// Adds a generator that reads one value of type `var`'s type at precedence `prec`.
+fn read_value(
+    checker: &mut Checker,
+    quals: &mut Vec<crate::syntax::ast::Stmt>,
+    cur: &mut String,
+    var: &str,
+    prec: i64,
+    loc: Loc,
+) {
+    use crate::syntax::ast::Stmt;
+    let next = checker.fresh_name("s");
+    quals.push(Stmt::Bind {
+        pat: Pat::Tuple(vec![Pat::Var(var.to_string(), loc), Pat::Var(next.clone(), loc)], loc),
+        expr: app(base_var("readsPrec", loc), vec![int(prec, loc), local(cur, loc)]),
+        loc,
+    });
+    *cur = next;
 }
 
 // ----- constructor classes: Functor, Foldable, Traversable --------------------------
