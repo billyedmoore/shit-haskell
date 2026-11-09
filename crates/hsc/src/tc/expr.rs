@@ -97,9 +97,17 @@ impl Checker {
             }
             Expr::Lam(pats, body, loc) => {
                 self.loc = *loc;
+                let mark = self.alt_begin();
                 let arg_tys: Vec<Ty> = pats.iter().map(|_| self.meta()).collect();
                 let cpats = self.check_pats(pats, &arg_tys)?;
                 let (cbody, tbody) = self.infer(body)?;
+                let cbody = match self.alt_end(mark, CBody::Expr(cbody))? {
+                    CBody::Expr(c) => c,
+                    other => {
+                        let mut fresh = |b: &str| self.fresh_name(b);
+                        compile_body(&other, Core::Fail("guard".into()), &mut fresh)
+                    }
+                };
                 let scruts: Vec<String> = pats.iter().map(|_| self.fresh_name("arg")).collect();
                 let rows = vec![Row {
                     pats: cpats,
@@ -390,9 +398,8 @@ impl Checker {
             Pat::Con(q, args, loc) => {
                 self.loc = *loc;
                 let key = qkey(q);
-                let (fields, arg_tys) = self.con_arg_types(&key, args.len(), ty)?;
-                let _ = fields;
-                let mut subs = Vec::with_capacity(args.len());
+                let (arg_tys, dict_pats) = self.con_pattern_types(&key, args.len(), ty)?;
+                let mut subs = dict_pats;
                 for (a, t) in args.iter().zip(&arg_tys) {
                     subs.push(self.check_pat(a, t)?);
                 }
@@ -469,8 +476,10 @@ impl Checker {
         }
     }
 
-    /// Argument types of a constructor pattern, unified with the scrutinee type.
-    fn con_arg_types(&mut self, key: &str, n: usize, ty: &Ty) -> TR<(Vec<String>, Vec<Ty>)> {
+    /// The field types of a constructor pattern, after unifying its result type with the
+    /// scrutinee type. Variables the scrutinee does not determine are existential: they
+    /// become rigid. Context dictionaries are bound by pattern variables and become givens.
+    fn con_pattern_types(&mut self, key: &str, n: usize, ty: &Ty) -> TR<(Vec<Ty>, Vec<CPat>)> {
         let con = self.env.datacons.get(key).cloned().ok_or_else(|| super::TcError {
             loc: self.loc,
             msg: format!("Data constructor not in scope: {key}"),
@@ -484,22 +493,49 @@ impl Checker {
                 n
             ));
         }
-        let (cty, _, _) = self.metas.instantiate(&con.scheme, self.level);
+        let (cty, preds, vars) = self.metas.instantiate(&con.scheme, self.level);
         let mut arg_tys = Vec::with_capacity(n);
         let mut cur = cty;
         for _ in 0..n {
-            let (a, r) = {
-                let pruned = self.metas.prune(&cur);
-                match pruned.as_fun() {
-                    Some((a, r)) => (a.clone(), r.clone()),
-                    None => return self.err("internal: constructor type is not a function"),
+            let split = self.metas.prune(&cur).as_fun().map(|(a, r)| (a.clone(), r.clone()));
+            match split {
+                Some((a, r)) => {
+                    arg_tys.push(a);
+                    cur = r;
                 }
-            };
-            arg_tys.push(a);
-            cur = r;
+                None => return self.err("internal: constructor type is not a function"),
+            }
         }
-        self.unify_at(&cur, ty)?;
-        Ok((con.fields, arg_tys))
+        // Refinement: the result type may be more specific than the scrutinee (GADTs).
+        match self.metas.unify_refine(&cur, ty) {
+            Ok(()) => {}
+            Err(_) => {
+                let (r, t) = (self.show(&cur), self.show(ty));
+                return self.err(format!("Couldn't match expected type ‘{t}’ with actual type ‘{r}’"));
+            }
+        }
+        // Variables that do not occur in the scrutinee type are existential: rigid.
+        let mut scrut_metas = Vec::new();
+        self.metas.free_metas(&self.metas.zonk(ty), &mut scrut_metas);
+        for v in &vars {
+            if let Ty::Meta(m) = self.metas.prune(v) {
+                if !scrut_metas.contains(&m) {
+                    self.metas.skolems += 1;
+                    let sk = Ty::Skol(self.metas.skolems, format!("x{}", self.metas.skolems));
+                    self.metas.subst[m as usize] = Some(sk);
+                }
+            }
+        }
+        let mut dict_pats = Vec::with_capacity(preds.len());
+        for p in preds {
+            let dv = self.fresh_name("dx");
+            self.givens.push(super::Given {
+                pred: p,
+                ev: Core::Var(dv.clone()),
+            });
+            dict_pats.push(CPat::Var(dv));
+        }
+        Ok((arg_tys, dict_pats))
     }
 
     /// A literal pattern: a predicate `\x -> x == lit` used as a test.
@@ -555,8 +591,10 @@ impl Checker {
         let mut rows = Vec::with_capacity(alts.len());
         for a in alts {
             self.loc = a.loc;
+            let mark = self.alt_begin();
             let pat = self.check_pat(&a.pat, scrut_ty)?;
             let body = self.rhs_body(&a.rhs, res)?;
+            let body = self.alt_end(mark, body)?;
             rows.push(Row {
                 pats: vec![pat],
                 body,

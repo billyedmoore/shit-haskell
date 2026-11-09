@@ -220,9 +220,11 @@ impl Checker {
         );
     }
 
-    /// Registers a data constructor, its type and its Core wrapper.
+    /// Registers a data constructor, its type and its Core wrapper. The wrapper takes the
+    /// constructor's context dictionaries first, then its fields.
     pub fn add_con(&mut self, name: &str, tycon: &str, tag: usize, scheme: Scheme, fields: Vec<String>) {
         let arity = count_args(&scheme.ty);
+        let ndicts = scheme.preds.len();
         self.env.values.insert(name.to_string(), scheme.clone());
         self.env.datacons.insert(
             name.to_string(),
@@ -235,10 +237,11 @@ impl Checker {
                 fields,
             },
         );
-        let body = if arity == 0 {
+        let total = ndicts + arity;
+        let body = if total == 0 {
             Core::Con(name.to_string(), vec![])
         } else {
-            let params: Vec<String> = (0..arity).map(|i| format!("c{i}%")).collect();
+            let params: Vec<String> = (0..total).map(|i| format!("c{i}%")).collect();
             let args: Vec<Core> = params.iter().map(|p| Core::Var(p.clone())).collect();
             let mut core = Core::Con(name.to_string(), args);
             for p in params.iter().rev() {
@@ -265,6 +268,46 @@ impl Checker {
 impl Default for Checker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// State saved when an alternative (case branch, clause, lambda) starts, so that the
+/// givens and refinements it introduces can be scoped to it.
+pub struct AltMark {
+    givens: usize,
+    skol: std::collections::HashMap<u32, Ty>,
+    outer: Vec<Wanted>,
+}
+
+impl Checker {
+    pub fn alt_begin(&mut self) -> AltMark {
+        AltMark {
+            givens: self.givens.len(),
+            skol: self.metas.skol_binds.clone(),
+            outer: std::mem::take(&mut self.wanted),
+        }
+    }
+
+    /// Ends an alternative. Constraints raised in it are solved while its givens are still
+    /// in scope; the rest float outwards.
+    pub fn alt_end(&mut self, mark: AltMark, body: crate::core::matcher::CBody) -> TR<crate::core::matcher::CBody> {
+        let inner = std::mem::replace(&mut self.wanted, mark.outer);
+        let introduced = self.givens.len() > mark.givens || self.metas.skol_binds.len() != mark.skol.len();
+        let body = if introduced {
+            let (binds, residual) = self.solve(inner)?;
+            self.wanted.extend(residual);
+            if binds.is_empty() {
+                body
+            } else {
+                crate::core::matcher::CBody::Where(binds, Box::new(body))
+            }
+        } else {
+            self.wanted.extend(inner);
+            body
+        };
+        self.givens.truncate(mark.givens);
+        self.metas.skol_binds = mark.skol;
+        Ok(body)
     }
 }
 

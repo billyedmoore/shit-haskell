@@ -1,5 +1,6 @@
 //! Types, predicates, schemes, and unification with levels for generalisation.
 
+use std::collections::HashMap;
 use std::fmt;
 
 pub const ARROW: &str = "Builtin.->";
@@ -126,12 +127,14 @@ pub fn subst_gen_pred(p: &Pred, args: &[Ty]) -> Pred {
     }
 }
 
-/// The unification variables of the checker, with their levels.
+/// The unification variables of the checker, with their levels. Rigid variables can
+/// be bound locally (`skol_binds`) while checking a GADT alternative, which refines them.
 #[derive(Default)]
 pub struct Metas {
     pub subst: Vec<Option<Ty>>,
     pub levels: Vec<u32>,
     pub skolems: u32,
+    pub skol_binds: HashMap<u32, Ty>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -152,22 +155,33 @@ impl Metas {
         Ty::Skol(self.skolems, name.to_string())
     }
 
-    /// Resolves the outermost meta chain of a type.
+    /// Resolves the outermost meta chain of a type (and locally refined rigid variables).
     pub fn prune(&self, t: &Ty) -> Ty {
         let mut cur = t.clone();
-        while let Ty::Meta(i) = cur {
-            match &self.subst[i as usize] {
-                Some(next) => cur = next.clone(),
-                None => break,
+        loop {
+            match &cur {
+                Ty::Meta(i) => match &self.subst[*i as usize] {
+                    Some(next) => cur = next.clone(),
+                    None => break,
+                },
+                Ty::Skol(id, _) => match self.skol_binds.get(id) {
+                    Some(next) => cur = next.clone(),
+                    None => break,
+                },
+                _ => break,
             }
         }
         cur
     }
 
-    /// Fully substitutes all solved metas.
+    /// Fully substitutes all solved metas and refined rigid variables.
     pub fn zonk(&self, t: &Ty) -> Ty {
         match t {
             Ty::Meta(i) => match &self.subst[*i as usize] {
+                Some(s) => self.zonk(s),
+                None => t.clone(),
+            },
+            Ty::Skol(id, _) => match self.skol_binds.get(id) {
                 Some(s) => self.zonk(s),
                 None => t.clone(),
             },
@@ -215,6 +229,25 @@ impl Metas {
                 self.unify(a1, a2)
             }
             _ => Err(UnifyError::Mismatch),
+        }
+    }
+
+    /// Unification for matching a constructor's result type against a scrutinee: an
+    /// unbound rigid variable is refined to the other side, for the rest of the alternative.
+    pub fn unify_refine(&mut self, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
+        let a = self.prune(a);
+        let b = self.prune(b);
+        match (&a, &b) {
+            (Ty::Skol(x, _), Ty::Skol(y, _)) if x == y => Ok(()),
+            (Ty::Skol(x, _), t) | (t, Ty::Skol(x, _)) => {
+                self.skol_binds.insert(*x, t.clone());
+                Ok(())
+            }
+            (Ty::App(f1, a1), Ty::App(f2, a2)) => {
+                self.unify_refine(f1, f2)?;
+                self.unify_refine(a1, a2)
+            }
+            _ => self.unify(&a, &b),
         }
     }
 

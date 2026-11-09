@@ -385,8 +385,10 @@ impl Checker {
         let mut rows = Vec::with_capacity(clauses.len());
         for c in clauses {
             self.loc = c.loc;
+            let mark = self.alt_begin();
             let pats = self.check_pats(&c.pats, &arg_tys)?;
             let body = self.rhs_body(&c.rhs, &res)?;
+            let body = self.alt_end(mark, body)?;
             rows.push(Row { pats, body });
         }
         let mut fresh = |b: &str| self.fresh_name(b);

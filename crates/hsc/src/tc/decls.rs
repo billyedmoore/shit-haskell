@@ -169,11 +169,15 @@ impl Checker {
                 Some(t) => self.convert_type(t, &mut vars)?,
                 None => result_head.clone(),
             };
+            let mut preds = Vec::new();
+            for ctx in &c.context {
+                preds.push(self.convert_pred(ctx, &mut vars)?);
+            }
             let name = format!("{}.{}", self.module, c.name);
             let scheme = Scheme {
                 nvars: vars.len() as u32,
                 names: vars,
-                preds: Vec::new(),
+                preds,
                 ty: Ty::funs(field_tys.clone(), res),
             };
             per_con.push((name, occs, field_tys, scheme));
