@@ -199,6 +199,8 @@ pub struct Clause {
     pub pats: Vec<Pat>,
     pub rhs: Rhs,
     pub loc: Loc,
+    /// The last character of the clause (for source spans in pattern-match failures).
+    pub end: Loc,
 }
 
 #[derive(Clone, Debug, PartialEq)]

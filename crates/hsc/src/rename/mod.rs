@@ -955,6 +955,7 @@ impl<'a> Renamer<'a> {
             pats,
             rhs,
             loc: c.loc,
+            end: c.end,
         })
     }
 
@@ -1855,6 +1856,7 @@ fn builder_decls(name: &str, args: &[String], pat: &Pat, dir: &PatSynDir, loc: L
                 pats: args.iter().map(|a| Pat::Var(a.clone(), loc)).collect(),
                 rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() },
                 loc,
+                end: loc,
             };
             Ok(vec![Decl::Fun { name: fname, clauses: vec![clause], loc }])
         }
@@ -1864,7 +1866,7 @@ fn builder_decls(name: &str, args: &[String], pat: &Pat, dir: &PatSynDir, loc: L
                 match d {
                     Decl::PatBind { pat: Pat::Con(_, pats, _), rhs, loc } => funs.push(Decl::Fun {
                         name: fname.clone(),
-                        clauses: vec![Clause { pats: pats.clone(), rhs: rhs.clone(), loc: *loc }],
+                        clauses: vec![Clause { pats: pats.clone(), rhs: rhs.clone(), loc: *loc, end: *loc }],
                         loc: *loc,
                     }),
                     other => {

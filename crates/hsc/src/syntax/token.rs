@@ -157,6 +157,9 @@ pub struct Token {
     pub tok: Tok,
     pub line: u32,
     pub col: u32,
+    /// The position of the token's last character (its end, for source spans).
+    pub end_line: u32,
+    pub end_col: u32,
     /// True when this is the first token on its line (drives the layout rule).
     pub first_on_line: bool,
     /// Whitespace, or an opening bracket, precedes the token.

@@ -390,11 +390,6 @@ instance Show NonTermination where
 -- | @since base-4.0
 instance Exception NonTermination
 
--- | The exception the runtime raises for a computation that depends on itself (hsc's runtime
--- looks this value up by name; GHC raises NonTermination the same way).
-nonTerminationException :: SomeException
-nonTerminationException = toException NonTermination
-
 -----
 
 -- |Thrown when the program attempts to call @atomically@, from the @stm@
@@ -457,3 +452,8 @@ nestedAtomically = toException NestedAtomically
 -- GHC's RTS calls this
 noMatchingContinuationPrompt :: SomeException
 noMatchingContinuationPrompt = toException NoMatchingContinuationPrompt
+
+-- | The exception the runtime raises for a computation that depends on itself (hsc's runtime
+-- looks this value up by name; GHC raises NonTermination the same way).
+nonTerminationException :: SomeException
+nonTerminationException = toException NonTermination

@@ -100,6 +100,7 @@ fn clause(pats: Vec<Pat>, body: Expr, loc: Loc) -> Clause {
             wheres: Vec::new(),
         },
         loc,
+        end: loc,
     }
 }
 

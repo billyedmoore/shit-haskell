@@ -166,6 +166,8 @@ impl Lexer {
                     tok: Tok::Eof,
                     line,
                     col,
+                    end_line: line,
+                    end_col: col,
                     first_on_line: true,
                     space_before: true,
                     space_after: true,
@@ -182,10 +184,14 @@ impl Lexer {
                 None => true,
                 Some(c) => c.is_whitespace() || matches!(c, ')' | ']' | ',' | ';' | '}'),
             };
+            // The token's last character is the one before the lexer's position.
+            let (end_line, end_col) = (self.line, self.col.saturating_sub(1).max(1));
             self.toks.push(Token {
                 tok,
                 line,
                 col,
+                end_line,
+                end_col,
                 first_on_line,
                 space_before,
                 space_after,

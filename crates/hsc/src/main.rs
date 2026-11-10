@@ -82,7 +82,7 @@ fn main() -> ExitCode {
                 i += 1;
             }
             _ if VALUE_FLAGS.contains(&a) => i += 1,
-            _ if a.starts_with("-X") || a == driver::REAL_BASE_FLAG => flags.push(a.to_string()),
+            _ if a.starts_with("-X") => flags.push(a.to_string()),
             _ if a.starts_with('-') => {}
             _ => files.push(a.to_string()),
         }

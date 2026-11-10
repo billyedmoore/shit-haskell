@@ -188,6 +188,14 @@ impl Parser {
         &self.toks[i].tok
     }
 
+    /// The position of the last character of the last real token consumed.
+    pub(crate) fn prev_end(&self) -> Loc {
+        match self.pos.checked_sub(1).and_then(|i| self.toks.get(i)) {
+            Some(t) => Loc { line: t.end_line, col: t.end_col },
+            None => Loc { line: 1, col: 1 },
+        }
+    }
+
     fn bump(&mut self) {
         match self.cur() {
             Cur::VSemi => self.semi_done = Some((self.pos, self.ctx.len())),

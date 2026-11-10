@@ -23,9 +23,6 @@ pub struct Driver {
 }
 
 /// The default library directory: `libs/` at the project root.
-/// The flag that selects the vendored `base` package as the libraries.
-pub const REAL_BASE_FLAG: &str = "-hsc-real-base";
-
 pub fn default_lib_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("HSC_LIBDIR") {
         return PathBuf::from(dir);
@@ -35,16 +32,10 @@ pub fn default_lib_dir() -> PathBuf {
 
 impl Driver {
     pub fn new(main_dir: &Path, flags: Vec<String>) -> Driver {
-        // `-hsc-real-base`: the Haskell libraries come from the vendored `base` sources (the
-        // GHC package, Prelude included) rather than the mini library in the library root.
-        let real_base = flags.iter().any(|f| f == REAL_BASE_FLAG);
+        // The Haskell libraries are the vendored GHC packages: base (Prelude included), ghc-prim,
+        // ghc-internal and ghc-bignum.
         let libs = default_lib_dir();
-        let mut search = vec![main_dir.to_path_buf()];
-        if real_base {
-            search.push(libs.join("base").join("src"));
-        } else {
-            search.push(libs.clone());
-        }
+        let mut search = vec![main_dir.to_path_buf(), libs.join("base").join("src")];
         search.push(libs.join("ghc-prim"));
         search.push(libs.join("ghc-internal").join("src"));
         search.push(libs.join("ghc-bignum").join("src"));

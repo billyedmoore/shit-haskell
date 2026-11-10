@@ -199,7 +199,7 @@ impl Parser {
                     let pats = vec![self.expr_to_pat(l.clone())?, self.expr_to_pat(r.clone())?];
                     return Ok(Decl::Fun {
                         name: op.name.clone(),
-                        clauses: vec![Clause { pats, rhs, loc }],
+                        clauses: vec![Clause { pats, rhs, loc, end: self.prev_end() }],
                         loc,
                     });
                 }
@@ -222,7 +222,7 @@ impl Parser {
                     .collect::<PResult<Vec<_>>>()?;
                 Ok(Decl::Fun {
                     name: q.name,
-                    clauses: vec![Clause { pats, rhs, loc }],
+                    clauses: vec![Clause { pats, rhs, loc, end: self.prev_end() }],
                     loc,
                 })
             }
@@ -236,7 +236,7 @@ impl Parser {
                         }
                         return Ok(Decl::Fun {
                             name: op.name.clone(),
-                            clauses: vec![Clause { pats, rhs, loc }],
+                            clauses: vec![Clause { pats, rhs, loc, end: self.prev_end() }],
                             loc,
                         });
                     }
@@ -261,6 +261,7 @@ impl Parser {
                             pats: Vec::new(),
                             rhs,
                             loc,
+                            end: self.prev_end(),
                         }],
                         loc,
                     },
@@ -1246,6 +1247,7 @@ impl Parser {
                     pats: vec![Pat::Con(QName::unqual(name.clone()), pats, loc)],
                     rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() },
                     loc,
+                    end: loc,
                 }],
                 loc,
             });

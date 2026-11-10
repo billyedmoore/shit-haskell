@@ -390,6 +390,23 @@ impl Checker {
     }
 
     /// Core for a function's clauses against a type. Zero-argument bindings are values.
+    /// The expression for a pattern-match failure over these clauses: GHC's `patError` with the
+    /// source span of the clauses and the construct, where the library provides it.
+    pub fn pattern_failure(&self, clauses: &[Clause], construct: &str) -> Core {
+        let (first, last) = (clauses.first().map(|c| c.loc), clauses.last().map(|c| c.end));
+        let (Some(start), Some(end)) = (first, last) else {
+            return Core::Fail(format!("Non-exhaustive patterns in {construct}"));
+        };
+        let span = source_span(&self.source_name, start, end);
+        let message = format!("{span}|{construct}");
+        if self.env.values.contains_key("GHC.Internal.Control.Exception.Base.patError") {
+            let raise = Core::Var("GHC.Internal.Control.Exception.Base.patError".into());
+            Core::App(Box::new(raise), Box::new(Core::Lit(crate::core::Lit::Addr(message))))
+        } else {
+            Core::Fail(format!("Non-exhaustive patterns in {construct}"))
+        }
+    }
+
     pub fn fun_clauses(&mut self, clauses: &[Clause], ty: &Ty, name: &str) -> TR<Core> {
         let arity = clauses.first().map(|c| c.pats.len()).unwrap_or(0);
         if arity == 0 {
@@ -433,16 +450,12 @@ impl Checker {
             }
             rows.push(Row { pats, body });
         }
-        let mut fresh = |b: &str| self.fresh_name(b);
-        let matched = compile_rows(
-            &scruts,
-            &rows,
-            Core::Fail(format!(
-                "Non-exhaustive patterns in function {}",
-                super::types::unqualify(name)
-            )),
-            &mut fresh,
+        let failure = self.pattern_failure(
+            clauses,
+            &format!("function {}", super::types::unqualify(name)),
         );
+        let mut fresh = |b: &str| self.fresh_name(b);
+        let matched = compile_rows(&scruts, &rows, failure, &mut fresh);
         Ok(scruts.into_iter().rev().fold(matched, |acc, s| Core::Lam(s, Box::new(acc))))
     }
 }
@@ -723,5 +736,19 @@ fn is_kind_var_name(n: &str) -> bool {
         Some('k') => digits(&n[1..]),
         Some('r') => n == "rep" || n == "rr" || (n.len() > 1 && digits(&n[1..])),
         _ => false,
+    }
+}
+
+/// A source span as GHC prints it: `file:line:col`, `file:line:col1-col2` on one line, and
+/// `file:(line1,col1)-(line2,col2)` across lines (the end column is inclusive).
+pub fn source_span(file: &str, start: Loc, end: Loc) -> String {
+    if start.line == end.line {
+        if start.col == end.col {
+            format!("{file}:{}:{}", start.line, start.col)
+        } else {
+            format!("{file}:{}:{}-{}", start.line, start.col, end.col)
+        }
+    } else {
+        format!("{file}:({},{})-({},{})", start.line, start.col, end.line, end.col)
     }
 }
