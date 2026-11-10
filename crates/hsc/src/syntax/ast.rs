@@ -177,6 +177,8 @@ pub enum Decl {
     Many(Vec<Decl>),
     Foreign {
         import: bool,
+        /// `foreign import prim`: the runtime's own primitive, which answers in Haskell's terms.
+        prim: bool,
         entity: Option<String>,
         name: String,
         ty: Type,

@@ -725,6 +725,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 Value::Addr(b, o) => (b, o),
                 _ => return Err(RtError::Fail("internal: indexing a non-address".into())),
             };
+            let bytes = bytes.borrow();
             let i = int(rt, &args[1])?;
             let at = |k: usize| bytes.get(k).copied().unwrap_or(0) as i64;
             let base = off as i64 + i;
@@ -761,17 +762,21 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let at = int(rt, &args[1])?;
             let off = (at * size as i64).max(0) as usize;
             match (access, rt.force(&args[0])?) {
-                ("index", Value::Addr(bytes, o)) => Ok(read_element(&bytes, o + off, size, kind)),
-                ("read", Value::Addr(bytes, o)) => Ok(io_result(read_element(&bytes, o + off, size, kind))),
+                ("index", Value::Addr(bytes, o)) => Ok(read_element(&bytes.borrow(), o + off, size, kind)),
+                ("read", Value::Addr(bytes, o)) => Ok(io_result(read_element(&bytes.borrow(), o + off, size, kind))),
                 ("index", Value::Bytes(b)) => Ok(read_element(&b.borrow(), off, size, kind)),
                 ("read", Value::Bytes(b)) => Ok(io_result(read_element(&b.borrow(), off, size, kind))),
                 ("write", Value::Bytes(b)) => {
-                    let v = rt.force(&args[2])?;
+                    let v = unbox_element(rt, rt.force(&args[2])?)?;
                     write_element(&mut b.borrow_mut(), off, size, kind, &v);
                     Ok(unit_value())
                 }
-                ("write", Value::Addr(..)) => Err(RtError::Error("writing to an immutable address is not supported".into())),
-                _ => Err(RtError::Fail(format!("internal: {name} on an unsupported value"))),
+                ("write", Value::Addr(bytes, o)) => {
+                    let v = unbox_element(rt, rt.force(&args[2])?)?;
+                    write_element(&mut bytes.borrow_mut(), o + off, size, kind, &v);
+                    Ok(unit_value())
+                }
+                (_, other) => Err(RtError::Fail(format!("internal: {name} on an unsupported value {}", match other { Value::Con(c) => format!("con {}/{}", c.name, c.args.len()), Value::Int(i) => format!("int {i}"), Value::Addr(..) => "addr".into(), Value::Bytes(_) => "bytes".into(), _ => "other".into() }))),
             }
         }
         "plusAddr#" => match rt.force(&args[0])? {
@@ -779,11 +784,13 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             _ => Err(RtError::Fail("internal: plusAddr# of a non-address".into())),
         },
         "minusAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
-            (Value::Addr(_, a), Value::Addr(_, b)) => int_v(a as i64 - b as i64),
+            (Value::Addr(a, x), Value::Addr(b, y)) if Rc::ptr_eq(&a, &b) => int_v(x as i64 - y as i64),
             _ => Err(RtError::Fail("internal: minusAddr# of non-addresses".into())),
         },
         "eqAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
-            (Value::Addr(_, a), Value::Addr(_, b)) => int_v((a == b) as i64),
+            (Value::Addr(a, x), Value::Addr(b, y)) => int_v((Rc::ptr_eq(&a, &b) && x == y) as i64),
+            // Integer addresses (stable pointer indices, the null address) compare by value.
+            (Value::Int(x), Value::Int(y)) => int_v((x == y) as i64),
             _ => int_v(0),
         },
         _ if sized_conversion(name).is_some() => {
@@ -1141,12 +1148,23 @@ fn read_element(bytes: &[u8], at: usize, size: usize, kind: &str) -> Value {
         }
         "word" => Value::Int(v as i64),
         "double" => Value::Double(f64::from_bits(v)),
-        "addr" => Value::Addr(Rc::new(Vec::new()), 0),
+        "addr" => Value::Addr(Rc::new(RefCell::new(Vec::new())), 0),
         _ => Value::Double(f32::from_bits(v as u32) as f64),
     }
 }
 
 /// Stores an element at byte offset `at` of a byte buffer.
+/// The raw element of a sized box (`W8#` and the like around one machine value).
+fn unbox_element(rt: &Runtime, v: Value) -> Result<Value, RtError> {
+    match v {
+        Value::Con(c) if c.args.len() == 1 => {
+            let inner = rt.force(&c.args[0])?;
+            unbox_element(rt, inner)
+        }
+        other => Ok(other),
+    }
+}
+
 fn write_element(bytes: &mut [u8], at: usize, size: usize, kind: &str, v: &Value) {
     let bits: u64 = match (kind, v) {
         ("double", Value::Double(d)) => d.to_bits(),

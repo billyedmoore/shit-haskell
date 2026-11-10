@@ -35,6 +35,14 @@ fn run_io(rt: &Runtime, io: &Cell, state: &Cell) -> RR {
 
 /// The `ErrorCall` exception for a runtime error message, built by the library's own function.
 fn error_call(rt: &Runtime, msg: &str) -> Option<Value> {
+    // A computation that depends on itself is NonTermination, as in GHC.
+    if msg == "<<loop>>" {
+        if let Some(c) = rt.global("GHC.Internal.Control.Exception.Base.nonTerminationException") {
+            if let Ok(v) = rt.force(&c) {
+                return Some(v);
+            }
+        }
+    }
     let f = rt.global("GHC.Internal.Exception.errorCallException")?;
     let f = rt.force(&f).ok()?;
     rt.apply(f, cell_of(string_value(msg))).ok()
@@ -81,8 +89,100 @@ fn decode_double(x: f64) -> (i64, i64) {
     (sign * m, e)
 }
 
+/// The Int64#, Word64# and sized (Int8# .. Word32#) operations: each is an Int# or Word# operation, with
+/// the result narrowed to the width where that matters. Returns the base operation and the narrowing.
+fn sized_alias(name: &str) -> Option<(&'static str, Option<&'static str>)> {
+    let fixed: Option<&'static str> = match name {
+        "and64#" => Some("and#"),
+        "or64#" => Some("or#"),
+        "xor64#" => Some("xor#"),
+        "not64#" => Some("not#"),
+        "plusInt64#" => Some("+#"),
+        "subInt64#" => Some("-#"),
+        "timesInt64#" => Some("*#"),
+        "quotInt64#" => Some("quotInt#"),
+        "remInt64#" => Some("remInt#"),
+        "negateInt64#" => Some("negateInt#"),
+        "eqInt64#" => Some("==#"),
+        "neInt64#" => Some("/=#"),
+        "ltInt64#" => Some("<#"),
+        "leInt64#" => Some("<=#"),
+        "gtInt64#" => Some(">#"),
+        "geInt64#" => Some(">=#"),
+        "uncheckedIShiftL64#" => Some("uncheckedIShiftL#"),
+        "uncheckedIShiftRA64#" => Some("uncheckedIShiftRA#"),
+        "uncheckedIShiftRL64#" => Some("uncheckedIShiftRL#"),
+        "plusWord64#" => Some("plusWord#"),
+        "subWord64#" => Some("minusWord#"),
+        "timesWord64#" => Some("timesWord#"),
+        "quotWord64#" => Some("quotWord#"),
+        "remWord64#" => Some("remWord#"),
+        "eqWord64#" => Some("eqWord#"),
+        "neWord64#" => Some("neWord#"),
+        "ltWord64#" => Some("ltWord#"),
+        "leWord64#" => Some("leWord#"),
+        "gtWord64#" => Some("gtWord#"),
+        "geWord64#" => Some("geWord#"),
+        "uncheckedShiftL64#" => Some("uncheckedShiftL#"),
+        "uncheckedShiftRL64#" => Some("uncheckedShiftRL#"),
+        "int64ToInt#" | "intToInt64#" | "int64ToWord64#" | "word64ToInt64#" => Some("word2Int#"),
+        "word64ToWord#" | "wordToWord64#" => Some("int2Word#"),
+        _ => None,
+    };
+    if fixed.is_some() {
+        return fixed.map(|b| (b, None));
+    }
+    // Sized Int/Word operations: `plusInt8#` and friends narrow to their width.
+    let width = |w: &str| match w {
+        "8" => Some("narrow8Int#"),
+        "16" => Some("narrow16Int#"),
+        "32" => Some("narrow32Int#"),
+        _ => None,
+    };
+    let wwidth = |w: &str| match w {
+        "8" => Some("narrow8Word#"),
+        "16" => Some("narrow16Word#"),
+        "32" => Some("narrow32Word#"),
+        _ => None,
+    };
+    let stem = name.strip_suffix('#')?;
+    for (op, base) in [("plus", "+#"), ("sub", "-#"), ("times", "*#"), ("quot", "quotInt#"), ("rem", "remInt#")] {
+        for (ty, w_base) in [("Int", base), ("Word", match base { "+#" => "plusWord#", "-#" => "minusWord#", "*#" => "timesWord#", "quotInt#" => "quotWord#", _ => "remWord#" })] {
+            for w in ["8", "16", "32"] {
+                if stem == format!("{op}{ty}{w}") {
+                    let narrow = if ty == "Int" { width(w) } else { wwidth(w) };
+                    return Some((if ty == "Int" { base } else { w_base }, narrow));
+                }
+            }
+        }
+    }
+    for (op, base) in [("eq", "==#"), ("ne", "/=#"), ("lt", "<#"), ("le", "<=#"), ("gt", ">#"), ("ge", ">=#")] {
+        for ty in ["Int", "Word"] {
+            for w in ["8", "16", "32"] {
+                if stem == format!("{op}{ty}{w}") {
+                    let b = if ty == "Int" { base } else { match base { "==#" => "eqWord#", "/=#" => "neWord#", "<#" => "ltWord#", "<=#" => "leWord#", ">#" => "gtWord#", _ => "geWord#" } };
+                    return Some((b, None));
+                }
+            }
+        }
+    }
+    if stem == "negateInt8" || stem == "negateInt16" || stem == "negateInt32" {
+        return Some(("negateInt#", width(&stem["negateInt".len()..])));
+    }
+    None
+}
+
 /// Runs a GHC primitive by name, or answers None when it is not one of them.
 pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
+    if let Some((base, narrow)) = sized_alias(name) {
+        return Some(match super::prims::call(rt, base, args) {
+            Ok(v) => match narrow {
+                None => Ok(v),
+                Some(n) => super::prims::call(rt, n, &[cell_of(v)]),
+            },
+            Err(e) => Err(e),
+        });
+    }
     if let Some(r) = call_state(rt, name, args) {
         return Some(r);
     }
@@ -255,11 +355,15 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
     Some(r)
 }
 
+/// A `Ptr` value: the constructor around an address (a C function's `Ptr` result).
 /// The C functions that base imports with `foreign import ccall`, where the answer does not depend on
 /// the host's files or processes: the locale's codeset is UTF-8.
-fn ffi(_rt: &Runtime, name: &str, _args: &[Cell]) -> Option<RR> {
+fn ffi(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
+    if let Some(r) = super::ffi::call(rt, name, args) {
+        return Some(r);
+    }
     let r: RR = match name {
-        "localeEncoding" => Ok(io_result_of(Value::Addr(Rc::new(b"UTF-8\0".to_vec()), 0))),
+        "localeEncoding" => Ok(io_result_of(Value::Addr(Rc::new(RefCell::new(b"UTF-8\0".to_vec())), 0))),
         _ => return None,
     };
     Some(r)
@@ -311,6 +415,8 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         // ----- evaluation, masking, exceptions -----
         "seq#" => rt.force(&args[0]).and_then(state_result),
         "touch#" | "noDuplicate#" => Ok(unit_value()),
+        // keepAlive# x s k: the continuation runs on the state; x only has to stay alive meanwhile.
+        "keepAlive#" => rt.force(&args[2]).and_then(|k| rt.apply(k, args[1].clone())),
         "maskAsyncExceptions#" | "unmaskAsyncExceptions#" | "maskUninterruptible#" => {
             rt.force(&args[0]).and_then(|f| rt.apply(f, args[1].clone()))
         }
@@ -318,9 +424,169 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "raise#" => rt.force(&args[0]).and_then(|e| Err(RtError::Thrown(e))),
         "raiseIO#" => rt.force(&args[0]).and_then(|e| Err(RtError::Thrown(e))),
         "catch#" => catch_prim(rt, args),
+
+        // ----- byte arrays (the element accessors are in prims.rs) -----
+        "newAlignedPinnedByteArray#" | "newByteArray#" | "newPinnedByteArray#" => match rt.force(&args[0]) {
+            Ok(Value::Int(n)) => state_result(Value::Bytes(Rc::new(RefCell::new(vec![0u8; n.max(0) as usize])))),
+            Ok(_) => Err(RtError::Fail("internal: byte array size".into())),
+            Err(e) => Err(e),
+        },
+        "copyByteArray#" | "copyMutableByteArray#" | "copyMutableByteArrayNonOverlapping#" => {
+            copy_bytes(rt, args).map(|_| unit_value())
+        }
+        "setByteArray#" => set_bytes(rt, args).map(|_| unit_value()),
+        "shrinkMutableByteArray#" => match (rt.force(&args[0]), rt.force(&args[1])) {
+            (Ok(Value::Bytes(b)), Ok(Value::Int(n))) => {
+                b.borrow_mut().truncate(n.max(0) as usize);
+                Ok(unit_value())
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
+            _ => Err(RtError::Fail("internal: shrinkMutableByteArray#".into())),
+        },
+        "resizeMutableByteArray#" => match (rt.force(&args[0]), rt.force(&args[1])) {
+            (Ok(Value::Bytes(b)), Ok(Value::Int(n))) => {
+                let mut data = b.borrow().clone();
+                data.resize(n.max(0) as usize, 0);
+                state_result(Value::Bytes(Rc::new(RefCell::new(data))))
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
+            _ => Err(RtError::Fail("internal: resizeMutableByteArray#".into())),
+        },
+        "compareByteArrays#" => compare_bytes(rt, args).map(Value::Int),
+        "isMutableByteArrayPinned#" | "isByteArrayPinned#" => Ok(Value::Int(1)),
+
+        // ----- weak pointers: the runtime has no garbage collector, so a weak pointer keeps its value and
+        // its finalizer never runs -----
+        "mkWeak#" => Ok(state_result_value(con_value("GHC.Weak.Weak", vec![cell_value_of(&args[1])]))),
+        "mkWeakNoFinalizer#" => Ok(state_result_value(con_value("GHC.Weak.Weak", vec![cell_value_of(&args[1])]))),
+        "deRefWeak#" => match rt.force(&args[0]) {
+            Ok(Value::Con(w)) => {
+                let v = w.args.first().cloned().unwrap_or_else(unit_cell);
+                rt.force(&v).map(|val| con_value("Builtin.(,,)", vec![unit_value(), Value::Int(1), val]))
+            }
+            Ok(_) => Err(RtError::Fail("internal: deRefWeak# of a non-weak".into())),
+            Err(e) => Err(e),
+        },
+        "finalizeWeak#" => Ok(con_value("Builtin.(,,)", vec![unit_value(), Value::Int(0), unit_value()])),
+        "addCFinalizerToWeak#" => Ok(state_result_value(Value::Int(1))),
+
+        // ----- MVar# (the scheduler's primitives, under their GHC names) -----
+        "newMVar#" => super::prims::call(rt, "newMVar", args),
+        "takeMVar#" => super::prims::call(rt, "takeMVar", args),
+        "readMVar#" => super::prims::call(rt, "readMVar", args),
+        // putMVar# answers the state token alone, not a pair.
+        "putMVar#" => super::prims::call(rt, "putMVar", args).map(|_| unit_value()),
+
+        // ----- threads: the primops over the runtime's threads (a ThreadId# is the thread number) -----
+        "myThreadId#" => super::prims::call(rt, "myThreadId", args),
+        "fork#" => super::prims::call(rt, "forkThread", args),
+        "forkOn#" => super::prims::call(rt, "forkThread", &args[1..]),
+        "yield#" => super::prims::call(rt, "yieldThread", args).map(|_| unit_value()),
+        "delay#" => super::prims::call(rt, "threadDelay", args).map(|_| unit_value()),
+        "killThread#" => super::prims::call(rt, "throwTo", args).map(|_| unit_value()),
+        "isCurrentThreadBound#" => Ok(io_result_of(Value::Int(0))),
+        "labelThread#" => Ok(unit_value()),
+
+        // ----- stable pointers: an index into the runtime's table -----
+        "makeStablePtr#" => {
+            let mut table = rt.stable.borrow_mut();
+            table.push(Some(args[0].clone()));
+            state_result(Value::Int(table.len() as i64 - 1))
+        }
+        "deRefStablePtr#" => (|| {
+            let i = int(rt, &args[0])?;
+            let cell = rt.stable.borrow().get(i as usize).cloned().flatten();
+            match cell {
+                Some(c) => state_result(rt.force(&c)?),
+                None => Err(RtError::Fail("internal: dereferenced a freed stable pointer".into())),
+            }
+        })(),
+        "eqStablePtr#" => match (int(rt, &args[0]), int(rt, &args[1])) {
+            (Ok(x), Ok(y)) => Ok(b(x == y)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+
+        // ----- byte arrays and addresses: a pointer is a view of its array's buffer -----
+        "mutableByteArrayContents#" | "byteArrayContents#" => match rt.force(&args[0]) {
+            Ok(Value::Bytes(b)) => Ok(Value::Addr(b, 0)),
+            Ok(_) => Err(RtError::Fail("internal: contents of a non-array".into())),
+            Err(e) => Err(e),
+        },
+        "nullAddr#" => Ok(Value::Addr(Rc::new(RefCell::new(Vec::new())), 0)),
+        "addr2Int#" => match rt.force(&args[0]) {
+            Ok(Value::Addr(b, o)) => Ok(Value::Int(Rc::as_ptr(&b) as i64 + o as i64)),
+            Ok(_) => Err(RtError::Fail("internal: addr2Int# of a non-address".into())),
+            Err(e) => Err(e),
+        },
         _ => return None,
     };
     Some(r)
+}
+
+/// The bytes of a byte array argument (or an address's buffer) as a shared buffer and an offset.
+fn bytes_of(rt: &Runtime, c: &Cell) -> Result<(Rc<RefCell<Vec<u8>>>, usize), RtError> {
+    match rt.force(c)? {
+        Value::Bytes(b) => Ok((b, 0)),
+        Value::Addr(b, o) => Ok((b, o)),
+        _ => Err(RtError::Fail("internal: expected a byte array".into())),
+    }
+}
+
+fn int_arg(rt: &Runtime, c: &Cell) -> Result<i64, RtError> {
+    match rt.force(c)? {
+        Value::Int(n) => Ok(n),
+        _ => Err(RtError::Fail("internal: expected an Int#".into())),
+    }
+}
+
+/// copyByteArray# src srcOff dst dstOff n: the bytes are copied, overlapping ranges included.
+fn copy_bytes(rt: &Runtime, args: &[Cell]) -> Result<(), RtError> {
+    let (src, so) = bytes_of(rt, &args[0])?;
+    let so = so + int_arg(rt, &args[1])? as usize;
+    let (dst, dof) = bytes_of(rt, &args[2])?;
+    let dof = dof + int_arg(rt, &args[3])? as usize;
+    let n = int_arg(rt, &args[4])? as usize;
+    let chunk: Vec<u8> = src.borrow()[so..so + n].to_vec();
+    dst.borrow_mut()[dof..dof + n].copy_from_slice(&chunk);
+    Ok(())
+}
+
+/// setByteArray# arr off n c: fills n bytes from off with c.
+fn set_bytes(rt: &Runtime, args: &[Cell]) -> Result<(), RtError> {
+    let (arr, o) = bytes_of(rt, &args[0])?;
+    let off = o + int_arg(rt, &args[1])? as usize;
+    let n = int_arg(rt, &args[2])? as usize;
+    let c = int_arg(rt, &args[3])? as u8;
+    for b in &mut arr.borrow_mut()[off..off + n] {
+        *b = c;
+    }
+    Ok(())
+}
+
+/// compareByteArrays# a aOff b bOff n: memcmp-style ordering of two ranges.
+fn compare_bytes(rt: &Runtime, args: &[Cell]) -> Result<i64, RtError> {
+    let (a, ao) = bytes_of(rt, &args[0])?;
+    let ao = ao + int_arg(rt, &args[1])? as usize;
+    let (b, bo) = bytes_of(rt, &args[2])?;
+    let bo = bo + int_arg(rt, &args[3])? as usize;
+    let n = int_arg(rt, &args[4])? as usize;
+    let x = a.borrow();
+    let y = b.borrow();
+    Ok(match x[ao..ao + n].cmp(&y[bo..bo + n]) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })
+}
+
+/// A state-passing result around a value that is already evaluated.
+fn state_result_value(v: Value) -> Value {
+    io_result_of(v)
+}
+
+/// A cell holding the value of an argument, shared with the argument.
+fn cell_value_of(c: &Cell) -> Value {
+    Value::Ref(Rc::new(RefCell::new(c.clone())))
 }
 
 /// A pair value whose second component is the given cell.
@@ -401,11 +667,16 @@ fn copy_into(rt: &Runtime, args: &[Cell]) -> Result<(), RtError> {
     }
 }
 
+fn catch_handle(rt: &Runtime, exc: Value, args: &[Cell]) -> RR {
+    let handler = rt.force(&args[1])?;
+    let action = rt.apply(handler, cell_of(exc))?;
+    rt.apply(action, args[2].clone())
+}
+
 /// catch# io handler s: the action runs; an exception goes to the handler, which runs in its place.
 fn catch_prim(rt: &Runtime, args: &[Cell]) -> RR {
     let exc = match run_io(rt, &args[0], &args[2]) {
-        Ok(v) => return Ok(v),
-        Err(RtError::Thrown(e)) | Err(RtError::Async(e)) => e,
+        Ok(v) => return Ok(v),        Err(RtError::Thrown(e)) | Err(RtError::Async(e)) => e,
         Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) | Err(RtError::ErrorLoc(msg, _)) => {
             match error_call(rt, &msg) {
                 Some(e) => e,

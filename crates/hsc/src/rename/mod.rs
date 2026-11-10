@@ -844,12 +844,14 @@ impl<'a> Renamer<'a> {
             },
             Decl::Foreign {
                 import,
+                prim,
                 entity,
                 name,
                 ty,
                 loc,
             } => Decl::Foreign {
                 import,
+                prim,
                 entity,
                 name,
                 ty: self.ty(ty)?,

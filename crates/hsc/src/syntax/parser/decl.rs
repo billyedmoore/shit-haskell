@@ -1115,7 +1115,8 @@ impl Parser {
         } else {
             return self.unexpected();
         };
-        // Calling convention and safety are accepted and recorded nowhere yet.
+        // The calling convention is kept (`prim` is the runtime's own primitives); safety is not.
+        let prim = self.at_varid("prim");
         if ["ccall", "capi", "stdcall", "prim", "javascript"]
             .iter()
             .any(|cc| self.at_varid(cc))
@@ -1137,6 +1138,7 @@ impl Parser {
         let ty = self.sigtype()?;
         Ok(Decl::Foreign {
             import,
+            prim,
             entity,
             name,
             ty,

@@ -129,9 +129,9 @@ impl Checker {
 
         // 4. Foreign imports.
         for d in decls {
-            if let Decl::Foreign { import: true, entity, name, ty, loc } = d {
+            if let Decl::Foreign { import: true, prim, entity, name, ty, loc } = d {
                 self.loc = *loc;
-                self.foreign_import(name, entity.as_deref(), ty)?;
+                self.foreign_import(name, entity.as_deref(), ty, *prim)?;
             }
         }
 
@@ -206,6 +206,17 @@ impl Checker {
             .collect();
         for (k, v) in publish {
             self.env.values.insert(k, v);
+        }
+        // GHC's desugarer patches these magic definitions: the equality proof is the constructor
+        // (its source is self-referential), and unsafeCoerce# is the identity.
+        if self.module == "GHC.Internal.Unsafe.Coerce" {
+            for b in self.out.iter_mut() {
+                if b.name == "GHC.Internal.Unsafe.Coerce.unsafeEqualityProof" {
+                    b.body = Core::Con("GHC.Internal.Unsafe.Coerce.UnsafeRefl".into(), vec![]);
+                } else if b.name == "GHC.Internal.Unsafe.Coerce.unsafeCoerce#" {
+                    b.body = Core::Lam("uc%".into(), Box::new(Core::Var("uc%".into())));
+                }
+            }
         }
         Ok(std::mem::take(&mut self.out))
     }
@@ -484,7 +495,54 @@ impl Checker {
         Ok(binds.into_iter().next().expect("one binding").1)
     }
 
-    fn foreign_import(&mut self, name: &str, entity: Option<&str>, ty: &Type) -> TR<()> {
+    /// How a foreign result of this type is turned into a Haskell value: a `Bool` tests the raw
+    /// answer against zero, a one-field box (CInt, Word8, ...) wraps it, and anything else (Int,
+    /// Double, the identity boxes) is the raw value already. Newtypes around the type are followed.
+    fn ffi_result_kind(&self, ty: &Ty) -> Option<FfiResult> {
+        let mut t = ty.clone();
+        for _ in 0..8 {
+            let Ty::Con(name) = t.split_apps().0.clone() else { return None };
+            if name == "GHC.Types.Bool" {
+                return Some(FfiResult::Bool);
+            }
+            let info = self.env.tycons.get(&name)?;
+            if info.cons.len() != 1 {
+                return None;
+            }
+            let dc = self.env.datacons.get(&info.cons[0])?;
+            if dc.newtype {
+                if dc.scheme.nvars != 0 {
+                    return None;
+                }
+                t = dc.scheme.ty.as_fun()?.0.clone();
+                continue;
+            }
+            if dc.arity != 1 || !dc.scheme.preds.is_empty() || crate::tc::expr::is_boxing_con(&info.cons[0]) {
+                return None;
+            }
+            return Some(FfiResult::Box(info.cons[0].clone()));
+        }
+        None
+    }
+
+    fn ffi_wrap(&mut self, kind: FfiResult, raw: Core) -> Core {
+        match kind {
+            FfiResult::Box(con) => Core::Con(con, vec![raw]),
+            FfiResult::Bool => {
+                let b = self.fresh_name("fb");
+                Core::Case(
+                    Box::new(raw),
+                    b,
+                    vec![
+                        Alt::Lit(crate::core::Lit::Int(0), Core::Con("GHC.Types.False".into(), vec![])),
+                        Alt::Default(Core::Con("GHC.Types.True".into(), vec![])),
+                    ],
+                )
+            }
+        }
+    }
+
+    fn foreign_import(&mut self, name: &str, entity: Option<&str>, ty: &Type, is_prim: bool) -> TR<()> {
         let mut tvs = Vec::new();
         let (preds, body) = self.sig_parts(ty, &mut tvs)?;
         let scheme = Scheme {
@@ -494,7 +552,15 @@ impl Checker {
             ty: body.clone(),
         };
         let key = format!("{}.{name}", self.module);
-        let prim = entity.map(str::to_string).unwrap_or_else(|| name.to_string());
+        // The C entity: an optional `static`, an optional header (`HsBase.h`), then the symbol.
+        let prim = entity
+            .and_then(|e| {
+                e.split_whitespace()
+                    .filter(|w| *w != "static" && !w.ends_with(".h"))
+                    .last()
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| name.to_string());
         let arity = count_args(&body);
         // An IO result is a function of the state token, which the primitive takes last and
         // answers with the (# state, result #) pair, like the other IO primitives.
@@ -508,7 +574,35 @@ impl Checker {
         let total = arity + usize::from(io);
         let params: Vec<String> = (0..total).map(|_| self.fresh_name("fa")).collect();
         let args: Vec<Core> = params.iter().map(|p| Core::Var(p.clone())).collect();
-        let mut core = Core::Prim(prim, args);
+        // The primitive answers with the raw machine value; a boxed result type (CInt, Word8,
+        // ...) wraps it in its one-field constructor, inside the IO pair when there is one.
+        let value_ty = if io {
+            result.split_apps().1.first().map(|t| (*t).clone())
+        } else {
+            Some(result.clone())
+        };
+        // A C result is raw: a Bool, or a box around one, is made here. A runtime primitive
+        // already answers with Haskell values.
+        let boxed = if is_prim { None } else { value_ty.clone().and_then(|t| self.ffi_result_kind(&t)) };
+        let call = Core::Prim(prim, args);
+        let call = match (io, boxed) {
+            (_, None) => call,
+            (false, Some(kind)) => self.ffi_wrap(kind, call),
+            (true, Some(kind)) => {
+                let (s, v, r) = (self.fresh_name("fs"), self.fresh_name("fv"), self.fresh_name("fr"));
+                let inner = self.ffi_wrap(kind, Core::Var(v.clone()));
+                Core::Case(
+                    Box::new(call),
+                    r,
+                    vec![Alt::Con(
+                        "Builtin.(,)".into(),
+                        vec![s.clone(), v],
+                        Core::Con("Builtin.(,)".into(), vec![Core::Var(s), inner]),
+                    )],
+                )
+            }
+        };
+        let mut core = call;
         for p in params.iter().rev() {
             core = Core::Lam(p.clone(), Box::new(core));
         }
@@ -1022,3 +1116,10 @@ pub fn instantiate_method(mscheme: &Scheme, nparams: u32, head: &[Ty]) -> Scheme
     }
 }
 
+
+/// How a foreign import's raw result becomes its Haskell value.
+#[derive(Clone)]
+enum FfiResult {
+    Bool,
+    Box(String),
+}

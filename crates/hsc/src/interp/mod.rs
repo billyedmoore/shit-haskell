@@ -7,6 +7,8 @@ pub mod code;
 pub mod conc;
 pub mod prims;
 pub mod prims_ghc;
+pub mod ffi;
+pub mod md5;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -50,8 +52,9 @@ pub enum Value {
     Ref(Rc<RefCell<Cell>>),
     /// An immutable boxed vector (the cells are never reassigned after construction).
     Vec(Rc<RefCell<Vec<Cell>>>),
-    /// An `Addr#`: a byte buffer and an offset into it.
-    Addr(Rc<Vec<u8>>, usize),
+    /// An `Addr#`: a byte buffer and an offset into it. The buffer is shared with the byte arrays
+    /// it is taken from (`mutableByteArrayContents#`), so a pointer sees the array's writes.
+    Addr(Rc<RefCell<Vec<u8>>>, usize),
     /// A mutable byte array (`MutableByteArray#`, and `ByteArray#` once frozen).
     Bytes(Rc<RefCell<Vec<u8>>>),
     /// An `MVar`: empty, or holding a cell.
@@ -91,6 +94,10 @@ pub struct Runtime {
     pub cells: Vec<Cell>,
     pub index: HashMap<String, u32>,
     pub prog_name: String,
+    /// The stable pointers: a StablePtr# is the index of its cell here (0 is no pointer).
+    pub stable: RefCell<Vec<Option<Cell>>>,
+    /// The RTS's named pointer slots (`getOrSet…Store`), by name.
+    pub ffi_slots: RefCell<std::collections::HashMap<String, Value>>,
 }
 
 pub(super) fn new_cell(t: Thunk) -> Cell {
@@ -121,6 +128,8 @@ impl Runtime {
             cells,
             index: prog.index,
             prog_name,
+            stable: RefCell::new(vec![None]),
+            ffi_slots: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -221,7 +230,7 @@ impl Runtime {
                 Code::Frac(s) => return Ok(Value::Double(s.parse().unwrap_or(0.0))),
                 Code::Char(c) => return Ok(Value::Char(*c)),
                 Code::Str(s) => return Ok(string_value(s)),
-                Code::Addr(bytes) => return Ok(Value::Addr(bytes.clone(), 0)),
+                Code::Addr(bytes) => return Ok(Value::Addr(Rc::new(RefCell::new((**bytes).clone())), 0)),
                 Code::App(f, a) => {
                     let fv = self.eval(f, &frame)?;
                     let arg = self.delay(a, &frame);
@@ -285,7 +294,7 @@ impl Runtime {
                                 }
                             }
                             CAlt::Default(body) => {
-                                code = body;
+                                                code = body;
                                 continue 'outer;
                             }
                         }
@@ -357,7 +366,10 @@ pub fn lit_value(l: &Lit) -> RR {
         Lit::Double(d) => Value::Double(*d),
         Lit::Char(c) => Value::Char(*c),
         Lit::Str(s) => string_value(s),
-        Lit::Addr(s) => Value::Addr(Rc::new(s.chars().map(|c| c as u32 as u8).chain(std::iter::once(0)).collect()), 0),
+        Lit::Addr(s) => Value::Addr(
+            Rc::new(RefCell::new(s.chars().map(|c| c as u32 as u8).chain(std::iter::once(0)).collect())),
+            0,
+        ),
     })
 }
 
@@ -397,7 +409,16 @@ pub fn run_main(rt: &Runtime) -> i32 {
         return 1;
     };
     let result = (|| -> Result<(), RtError> {
-        let io = rt.force(&main_cell)?;
+        // With the real base loaded, main runs under its top handler, as GHC's compiled main does:
+        // uncaught exceptions are reported by the library and the standard handles are flushed.
+        let main_io = match rt.global("GHC.Internal.TopHandler.runMainIO") {
+            Some(run_main_io) => {
+                let f = rt.force(&run_main_io)?;
+                rt.apply(f, main_cell.clone())?
+            }
+            None => rt.force(&main_cell)?,
+        };
+        let io = main_io;
         // `main :: IO ()` is `IO (State# RealWorld -> (# State# RealWorld, () #))`.
         let run = match io {
             other_io @ Value::Con(_) | other_io @ Value::Fun(_) => other_io,
@@ -425,16 +446,32 @@ pub fn run_main(rt: &Runtime) -> i32 {
         }
         Err(RtError::Thrown(exc)) | Err(RtError::Async(exc)) => {
             prims::flush_stdout();
-            let text = match &exc {
-                Value::Con(c) if c.args.len() == 3 => rt.force_string(&c.args[2]).unwrap_or_default(),
-                _ => String::from("uncaught exception"),
-            };
+            let text = uncaught_text(rt, &exc).unwrap_or_else(|| String::from("uncaught exception"));
             eprintln!("{}: {}", rt.prog_name, text);
             1
         }
     };
+    // hs_exit in GHC flushes the Haskell standard handles; so does the library's flush, if loaded.
+    if let Some(flush) = rt.global("GHC.Internal.TopHandler.flushStdHandles") {
+        if let Ok(io) = rt.force(&flush) {
+            let _ = rt.apply(io, new_cell(Thunk::Done(unit_value())));
+        }
+    }
     prims::flush_stdout();
     code
+}
+
+/// The text of an uncaught exception: the library's `displayException` of the wrapped exception,
+/// applied through the wrapper's dictionary (a `SomeException` is `dict, context, exception`).
+fn uncaught_text(rt: &Runtime, exc: &Value) -> Option<String> {
+    let Value::Con(c) = exc else { return None };
+    if c.args.len() != 3 {
+        return None;
+    }
+    let display = rt.force(&rt.global("GHC.Internal.Exception.Type.displayException")?).ok()?;
+    let method = rt.apply(display, c.args[0].clone()).ok()?;
+    let text = rt.apply(method, c.args[2].clone()).ok()?;
+    rt.force_string(&new_cell(Thunk::Done(text))).ok()
 }
 
 pub fn bool_value(b: bool) -> Value {

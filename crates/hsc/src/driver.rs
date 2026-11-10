@@ -207,6 +207,10 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
             d.load(dep)?;
         }
     }
+    // A program on the real base runs under its top handler, which GHC links into every program.
+    if deps.iter().any(|x| x.starts_with("GHC.Internal.")) && !source.contains("GHC.Internal.TopHandler") {
+        d.load("GHC.Internal.TopHandler")?;
+    }
     let name = parsed.name.clone();
     d.compile_module(parsed, exts, main_file)?;
     d.load_booted()?;

@@ -834,6 +834,7 @@ newtype Par1 p = Par1 { unPar1 :: p }
            , Show     -- ^ @since base-4.7.0.0
            , Functor  -- ^ @since base-4.9.0.0
            , Generic  -- ^ @since base-4.7.0.0
+           , Generic1 -- ^ @since base-4.9.0.0
            )
 
 -- | @since base-4.9.0.0

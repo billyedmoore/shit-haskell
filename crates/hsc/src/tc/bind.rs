@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::expr::{qkey, wrap_let};
+use super::expr::{qkey, wrap_let, STRICT_BIND};
 use super::types::{subst_gen, Pred, Scheme, Ty};
 use super::{Checker, Given, Wanted, TR};
 use crate::core::matcher::{compile_body, compile_rows, CBody, Row};
@@ -172,6 +172,11 @@ impl Checker {
                     let mut fresh = |b: &str| self.fresh_name(b);
                     let rhs_core = compile_body(&body, Core::Fail("Non-exhaustive guards in pattern binding".into()), &mut fresh);
                     cores.push((s.clone(), rhs_core));
+                    // A banged pattern binding is evaluated before the body: its alias is forced
+                    // by `wrap_let`, which is what makes `let !(# s, () #) = io s0` run its effect.
+                    if matches!(pat, Pat::Bang(..)) {
+                        cores.push((format!("{STRICT_BIND}{s}"), Core::Var(s.clone())));
+                    }
                     for k in &it.keys {
                         let extract = compile_rows(
                             std::slice::from_ref(&s),

@@ -53,7 +53,7 @@ impl Checker {
                     Core::Fail("Non-exhaustive patterns in case".into()),
                     &mut fresh,
                 );
-                Ok(Core::Let(vec![(s, cs)], Box::new(matched)))
+                Ok(self.bind_scrutinee(&ts, s, cs, matched))
             }
             Expr::Let(decls, body, loc) if !decls.iter().any(|d| matches!(d, Decl::IPBind { .. })) => {
                 self.loc = *loc;
@@ -75,6 +75,19 @@ impl Checker {
                 self.unify_at(&t, ty)?;
                 Ok(c)
             }
+        }
+    }
+
+    /// Binds a case scrutinee to its variable. A scrutinee of an unlifted type (`State#`, `Int#`, ...)
+    /// is evaluated first, even when the alternatives only bind it: the primitive it comes from has
+    /// its effect when it is run, as in GHC. A lifted scrutinee stays lazy.
+    fn bind_scrutinee(&mut self, ts: &Ty, s: String, cs: Core, body: Core) -> Core {
+        let head = self.metas.zonk(ts);
+        let unlifted = matches!(head.split_apps().0, Ty::Con(c) if c.ends_with('#'));
+        if unlifted {
+            Core::Case(Box::new(cs), s, vec![crate::core::Alt::Default(body)])
+        } else {
+            Core::Let(vec![(s, cs)], Box::new(body))
         }
     }
 
@@ -385,7 +398,7 @@ impl Checker {
                     Core::Fail("Non-exhaustive patterns in case".into()),
                     &mut fresh,
                 );
-                Ok((Core::Let(vec![(s, cs)], Box::new(matched)), r))
+                Ok((self.bind_scrutinee(&ts, s, cs, matched), r))
             }
             Expr::LamCase(alts, loc) => {
                 self.loc = *loc;
@@ -1239,7 +1252,9 @@ impl Checker {
             loc,
             msg: format!("Data constructor not in scope: {key}"),
         })?;
-        let (cty, _, _) = self.metas.instantiate(&info.scheme, self.level);
+        // The constructor is instantiated like a plain constructor reference, so its context
+        // dictionaries are passed (as wanteds) ahead of the fields, as the wrapper expects.
+        let (con_core, cty) = self.inst_var(&key, &info.scheme, loc);
         let mut arg_tys = Vec::new();
         let mut cur = cty;
         for _ in 0..info.arity {
@@ -1262,25 +1277,16 @@ impl Checker {
             };
             args[pos] = Some(self.check(&value, &arg_tys[pos])?);
         }
-        if info.newtype {
-            let inner = args.into_iter().next().flatten().unwrap_or_else(|| {
-                Core::Fail("Missing field in record construction".into())
+        let core = args.into_iter().enumerate().fold(con_core, |acc, (i, a)| {
+            let a = a.unwrap_or_else(|| {
+                Core::Fail(format!(
+                    "Missing field in record construction {}",
+                    info.fields.get(i).cloned().unwrap_or_default()
+                ))
             });
-            return Ok((inner, cur));
-        }
-        let cores: Vec<Core> = args
-            .into_iter()
-            .enumerate()
-            .map(|(i, a)| {
-                a.unwrap_or_else(|| {
-                    Core::Fail(format!(
-                        "Missing field in record construction {}",
-                        info.fields.get(i).cloned().unwrap_or_default()
-                    ))
-                })
-            })
-            .collect();
-        Ok((Core::Con(key, cores), cur))
+            Core::App(Box::new(acc), Box::new(a))
+        });
+        Ok((core, cur))
     }
 
     /// Elaborates a group of local bindings (a `let` or `where`).
@@ -1340,12 +1346,23 @@ fn split_qualified(key: &str) -> QName {
     }
 }
 
+/// Prefix of the alias of a banged pattern binding: the body forces these before running.
+pub const STRICT_BIND: &str = "strict%";
+
 pub fn wrap_let(binds: Vec<(String, Core)>, body: Core) -> Core {
     if binds.is_empty() {
-        body
-    } else {
-        Core::Let(binds, Box::new(body))
+        return body;
     }
+    let forced: Vec<String> = binds
+        .iter()
+        .filter(|(n, _)| n.starts_with(STRICT_BIND))
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut body = body;
+    for n in forced.into_iter().rev() {
+        body = Core::Case(Box::new(Core::Var(n.clone())), format!("{n}!"), vec![Alt::Default(body)]);
+    }
+    Core::Let(binds, Box::new(body))
 }
 
 /// A MagicHash literal as Core, with the name of its primitive type (from GHC.Prim).

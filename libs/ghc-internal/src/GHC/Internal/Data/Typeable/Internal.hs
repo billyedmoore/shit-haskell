@@ -405,7 +405,20 @@ mkTrType = TrType
 -- | Compiler support: the representation of a type constructor, built by hsc's Typeable
 -- solver from the constructor's module and name. Its kind is approximated as Type.
 mkTypeableCon# :: [Char] -> [Char] -> TypeRep a
-mkTypeableCon# modl name = mkTrCon (mkTyCon "main" modl name 0 (KindRepTYPE (BoxedRep Lifted))) []
+mkTypeableCon# modl name = mkTrCon (mkTyCon (packageOfModule modl) modl name 0 (KindRepTYPE (BoxedRep Lifted))) []
+
+-- The package a type constructor's module belongs to, as GHC names it in a TyCon.
+packageOfModule :: [Char] -> [Char]
+packageOfModule m
+  | hasPrefix "GHC.Internal." m = "ghc-internal"
+  | hasPrefix "GHC.Num." m = "ghc-bignum"
+  | hasPrefix "GHC.Prim" m || hasPrefix "GHC.Types" m || hasPrefix "GHC.Classes" m
+    || hasPrefix "GHC.CString" m || hasPrefix "GHC.Tuple" m = "ghc-prim"
+  | otherwise = "main"
+  where
+    hasPrefix [] _ = True
+    hasPrefix (p:ps) (c:cs) = p == c && hasPrefix ps cs
+    hasPrefix _ [] = False
 
 -- | Construct a representation for a type constructor
 -- applied at a monomorphic kind.
