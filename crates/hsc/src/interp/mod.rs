@@ -6,6 +6,7 @@ pub mod bigint;
 pub mod code;
 pub mod conc;
 pub mod prims;
+pub mod prims_ghc;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -92,7 +93,7 @@ pub struct Runtime {
     pub prog_name: String,
 }
 
-fn new_cell(t: Thunk) -> Cell {
+pub(super) fn new_cell(t: Thunk) -> Cell {
     Rc::new(RefCell::new(t))
 }
 

@@ -790,8 +790,28 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let f = sized_conversion(name).unwrap_or(|x| x);
             int_v(f(int(rt, &args[0])?))
         }
-        _ => Err(RtError::Fail(format!("internal: unknown primitive {name}"))),
+        _ => match super::prims_ghc::call(rt, name, args) {
+            Some(r) => r,
+            None => Err(RtError::Fail(format!("internal: unknown primitive {name}"))),
+        },
     }
+}
+
+/// Access to the unboxed-value helpers, for the GHC primitive table.
+pub(super) fn int_of(rt: &Runtime, c: &Cell) -> Result<i64, RtError> {
+    int(rt, c)
+}
+
+pub(super) fn double_of(rt: &Runtime, c: &Cell) -> Result<f64, RtError> {
+    double(rt, c)
+}
+
+pub(super) fn chr_of(rt: &Runtime, c: &Cell) -> Result<char, RtError> {
+    chr(rt, c)
+}
+
+pub(super) fn io_result_of(v: Value) -> Value {
+    io_result(v)
 }
 
 /// A Haskell list of values.
