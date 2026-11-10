@@ -34,6 +34,9 @@ pub struct NativeTable {
     /// The bodies in address order: entry address, name pointer and length.
     pub bodies: *const [u64; 3],
     pub nbodies: u64,
+    /// The bindings the runtime uses (`native::RTS_GLOBALS`): name pointer, length, global index.
+    pub rts: *const [u64; 3],
+    pub nrts: u64,
 }
 
 /// The name written at a pointer and length.
@@ -76,6 +79,11 @@ pub unsafe fn run(table: *const NativeTable) -> i32 {
         }
         m.heap_set(p + 8, code as Word);
         gvec.push(p);
+    }
+    for i in 0..t.nrts as usize {
+        let [ptr, len, idx] = *t.rts.add(i);
+        let name = String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, len as usize)).into_owned();
+        m.rts_globals.insert(name, idx as usize);
     }
     m.globals = gvec.as_mut_ptr();
     m.global_vec = gvec;

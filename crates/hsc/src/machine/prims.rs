@@ -4,7 +4,7 @@
 
 use super::heap::{self, kind, Word};
 use super::Machine;
-use crate::interp::bigint::{limb64, limb64_count, shift_left, BigInt};
+use crate::interp::bigint::{limb64, limb64_count, BigInt};
 use crate::native::codegen::{CHAR, INT};
 
 /// A new `Int#` object.
@@ -44,6 +44,9 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
     if name == "ratioLit" {
         return force_arg(m, 0).unwrap_or(0);
     }
+    // The flag records a failed evaluation inside this primitive only: an earlier primitive that
+    // failed (and answered 0 itself) must not make this one look failed.
+    m.prim_failed = false;
     let result = super::prims_num::run(m, name)
         .or_else(|| super::prims_mem::run(m, name))
         .or_else(|| super::prims_ffi::run(m, name, nargs))

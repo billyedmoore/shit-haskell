@@ -331,6 +331,11 @@ pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), Str
         );
         binds.push(crate::core::TopBind { name: "hsc$main".into(), body });
     }
+    // Only what the program reaches is compiled: its entry, and the bindings the runtime uses.
+    let entry = if binds.iter().any(|b| b.name == "hsc$main") { "hsc$main" } else { "Main.main" };
+    let mut roots: Vec<&str> = vec![entry];
+    roots.extend_from_slice(crate::native::RTS_GLOBALS);
+    let binds = crate::native::reachable(binds, &roots);
     let prog = crate::native::stg::Lowering::program(&binds);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());

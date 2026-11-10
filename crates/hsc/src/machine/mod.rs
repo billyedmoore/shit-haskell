@@ -65,6 +65,8 @@ pub struct Machine {
     pub named: std::collections::HashMap<String, Word>,
     /// The global closures (the GC roots `globals` points to).
     pub global_vec: Vec<Word>,
+    /// The bindings the runtime uses, by name: their index among the globals.
+    pub rts_globals: std::collections::HashMap<String, usize>,
     /// The program's name, as the runtime reports errors.
     pub prog_name: String,
     /// The bodies of the program in address order, with their names (for diagnostics).
@@ -113,6 +115,7 @@ impl Machine {
             runq: std::collections::VecDeque::new(),
             named: std::collections::HashMap::new(),
             global_vec: Vec::new(),
+            rts_globals: std::collections::HashMap::new(),
             prog_name: std::env::args().next().and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "main".into()),
             saved_args: Vec::new(),
             prim_failed: false,
@@ -160,11 +163,36 @@ impl Machine {
     }
 
     /// An exception value for a failure the runtime reports (a constructor with the message).
-    pub fn error_value(&mut self, _msg: &str) -> Word {
+    /// It is the library's own value: `NonTermination` for a computation that depends on itself, and
+    /// otherwise an `ErrorCall` with the message, as a `SomeException`.
+    pub fn error_value(&mut self, msg: &str) -> Word {
+        if msg == "<<loop>>" {
+            if let Some(g) = self.rts_global("GHC.Internal.Control.Exception.Base.nonTerminationException") {
+                if let Some(v) = self.force(g) {
+                    return v;
+                }
+            }
+        }
+        if self.rts_globals.contains_key("GHC.Internal.Exception.errorCallException") {
+            // The text is built first: the function is read after the allocation (which may collect).
+            let text = prims::string_list(self, msg);
+            let f = self.rts_global("GHC.Internal.Exception.errorCallException").unwrap_or(0);
+            if let Some(v) = self.apply_nested(f, &[text]) {
+                return v;
+            }
+        }
+        // A program without the library: a bare constructor.
+        self.exc = 0;
+        self.prim_failed = false;
         let p = self.alloc(2);
         let id = self.con_ids.get("GHC.Internal.Exception.ErrorCall").copied().unwrap_or(0);
-        self.heap_set(p, heap::header(kind::CON, 0, id as u32));
+        self.heap_set(p, heap::header(kind::CON, 0, id));
         p
+    }
+
+    /// A binding the runtime uses, if the program has it.
+    pub fn rts_global(&self, name: &str) -> Option<Word> {
+        self.rts_globals.get(name).map(|i| self.global_vec[*i])
     }
 
     /// The name of the constructor of an evaluated object.

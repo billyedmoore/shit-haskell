@@ -82,9 +82,7 @@ impl Checker {
     /// is evaluated first, even when the alternatives only bind it: the primitive it comes from has
     /// its effect when it is run, as in GHC. A lifted scrutinee stays lazy.
     fn bind_scrutinee(&mut self, ts: &Ty, s: String, cs: Core, body: Core) -> Core {
-        let head = self.metas.zonk(ts);
-        let unlifted = matches!(head.split_apps().0, Ty::Con(c) if c.ends_with('#'));
-        if unlifted {
+        if self.is_unlifted(ts) {
             Core::Case(Box::new(cs), s, vec![crate::core::Alt::Default(body)])
         } else {
             Core::Let(vec![(s, cs)], Box::new(body))
@@ -181,10 +179,29 @@ impl Checker {
                 }
             }
         }
-        for c in checked.into_iter().flatten() {
+        // An argument of an unlifted type is evaluated before the call, as in GHC: the primitive it
+        // comes from has its effect then. It is bound by a case around the application.
+        let mut eager: Vec<(String, Core)> = Vec::new();
+        for (c, p) in checked.into_iter().flatten().zip(&params) {
+            let c = if !matches!(c, Core::Var(_) | Core::Lit(_)) && self.is_unlifted(p) {
+                let v = self.fresh_name("u");
+                eager.push((v.clone(), c));
+                Core::Var(v)
+            } else {
+                c
+            };
             core = Core::App(Box::new(core), Box::new(c));
         }
+        for (v, c) in eager.into_iter().rev() {
+            core = Core::Case(Box::new(c), v, vec![crate::core::Alt::Default(core)]);
+        }
         Ok((core, tf))
+    }
+
+    /// Whether a type is known to be unlifted (`State#`, `Int#`, ...): its values are never thunks.
+    fn is_unlifted(&self, t: &Ty) -> bool {
+        let head = self.metas.zonk(t);
+        matches!(head.split_apps().0, Ty::Con(c) if c.ends_with('#'))
     }
 
     /// Checks an argument against its parameter type. A polymorphic or constrained parameter

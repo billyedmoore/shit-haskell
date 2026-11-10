@@ -190,6 +190,9 @@ impl Gen {
     /// Generates the assembly of a whole program.
     pub fn program(prog: &SProgram) -> String {
         let mut g = Gen::new();
+        for c in super::RTS_CONS {
+            g.con_id(c);
+        }
         let mut global_labels = Vec::new();
         for gl in &prog.globals {
             let l = g.label("g");
@@ -243,16 +246,28 @@ impl Gen {
         for (i, (_, n)) in bodies.iter().enumerate() {
             let _ = writeln!(g.out, ".Lbn{i}:\n    .ascii \"{}\"", escape(n));
         }
+        // The bindings the runtime uses: name and index, for those the program has.
+        let rts: Vec<(&str, u32)> =
+            super::RTS_GLOBALS.iter().filter_map(|n| prog.index.get(*n).map(|i| (*n, *i))).collect();
+        g.out.push_str("    .p2align 3\nhsc_rts_globals:\n");
+        for (i, (n, idx)) in rts.iter().enumerate() {
+            let _ = writeln!(g.out, "    .quad .Lrg{i}, {}, {idx}", n.len());
+        }
+        for (i, (n, _)) in rts.iter().enumerate() {
+            let _ = writeln!(g.out, ".Lrg{i}:\n    .ascii \"{}\"", escape(n));
+        }
+        g.out.push_str("    .p2align 3\n");
         let main_index = prog.index.get("hsc$main").or_else(|| prog.index.get("Main.main")).copied().unwrap_or(0);
         // The table the runtime reads (`machine::entry::NativeTable`).
         let _ = writeln!(
             g.out,
-            "    .globl hsc_table\nhsc_table:\n    .quad hsc_globals, {}, hsc_con_names, {}, hsc_prim_names, {}, {}, hsc_body_table, {}",
+            "    .globl hsc_table\nhsc_table:\n    .quad hsc_globals, {}, hsc_con_names, {}, hsc_prim_names, {}, {}, hsc_body_table, {}, hsc_rts_globals, {}",
             prog.globals.len(),
             cons.len(),
             prims.len(),
             main_index,
-            bodies_count
+            bodies_count,
+            rts.len()
         );
         g.out.push_str("    .section .note.GNU-stack,\"\",@progbits\n");
         g.out
