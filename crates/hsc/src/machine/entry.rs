@@ -98,11 +98,33 @@ pub unsafe fn run(table: *const NativeTable) -> i32 {
 /// Entry point called by the program's `main`.
 #[no_mangle]
 pub extern "C" fn hsc_native_main(table: *const NativeTable) -> i32 {
-    // SAFETY: the object's `main` passes the table generated for this program.
-    unsafe { run(table) }
+    // Nested evaluations from the runtime (a primitive forcing an argument) use the native stack, and
+    // a chain of lazy values can be deep, so the program runs on a thread with a large stack, as the
+    // interpreter does.
+    let t = table as usize;
+    std::thread::Builder::new()
+        .stack_size(4 << 30)
+        .spawn(move || {
+            // SAFETY: the object's `main` passes the table generated for this program.
+            unsafe { run(t as *const NativeTable) }
+        })
+        .map(|h| h.join().unwrap_or(1))
+        .unwrap_or(1)
 }
 
 impl Machine {
+    /// Runs the first queued thread to the end (or to its exception, which ends only that thread).
+    /// Answers false when no thread is queued.
+    pub fn run_one_thread(&mut self) -> bool {
+        let Some(f) = self.runq.pop_front() else { return false };
+        if self.apply_nested(f, &[0]).is_none() {
+            // An exception in a forked thread ends that thread; it does not reach the program.
+            self.exc = 0;
+            self.prim_failed = false;
+        }
+        true
+    }
+
     /// The value of an object, evaluated: a runtime call for a thunk runs it to weak head normal form
     /// on this stack, above the current frame. Returns None when the evaluation raised (the exception
     /// is in `exc`).

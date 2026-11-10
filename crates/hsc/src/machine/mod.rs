@@ -58,6 +58,9 @@ pub struct Machine {
     pub con_ids: std::collections::HashMap<String, u32>,
     /// Extra roots the runtime keeps (stable pointers and similar), by index.
     pub stable: Vec<Word>,
+    /// Forked threads not yet run: their actions (state-token functions). A thread runs when another
+    /// blocks on an MVar, or when the program delays or yields; the actions are roots.
+    pub runq: std::collections::VecDeque<Word>,
     /// The per-name pointer slots of the RTS (`getOrSet…`), by name.
     pub named: std::collections::HashMap<String, Word>,
     /// The global closures (the GC roots `globals` points to).
@@ -107,6 +110,7 @@ impl Machine {
             prog,
             con_ids: std::collections::HashMap::new(),
             stable: vec![0],
+            runq: std::collections::VecDeque::new(),
             named: std::collections::HashMap::new(),
             global_vec: Vec::new(),
             prog_name: std::env::args().next().and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "main".into()),
@@ -223,6 +227,9 @@ impl Machine {
         locs.push(&mut self.exc as *mut Word);
         for s in self.stable.iter_mut() {
             locs.push(s as *mut Word);
+        }
+        for t in self.runq.iter_mut() {
+            locs.push(t as *mut Word);
         }
         for v in self.named.values_mut() {
             locs.push(v as *mut Word);

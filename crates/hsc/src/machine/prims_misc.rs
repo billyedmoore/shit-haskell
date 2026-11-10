@@ -20,7 +20,20 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             m.exc = m.args[0];
             0
         }
-        "noDuplicate#" | "touch#" | "realWorld#" | "proxy#" | "void#" | "yield#" | "delay#" | "labelThread#" => {
+        "yield#" | "delay#" => {
+            // Other threads run to their ends (cooperative scheduling).
+            while m.run_one_thread() {}
+            unit(m)
+        }
+        "fork#" | "forkOn#" => {
+            // The action runs later, when another thread blocks or the program delays or yields.
+            let f = if name == "forkOn#" { m.args[1] } else { m.args[0] };
+            m.runq.push_back(f);
+            let tid = m.runq.len() as i64 + 1;
+            let t = int_value(m, tid);
+            state_pair(m, t)
+        }
+        "noDuplicate#" | "touch#" | "realWorld#" | "proxy#" | "void#" | "labelThread#" => {
             unit(m)
         }
         "runRW#" => {
@@ -112,13 +125,16 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
         }
         "takeMVar#" | "readMVar#" => {
             let Some(_) = force_arg(m, 0) else { return Some(0) };
+            // While it is empty, queued threads run: one of them may fill it.
+            while m.heap_get(m.args[0], 1) == 0 {
+                if !m.run_one_thread() {
+                    // No other thread can fill it: the program is blocked forever.
+                    m.exc = m.error_value("thread blocked indefinitely in an MVar operation");
+                    return Some(0);
+                }
+            }
             let mv = m.args[0];
             let v = m.heap_get(mv, 1);
-            if v == 0 {
-                // No other thread can fill it: the program is blocked forever.
-                m.exc = m.error_value("thread blocked indefinitely in an MVar operation");
-                return Some(0);
-            }
             if name == "takeMVar#" {
                 m.heap_set(mv + 8, 0);
             }
@@ -126,11 +142,14 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
         }
         "putMVar#" => {
             let Some(_) = force_arg(m, 0) else { return Some(0) };
-            let mv = m.args[0];
-            if m.heap_get(mv, 1) != 0 {
-                m.exc = m.error_value("thread blocked indefinitely in an MVar operation");
-                return Some(0);
+            // While it is full, queued threads run: one of them may empty it.
+            while m.heap_get(m.args[0], 1) != 0 {
+                if !m.run_one_thread() {
+                    m.exc = m.error_value("thread blocked indefinitely in an MVar operation");
+                    return Some(0);
+                }
             }
+            let mv = m.args[0];
             let v = m.args[1];
             m.heap_set(mv + 8, v);
             unit(m)
