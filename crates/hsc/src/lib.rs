@@ -5,6 +5,7 @@
 pub mod core;
 pub mod driver;
 pub mod interp;
+pub mod machine;
 pub mod native;
 pub mod rename;
 pub mod syntax;

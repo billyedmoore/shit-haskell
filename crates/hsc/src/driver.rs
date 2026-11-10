@@ -304,8 +304,8 @@ pub fn run_payload_bytes(payload: Vec<u8>) -> i32 {
     run_binds_code(binds, prog_name)
 }
 
-/// Writes a native executable for a program: its assembly (which carries the payload) is
-/// assembled and linked with the hsc runtime library next to this binary.
+/// Writes a native executable for a program: its code is generated as assembly, assembled, and
+/// linked with the hsc runtime library next to this binary.
 pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let runtime = exe.parent().map(|d| d.join("libhsc.a")).unwrap_or_default();
@@ -314,13 +314,12 @@ pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), Str
     }
     let dir = std::env::temp_dir().join(format!("hsc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let payload = dir.join("program.payload");
     let asm = dir.join("program.s");
     let obj = dir.join("program.o");
-    let bytes = crate::core::serial::encode(binds);
-    std::fs::write(&payload, &bytes).map_err(|e| e.to_string())?;
-    std::fs::write(&asm, crate::native::program_assembly(&payload.display().to_string()))
-        .map_err(|e| e.to_string())?;
+    let prog = crate::native::stg::Lowering::program(binds);
+    let mut text = crate::native::codegen::Gen::program(&prog);
+    text.push_str(&crate::native::program_main());
+    std::fs::write(&asm, text).map_err(|e| e.to_string())?;
     let run = |args: &[&str]| -> Result<(), String> {
         let st = std::process::Command::new("gcc").args(args).status().map_err(|e| format!("gcc: {e}"))?;
         if st.success() { Ok(()) } else { Err(format!("gcc {} failed", args.join(" "))) }

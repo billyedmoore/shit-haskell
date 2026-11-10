@@ -11,6 +11,8 @@
 
 use hsc::{core, driver, interp, rename, syntax, tc};
 
+const MAGIC: &[u8; 8] = b"HSCPROG1";
+
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::ExitCode;
@@ -51,6 +53,9 @@ fn tune_allocator() {
 
 fn main() -> ExitCode {
     tune_allocator();
+    if let Some(payload) = embedded_payload() {
+        return ExitCode::from(driver::run_payload_bytes(payload) as u8);
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut flags: Vec<String> = Vec::new();
@@ -60,6 +65,7 @@ fn main() -> ExitCode {
     let mut dump_ast = false;
     let mut preprocess_only = false;
     let mut dump_core = false;
+    let mut native = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -68,6 +74,7 @@ fn main() -> ExitCode {
             "--dump-ast" => dump_ast = true,
             "-E" => preprocess_only = true,
             "--dump-core" => dump_core = true,
+            "--native" => native = true,
             "-o" => {
                 output = args.get(i + 1).cloned();
                 i += 1;
@@ -130,6 +137,11 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if std::env::var("HSC_LOWER_CHECK").is_ok() {
+        let prog = hsc::native::stg::Lowering::program(&binds);
+        println!("globals {}", prog.globals.len());
+        return ExitCode::SUCCESS;
+    }
     if dump_core {
         for b in &binds {
             println!("{} = {}", b.name, crate::core::pretty::show(&b.body));
@@ -144,7 +156,12 @@ fn main() -> ExitCode {
         return run_binds(binds, prog_name);
     }
     if let Some(out) = output {
-        return match driver::write_native(&out, &binds) {
+        let written = if native {
+            driver::write_native(&out, &binds)
+        } else {
+            write_executable(&out, &binds).map_err(|e| e.to_string())
+        };
+        return match written {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("hsc: cannot write {out}: {e}");
@@ -160,3 +177,54 @@ fn run_binds(binds: Vec<core::TopBind>, prog_name: String) -> ExitCode {
     ExitCode::from(driver::run_binds_code(binds, prog_name) as u8)
 }
 
+/// Writes an executable: this binary, then the serialised program, its length, and a
+/// magic trailer.
+fn write_executable(path: &str, binds: &[core::TopBind]) -> std::io::Result<()> {
+    let me = std::env::current_exe()?;
+    let mut bytes = std::fs::read(me)?;
+    if let Some(start) = payload_offset(&bytes) {
+        bytes.truncate(start);
+    }
+    let payload = core::serial::encode(binds);
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(MAGIC);
+    std::fs::write(path, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// Where an embedded payload starts, if this file has one.
+fn payload_offset(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 16 || &bytes[bytes.len() - 8..] != MAGIC {
+        return None;
+    }
+    let len_bytes: [u8; 8] = bytes[bytes.len() - 16..bytes.len() - 8].try_into().ok()?;
+    let len = u64::from_le_bytes(len_bytes) as usize;
+    (bytes.len() - 16).checked_sub(len)
+}
+
+/// The payload of this executable, if it carries one. Reads only the trailer first.
+fn embedded_payload() -> Option<Vec<u8>> {
+    let me = std::env::current_exe().ok()?;
+    let mut f = std::fs::File::open(me).ok()?;
+    let size = f.seek(SeekFrom::End(0)).ok()?;
+    if size < 16 {
+        return None;
+    }
+    f.seek(SeekFrom::End(-16)).ok()?;
+    let mut trailer = [0u8; 16];
+    f.read_exact(&mut trailer).ok()?;
+    if &trailer[8..] != MAGIC {
+        return None;
+    }
+    let len = u64::from_le_bytes(trailer[..8].try_into().ok()?);
+    f.seek(SeekFrom::Start(size - 16 - len)).ok()?;
+    let mut payload = vec![0u8; len as usize];
+    f.read_exact(&mut payload).ok()?;
+    Some(payload)
+}
