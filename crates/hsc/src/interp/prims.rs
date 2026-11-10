@@ -476,7 +476,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let s = rt.force_string(&args[0])?;
             Ok(Value::Double(s.parse::<f64>().unwrap_or(0.0)))
         }
-        "doubleToRatio" => Ok(double_to_ratio(double(rt, &args[0])?)),
+        "doubleToRatio" => Ok(double_to_ratio(double(rt, &args[0])?, rt.ratio_con)),
         "doubleIsNaN" => Ok(bool_value(double(rt, &args[0])?.is_nan())),
         "doubleIsInfinite" => Ok(bool_value(double(rt, &args[0])?.is_infinite())),
 
@@ -993,9 +993,9 @@ pub fn show_double(x: f64) -> String {
 }
 
 /// The exact value of a finite double as a reduced `Ratio Integer` (`toRational`).
-pub fn double_to_ratio(x: f64) -> Value {
+pub fn double_to_ratio(x: f64, ratio: &'static str) -> Value {
     if !x.is_finite() {
-        return con_value("Base.:%", vec![integer_con(BigInt::zero()), integer_con(BigInt::from_i64(1))]);
+        return con_value(ratio, vec![integer_con(BigInt::zero()), integer_con(BigInt::from_i64(1))]);
     }
     let bits = x.to_bits();
     let exp_bits = ((bits >> 52) & 0x7ff) as i64;
@@ -1016,11 +1016,11 @@ pub fn double_to_ratio(x: f64) -> Value {
         num = num.quot_rem(&g).0;
         den = den.quot_rem(&g).0;
     }
-    con_value("Base.:%", vec![integer_con(num), integer_con(den)])
+    con_value(ratio, vec![integer_con(num), integer_con(den)])
 }
 
 /// `ratioLit` for a fractional literal: the exact value as a reduced `Ratio Integer`.
-pub fn ratio_literal(text: &str) -> Value {
+pub fn ratio_literal(text: &str, ratio: &'static str) -> Value {
     let (neg, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text),
@@ -1050,10 +1050,7 @@ pub fn ratio_literal(text: &str) -> Value {
         num = num.quot_rem(&g).0;
         den = den.quot_rem(&g).0;
     }
-    con_value(
-        "Base.:%",
-        vec![integer_con(num), integer_con(den)],
-    )
+    con_value(ratio, vec![integer_con(num), integer_con(den)])
 }
 
 #[allow(dead_code)]

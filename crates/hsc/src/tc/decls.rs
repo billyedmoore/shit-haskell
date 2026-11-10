@@ -584,7 +584,18 @@ impl Checker {
         // A C result is raw: a Bool, or a box around one, is made here. A runtime primitive
         // already answers with Haskell values.
         let boxed = if is_prim { None } else { value_ty.clone().and_then(|t| self.ffi_result_kind(&t)) };
+        // The runtime answers a C call with the (# state, value #) pair; a pure call takes the value.
         let call = Core::Prim(prim, args);
+        let call = if !io && !is_prim {
+            let (s, v, r) = (self.fresh_name("fs"), self.fresh_name("fv"), self.fresh_name("fr"));
+            Core::Case(
+                Box::new(call),
+                r,
+                vec![Alt::Con("Builtin.(,)".into(), vec![s, v.clone()], Core::Var(v))],
+            )
+        } else {
+            call
+        };
         let call = match (io, boxed) {
             (_, None) => call,
             (false, Some(kind)) => self.ffi_wrap(kind, call),

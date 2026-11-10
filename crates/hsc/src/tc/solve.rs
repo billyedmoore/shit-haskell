@@ -19,6 +19,20 @@ const NUMERIC_CLASSES: &[&str] = &[
 /// Candidate types for defaulting, in order.
 const DEFAULT_CANDIDATES: &[&str] = &["GHC.Num.Integer.Integer", "GHC.Types.Double"];
 
+/// Whether a class is one of the standard numeric classes, under the mini Prelude's names or the
+/// real base's (`GHC.Internal.Num.Num` and the like).
+fn is_numeric_class(class: &str) -> bool {
+    if NUMERIC_CLASSES.contains(&class) {
+        return true;
+    }
+    let unqualified = class.rsplit('.').next().unwrap_or(class);
+    class.starts_with("GHC.Internal.")
+        && matches!(
+            unqualified,
+            "Num" | "Real" | "Integral" | "Fractional" | "Floating" | "RealFrac" | "RealFloat"
+        )
+}
+
 /// The class of equality constraints `a ~ b` (the builtin type operator `~`). Their evidence is
 /// a unit value; a wanted one is solved by unification and a given one refines rigid variables.
 pub const EQ_CLASS: &str = "Builtin.~";
@@ -475,7 +489,7 @@ impl Checker {
                     progress = true;
                     continue;
                 }
-                if !preds_on_m.iter().any(|p| NUMERIC_CLASSES.contains(&p.class.as_str())) {
+                if !preds_on_m.iter().any(|p| is_numeric_class(&p.class)) {
                     continue;
                 }
                 for cand in DEFAULT_CANDIDATES {

@@ -96,6 +96,8 @@ pub struct Runtime {
     pub prog_name: String,
     /// The stable pointers: a StablePtr# is the index of its cell here (0 is no pointer).
     pub stable: RefCell<Vec<Option<Cell>>>,
+    /// The constructor of `Ratio` in this program: the mini Prelude's or the real base's.
+    pub ratio_con: &'static str,
     /// The RTS's named pointer slots (`getOrSet…Store`), by name.
     pub ffi_slots: RefCell<std::collections::HashMap<String, Value>>,
 }
@@ -116,6 +118,7 @@ impl Runtime {
     /// Compiles the program and creates a cell for each top-level binding. Top-level
     /// code is a constant: each binding is evaluated at most once, on first use.
     pub fn new(binds: Vec<TopBind>, prog_name: String) -> Runtime {
+        let prog_has_real_base = binds.iter().any(|b| b.name.starts_with("GHC.Internal.Real."));
         let prog = code::compile_program(binds);
         let empty: Rc<Vec<Cell>> = Rc::new(Vec::new());
         let mut cells = Vec::with_capacity(prog.bodies.len());
@@ -130,6 +133,7 @@ impl Runtime {
             prog_name,
             stable: RefCell::new(vec![None]),
             ffi_slots: RefCell::new(std::collections::HashMap::new()),
+            ratio_con: if prog_has_real_base { "GHC.Internal.Real.:%" } else { "Base.:%" },
         }
     }
 
@@ -308,7 +312,7 @@ impl Runtime {
                 Code::Prim(name, args) => {
                     if name == "ratioLit" {
                         if let [Code::Frac(s)] = args.as_slice() {
-                            return Ok(prims::ratio_literal(s));
+                            return Ok(prims::ratio_literal(s, self.ratio_con));
                         }
                     }
                     if name == "seq" {
