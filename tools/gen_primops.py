@@ -110,6 +110,9 @@ def main():
         out.append(f'foreign import prim "write{name}OffAddr#" write{name}OffAddr# :: Addr# -> Int# -> {prim} -> State# s -> State# s')
     out.append("data TYPE r")
     out.append("data CONSTRAINT r")
+    # mkApUpd0# (a bytecode-object primitive, GHCi only) is absent from the table's type form; it is
+    # declared here so that GHC.Exts type-checks. Calling it is an error at run time.
+    out.append('foreign import prim "mkApUpd0#" mkApUpd0# :: BCO -> (# a #)')
     out.append("")
     done = set()
     for sym, ty in prims:

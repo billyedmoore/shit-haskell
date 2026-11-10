@@ -142,6 +142,7 @@ foreign import prim "readStablePtrOffAddr#" readStablePtrOffAddr# :: Addr# -> In
 foreign import prim "writeStablePtrOffAddr#" writeStablePtrOffAddr# :: Addr# -> Int# -> StablePtr# a -> State# s -> State# s
 data TYPE r
 data CONSTRAINT r
+foreign import prim "mkApUpd0#" mkApUpd0# :: BCO -> (# a #)
 
 foreign import prim "gtChar#" gtChar# :: Char# -> Char# -> Int#
 foreign import prim "geChar#" geChar# :: Char# -> Char# -> Int#

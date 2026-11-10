@@ -220,6 +220,18 @@ fn collect_needs(t: &Type, last: Option<&str>, add: &mut dyn FnMut(&Type)) {
     if vars.is_empty() {
         return;
     }
+    // Lists and tuples are instances of the class at their elements: a list needs what its
+    // element needs (`[a]` needs `Show a`), a tuple what each component needs.
+    match t {
+        Type::List(e, _) => return collect_needs(e, last, add),
+        Type::Tuple(ts, _) => {
+            for x in ts {
+                collect_needs(x, last, add);
+            }
+            return;
+        }
+        _ => {}
+    }
     let (head, args) = spine(t);
     match (last, head) {
         // Constructor classes: the head variable applied to the last parameter.
@@ -626,6 +638,10 @@ fn derive_show(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
 
 /// Operator constructors are shown in parentheses when used prefix.
 fn display_name(name: &str) -> String {
+    // The unit and tuple constructors are written as themselves: `()`, `(,)`.
+    if name.starts_with("(") {
+        return name.to_string();
+    }
     if is_operator(name) {
         format!("({name})")
     } else {

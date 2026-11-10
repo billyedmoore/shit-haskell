@@ -681,10 +681,15 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         }
         "==#" | "eqWord#" | "eqChar#" => int_v((int_or_char(rt, &args[0])? == int_or_char(rt, &args[1])?) as i64),
         "/=#" | "neWord#" | "neChar#" => int_v((int_or_char(rt, &args[0])? != int_or_char(rt, &args[1])?) as i64),
-        "<#" | "ltWord#" | "ltChar#" => int_v((int_or_char(rt, &args[0])? < int_or_char(rt, &args[1])?) as i64),
-        "<=#" | "leWord#" | "leChar#" => int_v((int_or_char(rt, &args[0])? <= int_or_char(rt, &args[1])?) as i64),
-        ">#" | "gtWord#" | "gtChar#" => int_v((int_or_char(rt, &args[0])? > int_or_char(rt, &args[1])?) as i64),
-        ">=#" | "geWord#" | "geChar#" => int_v((int_or_char(rt, &args[0])? >= int_or_char(rt, &args[1])?) as i64),
+        "<#" | "ltChar#" => int_v((int_or_char(rt, &args[0])? < int_or_char(rt, &args[1])?) as i64),
+        "<=#" | "leChar#" => int_v((int_or_char(rt, &args[0])? <= int_or_char(rt, &args[1])?) as i64),
+        ">#" | "gtChar#" => int_v((int_or_char(rt, &args[0])? > int_or_char(rt, &args[1])?) as i64),
+        ">=#" | "geChar#" => int_v((int_or_char(rt, &args[0])? >= int_or_char(rt, &args[1])?) as i64),
+        // Word# values are machine words: their order is unsigned.
+        "ltWord#" => int_v((word_of(rt, &args[0])? < word_of(rt, &args[1])?) as i64),
+        "leWord#" => int_v((word_of(rt, &args[0])? <= word_of(rt, &args[1])?) as i64),
+        "gtWord#" => int_v((word_of(rt, &args[0])? > word_of(rt, &args[1])?) as i64),
+        "geWord#" => int_v((word_of(rt, &args[0])? >= word_of(rt, &args[1])?) as i64),
         "andI#" => int_v(int(rt, &args[0])? & int(rt, &args[1])?),
         "orI#" => int_v(int(rt, &args[0])? | int(rt, &args[1])?),
         "xorI#" => int_v(int(rt, &args[0])? ^ int(rt, &args[1])?),
@@ -1055,6 +1060,11 @@ pub fn ratio_literal(text: &str, ratio: &'static str) -> Value {
 
 #[allow(dead_code)]
 fn unused(_: &RefCell<Thunk>) {}
+
+/// A `Word#`: the machine word, read as unsigned.
+fn word_of(rt: &Runtime, c: &Cell) -> Result<u64, RtError> {
+    int_or_char(rt, c).map(|i| i as u64)
+}
 
 /// An `Int#`, or a `Char#` as its code point (comparisons accept both).
 fn int_or_char(rt: &Runtime, c: &Cell) -> Result<i64, RtError> {
