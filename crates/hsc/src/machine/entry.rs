@@ -134,7 +134,11 @@ impl Machine {
         self.sp = outer_sp;
         self.top = outer_top;
         if status == 0 {
-            Some(self.r1)
+            let r = self.r1;
+            if matches!(heap::kind_of(self.heap_get(r, 0)), kind::THUNK | kind::IND) {
+                return self.force(r);
+            }
+            Some(r)
         } else {
             self.prim_failed = true;
             None
@@ -161,7 +165,13 @@ pub extern "C" fn hsc_prim(m: *mut Machine, id: u64, nargs: u64) -> Word {
     // locals; a collection between them would move those objects. So the collection happens before
     // it runs, and the room it needs is reserved then.
     m.reserve(PRIM_SLACK);
-    super::prims::run(m, &name, (nargs as usize).min(ARG_SLOTS))
+    let r = super::prims::run(m, &name, (nargs as usize).min(ARG_SLOTS));
+    // Generated code takes a primitive's result as a value: a thunk (a result that is a variable of
+    // the program, not yet evaluated) is evaluated here first.
+    if r != 0 && matches!(heap::kind_of(m.heap_get(r, 0)), kind::THUNK | kind::IND) {
+        return m.force(r).unwrap_or(0);
+    }
+    r
 }
 
 /// The words a primitive may allocate without a collection (see `hsc_prim`).
