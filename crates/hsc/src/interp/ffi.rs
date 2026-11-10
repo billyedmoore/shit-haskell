@@ -19,6 +19,11 @@ extern "C" {
     fn getppid() -> i32;
     fn __errno_location() -> *mut i32;
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32;
+    fn ftruncate(fd: i32, len: i64) -> i32;
+    fn dup(fd: i32) -> i32;
+    fn dup2(fd: i32, to: i32) -> i32;
 }
 
 /// The descriptor record `poll` takes.
@@ -68,6 +73,36 @@ fn ret_int(n: i64) -> RR {
 fn errno() -> i64 {
     // SAFETY: __errno_location returns the calling thread's errno, valid for reading.
     unsafe { *__errno_location() as i64 }
+}
+
+/// The size of the stat buffer the RTS accessors read: x86-64's `struct stat`.
+const STAT_SIZE: i64 = 144;
+
+/// ENOENT, for a stat that failed without a usable errno.
+fn libc_enoent() -> i64 {
+    2
+}
+
+fn errno_or(fallback: i64) -> i64 {
+    let e = errno();
+    if e == 0 { fallback } else { e }
+}
+
+fn write_u64(data: &mut [u8], at: usize, v: u64) {
+    data[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+fn write_u32(data: &mut [u8], at: usize, v: u32) {
+    data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// An integer field of a stat buffer, at a byte offset, `width` bytes wide.
+fn stat_field(rt: &Runtime, c: &Cell, at: usize, width: usize) -> RR {
+    let (buf, off) = addr_of(rt, c)?;
+    let data = buf.borrow();
+    let mut bytes = [0u8; 8];
+    bytes[..width].copy_from_slice(&data[off + at..off + at + width]);
+    ret_int(i64::from_le_bytes(bytes))
 }
 
 /// Runs a C entry point by its symbol, or answers None when it is not one of them.
@@ -189,6 +224,119 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             super::prims::flush_stdout();
             eprintln!("{}: {}", rt.prog_name, fmt.replacen("%s", &msg, 1));
             Ok(io_result_of(unit_value()))
+        })(),
+        // ----- files: the RTS's open/stat wrappers and their constants (Linux values) -----
+        "__hscore_o_rdonly" => ret_int(0),
+        "__hscore_o_wronly" => ret_int(1),
+        "__hscore_o_rdwr" => ret_int(2),
+        "__hscore_o_append" => ret_int(0o2000),
+        "__hscore_o_creat" => ret_int(0o100),
+        "__hscore_o_excl" => ret_int(0o200),
+        "__hscore_o_trunc" => ret_int(0o1000),
+        "__hscore_o_noctty" => ret_int(0o400),
+        "__hscore_o_nonblock" => ret_int(0o4000),
+        "__hscore_o_binary" => ret_int(0),
+        "__hscore_f_getfl" => ret_int(3),
+        "__hscore_f_setfl" => ret_int(4),
+        "__hscore_f_setfd" => ret_int(2),
+        "__hscore_fd_cloexec" => ret_int(1),
+        "__hscore_sizeof_stat" => ret_int(STAT_SIZE),
+        "__hscore_setmode" => ret_int(0),
+        "lockFile" | "unlockFile" => ret_int(0),
+        "__hscore_open" => (|| {
+            let (path, poff) = addr_of(rt, &args[0])?;
+            let mut bytes: Vec<u8> = path.borrow()[poff..].iter().take_while(|&&b| b != 0).copied().collect();
+            bytes.push(0);
+            let flags = int_of(rt, &args[1])? as i32;
+            let mode = int_of(rt, &args[2])? as u32;
+            // SAFETY: bytes is NUL-terminated and lives for the call.
+            let fd = unsafe { open(bytes.as_ptr(), flags, mode) };
+            if fd < 0 {
+                return ret_int(-errno());
+            }
+            ret_int(fd as i64)
+        })(),
+        "__hscore_fstat" | "__hscore_stat" | "__hscore_lstat" => (|| {
+            let meta = match name {
+                "__hscore_fstat" => {
+                    let fd = int_of(rt, &args[0])? as i32;
+                    // SAFETY: the file is borrowed from the descriptor and not closed here.
+                    let f = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+                    f.metadata()
+                }
+                _ => {
+                    let (path, poff) = addr_of(rt, &args[0])?;
+                    let text: Vec<u8> = path.borrow()[poff..].iter().take_while(|&&b| b != 0).copied().collect();
+                    let p = std::path::PathBuf::from(String::from_utf8_lossy(&text).into_owned());
+                    if name == "__hscore_stat" { std::fs::metadata(p) } else { std::fs::symlink_metadata(p) }
+                }
+            };
+            let Ok(meta) = meta else {
+                return ret_int(-errno_or(libc_enoent()));
+            };
+            use std::os::unix::fs::MetadataExt;
+            let (buf, off) = addr_of(rt, &args[1])?;
+            let mut data = buf.borrow_mut();
+            write_u64(&mut data, off, meta.dev());
+            write_u64(&mut data, off + 8, meta.ino());
+            write_u32(&mut data, off + 24, meta.mode());
+            write_u64(&mut data, off + 48, meta.size());
+            write_u64(&mut data, off + 88, meta.mtime() as u64);
+            ret_int(0)
+        })(),
+        "__hscore_st_dev" => stat_field(rt, &args[0], 0, 8),
+        "__hscore_st_ino" => stat_field(rt, &args[0], 8, 8),
+        "__hscore_st_mode" => stat_field(rt, &args[0], 24, 4),
+        "__hscore_st_size" => stat_field(rt, &args[0], 48, 8),
+        "__hscore_st_mtime" => stat_field(rt, &args[0], 88, 8),
+        "__hscore_ftruncate" => (|| {
+            let fd = int_of(rt, &args[0])? as i32;
+            let len = int_of(rt, &args[1])?;
+            // SAFETY: ftruncate takes plain integers.
+            ret_int(unsafe { ftruncate(fd, len) } as i64)
+        })(),
+        "fcntl" => (|| {
+            let fd = int_of(rt, &args[0])? as i32;
+            let cmd = int_of(rt, &args[1])? as i32;
+            let arg = int_of(rt, &args[2])?;
+            // SAFETY: fcntl takes plain integers.
+            ret_int(unsafe { fcntl(fd, cmd, arg) } as i64)
+        })(),
+        "dup" => int_of(rt, &args[0]).and_then(|fd| {
+            // SAFETY: dup takes a descriptor number.
+            ret_int(unsafe { dup(fd as i32) } as i64)
+        }),
+        "dup2" => (|| {
+            let fd = int_of(rt, &args[0])? as i32;
+            let to = int_of(rt, &args[1])? as i32;
+            // SAFETY: dup2 takes descriptor numbers.
+            ret_int(unsafe { dup2(fd, to) } as i64)
+        })(),
+        // The file-type macros of <sys/stat.h>: a test of the type bits of a mode.
+        "S_ISDIR" | "S_ISREG" | "S_ISCHR" | "S_ISBLK" | "S_ISFIFO" | "S_ISSOCK" => (|| {
+            let mode = int_of(rt, &args[0])? & 0o170000;
+            let wanted = match name {
+                "S_ISDIR" => 0o040000,
+                "S_ISREG" => 0o100000,
+                "S_ISCHR" => 0o020000,
+                "S_ISBLK" => 0o060000,
+                "S_ISFIFO" => 0o010000,
+                _ => 0o140000,
+            };
+            ret_int(i64::from(mode == wanted))
+        })(),
+        "__hscore_get_errno" => ret_int(errno()),
+        "__hscore_set_errno" => (|| {
+            let e = int_of(rt, &args[0])?;
+            // SAFETY: __errno_location returns this thread's errno cell.
+            unsafe { *__errno_location() = e as i32 };
+            Ok(io_result_of(unit_value()))
+        })(),
+        "strlen" => (|| {
+            let (buf, off) = addr_of(rt, &args[0])?;
+            let data = buf.borrow();
+            let n = data[off..].iter().take_while(|&&b| b != 0).count();
+            ret_int(n as i64)
         })(),
         "rtsSupportsBoundThreads" => ret_int(0),
         "getNumberOfProcessors" => ret_int(

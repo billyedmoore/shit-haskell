@@ -295,11 +295,12 @@ impl Checker {
                 let b = self.fresh_name("rb");
                 let mut alts = Vec::new();
                 for (cname, cocc, _, cscheme) in per_con.iter() {
-                    let _ = cscheme;
                     if let Some(p) = cocc.iter().position(|o| o == f) {
+                        // The constructor's context dictionaries come before its fields.
+                        let ndicts = cscheme.preds.len();
                         let arity = cocc.len();
-                        let vars: Vec<String> = (0..arity).map(|_| self.fresh_name("sf")).collect();
-                        alts.push(Alt::Con(cname.clone(), vars.clone(), Core::Var(vars[p].clone())));
+                        let vars: Vec<String> = (0..ndicts + arity).map(|_| self.fresh_name("sf")).collect();
+                        alts.push(Alt::Con(cname.clone(), vars.clone(), Core::Var(vars[ndicts + p].clone())));
                     }
                 }
                 alts.push(Alt::Default(Core::Fail(format!("No match in record selector {f}"))));

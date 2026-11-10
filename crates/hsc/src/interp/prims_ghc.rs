@@ -324,6 +324,21 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "atanhDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(a.atanh())),
         "double2Float#" => dbl(rt, &args[0]).map(|a| f32v(a as f32)),
         "float2Double#" => dbl(rt, &args[0]).map(Value::Double),
+        // decodeFloat_Int# x: the single-precision mantissa (24 bits with the implicit bit) and exponent.
+        "decodeFloat_Int#" => dbl(rt, &args[0]).map(|x| {
+            let x = x as f32;
+            let (m, e) = if x == 0.0 || !x.is_finite() {
+                (0i64, 0i64)
+            } else {
+                let bits = x.to_bits();
+                let sign: i64 = if bits >> 31 == 1 { -1 } else { 1 };
+                let exp = ((bits >> 23) & 0xff) as i64;
+                let frac = (bits & ((1u32 << 23) - 1)) as i64;
+                let (mant, e) = if exp == 0 { (frac, -149) } else { (frac | (1 << 23), exp - 150) };
+                (sign * mant, e)
+            };
+            con_value("Builtin.(,)", vec![Value::Int(m), Value::Int(e)])
+        }),
         "decodeDouble_Int64#" => dbl(rt, &args[0]).map(|a| {
             let (m, e) = decode_double(a);
             pair(Value::Int(m), Value::Int(e))
@@ -375,6 +390,24 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
     let r: RR = match name {
         // ----- MutVar# -----
         "newMutVar#" => state_result(Value::Ref(Rc::new(RefCell::new(args[0].clone())))),
+        // atomicModifyMutVar2# mv f: the contents become the first component of `f old`, lazily; the
+        // answer is (# s, old, f old #).
+        "atomicModifyMutVar2#" => match rt.force(&args[0]) {
+            Ok(Value::Ref(r)) => (|| {
+                let old: Cell = r.borrow().clone();
+                let f = rt.force(&args[1])?;
+                let res = rt.apply(f, old.clone())?;
+                let new_contents = match &res {
+                    Value::Con(c) if c.args.len() == 2 => c.args[0].clone(),
+                    _ => return Err(RtError::Fail("internal: atomicModifyMutVar2# of a non-pair".into())),
+                };
+                *r.borrow_mut() = new_contents;
+                let res_cell = new_cell(Thunk::Done(res));
+                Ok(Value::Con(Rc::new(ConVal { name: "Builtin.(,,)", args: vec![unit_cell(), old, res_cell] })))
+            })(),
+            Ok(_) => Err(RtError::Fail("internal: atomicModifyMutVar2# of a non-variable".into())),
+            Err(e) => Err(e),
+        },
         "readMutVar#" => match rt.force(&args[0]) {
             Ok(Value::Ref(r)) => {
                 let contents = r.borrow().clone();
