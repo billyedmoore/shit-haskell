@@ -273,3 +273,70 @@ fn strip_boot_bodies(m: &mut Module) {
     }
     m.decls.retain(|d| !matches!(d, Decl::Fun { .. } | Decl::PatBind { .. }));
 }
+
+/// Runs a compiled program (its Core, decoded) on a thread with a large stack, since evaluation
+/// is recursive. Returns the exit code.
+pub fn run_binds_code(binds: Vec<crate::core::TopBind>, prog_name: String) -> i32 {
+    let handle = std::thread::Builder::new()
+        .stack_size(4 << 30)
+        .spawn(move || {
+            crate::interp::conc::set_stack_base();
+            let rt = crate::interp::Runtime::new(binds, prog_name);
+            crate::interp::run_main(&rt)
+        })
+        .expect("spawn interpreter thread");
+    handle.join().unwrap_or(1)
+}
+
+/// Runs the program in a payload (serialised Core) that a compiled program carries.
+pub fn run_payload_bytes(payload: Vec<u8>) -> i32 {
+    let binds = match crate::core::serial::decode(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("corrupt program payload: {e}");
+            return 1;
+        }
+    };
+    let prog_name = std::env::args()
+        .next()
+        .and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "main".into());
+    run_binds_code(binds, prog_name)
+}
+
+/// Writes a native executable for a program: its assembly (which carries the payload) is
+/// assembled and linked with the hsc runtime library next to this binary.
+pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let runtime = exe.parent().map(|d| d.join("libhsc.a")).unwrap_or_default();
+    if !runtime.is_file() {
+        return Err(format!("runtime library not found: {}", runtime.display()));
+    }
+    let dir = std::env::temp_dir().join(format!("hsc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let payload = dir.join("program.payload");
+    let asm = dir.join("program.s");
+    let obj = dir.join("program.o");
+    let bytes = crate::core::serial::encode(binds);
+    std::fs::write(&payload, &bytes).map_err(|e| e.to_string())?;
+    std::fs::write(&asm, crate::native::program_assembly(&payload.display().to_string()))
+        .map_err(|e| e.to_string())?;
+    let run = |args: &[&str]| -> Result<(), String> {
+        let st = std::process::Command::new("gcc").args(args).status().map_err(|e| format!("gcc: {e}"))?;
+        if st.success() { Ok(()) } else { Err(format!("gcc {} failed", args.join(" "))) }
+    };
+    let result = run(&["-c", &asm.display().to_string(), "-o", &obj.display().to_string()]).and_then(|()| {
+        run(&[
+            &obj.display().to_string(),
+            &runtime.display().to_string(),
+            "-o",
+            out,
+            "-lpthread",
+            "-ldl",
+            "-lm",
+            "-lgcc_s",
+        ])
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}

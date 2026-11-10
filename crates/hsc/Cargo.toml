@@ -5,6 +5,11 @@ version.workspace = true
 
 [dependencies]
 
+[lib]
+name = "hsc"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
+
 [[bin]]
 name = "hsc"
 path = "src/main.rs"
