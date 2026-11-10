@@ -8,6 +8,11 @@ pub mod entry;
 pub mod gc;
 pub mod heap;
 pub mod prims;
+pub mod prims_ffi;
+pub mod prims_integer;
+pub mod prims_misc;
+pub mod prims_mem;
+pub mod prims_num;
 
 use std::cell::Cell as StdCell;
 
@@ -57,8 +62,14 @@ pub struct Machine {
     pub named: std::collections::HashMap<String, Word>,
     /// The global closures (the GC roots `globals` points to).
     pub global_vec: Vec<Word>,
+    /// The program's name, as the runtime reports errors.
+    pub prog_name: String,
+    /// The bodies of the program in address order, with their names (for diagnostics).
+    pub bodies: Vec<(Word, String)>,
     /// The argument slots of the primitive operations that are waiting on a nested evaluation.
     pub saved_args: Vec<[Word; ARG_SLOTS]>,
+    /// Set when a nested evaluation a primitive made raised: the primitive answers the exception.
+    pub prim_failed: bool,
 }
 
 /// The tables the generated program provides (see `native::codegen`).
@@ -98,7 +109,10 @@ impl Machine {
             stable: vec![0],
             named: std::collections::HashMap::new(),
             global_vec: Vec::new(),
+            prog_name: std::env::args().next().and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "main".into()),
             saved_args: Vec::new(),
+            prim_failed: false,
+            bodies: Vec::new(),
         });
         m.stack = stack;
         m.sp = m.stack.as_mut_ptr() as Word + (STACK_WORDS as Word) * 8;
@@ -142,12 +156,17 @@ impl Machine {
     }
 
     /// An exception value for a failure the runtime reports (a constructor with the message).
-    pub fn error_value(&mut self, msg: &str) -> Word {
-        let _ = msg;
+    pub fn error_value(&mut self, _msg: &str) -> Word {
         let p = self.alloc(2);
         let id = self.con_ids.get("GHC.Internal.Exception.ErrorCall").copied().unwrap_or(0);
         self.heap_set(p, heap::header(kind::CON, 0, id as u32));
         p
+    }
+
+    /// The name of the constructor of an evaluated object.
+    pub fn con_name(&self, p: Word) -> &str {
+        let id = heap::aux_of(self.heap_get(p, 0)) as usize;
+        self.prog.con_names.get(id).map(|s| s.as_str()).unwrap_or("")
     }
 
     /// Whether a scrutinee (evaluated) matches a literal pattern given as text, by kind.
@@ -163,8 +182,17 @@ impl Machine {
 
     /// Allocates `words` words (header included), collecting when the heap is full. The caller
     /// keeps the stack state (`sp`, `top`) current, and the record's arguments are roots.
-    pub fn alloc(&mut self, words: usize) -> Word {
+    /// Makes room for `words` more words in one collection at most, so that a run of allocations
+    /// that follows cannot collect and move the objects already built in it.
+    pub fn reserve(&mut self, words: usize) {
         let bytes = (words as Word) * 8;
+        if self.hp + bytes > self.hplim {
+            self.collect(words);
+        }
+    }
+
+    pub fn alloc(&mut self, words: usize) -> Word {
+        let bytes = (words.max(2) as Word) * 8;
         if self.hp + bytes > self.hplim {
             self.collect(words);
         }
@@ -212,6 +240,33 @@ impl Machine {
         assert!(self.hp + (need as Word) * 8 <= self.hplim, "heap exhausted");
     }
 
+    /// The bodies of the frames on the stack, innermost first (for diagnostics).
+    pub fn stack_bodies(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut p = self.sp + 8 * self.top;
+        for _ in 0..64 {
+            let ret = unsafe { *(p as *const Word) };
+            if ret == 0 {
+                break;
+            }
+            out.push(self.body_name(ret));
+            let fkind = unsafe { *((ret - 16) as *const Word) };
+            let size = unsafe { *((ret - 8) as *const Word) };
+            p += 8;
+            match fkind {
+                crate::native::codegen::frame::BODY => p += 8 * size,
+                crate::native::codegen::frame::UPDATE => p += 8,
+                crate::native::codegen::frame::CATCH => p += 8,
+                crate::native::codegen::frame::APPLY => {
+                    let n = unsafe { *(p as *const Word) };
+                    p += 8 * (1 + n);
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
     /// The pointer slots of the Haskell stack: the innermost `top` words, then every frame above
     /// the return addresses (see `native::codegen::frame`). A stop frame links to the outer stack.
     fn stack_roots(&mut self, out: &mut Vec<*mut Word>) {
@@ -252,9 +307,9 @@ impl Machine {
                     p += 8;
                 }
                 frame::CATCH => {
+                    // The handler; the frame above the return address is that one word.
                     out.push(p as *mut Word);
-                    out.push((p + 8) as *mut Word);
-                    p += 16;
+                    p += 8;
                 }
                 frame::APPLY => {
                     let n = unsafe { *(p as *const Word) };

@@ -699,3 +699,6 @@ foreign import prim "prefetchByteArray0#" prefetchByteArray0# :: ByteArray# -> I
 foreign import prim "prefetchMutableByteArray0#" prefetchMutableByteArray0# :: MutableByteArray# s -> Int# -> State# s -> State# s
 foreign import prim "prefetchAddr0#" prefetchAddr0# :: Addr# -> Int# -> State# s -> State# s
 foreign import prim "prefetchValue0#" prefetchValue0# :: a -> State# s -> State# s
+infixl 6 +#, -#, +##, -##
+infixl 7 *#, *##, /##
+infix 4 ==#, /=#, <#, <=#, >#, >=#, ==##, /=##, <##, <=##, >##, >=##

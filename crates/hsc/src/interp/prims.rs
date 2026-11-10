@@ -1026,6 +1026,12 @@ pub fn double_to_ratio(x: f64, ratio: &'static str) -> Value {
 
 /// `ratioLit` for a fractional literal: the exact value as a reduced `Ratio Integer`.
 pub fn ratio_literal(text: &str, ratio: &'static str) -> Value {
+    let (num, den) = ratio_parts(text);
+    con_value(ratio, vec![integer_con(num), integer_con(den)])
+}
+
+/// The numerator and denominator of a fractional literal's text, in lowest terms.
+pub fn ratio_parts(text: &str) -> (BigInt, BigInt) {
     let (neg, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text),
@@ -1055,7 +1061,7 @@ pub fn ratio_literal(text: &str, ratio: &'static str) -> Value {
         num = num.quot_rem(&g).0;
         den = den.quot_rem(&g).0;
     }
-    con_value(ratio, vec![integer_con(num), integer_con(den)])
+    (num, den)
 }
 
 #[allow(dead_code)]
@@ -1076,7 +1082,7 @@ fn int_or_char(rt: &Runtime, c: &Cell) -> Result<i64, RtError> {
 }
 
 /// The position of a constructor in its type, for `dataToTag#` (Bool only for now).
-fn con_tag(name: &str) -> i64 {
+pub fn con_tag(name: &str) -> i64 {
     match name {
         "GHC.Types.False" | "Base.False" => 0,
         "GHC.Types.True" | "Base.True" => 1,

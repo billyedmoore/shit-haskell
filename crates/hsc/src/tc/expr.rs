@@ -755,6 +755,9 @@ impl Checker {
                     occs.len()
                 };
                 let mut args: Vec<Pat> = (0..n).map(|_| Pat::Wild(*loc)).collect();
+                // The sub-patterns start with the context dictionaries, so a field's position among
+                // them is offset by their number.
+                let ndicts = self.env.datacons.get(&key).map(|d| d.scheme.preds.len()).unwrap_or(0);
                 let mut order = Vec::new();
                 for (f, sub) in fields {
                     let pos = occs.iter().position(|o| *o == f.name).ok_or_else(|| super::TcError {
@@ -765,7 +768,7 @@ impl Checker {
                         Some(p) => p.clone(),
                         None => Pat::Var(f.name.clone(), *loc),
                     };
-                    order.push(pos);
+                    order.push(pos + ndicts);
                 }
                 let checked = self.check_pat(&Pat::Con(con.clone(), args, *loc), ty)?;
                 // Matching follows the order in which the fields are written.

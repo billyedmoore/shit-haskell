@@ -237,6 +237,16 @@ impl Lowering {
                 let atoms = args.iter().map(|a| self.atom(a)).collect();
                 self.allocating(mark, SExpr::Con(name.clone(), atoms))
             }
+            // `seq a b` evaluates a, then answers b; the identities answer their argument.
+            Core::Prim(name, args) if name == "seq" && args.len() == 2 => {
+                let slot = self.bind_local(&format!("seq%{}", self.bodies.len()));
+                let scrut = self.strict(&args[0]);
+                let body = self.strict(&args[1]);
+                SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(body)])
+            }
+            Core::Prim(name, args) if matches!(name.as_str(), "unsafeCoerce" | "unsafeCoerce#" | "lazy" | "oneShot" | "inline" | "noinline") && args.len() == 1 => {
+                self.strict(&args[0])
+            }
             Core::Prim(name, args) => {
                 let mark = self.pending.len();
                 let atoms = args.iter().map(|a| self.atom(a)).collect();
@@ -285,7 +295,8 @@ impl Lowering {
     fn atom(&mut self, e: &Core) -> Atom {
         match e {
             Core::Var(v) => self.resolve(v),
-            Core::Lit(l) => Atom::Lit(slit(l)),
+            // Numbers and characters are static objects; the others are built when they are used.
+            Core::Lit(l @ (Lit::Int(_) | Lit::Double(_) | Lit::Char(_))) => Atom::Lit(slit(l)),
             other => {
                 // A delayed expression (or a lambda): a closure, allocated before the operation.
                 let c = self.closure_of(other);

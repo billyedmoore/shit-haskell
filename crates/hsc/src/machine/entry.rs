@@ -31,6 +31,9 @@ pub struct NativeTable {
     pub nprims: u64,
     /// The index of `Main.main` among the globals.
     pub main_index: u64,
+    /// The bodies in address order: entry address, name pointer and length.
+    pub bodies: *const [u64; 3],
+    pub nbodies: u64,
 }
 
 /// The name written at a pointer and length.
@@ -55,6 +58,13 @@ pub unsafe fn run(table: *const NativeTable) -> i32 {
         })
         .collect();
     let mut m = Machine::new(Program { globals, con_names: cons, prim_names: prims });
+    m.bodies = (0..t.nbodies as usize)
+        .map(|i| {
+            let [addr, ptr, len] = *t.bodies.add(i);
+            let name = String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, len as usize)).into_owned();
+            (addr, name)
+        })
+        .collect();
     // The global closures: functions of their arity, or thunks, allocated on the heap.
     let mut gvec: Vec<Word> = Vec::with_capacity(t.nglobals as usize);
     for (kind_arity, code) in m.prog.globals.clone() {
@@ -126,6 +136,7 @@ impl Machine {
         if status == 0 {
             Some(self.r1)
         } else {
+            self.prim_failed = true;
             None
         }
     }
@@ -146,8 +157,15 @@ pub extern "C" fn hsc_prim(m: *mut Machine, id: u64, nargs: u64) -> Word {
     // SAFETY: generated code passes the machine record.
     let m = unsafe { &mut *m };
     let name = m.prog.prim_names[id as usize].clone();
+    // A primitive builds its result from several allocations, holding the earlier objects in Rust
+    // locals; a collection between them would move those objects. So the collection happens before
+    // it runs, and the room it needs is reserved then.
+    m.reserve(PRIM_SLACK);
     super::prims::run(m, &name, (nargs as usize).min(ARG_SLOTS))
 }
+
+/// The words a primitive may allocate without a collection (see `hsc_prim`).
+const PRIM_SLACK: usize = 16384;
 
 /// Application to a value that is not a function of the right arity: the slow path. Returns the
 /// action for the caller: 1 enter `m.code`, 2 return `m.r1`, 3 apply again to `m.nargs`, 4 raise.
@@ -243,9 +261,11 @@ pub extern "C" fn hsc_unwind(m: *mut Machine) -> i32 {
                 p += 8;
             }
             frame::CATCH => {
+                // The catch frame [return][handler] is popped; the handler gets the exception and the
+                // state token, as its two arguments, in its place.
                 let handler = m.stack_load(p);
                 let exc = m.exc;
-                let new_sp = p + 16 - 16;
+                let new_sp = p - 8;
                 m.stack_store(new_sp, exc);
                 m.stack_store(new_sp + 8, 0);
                 m.sp = new_sp;
@@ -288,3 +308,59 @@ pub extern "C" fn hsc_nontermination(m: *mut Machine) {
     let m = unsafe { &mut *m };
     m.exc = m.error_value("<<loop>>");
 }
+
+/// A literal built by the runtime: a string (a list of characters), an `Integer` (kind 1), a
+/// rational (kind 2) or an `Addr#` (kind 3). Allocates; the result is returned.
+#[no_mangle]
+pub extern "C" fn hsc_mk_literal(m: *mut Machine, ptr: *const u8, len: u64, kind_: u64) -> Word {
+    // SAFETY: generated code passes the machine record and the literal's text.
+    let m = unsafe { &mut *m };
+    let text = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len as usize) }).into_owned();
+    super::prims::literal(m, &text, kind_)
+}
+
+impl Machine {
+    /// Applies a function to arguments on this stack, as a nested run, and answers its result (in
+    /// weak head normal form), or None when it raised. The arguments are saved and restored around it
+    /// like those of a primitive.
+    pub fn apply_nested(&mut self, f: Word, args: &[Word]) -> Option<Word> {
+        let outer_sp = self.sp;
+        let outer_top = self.top;
+        let stop = hsc_stop_ret as usize as Word;
+        // [arguments][stop frame]: the stop frame records the outer stack.
+        let a = outer_sp - 24;
+        self.stack_store(a, stop);
+        self.stack_store(a + 8, outer_sp);
+        self.stack_store(a + 16, outer_top);
+        let n = args.len();
+        let base = a - 8 * n as Word;
+        for (i, v) in args.iter().enumerate() {
+            self.stack_store(base + 8 * i as Word, *v);
+        }
+        self.sp = base;
+        self.nargs = n as Word;
+        self.saved_args.push(self.args);
+        // SAFETY: the entry runs generated code on this machine's stack.
+        let status = unsafe { hsc_enter(self as *mut Machine, f) };
+        self.args = self.saved_args.pop().unwrap_or([0; super::ARG_SLOTS]);
+        self.sp = outer_sp;
+        self.top = outer_top;
+        if status == 0 {
+            Some(self.r1)
+        } else {
+            self.prim_failed = true;
+            None
+        }
+    }
+}
+
+impl Machine {
+    /// The name of the body containing a code address (for diagnostics).
+    pub fn body_name(&self, addr: Word) -> String {
+        match self.bodies.partition_point(|(a, _)| *a <= addr) {
+            0 => String::from("?"),
+            i => self.bodies[i - 1].1.clone(),
+        }
+    }
+}
+

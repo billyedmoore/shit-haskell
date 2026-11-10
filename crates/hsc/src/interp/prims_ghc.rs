@@ -91,7 +91,7 @@ fn decode_double(x: f64) -> (i64, i64) {
 
 /// The Int64#, Word64# and sized (Int8# .. Word32#) operations: each is an Int# or Word# operation, with
 /// the result narrowed to the width where that matters. Returns the base operation and the narrowing.
-fn sized_alias(name: &str) -> Option<(&'static str, Option<&'static str>)> {
+pub(crate) fn sized_alias(name: &str) -> Option<(&'static str, Option<&'static str>)> {
     let fixed: Option<&'static str> = match name {
         "and64#" => Some("and#"),
         "or64#" => Some("or#"),

@@ -188,10 +188,12 @@ listArray (l,u) es = runST (ST $ \s1# ->
                      then s4#
                      else r (i# +# 1#) s4#
       in
-        done l u n marr# (
-          if n == 0
-          then s2#
-          else foldr go (\_ s# -> s#) es 0# s2#)}})
+        -- The writes are run before the array is frozen: the state is bound by a case, which evaluates
+        -- it, rather than passed as an argument (an unlifted argument is not evaluated by a call).
+        case (if n == 0
+              then s2#
+              else foldr go (\_ s# -> s#) es 0# s2#) of
+          s3# -> done l u n marr# s3#}})
 
 -- | The value at the given index in an array.
 {-# INLINE (!) #-}

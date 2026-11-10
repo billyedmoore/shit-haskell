@@ -109,8 +109,12 @@ pub struct Gen {
     con_names: Vec<String>,
     prim_ids: HashMap<String, u32>,
     prim_names: Vec<String>,
-    /// Closure bodies still to generate: (label, closure).
-    pending: Vec<(String, SClosure)>,
+    /// Closure bodies still to generate: (label, closure, name for debugging).
+    pending: Vec<(String, SClosure, String)>,
+    /// The bodies in the order they are emitted (their addresses increase): (label, name).
+    body_names: Vec<(String, String)>,
+    /// The name of the body being generated.
+    current_name: String,
     /// Static objects (label, header, payload).
     statics: Vec<(String, u64, u64)>,
     /// Byte strings (label, bytes).
@@ -140,6 +144,8 @@ impl Gen {
             prim_ids: HashMap::new(),
             prim_names: Vec::new(),
             pending: Vec::new(),
+            body_names: Vec::new(),
+            current_name: String::new(),
             statics: Vec::new(),
             strings: Vec::new(),
         }
@@ -188,12 +194,13 @@ impl Gen {
         for gl in &prog.globals {
             let l = g.label("g");
             global_labels.push(l.clone());
-            g.pending.push((l, gl.closure.clone()));
+            g.pending.push((l, gl.closure.clone(), gl.name.clone()));
         }
         g.out.push_str("    .text\n");
         g.out.push_str(RUNTIME_ASM);
-        while let Some((label, c)) = g.pending.pop() {
-            g.closure_code(&label, &c);
+        while let Some((label, c, name)) = g.pending.pop() {
+            g.body_names.push((label.clone(), name.clone()));
+            g.closure_code(&label, &c, &name);
         }
         g.out.push_str("    .data\n    .p2align 3\n");
         g.out.push_str("hsc_globals:\n");
@@ -225,22 +232,35 @@ impl Gen {
         for (i, n) in prims.iter().enumerate() {
             let _ = writeln!(g.out, ".Lpn{i}:\n    .ascii \"{}\"", escape(n));
         }
-        let main_index = prog.index.get("Main.main").copied().unwrap_or(0);
+        // The body table: entry addresses in increasing order, with their names (for diagnostics).
+        g.out.push_str("    .data\n    .p2align 3\n    .globl hsc_body_table\nhsc_body_table:\n");
+        let bodies = std::mem::take(&mut g.body_names);
+        let bodies_count = bodies.len();
+        for (i, (l, _)) in bodies.iter().enumerate() {
+            let _ = writeln!(g.out, "    .quad {l}, .Lbn{i}, {}", bodies[i].1.len());
+        }
+        let _ = writeln!(g.out, "    .globl hsc_nbodies\nhsc_nbodies:\n    .quad {}", bodies.len());
+        for (i, (_, n)) in bodies.iter().enumerate() {
+            let _ = writeln!(g.out, ".Lbn{i}:\n    .ascii \"{}\"", escape(n));
+        }
+        let main_index = prog.index.get("hsc$main").or_else(|| prog.index.get("Main.main")).copied().unwrap_or(0);
         // The table the runtime reads (`machine::entry::NativeTable`).
         let _ = writeln!(
             g.out,
-            "    .globl hsc_table\nhsc_table:\n    .quad hsc_globals, {}, hsc_con_names, {}, hsc_prim_names, {}, {}",
+            "    .globl hsc_table\nhsc_table:\n    .quad hsc_globals, {}, hsc_con_names, {}, hsc_prim_names, {}, {}, hsc_body_table, {}",
             prog.globals.len(),
             cons.len(),
             prims.len(),
-            main_index
+            main_index,
+            bodies_count
         );
         g.out.push_str("    .section .note.GNU-stack,\"\",@progbits\n");
         g.out
     }
 
     /// A closure's code: the prologue, then its expression in tail position.
-    fn closure_code(&mut self, label: &str, c: &SClosure) {
+    fn closure_code(&mut self, label: &str, c: &SClosure, name: &str) {
+        self.current_name = name.to_string();
         let f = Frame { s: c.nslots, a: c.arity };
         self.put_label(label);
         // R1 is the closure; the arguments are above the new frame (they were pushed by the caller).
@@ -278,17 +298,27 @@ impl Gen {
                 self.eval_result(p);
             }
             SExpr::App(func, args) => {
-                // Arguments are read into registers first: a tail call releases the frame.
-                for (i, a) in args.iter().enumerate() {
-                    let reg = arg_reg(i);
-                    self.load(a, p, &reg);
-                }
+                // The function is loaded first (into R1, which nothing below clobbers). The arguments
+                // are then copied one at a time, through a scratch register, into a new argument area
+                // below the frame; a tail call moves that area up over the frame it replaces.
+                let n = args.len() as i64;
                 self.load(func, p, "%r14");
-                if p.mode == Mode::Tail {
-                    self.emit(&format!("addq ${}, %rbp", 8 * p.f.s as i64));
+                self.emit(&format!("subq ${}, %rbp", 8 * n));
+                let inner = Pos { pushed: p.pushed + n, ..p };
+                for (i, a) in args.iter().enumerate() {
+                    self.load(a, inner, "%rcx");
+                    self.emit(&format!("movq %rcx, {}(%rbp)", 8 * i as i64));
                 }
-                self.push_args(args.len());
-                self.emit(&format!("movl ${}, %ecx", args.len()));
+                if p.mode == Mode::Tail {
+                    let s = p.f.s as i64;
+                    // Highest first: the destination of an argument may be the source of a later one.
+                    for i in (0..n).rev() {
+                        self.emit(&format!("movq {}(%rbp), %rcx", 8 * i));
+                        self.emit(&format!("movq %rcx, {}(%rbp)", 8 * (i + s)));
+                    }
+                    self.emit(&format!("addq ${}, %rbp", 8 * s));
+                }
+                self.emit(&format!("movl ${}, %ecx", n));
                 self.emit("jmp hsc_apply");
             }
             SExpr::Con(name, args) => {
@@ -382,7 +412,18 @@ impl Gen {
             }
         }
         if !has_default {
-            let fail_msg = "Non-exhaustive patterns in case".to_string();
+            // Diagnostic: the scrutinee is left in the record for the failure's message.
+            self.emit(&format!("movq {}, %rax", p.slot(bslot)));
+            self.emit(&format!("movq %rax, {}(%rbx)", mach::R1));
+            let names: Vec<String> = alts
+                .iter()
+                .map(|a| match a {
+                    SAlt::Con(n, _, _) => n.clone(),
+                    SAlt::Lit(l, _) => format!("{:?}", l),
+                    SAlt::Default(_) => "_".into(),
+                })
+                .collect();
+            let fail_msg = format!("Non-exhaustive patterns in case [{}]", names.join(" | "));
             self.fail(&fail_msg, p);
         }
         for (a, l) in alts.iter().zip(&labels) {
@@ -394,6 +435,12 @@ impl Gen {
                         self.emit(&format!("movq %rcx, {}", p.slot(*s)));
                     }
                     self.expr(body, p);
+                }
+                SAlt::Default(SExpr::Fail(msg)) => {
+                    // Diagnostic: a pattern failure leaves the scrutinee in the record.
+                    self.emit(&format!("movq {}, %rax", p.slot(bslot)));
+                    self.emit(&format!("movq %rax, {}(%rbx)", mach::R1));
+                    self.fail(msg, p);
                 }
                 SAlt::Lit(_, body) | SAlt::Default(body) => self.expr(body, p),
             }
@@ -446,8 +493,24 @@ impl Gen {
             SLit::Char(c) => stat(self, CHAR, *c as u64),
             SLit::Double(d) => stat(self, DOUBLE, d.to_bits()),
             other => {
-                // Strings, big integers, fractions and addresses are closures (see the lowering).
-                panic!("internal: literal {other:?} is not an atom")
+                // Strings, big integers, fractions and addresses: the runtime builds the object (the
+                // call allocates, so the atom is loaded last).
+                let (kind, text) = match other {
+                    SLit::Str(s) => (0u64, s.clone()),
+                    SLit::Integer(s) => (1, s.clone()),
+                    SLit::Frac(s) => (2, s.clone()),
+                    SLit::Addr(s) => (3, s.clone()),
+                    _ => unreachable!("numbers and characters are static"),
+                };
+                let t = self.string_label(text.as_bytes());
+                self.emit(&format!("leaq {t}(%rip), %rsi"));
+                self.emit(&format!("movq ${}, %rdx", text.len()));
+                self.emit(&format!("movq ${kind}, %rcx"));
+                self.rt_call("hsc_mk_literal", p, 3);
+                if reg != "%rax" {
+                    self.emit(&format!("movq %rax, {reg}"));
+                }
+                return;
             }
         };
         self.emit(&format!("leaq {lbl}(%rip), {reg}"));
@@ -462,6 +525,8 @@ impl Gen {
 
     /// Allocates `words` words into %rax. A full heap calls the collector with the frame as it is.
     fn alloc(&mut self, words: usize, p: Pos) {
+        // Every object has at least two words (the collector relies on it).
+        let words = words.max(2);
         let ok = self.label("ok");
         self.emit(&format!("leaq {}(%r12), %rax", 8 * words));
         self.emit("cmpq %r13, %rax");
@@ -476,7 +541,7 @@ impl Gen {
     /// Fills the closure at word `base` of the block in %rax; its body is generated separately.
     fn fill_closure(&mut self, c: &SClosure, base: usize, p: Pos) {
         let code = self.label("c");
-        self.pending.push((code.clone(), c.clone()));
+        self.pending.push((code.clone(), c.clone(), format!("{}/closure", self.current_name)));
         let hdr = if c.arity > 0 {
             header(FUN, c.captures.len() as u64 + 1, c.arity as u64)
         } else {
@@ -638,6 +703,8 @@ hsc_leave_ok:
 hsc_leave_exc:
     movl $1, %eax
 hsc_leave:
+    movq %r12, 0(%rbx)
+    movq %r13, 8(%rbx)
     popq %r15
     popq %r14
     popq %r13
@@ -673,8 +740,10 @@ hsc_eval:
     movq 8(%r14), %rcx
     jmp *%rcx
 .Leval_loop:
+    movq %r14, 40(%rbx)
     movq %r12, 0(%rbx)
     movq %rbp, 16(%rbx)
+    movq $0, 24(%rbx)
     movq %rbx, %rdi
     movq %rsp, %r15
     andq $-16, %rsp
@@ -761,7 +830,7 @@ hsc_apply_ret:
     jmp hsc_apply
 
     .p2align 4
-    .quad 3, 2
+    .quad 3, 1
 hsc_catch_ret:
     addq $16, %rbp
     jmp *(%rbp)

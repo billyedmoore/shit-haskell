@@ -123,6 +123,17 @@ def main():
         is_op = not re.match(r'^[a-z_]', sym)
         shown = f"({name})" if is_op else name
         out.append(f'foreign import prim "{sym}" {shown} :: {ty}')
+    # The fixities GHC gives the operator primops (primops.txt.pp): arithmetic binds tighter than
+    # comparisons, and `i# ==# n# -# 1#` means `i# ==# (n# -# 1#)`. Only the operators the table defines.
+    fixities = [
+        ("infixl 6", ["+#", "-#", "+##", "-##"]),
+        ("infixl 7", ["*#", "*##", "/##"]),
+        ("infix 4", ["==#", "/=#", "<#", "<=#", ">#", ">=#", "==##", "/=##", "<##", "<=##", ">##", ">=##"]),
+    ]
+    for decl, ops in fixities:
+        present = [op for op in ops if op in done]
+        if present:
+            out.append(f"{decl} {', '.join(present)}")
     print("\n".join(out))
 
 

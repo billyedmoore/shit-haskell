@@ -137,11 +137,6 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if std::env::var("HSC_LOWER_CHECK").is_ok() {
-        let prog = hsc::native::stg::Lowering::program(&binds);
-        println!("globals {}", prog.globals.len());
-        return ExitCode::SUCCESS;
-    }
     if dump_core {
         for b in &binds {
             println!("{} = {}", b.name, crate::core::pretty::show(&b.body));

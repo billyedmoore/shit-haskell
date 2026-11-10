@@ -166,6 +166,16 @@ impl BigInt {
         }
     }
 
+    /// A value from its magnitude as 64-bit limbs, least significant first (linear in the limbs).
+    pub fn from_u64_limbs(neg: bool, limbs: &[u64]) -> BigInt {
+        let mut mag: Vec<u32> = Vec::with_capacity(limbs.len() * 2);
+        for &l in limbs {
+            mag.push(l as u32);
+            mag.push((l >> 32) as u32);
+        }
+        BigInt::from_parts(neg, mag)
+    }
+
     fn from_parts(neg: bool, mut mag: Vec<u32>) -> BigInt {
         trim(&mut mag);
         let neg = neg && !mag.is_empty();

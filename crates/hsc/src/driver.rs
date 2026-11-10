@@ -312,11 +312,26 @@ pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), Str
     if !runtime.is_file() {
         return Err(format!("runtime library not found: {}", runtime.display()));
     }
-    let dir = std::env::temp_dir().join(format!("hsc-{}", std::process::id()));
+    // The build directory sits beside the output, not in the temporary directory, which may be a small tmpfs.
+    let out_dir = std::path::Path::new(out).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let dir = out_dir.join(format!(".hsc-build-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let asm = dir.join("program.s");
     let obj = dir.join("program.o");
-    let prog = crate::native::stg::Lowering::program(binds);
+    // With the real base, main runs under its top handler, and stdout is flushed when the program
+    // exits, as GHC's `hs_exit` does: `hsc$main` is `runMainIO Main.main >> flushStdHandles`.
+    let mut binds = binds.to_vec();
+    let has = |n: &str| binds.iter().any(|b| b.name == n);
+    if has("GHC.Internal.TopHandler.runMainIO") && has("Main.main") && has("GHC.Internal.TopHandler.flushStdHandles") && has("GHC.Internal.Base.thenIO") {
+        use crate::core::Core::{App, Var};
+        let run_main = App(Box::new(Var("GHC.Internal.TopHandler.runMainIO".into())), Box::new(Var("Main.main".into())));
+        let body = App(
+            Box::new(App(Box::new(Var("GHC.Internal.Base.thenIO".into())), Box::new(run_main))),
+            Box::new(Var("GHC.Internal.TopHandler.flushStdHandles".into())),
+        );
+        binds.push(crate::core::TopBind { name: "hsc$main".into(), body });
+    }
+    let prog = crate::native::stg::Lowering::program(&binds);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
     std::fs::write(&asm, text).map_err(|e| e.to_string())?;
@@ -330,6 +345,7 @@ pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), Str
             &runtime.display().to_string(),
             "-o",
             out,
+            "-s",
             "-lpthread",
             "-ldl",
             "-lm",
