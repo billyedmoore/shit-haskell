@@ -1,7 +1,7 @@
 //! The driver: finds and loads modules, runs the renamer and type checker over them in
 //! dependency order, and assembles the program's Core.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::core::TopBind;
@@ -15,10 +15,10 @@ pub struct Driver {
     pub ifaces: BTreeMap<String, Iface>,
     pub checker: Checker,
     pub binds: Vec<TopBind>,
-    loaded: HashSet<String>,
+    loaded: BTreeSet<String>,
     loading: Vec<String>,
     /// Modules imported through `{-# SOURCE #-}`, known so far by their `.hs-boot` file.
-    booted: HashSet<String>,
+    booted: BTreeSet<String>,
     flags: Vec<String>,
 }
 
@@ -43,8 +43,8 @@ impl Driver {
             ifaces: BTreeMap::new(),
             checker: Checker::new(),
             binds: Vec::new(),
-            loaded: HashSet::new(),
-            booted: HashSet::new(),
+            loaded: BTreeSet::new(),
+            booted: BTreeSet::new(),
             loading: Vec::new(),
             flags,
         }
@@ -140,9 +140,14 @@ impl Driver {
             .ok_or_else(|| format!("Could not find module ‘{module}’"))?;
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &self.flags)?;
-        let (parsed, exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
+        let (parsed, mut exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
+        // The GHC packages compile with NoImplicitPrelude as a package default (their cabal files).
+        let path_text = path.to_string_lossy();
+        if ["/libs/ghc-internal/", "/libs/ghc-prim/", "/libs/ghc-bignum/"].iter().any(|p| path_text.contains(p)) {
+            exts.apply("NoImplicitPrelude")?;
+        }
         self.loading.push(module.to_string());
         let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
         if exts.is_on("ImplicitPrelude") && module != "Prelude" && !deps.iter().any(|d| d == "Prelude") {

@@ -39,7 +39,6 @@ fn lam1(p: Pat, body: Expr, loc: Loc) -> Expr {
 impl Checker {
     /// Checks an expression against a known type.
     pub fn check(&mut self, e: &Expr, ty: &Ty) -> TR<Core> {
-        if std::env::var("HSC_MK").is_ok() && format!("{:?}", e).contains("mkTrApp") { let t = self.show(ty); eprintln!("CHECK {} expected={}", &format!("{:?}", e).chars().take(160).collect::<String>(), t); }
         // The expected type reaches the alternatives, so that a GADT match can refine it there.
         match e {
             Expr::Case(scrut, alts, loc) => {
@@ -156,7 +155,6 @@ impl Checker {
             params.push(arg);
             tf = res;
         }
-        if std::env::var("HSC_MK").is_ok() && format!("{:?}", e).contains("SomeTypeRep") { let ps: Vec<String> = params.iter().map(|p| self.show(p)).collect(); let r = self.show(&tf); let ex = expected.map(|t| self.show(t)); eprintln!("SPINE params={:?} res={} expected={:?} head={:?}", ps, r, ex, head); }
         if let Some(ty) = expected {
             self.unify_at(&tf, ty)?;
         }
@@ -594,7 +592,6 @@ impl Checker {
     }
 
     pub fn inst_var_explicit(&mut self, name: &str, scheme: &Scheme, loc: Loc, explicit: &[Ty]) -> (Core, Ty) {
-        if std::env::var("HSC_MK").is_ok() && name.ends_with("mkTrApp") { eprintln!("MKTRAPP nvars={} names={:?} ty={}", scheme.nvars, scheme.names, self.show(&scheme.ty)); }
         let args: Vec<Ty> = (0..scheme.nvars as usize)
             .map(|i| match explicit.get(i) {
                 Some(t) => t.clone(),
@@ -751,7 +748,12 @@ impl Checker {
                     .get(&key)
                     .map(|d| d.fields.clone())
                     .unwrap_or_default();
-                let n = occs.len();
+                // A constructor without field names (`C{}` on a positional one) has its arity.
+                let n = if occs.is_empty() {
+                    self.env.datacons.get(&key).map(|d| d.arity).unwrap_or(0)
+                } else {
+                    occs.len()
+                };
                 let mut args: Vec<Pat> = (0..n).map(|_| Pat::Wild(*loc)).collect();
                 let mut order = Vec::new();
                 for (f, sub) in fields {

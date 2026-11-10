@@ -1190,6 +1190,26 @@ impl Parser {
                 _ => break,
             }
         }
+        // A record pattern synonym `P{f1, .., fn}`: its arguments are the fields, and each field
+        // is also a selector function.
+        let record = self.at_special('{');
+        if record {
+            self.bump();
+            args.clear();
+            while !self.at_special('}') {
+                match self.tok().clone() {
+                    Tok::VarId(v) if self.real() => {
+                        self.bump();
+                        args.push(v);
+                    }
+                    _ => return self.unexpected(),
+                }
+                if self.at_special(',') {
+                    self.bump();
+                }
+            }
+            self.bump();
+        }
         let (pat, dir) = if self.at_res(ROp::Eq) {
             self.bump();
             let e = self.expr()?;
@@ -1208,7 +1228,27 @@ impl Parser {
         } else {
             return self.unexpected();
         };
-        Ok(Decl::PatSyn { name, args, pat, dir, loc })
+        let synonym = Decl::PatSyn { name: name.clone(), args: args.clone(), pat, dir, loc };
+        if !record {
+            return Ok(synonym);
+        }
+        let mut decls = vec![synonym];
+        for (i, field) in args.iter().enumerate() {
+            let pats: Vec<Pat> = (0..args.len())
+                .map(|j| if j == i { Pat::Var("sel%x".into(), loc) } else { Pat::Wild(loc) })
+                .collect();
+            let body = Expr::Var(QName::unqual("sel%x"), loc);
+            decls.push(Decl::Fun {
+                name: field.clone(),
+                clauses: vec![Clause {
+                    pats: vec![Pat::Con(QName::unqual(name.clone()), pats, loc)],
+                    rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() },
+                    loc,
+                }],
+                loc,
+            });
+        }
+        Ok(Decl::Many(decls))
     }
 }
 
@@ -1246,7 +1286,9 @@ fn type_vars_of(t: &Type, out: &mut Vec<String>) {
                 out.push(v.clone());
             }
         }
-        Type::App(f, a) | Type::Fun(f, a) | Type::Sig(f, a) => {
+        // A kind annotation's variables are kinds, not parameters of the type.
+        Type::Sig(t, _) => type_vars_of(t, out),
+        Type::App(f, a) | Type::Fun(f, a) => {
             type_vars_of(f, out);
             type_vars_of(a, out);
         }

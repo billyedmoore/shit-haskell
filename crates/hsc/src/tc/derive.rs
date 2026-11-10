@@ -280,7 +280,8 @@ pub fn type_vars(t: &Type, out: &mut Vec<String>) {
                 out.push(v.clone());
             }
         }
-        Type::App(f, a) | Type::Fun(f, a) | Type::Sig(f, a) => {
+        Type::Sig(t, _) => type_vars(t, out),
+        Type::App(f, a) | Type::Fun(f, a) => {
             type_vars(f, out);
             type_vars(a, out);
         }

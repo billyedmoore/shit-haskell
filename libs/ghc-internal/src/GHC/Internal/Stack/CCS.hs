@@ -37,6 +37,7 @@ module GHC.Internal.Stack.CCS (
 import GHC.Internal.Base
 import GHC.Internal.Ptr
 import GHC.Internal.Foreign.C.String (CString)
+import GHC.Internal.List (concatMap, reverse)
 
 -- | A cost-centre stack from GHC's cost-center profiler.
 data CostCentreStack

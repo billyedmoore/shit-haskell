@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE NoImplicitPrelude #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.Internal.Lexeme

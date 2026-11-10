@@ -460,6 +460,15 @@ impl<'a> Renamer<'a> {
 
     // ----- lookup -----------------------------------------------------------
 
+    /// A record field named in a pattern, an expression or an update: the field itself, even where a
+    /// local variable of the same name is in scope (a record wildcard binds such variables).
+    fn field_ref(&mut self, f: &QName, loc: Loc) -> RR<QName> {
+        match self.lookup_global(f, Ns::Value) {
+            Ok(e) => Ok(QName { qual: Some(e.global.module.clone()), name: e.global.name.clone() }),
+            Err(_) => self.value_ref(f, loc, false),
+        }
+    }
+
     fn lookup_global(&self, q: &QName, ns: Ns) -> Result<Entity, Vec<Entity>> {
         let list = match (&q.qual, ns) {
             (None, Ns::Value) => self.vals.get(&q.name),
@@ -1244,7 +1253,7 @@ impl<'a> Renamer<'a> {
                 let mut given: HashSet<String> = HashSet::new();
                 for (f, v) in fields {
                     given.insert(f.name.clone());
-                    let fq = self.value_ref(&f, loc, false)?;
+                    let fq = self.field_ref(&f, loc)?;
                     let v = match v {
                         Some(x) => Some(self.expr(x)?),
                         None => Some(self.expr(Expr::Var(QName::unqual(f.name.clone()), loc))?),
@@ -1254,7 +1263,7 @@ impl<'a> Renamer<'a> {
                 if dotdot {
                     for f in &entity.fields {
                         if !given.contains(f) {
-                            let fq = self.value_ref(&QName::unqual(f.clone()), loc, false)?;
+                            let fq = self.field_ref(&QName::unqual(f.clone()), loc)?;
                             let v = self.expr(Expr::Var(QName::unqual(f.clone()), loc))?;
                             out.push((fq, Some(v)));
                         }
@@ -1271,7 +1280,9 @@ impl<'a> Renamer<'a> {
                 let e = self.expr(*e)?;
                 let mut out = Vec::with_capacity(fields.len());
                 for (f, v) in fields {
-                    let fq = self.value_ref(&f, loc, false)?;
+                    // A field name in an update is the field itself, even where a local variable of
+                    // the same name (a record wildcard's, say) is in scope.
+                    let fq = self.field_ref(&f, loc)?;
                     let v = match v {
                         Some(x) => Some(self.expr(x)?),
                         None => Some(self.expr(Expr::Var(QName::unqual(f.name.clone()), loc))?),
@@ -1416,7 +1427,7 @@ impl<'a> Renamer<'a> {
                 let mut given: HashSet<String> = HashSet::new();
                 for (f, p) in fields {
                     given.insert(f.name.clone());
-                    let fq = self.value_ref(&f, loc, false)?;
+                    let fq = self.field_ref(&f, loc)?;
                     let p = match p {
                         Some(p) => Some(self.pat(p, mode)?),
                         None => Some(Pat::Var(self.bind(&f.name, loc, mode)?, loc)),
@@ -1426,7 +1437,7 @@ impl<'a> Renamer<'a> {
                 if dotdot {
                     for f in &entity.fields {
                         if !given.contains(f) {
-                            let fq = self.value_ref(&QName::unqual(f.clone()), loc, false)?;
+                            let fq = self.field_ref(&QName::unqual(f.clone()), loc)?;
                             let v = Pat::Var(self.bind(f, loc, mode)?, loc);
                             out.push((fq, Some(v)));
                         }
@@ -1694,19 +1705,14 @@ fn select_item(exports: &[Entity], item: &IEItem) -> Option<Vec<Entity>> {
                 // No type of this name: a constructor (possibly inside an exported type).
                 return select_item(exports, &IEItem::Var(name.clone()));
             };
-            let mut out = vec![t.clone()];
-            match subs {
-                Subs::None => {}
-                Subs::All => out.extend(t.subs.iter().cloned()),
-                Subs::AllPlus(_) => out.extend(t.subs.iter().cloned()),
-                Subs::Some(names) => out.extend(
-                    t.subs
-                        .iter()
-                        .filter(|s| names.contains(&s.global.name))
-                        .cloned(),
-                ),
-            }
-            Some(out)
+            // The type or class, with the sub-entities the item names (none for a bare `C`).
+            let mut kept = t.clone();
+            kept.subs = match subs {
+                Subs::None => Vec::new(),
+                Subs::All | Subs::AllPlus(_) => t.subs.clone(),
+                Subs::Some(names) => t.subs.iter().filter(|s| names.contains(&s.global.name)).cloned().collect(),
+            };
+            Some(vec![kept])
         }
         IEItem::Module(_) => Some(Vec::new()),
     }

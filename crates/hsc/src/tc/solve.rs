@@ -28,6 +28,9 @@ pub fn is_eq_class(class: &str) -> bool {
     class == EQ_CLASS || class == "Builtin.~~"
 }
 
+/// The class of `dataToTag#` (GHC.Magic), whose instances the compiler builds.
+pub const DATA_TO_TAG_CLASS: &str = "GHC.Magic.DataToTag";
+
 /// The class of `withDict`: `WithDict cls meth`, solved by the compiler (GHC.Magic.Dict).
 pub const WITH_DICT_CLASS: &str = "GHC.Magic.Dict.WithDict";
 
@@ -35,6 +38,40 @@ pub const WITH_DICT_CLASS: &str = "GHC.Magic.Dict.WithDict";
 pub const TYPEABLE_CLASS: &str = "GHC.Internal.Data.Typeable.Internal.Typeable";
 
 impl Checker {
+    /// The evidence for `DataToTag t`: a function from a value to the position of its
+    /// constructor (a newtype is erased, so its only constructor is position 0).
+    fn data_to_tag_evidence(&mut self, pred: &Pred) -> Option<Core> {
+        let tycon = match pred.args[0].split_apps().0 {
+            Ty::Con(c) => c.clone(),
+            _ => return None,
+        };
+        let mut cons: Vec<(usize, String, usize, bool)> = self
+            .env
+            .datacons
+            .values()
+            .filter(|d| d.tycon == tycon)
+            .map(|d| (d.tag, d.name.clone(), d.arity, d.newtype))
+            .collect();
+        if cons.is_empty() {
+            return None;
+        }
+        cons.sort();
+        let dict_con = self.class(DATA_TO_TAG_CLASS)?.dict_con.clone();
+        let x = self.fresh_name("dtt");
+        let body = if cons.iter().any(|c| c.3) {
+            Core::Lit(crate::core::Lit::Int(0))
+        } else {
+            let scrut = self.fresh_name("dtt");
+            let mut alts: Vec<crate::core::Alt> = Vec::new();
+            for (tag, name, arity, _) in &cons {
+                let vars: Vec<String> = (0..*arity).map(|_| self.fresh_name("dttf")).collect();
+                alts.push(crate::core::Alt::Con(name.clone(), vars, Core::Lit(crate::core::Lit::Int(*tag as i64))));
+            }
+            Core::Case(Box::new(Core::Var(x.clone())), scrut, alts)
+        };
+        Some(Core::Con(dict_con, vec![Core::Lam(x, Box::new(body))]))
+    }
+
     /// The evidence for `Typeable t` from the structure of `t`: a constructor's representation
     /// comes from its name, and an application's from its parts (whose evidence is wanted).
     /// Returns `None` when `t` is not yet known (a unification variable) or a given applies.
@@ -147,6 +184,13 @@ impl Checker {
                 // and GHC's own proof (from the pattern that provides it) is not reproduced here.
                 if !self.pred_has_metas(&pred) {
                     binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
+                    continue;
+                }
+            }
+            // DataToTag is solved by the compiler for every data type: the tag of a value's constructor.
+            if pred.class == DATA_TO_TAG_CLASS && pred.args.len() == 1 {
+                if let Some(ev) = self.data_to_tag_evidence(&pred) {
+                    binds.push((w.ev.clone(), ev));
                     continue;
                 }
             }

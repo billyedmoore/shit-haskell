@@ -172,16 +172,19 @@ impl Checker {
     /// The real defining module of a wired-in name written `Base.x`: the module being checked
     /// (for a definition in progress), or the first library module that defines it.
     pub fn resolve_key(&self, key: &str) -> String {
-        if self.vars.contains_key(key) || self.env.values.contains_key(key) {
+        if self.vars.contains_key(key) {
             return key.to_string();
         }
         let Some(occ) = key.strip_prefix("Base.") else {
             return key.to_string();
         };
+        // A definition of the module being checked (a class method included) comes first.
         let own = format!("{}.{occ}", self.module);
-        if self.vars.contains_key(&own) {
+        if self.vars.contains_key(&own) || self.env.values.contains_key(&own) {
             return own;
         }
+        // The real library's definition is preferred when it is loaded: a name written `Base.x`
+        // stands for it, so that its classes are the ones the program's instances are for.
         for m in WIRED_MODULES {
             let candidate = format!("{m}.{occ}");
             if self.env.values.contains_key(&candidate) {
@@ -228,6 +231,13 @@ impl Checker {
         self.unify_fam(actual, expected)
     }
 
+    fn saturated_family(&self, t: &Ty) -> bool {
+        match self.family_app(t) {
+            Some((name, args)) => self.env.families.get(&name).is_some_and(|f| f.arity == args.len()),
+            None => false,
+        }
+    }
+
     /// Structural unification with families: applications are decomposed, so only the
     /// equalities whose head is a stuck family application are deferred.
     fn unify_fam(&mut self, actual: &Ty, expected: &Ty) -> TR<()> {
@@ -238,7 +248,8 @@ impl Checker {
         if a_meta || e_meta || !(self.has_family(&a) || self.has_family(&e)) {
             return self.unify_at_raw(&a, &e);
         }
-        if self.family_app(&a).is_some() || self.family_app(&e).is_some() {
+        // A family applied to exactly its arity is stuck; extra arguments decompose as applications.
+        if self.saturated_family(&a) || self.saturated_family(&e) {
             self.deferred_eqs.push((a, e, self.loc));
             return Ok(());
         }
@@ -484,6 +495,7 @@ pub struct AltMark {
     givens: usize,
     skol: std::collections::HashMap<u32, Ty>,
     outer: Vec<Wanted>,
+    scoped: usize,
 }
 
 impl Checker {
@@ -492,6 +504,7 @@ impl Checker {
             givens: self.givens.len(),
             skol: self.metas.skol_binds.clone(),
             outer: std::mem::take(&mut self.wanted),
+            scoped: self.scoped.len(),
         }
     }
 
@@ -514,6 +527,8 @@ impl Checker {
         };
         self.givens.truncate(mark.givens);
         self.metas.skol_binds = mark.skol;
+        // Type variables that a pattern signature bound are in scope in its alternative only.
+        self.scoped.truncate(mark.scoped);
         Ok(body)
     }
 }

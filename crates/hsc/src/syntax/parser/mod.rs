@@ -262,7 +262,8 @@ impl Parser {
             Some(Ctx::Implicit(m)) => *m,
             _ => 0,
         };
-        if n > m {
+        // NondecreasingIndentation lets a nested block start at the column of its enclosing one.
+        if n > m || (n == m && self.exts.is_on("NondecreasingIndentation")) {
             self.ctx.push(Ctx::Implicit(n));
             self.semi_done = Some((self.pos, self.ctx.len()));
             Ok(BlockKind::Implicit)

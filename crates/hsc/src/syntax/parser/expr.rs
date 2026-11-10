@@ -151,7 +151,7 @@ impl Parser {
                 }
                 let mut pats = Vec::new();
                 while !self.at_res(ROp::RArrow) {
-                    let a = self.aexp()?;
+                    let a = self.aexp_postfix()?;
                     pats.push(self.expr_to_pat(a)?);
                 }
                 self.bump();

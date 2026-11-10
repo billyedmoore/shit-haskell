@@ -15,7 +15,7 @@ enum Match {
 }
 
 /// One-way matching of an equation pattern against a zonked type.
-fn match_pat(pat: &Ty, t: &Ty, sub: &mut Vec<Option<Ty>>) -> Match {
+pub(super) fn match_pat(pat: &Ty, t: &Ty, sub: &mut Vec<Option<Ty>>) -> Match {
     match (pat, t) {
         (Ty::Gen(i), _) => {
             let i = *i as usize;
@@ -58,6 +58,31 @@ fn match_pat(pat: &Ty, t: &Ty, sub: &mut Vec<Option<Ty>>) -> Match {
 }
 
 impl Checker {
+    /// The representation type of a data family applied to fewer arguments than its arity: the
+    /// right-hand side of the first equation whose leading arguments match. (A data instance's
+    /// representation is a data type, so the partial application names it.)
+    pub(super) fn partial_family_rep(&self, t: &Ty) -> Option<String> {
+        let (head, args) = t.split_apps();
+        let Ty::Con(name) = head else {
+            return None;
+        };
+        let info = self.env.families.get(name)?;
+        if args.len() >= info.arity {
+            return None;
+        }
+        let args: Vec<Ty> = args.into_iter().cloned().collect();
+        for eqn in &info.equations {
+            let mut sub: Vec<Option<Ty>> = vec![None; eqn.nvars as usize];
+            let matched = eqn.args.iter().zip(&args).all(|(p, a)| matches!(match_pat(p, a, &mut sub), Match::Yes));
+            if matched {
+                if let Ty::Con(rep) = eqn.rhs.split_apps().0 {
+                    return Some(rep.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// The family at the head of a type application, if it is saturated.
     pub(super) fn family_app(&self, t: &Ty) -> Option<(String, Vec<Ty>)> {
         let (head, args) = t.split_apps();
@@ -71,9 +96,59 @@ impl Checker {
         Some((name.clone(), args.into_iter().cloned().collect()))
     }
 
+    /// A family applied to fewer arguments than its arity reduces when an equation's right-hand side
+    /// ends in the missing arguments: `F p1 .. pk` with `F p1 .. pk q = R x q` is `R x`. This is how a
+    /// data family's representation is named by a partial application.
+    fn partial_family_reduce(&self, t: &Ty) -> Option<Ty> {
+        let (head, args) = t.split_apps();
+        let Ty::Con(name) = head else {
+            return None;
+        };
+        let info = self.env.families.get(name)?;
+        if args.len() >= info.arity {
+            return None;
+        }
+        let args: Vec<Ty> = args.into_iter().cloned().collect();
+        let extra = info.arity - args.len();
+        for eqn in &info.equations {
+            if eqn.args.len() != info.arity {
+                continue;
+            }
+            let mut sub: Vec<Option<Ty>> = vec![None; eqn.nvars as usize];
+            let leading_match = eqn.args[..args.len()]
+                .iter()
+                .zip(&args)
+                .all(|(p, a)| matches!(match_pat(p, a, &mut sub), Match::Yes));
+            if !leading_match {
+                continue;
+            }
+            let trailing = &eqn.args[args.len()..];
+            if !trailing.iter().all(|p| matches!(p, Ty::Gen(_))) {
+                continue;
+            }
+            let (rhs_head, rhs_args) = eqn.rhs.split_apps();
+            if rhs_args.len() < extra {
+                continue;
+            }
+            let split = rhs_args.len() - extra;
+            if !rhs_args[split..].iter().zip(trailing).all(|(r, p)| **r == *p) {
+                continue;
+            }
+            let mut rebuilt = rhs_head.clone();
+            for a in &rhs_args[..split] {
+                rebuilt = Ty::app(rebuilt, (*a).clone());
+            }
+            let vals: Vec<Ty> = sub.into_iter().map(|x| x.unwrap_or_else(|| Ty::con("Builtin.()"))).collect();
+            return Some(super::types::subst_gen(&rebuilt, &vals));
+        }
+        None
+    }
+
     /// One reduction step at the head of `t`, if it is a family application that can reduce.
     fn reduce_head(&self, t: &Ty) -> Option<Ty> {
-        let (name, args) = self.family_app(t)?;
+        let Some((name, args)) = self.family_app(t) else {
+            return self.partial_family_reduce(t);
+        };
         let info: &FamilyInfo = self.env.families.get(&name)?;
         let arity = info.arity;
         let args: Vec<Ty> = args.iter().map(|a| self.metas.zonk(a)).collect();

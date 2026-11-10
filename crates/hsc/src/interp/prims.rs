@@ -325,6 +325,13 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             _ => Err(RtError::Fail("internal: vecUpdate of a non-vector".into())),
         },
         "newMVar" => Ok(io_result(Value::MVar(Rc::new(RefCell::new(None))))),
+        // The monotonic clock (GHC.Internal.Clock): nanoseconds since the first reading.
+        "getMonotonicNSec" => {
+            use std::sync::OnceLock;
+            static START: OnceLock<std::time::Instant> = OnceLock::new();
+            let start = START.get_or_init(std::time::Instant::now);
+            Ok(io_result(int_v(start.elapsed().as_nanos() as i64)?))
+        }
         "takeMVar" | "readMVar" => {
             let take = name == "takeMVar";
             let mv = match rt.force(&args[0])? {

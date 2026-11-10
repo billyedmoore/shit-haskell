@@ -35,19 +35,28 @@ impl Checker {
             }
         }
 
-        // 1. Type synonyms and type constructors.
-        for d in decls {
-            if let Decl::TypeSyn { name, tyvars, rhs, loc } = d {
-                self.loc = *loc;
-                let mut tvs: Vec<String> = tyvars.iter().map(|t| t.name.clone()).collect();
-                let rhs_ty = self.convert_type(rhs, &mut tvs)?;
-                self.env.synonyms.insert(
-                    format!("{}.{name}", self.module),
-                    Synonym {
-                        nparams: tyvars.len() as u32,
-                        rhs: rhs_ty,
-                    },
-                );
+        // 1. Type synonyms and type constructors. A synonym may mention one declared after it, so the
+        // right-hand sides are converted again until nothing changes (a chain has at most one
+        // link per synonym).
+        let synonym_decls: Vec<&Decl> = decls.iter().filter(|d| matches!(d, Decl::TypeSyn { .. })).collect();
+        for _ in 0..=synonym_decls.len() {
+            let mut changed = false;
+            for d in &synonym_decls {
+                if let Decl::TypeSyn { name, tyvars, rhs, loc } = d {
+                    self.loc = *loc;
+                    let mut tvs: Vec<String> = tyvars.iter().map(|t| t.name.clone()).collect();
+                    let rhs_ty = self.convert_type(rhs, &mut tvs)?;
+                    let key = format!("{}.{name}", self.module);
+                    let syn = Synonym { nparams: tyvars.len() as u32, rhs: rhs_ty };
+                    let same = self.env.synonyms.get(&key).is_some_and(|old| old.rhs == syn.rhs && old.nparams == syn.nparams);
+                    if !same {
+                        changed = true;
+                        self.env.synonyms.insert(key, syn);
+                    }
+                }
+            }
+            if !changed {
+                break;
             }
         }
         for d in decls {
@@ -487,7 +496,17 @@ impl Checker {
         let key = format!("{}.{name}", self.module);
         let prim = entity.map(str::to_string).unwrap_or_else(|| name.to_string());
         let arity = count_args(&body);
-        let params: Vec<String> = (0..arity).map(|_| self.fresh_name("fa")).collect();
+        // An IO result is a function of the state token, which the primitive takes last and
+        // answers with the (# state, result #) pair, like the other IO primitives.
+        let mut result = body.clone();
+        for _ in 0..arity {
+            if let Some((_, r)) = result.as_fun() {
+                result = r.clone();
+            }
+        }
+        let io = matches!(result.split_apps().0, Ty::Con(c) if c == "GHC.Types.IO");
+        let total = arity + usize::from(io);
+        let params: Vec<String> = (0..total).map(|_| self.fresh_name("fa")).collect();
         let args: Vec<Core> = params.iter().map(|p| Core::Var(p.clone())).collect();
         let mut core = Core::Prim(prim, args);
         for p in params.iter().rev() {
@@ -520,20 +539,34 @@ impl Checker {
         let mut tvs = Vec::new();
         let mut head = Vec::new();
         for a in args {
-            head.push(self.convert_type(a, &mut tvs)?);
+            // A head may name a data family instance: it is the representation type then.
+            let converted = self.convert_type(a, &mut tvs)?;
+            head.push(self.normalize(&converted));
         }
         let mut ctx = Vec::new();
         for c in &id.context {
             ctx.extend(self.convert_context_item(c, &mut tvs)?);
         }
-        let dict = format!(
-            "{}.$f{}{}_{}",
-            self.module,
-            super::types::unqualify(&class),
-            head.iter().map(|t| head_name(t)).collect::<String>(),
-            self.counter
-        );
-        self.counter += 1;
+        // A module can be registered twice (first as a boot file, then for real): the same instance
+        // keeps its dictionary name, so that what was compiled against the first still refers to it.
+        let earlier = self
+            .env
+            .instances
+            .iter()
+            .position(|i| i.class == class && i.head == head && i.dict.starts_with(&format!("{}.$f", self.module)));
+        let dict = match earlier {
+            Some(i) => self.env.instances.remove(i).dict,
+            None => {
+                self.counter += 1;
+                format!(
+                    "{}.$f{}{}_{}",
+                    self.module,
+                    super::types::unqualify(&class),
+                    head.iter().map(|t| head_name(t)).collect::<String>(),
+                    self.counter
+                )
+            }
+        };
         self.env.instances.push(InstInfo {
             class,
             nvars: tvs.len() as u32,
@@ -573,7 +606,8 @@ impl Checker {
         let mut tvs = Vec::new();
         let mut head_check = Vec::new();
         for a in args {
-            head_check.push(self.convert_type(a, &mut tvs)?);
+            let converted = self.convert_type(a, &mut tvs)?;
+            head_check.push(self.normalize(&converted));
         }
         let inst = self
             .env
@@ -811,6 +845,20 @@ impl Checker {
 
     /// `deriving instance C (T ..)`: the stock instance for `T`, generated from its declaration
     /// (possibly in another module, whose names are then resolved in that module).
+    /// The data type that a data family instance type reduces to, if it is one.
+    fn family_representation(&mut self, t: &Type) -> Option<String> {
+        let mut tvs = Vec::new();
+        let ty = self.convert_type(t, &mut tvs).ok()?;
+        let reduced = self.normalize(&ty);
+        if let Some(rep) = self.partial_family_rep(&reduced) {
+            return self.env.data_decls.contains_key(&rep).then_some(rep);
+        }
+        match reduced.split_apps().0 {
+            Ty::Con(c) if self.env.data_decls.contains_key(c) => Some(c.clone()),
+            _ => None,
+        }
+    }
+
     fn standalone_derive(&mut self, sd: &crate::syntax::ast::StandaloneDeriving) -> TR<Vec<Decl>> {
         use crate::syntax::ast::{Deriving, Type};
         let (cls, arg) = match &sd.head {
@@ -870,6 +918,12 @@ impl Checker {
             self.module = here;
             return derived;
         }
+        // A data family instance: the declaration is the representation type the family reduces to.
+        let tycon = if self.env.data_decls.contains_key(&tycon) {
+            tycon
+        } else {
+            self.family_representation(&arg).unwrap_or(tycon)
+        };
         let Some((defining, dd)) = self.env.data_decls.get(&tycon).cloned() else {
             return self.err(format!("Cannot derive an instance for ‘{}’: its declaration is not known", super::types::unqualify(&tycon)));
         };

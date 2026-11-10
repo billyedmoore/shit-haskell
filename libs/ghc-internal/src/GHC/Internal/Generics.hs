@@ -834,7 +834,6 @@ newtype Par1 p = Par1 { unPar1 :: p }
            , Show     -- ^ @since base-4.7.0.0
            , Functor  -- ^ @since base-4.9.0.0
            , Generic  -- ^ @since base-4.7.0.0
-           , Generic1 -- ^ @since base-4.9.0.0
            )
 
 -- | @since base-4.9.0.0
@@ -1171,12 +1170,12 @@ class Datatype d where
   isNewtype _ = False
 
 -- | @since base-4.9.0.0
-instance (KnownSymbol n, KnownSymbol m, KnownSymbol p, SingI nt)
+instance (KnownSymbol n, KnownSymbol m, KnownSymbol p, ReifyBool nt)
     => Datatype ('MetaData n m p nt) where
   datatypeName _ = symbolVal (Proxy :: Proxy n)
   moduleName   _ = symbolVal (Proxy :: Proxy m)
   packageName  _ = symbolVal (Proxy :: Proxy p)
-  isNewtype    _ = fromSing  (sing  :: Sing nt)
+  isNewtype    _ = reifyBool (Proxy :: Proxy nt)
 
 -- | Class for datatypes that represent data constructors
 class Constructor c where
@@ -1192,11 +1191,11 @@ class Constructor c where
   conIsRecord _ = False
 
 -- | @since base-4.9.0.0
-instance (KnownSymbol n, SingI f, SingI r)
+instance (KnownSymbol n, ReifyFixity f, ReifyBool r)
     => Constructor ('MetaCons n f r) where
   conName     _ = symbolVal (Proxy :: Proxy n)
-  conFixity   _ = fromSing  (sing  :: Sing f)
-  conIsRecord _ = fromSing  (sing  :: Sing r)
+  conFixity   _ = reifyFixity (Proxy :: Proxy f)
+  conIsRecord _ = reifyBool (Proxy :: Proxy r)
 
 -- | Datatype to represent the fixity of a constructor. An infix
 -- | declaration directly corresponds to an application of 'Infix'.
@@ -1335,12 +1334,12 @@ class Selector s where
   selDecidedStrictness :: t s (f :: k -> Type) (a :: k) -> DecidedStrictness
 
 -- | @since base-4.9.0.0
-instance (SingI mn, SingI su, SingI ss, SingI ds)
+instance (ReifyMaybeSymbol mn, ReifySourceUnpackedness su, ReifySourceStrictness ss, ReifyDecidedStrictness ds)
     => Selector ('MetaSel mn su ss ds) where
-  selName _ = fromMaybe "" (fromSing (sing :: Sing mn))
-  selSourceUnpackedness _ = fromSing (sing :: Sing su)
-  selSourceStrictness   _ = fromSing (sing :: Sing ss)
-  selDecidedStrictness  _ = fromSing (sing :: Sing ds)
+  selName _ = fromMaybe "" (reifyMaybeSymbol (Proxy :: Proxy mn))
+  selSourceUnpackedness _ = reifySourceUnpackedness (Proxy :: Proxy su)
+  selSourceStrictness   _ = reifySourceStrictness (Proxy :: Proxy ss)
+  selDecidedStrictness  _ = reifyDecidedStrictness (Proxy :: Proxy ds)
 
 -- | Representable types of kind @*@.
 -- This class is derivable in GHC with the @DeriveGeneric@ flag on.
@@ -1705,178 +1704,88 @@ deriving instance Generic1 ((,,,,,,,,,,,,,,) a b c d e f g h i j k l m n)
 deriving instance Generic1 Down
 
 --------------------------------------------------------------------------------
--- Copied from the singletons package
+-- Reading promoted metadata back
 --------------------------------------------------------------------------------
 
--- | The singleton kind-indexed data family.
-data family Sing (a :: k)
+-- hsc: the metadata instances below were written with the singletons of GHC's
+-- sources, a kind-indexed data family with classes over kinds. Those need kind
+-- inference that this compiler does not have. The metadata only ever reads the
+-- promoted values back, so each promoted kind gets a class over its constructors,
+-- with the same results.
 
--- | A 'SingI' constraint is essentially an implicitly-passed singleton.
-class SingI (a :: k) where
-  -- | Produce the singleton explicitly. You will likely need the @ScopedTypeVariables@
-  -- extension to use this method the way you want.
-  sing :: Sing a
+class ReifyBool (a :: Bool) where
+  reifyBool :: Proxy a -> Bool
 
--- | The 'SingKind' class is essentially a /kind/ class. It classifies all kinds
--- for which singletons are defined. The class supports converting between a singleton
--- type and the base (unrefined) type which it is built from.
-class SingKind k where
-  -- | Get a base type from a proxy for the promoted kind. For example,
-  -- @DemoteRep Bool@ will be the type @Bool@.
-  type DemoteRep k :: Type
+instance ReifyBool 'True where
+  reifyBool _ = True
 
-  -- | Convert a singleton to its unrefined version.
-  fromSing :: Sing (a :: k) -> DemoteRep k
+instance ReifyBool 'False where
+  reifyBool _ = False
 
--- Singleton symbols
-data instance Sing (s :: Symbol) where
-  SSym :: KnownSymbol s => Sing s
+class ReifyAssociativity (a :: Associativity) where
+  reifyAssociativity :: Proxy a -> Associativity
 
--- | @since base-4.9.0.0
-instance KnownSymbol a => SingI a where sing = SSym
+instance ReifyAssociativity 'LeftAssociative where
+  reifyAssociativity _ = LeftAssociative
 
--- | @since base-4.9.0.0
-instance SingKind Symbol where
-  type DemoteRep Symbol = String
-  fromSing (SSym :: Sing s) = symbolVal (Proxy :: Proxy s)
+instance ReifyAssociativity 'RightAssociative where
+  reifyAssociativity _ = RightAssociative
 
--- Singleton booleans
-data instance Sing (a :: Bool) where
-  STrue  :: Sing 'True
-  SFalse :: Sing 'False
+instance ReifyAssociativity 'NotAssociative where
+  reifyAssociativity _ = NotAssociative
 
--- | @since base-4.9.0.0
-instance SingI 'True  where sing = STrue
+class ReifyFixity (a :: FixityI) where
+  reifyFixity :: Proxy a -> Fixity
 
--- | @since base-4.9.0.0
-instance SingI 'False where sing = SFalse
+instance ReifyFixity 'PrefixI where
+  reifyFixity _ = Prefix
 
--- | @since base-4.9.0.0
-instance SingKind Bool where
-  type DemoteRep Bool = Bool
-  fromSing STrue  = True
-  fromSing SFalse = False
+instance (ReifyAssociativity a, KnownNat n) => ReifyFixity ('InfixI a n) where
+  reifyFixity _ =
+    Infix (reifyAssociativity (Proxy :: Proxy a)) (integerToInt (natVal (Proxy :: Proxy n)))
 
--- Singleton Maybe
-data instance Sing (b :: Maybe a) where
-  SNothing :: Sing 'Nothing
-  SJust    :: Sing a -> Sing ('Just a)
+class ReifySourceUnpackedness (a :: SourceUnpackedness) where
+  reifySourceUnpackedness :: Proxy a -> SourceUnpackedness
 
--- | @since base-4.9.0.0
-instance            SingI 'Nothing  where sing = SNothing
+instance ReifySourceUnpackedness 'NoSourceUnpackedness where
+  reifySourceUnpackedness _ = NoSourceUnpackedness
 
--- | @since base-4.9.0.0
-instance SingI a => SingI ('Just a) where sing = SJust sing
+instance ReifySourceUnpackedness 'SourceNoUnpack where
+  reifySourceUnpackedness _ = SourceNoUnpack
 
--- | @since base-4.9.0.0
-instance SingKind a => SingKind (Maybe a) where
-  type DemoteRep (Maybe a) = Maybe (DemoteRep a)
-  fromSing SNothing  = Nothing
-  fromSing (SJust a) = Just (fromSing a)
+instance ReifySourceUnpackedness 'SourceUnpack where
+  reifySourceUnpackedness _ = SourceUnpack
 
--- Singleton Fixity
-data instance Sing (a :: FixityI) where
-  SPrefix :: Sing 'PrefixI
-  SInfix  :: Sing a -> Integer -> Sing ('InfixI a n)
+class ReifySourceStrictness (a :: SourceStrictness) where
+  reifySourceStrictness :: Proxy a -> SourceStrictness
 
--- | @since base-4.9.0.0
-instance SingI 'PrefixI where sing = SPrefix
+instance ReifySourceStrictness 'NoSourceStrictness where
+  reifySourceStrictness _ = NoSourceStrictness
 
--- | @since base-4.9.0.0
-instance (SingI a, KnownNat n) => SingI ('InfixI a n) where
-  sing = SInfix (sing :: Sing a) (natVal (Proxy :: Proxy n))
+instance ReifySourceStrictness 'SourceLazy where
+  reifySourceStrictness _ = SourceLazy
 
--- | @since base-4.9.0.0
-instance SingKind FixityI where
-  type DemoteRep FixityI = Fixity
-  fromSing SPrefix      = Prefix
-  fromSing (SInfix a n) = Infix (fromSing a) (integerToInt n)
+instance ReifySourceStrictness 'SourceStrict where
+  reifySourceStrictness _ = SourceStrict
 
--- Singleton Associativity
-data instance Sing (a :: Associativity) where
-  SLeftAssociative  :: Sing 'LeftAssociative
-  SRightAssociative :: Sing 'RightAssociative
-  SNotAssociative   :: Sing 'NotAssociative
+class ReifyDecidedStrictness (a :: DecidedStrictness) where
+  reifyDecidedStrictness :: Proxy a -> DecidedStrictness
 
--- | @since base-4.9.0.0
-instance SingI 'LeftAssociative  where sing = SLeftAssociative
+instance ReifyDecidedStrictness 'DecidedLazy where
+  reifyDecidedStrictness _ = DecidedLazy
 
--- | @since base-4.9.0.0
-instance SingI 'RightAssociative where sing = SRightAssociative
+instance ReifyDecidedStrictness 'DecidedStrict where
+  reifyDecidedStrictness _ = DecidedStrict
 
--- | @since base-4.9.0.0
-instance SingI 'NotAssociative   where sing = SNotAssociative
+instance ReifyDecidedStrictness 'DecidedUnpack where
+  reifyDecidedStrictness _ = DecidedUnpack
 
--- | @since base-4.0.0.0
-instance SingKind Associativity where
-  type DemoteRep Associativity = Associativity
-  fromSing SLeftAssociative  = LeftAssociative
-  fromSing SRightAssociative = RightAssociative
-  fromSing SNotAssociative   = NotAssociative
+class ReifyMaybeSymbol (a :: Maybe Symbol) where
+  reifyMaybeSymbol :: Proxy a -> Maybe [Char]
 
--- Singleton SourceUnpackedness
-data instance Sing (a :: SourceUnpackedness) where
-  SNoSourceUnpackedness :: Sing 'NoSourceUnpackedness
-  SSourceNoUnpack       :: Sing 'SourceNoUnpack
-  SSourceUnpack         :: Sing 'SourceUnpack
+instance ReifyMaybeSymbol 'Nothing where
+  reifyMaybeSymbol _ = Nothing
 
--- | @since base-4.9.0.0
-instance SingI 'NoSourceUnpackedness where sing = SNoSourceUnpackedness
-
--- | @since base-4.9.0.0
-instance SingI 'SourceNoUnpack       where sing = SSourceNoUnpack
-
--- | @since base-4.9.0.0
-instance SingI 'SourceUnpack         where sing = SSourceUnpack
-
--- | @since base-4.9.0.0
-instance SingKind SourceUnpackedness where
-  type DemoteRep SourceUnpackedness = SourceUnpackedness
-  fromSing SNoSourceUnpackedness = NoSourceUnpackedness
-  fromSing SSourceNoUnpack       = SourceNoUnpack
-  fromSing SSourceUnpack         = SourceUnpack
-
--- Singleton SourceStrictness
-data instance Sing (a :: SourceStrictness) where
-  SNoSourceStrictness :: Sing 'NoSourceStrictness
-  SSourceLazy         :: Sing 'SourceLazy
-  SSourceStrict       :: Sing 'SourceStrict
-
--- | @since base-4.9.0.0
-instance SingI 'NoSourceStrictness where sing = SNoSourceStrictness
-
--- | @since base-4.9.0.0
-instance SingI 'SourceLazy         where sing = SSourceLazy
-
--- | @since base-4.9.0.0
-instance SingI 'SourceStrict       where sing = SSourceStrict
-
--- | @since base-4.9.0.0
-instance SingKind SourceStrictness where
-  type DemoteRep SourceStrictness = SourceStrictness
-  fromSing SNoSourceStrictness = NoSourceStrictness
-  fromSing SSourceLazy         = SourceLazy
-  fromSing SSourceStrict       = SourceStrict
-
--- Singleton DecidedStrictness
-data instance Sing (a :: DecidedStrictness) where
-  SDecidedLazy   :: Sing 'DecidedLazy
-  SDecidedStrict :: Sing 'DecidedStrict
-  SDecidedUnpack :: Sing 'DecidedUnpack
-
--- | @since base-4.9.0.0
-instance SingI 'DecidedLazy   where sing = SDecidedLazy
-
--- | @since base-4.9.0.0
-instance SingI 'DecidedStrict where sing = SDecidedStrict
-
--- | @since base-4.9.0.0
-instance SingI 'DecidedUnpack where sing = SDecidedUnpack
-
--- | @since base-4.9.0.0
-instance SingKind DecidedStrictness where
-  type DemoteRep DecidedStrictness = DecidedStrictness
-  fromSing SDecidedLazy   = DecidedLazy
-  fromSing SDecidedStrict = DecidedStrict
-  fromSing SDecidedUnpack = DecidedUnpack
+instance KnownSymbol s => ReifyMaybeSymbol ('Just s) where
+  reifyMaybeSymbol _ = Just (symbolVal (Proxy :: Proxy s))
 
