@@ -106,6 +106,33 @@ impl Checker {
         Ok(Some(Core::Con(class, vec![rep])))
     }
 
+    /// The call stack of a call to `fname` at `loc`: its frame pushed onto `base`.
+    fn push_call_frame(&self, fname: &str, loc: crate::syntax::ast::Loc, base: Core) -> Core {
+        let pkg = if self.module.starts_with("GHC.Internal.") { "ghc-internal" } else { "main" };
+        let lit = |s: &str| Core::Lit(crate::core::Lit::Str(s.to_string()));
+        let int = |n: u32| Core::Lit(crate::core::Lit::Int(i64::from(n)));
+        let srcloc = Core::Con(
+            "GHC.Internal.Stack.Types.SrcLoc".into(),
+            vec![
+                lit(pkg),
+                lit(&self.module),
+                lit(&self.source_name),
+                int(loc.line),
+                int(loc.col),
+                int(loc.line),
+                int(loc.col + fname.chars().count() as u32),
+            ],
+        );
+        let frame = Core::Con("Builtin.(,)".into(), vec![lit(fname), srcloc]);
+        Core::App(
+            Box::new(Core::App(
+                Box::new(Core::Var("GHC.Internal.Stack.Types.pushCallStack".into())),
+                Box::new(frame),
+            )),
+            Box::new(base),
+        )
+    }
+
     /// The `typeRep#` field of a Typeable dictionary variable.
     fn typeable_rep_of(&mut self, dict: &str, class: &str) -> Core {
         super::select_field(Core::Var(dict.to_string()), class, 1, 0, &mut || self.fresh_name("trv"))
@@ -213,17 +240,28 @@ impl Checker {
                 continue;
             }
             if pred.class.starts_with('?') {
-                // An implicit parameter is solved by the innermost binding of that name.
+                // An implicit parameter is solved by the innermost binding of that name. A call
+                // of a HasCallStack function pushes its frame onto the enclosing stack, which is
+                // the empty stack when there is none.
+                let site = if pred.class == "?callStack" { self.callsites.get(&w.ev).cloned() } else { None };
                 let given = self.givens.iter().rev().find(|g| g.pred.class == pred.class).cloned();
                 match given {
                     Some(g) => {
                         self.unify_at(&g.pred.args[0], &pred.args[0])?;
-                        binds.push((w.ev.clone(), g.ev.clone()));
+                        let ev = match site {
+                            Some((f, l)) => self.push_call_frame(&f, l, g.ev.clone()),
+                            None => g.ev.clone(),
+                        };
+                        binds.push((w.ev.clone(), ev));
                     }
                     None if pred.class == "?callStack" && self.env.values.contains_key("GHC.Internal.Stack.Types.emptyCallStack") => {
-                        // Without an enclosing call stack, a call starts an empty one.
                         self.unify_at(&Ty::con("GHC.Internal.Stack.Types.CallStack"), &pred.args[0])?;
-                        binds.push((w.ev.clone(), Core::Var("GHC.Internal.Stack.Types.emptyCallStack".into())));
+                        let empty = Core::Var("GHC.Internal.Stack.Types.emptyCallStack".into());
+                        let ev = match site {
+                            Some((f, l)) => self.push_call_frame(&f, l, empty),
+                            None => empty,
+                        };
+                        binds.push((w.ev.clone(), ev));
                     }
                     None => residual.push(Wanted { pred, ..w }),
                 }

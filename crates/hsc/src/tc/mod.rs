@@ -67,6 +67,9 @@ pub struct Checker {
     pub user_module: bool,
     /// The source file name, as shown in call stacks.
     pub source_name: String,
+    /// The call sites of `HasCallStack` functions in user code: the evidence name of each
+    /// `?callStack` wanted, with the called function's name and the call's location.
+    pub callsites: HashMap<String, (String, Loc)>,
     /// Checking a `.hs-boot` file: its signatures are the module's values, without bindings.
     pub boot: bool,
     /// Variables bound by nested `forall`s in the type being converted (innermost last).
@@ -133,6 +136,7 @@ impl Checker {
             bound_scope: Vec::new(),
             bound_counter: 0,
             source_name: String::new(),
+            callsites: HashMap::new(),
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),
             flex_kinds: Vec::new(),

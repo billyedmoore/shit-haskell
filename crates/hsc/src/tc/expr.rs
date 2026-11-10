@@ -616,6 +616,10 @@ impl Checker {
         let mut core = Core::Var(name.to_string());
         for p in preds {
             let ev = self.fresh_name("d");
+            if p.class == "?callStack" {
+                // The call pushes its frame onto the enclosing stack when the wanted is solved.
+                self.callsites.insert(ev.clone(), (super::types::unqualify(name).to_string(), loc));
+            }
             self.wanted.push(Wanted {
                 pred: p,
                 ev: ev.clone(),

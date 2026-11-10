@@ -172,7 +172,16 @@ impl Driver {
     fn compile_module(&mut self, m: Module, exts: Extensions, path: &Path) -> Result<(), String> {
         let name = m.name.clone();
         self.checker.user_module = !path.starts_with(default_lib_dir());
-        self.checker.source_name = path.display().to_string();
+        // Call stacks name a library file as GHC's build does (libraries/<package>/...).
+        self.checker.source_name = if self.checker.user_module {
+            path.display().to_string()
+        } else {
+            let text = path.display().to_string();
+            match text.find("/libs/") {
+                Some(i) => format!("libraries/{}", &text[i + "/libs/".len()..]),
+                None => text,
+            }
+        };
         let located = |loc: crate::syntax::ast::Loc, msg: &str| {
             format!("{}:{}:{}: error:\n    {}", path.display(), loc.line, loc.col, msg)
         };
