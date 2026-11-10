@@ -8,5 +8,6 @@ pub mod interp;
 pub mod machine;
 pub mod native;
 pub mod rename;
+pub mod sched;
 pub mod syntax;
 pub mod tc;

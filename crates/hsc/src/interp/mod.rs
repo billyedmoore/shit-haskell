@@ -6,6 +6,7 @@ pub mod bigint;
 pub mod code;
 pub mod conc;
 pub mod prims;
+pub mod prims_conc;
 pub mod prims_ghc;
 pub mod ffi;
 pub mod md5;
@@ -85,6 +86,8 @@ pub enum RtError {
     Thrown(Value),
     /// An asynchronous exception (from `throwTo`), delivered at a safe point.
     Async(Value),
+    /// `retry#`: the transaction running undoes its writes and waits for another to commit.
+    Retry,
 }
 
 pub type RR = Result<Value, RtError>;
@@ -176,14 +179,19 @@ impl Runtime {
             };
             match step {
                 Step::Ret(v) => return Ok(v),
-                Step::Wait => conc::yield_now(),
+                Step::Wait => {
+                    conc::yield_now();
+                    if let Some(i) = conc::interrupt() {
+                        return Err(prims_conc::interrupt_error(self, i));
+                    }
+                }
                 Step::Run(code, frame) => {
                     return match self.eval(code, &frame) {
                         Ok(v) => {
                             *cell.borrow_mut() = Thunk::Done(v.clone());
                             Ok(v)
                         }
-                        Err(e @ (RtError::Async(_) | RtError::Exit(_))) => {
+                        Err(e @ (RtError::Async(_) | RtError::Exit(_) | RtError::Retry)) => {
                             // Interrupted, not failed: the thunk can be evaluated again.
                             *cell.borrow_mut() = Thunk::Pending(code, frame);
                             Err(e)
@@ -220,8 +228,8 @@ impl Runtime {
         let mut code = code;
         let mut frame = frame.clone();
         'outer: loop {
-            if let Some(exc) = conc::safe_point() {
-                return Err(RtError::Async(exc));
+            if let Some(i) = conc::safe_point() {
+                return Err(prims_conc::interrupt_error(self, i));
             }
             match code {
                 Code::Var(acc) => {
@@ -407,7 +415,6 @@ fn lit_matches(rt: &Runtime, v: &Value, l: &Lit) -> Result<bool, RtError> {
 
 /// Runs `Main.main`, returning the process exit code.
 pub fn run_main(rt: &Runtime) -> i32 {
-    conc::gil_acquire();
     let Some(main_cell) = rt.global("Main.main") else {
         eprintln!("{}: The IO action ‘main’ is not defined in module ‘Main’", rt.prog_name);
         return 1;
@@ -446,6 +453,11 @@ pub fn run_main(rt: &Runtime) -> i32 {
         Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) => {
             prims::flush_stdout();
             eprintln!("{}: {}", rt.prog_name, msg);
+            1
+        }
+        Err(RtError::Retry) => {
+            prims::flush_stdout();
+            eprintln!("{}: internal: retry outside a transaction", rt.prog_name);
             1
         }
         Err(RtError::Thrown(exc)) | Err(RtError::Async(exc)) => {

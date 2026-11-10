@@ -387,6 +387,9 @@ fn ffi(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
 /// The primitives that act on mutable state, arrays, exceptions and masking. Each takes the
 /// state token last and answers the `(# State#, _ #)` pair, or just the state where it has no result.
 fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
+    if let Some(r) = super::prims_conc::call(rt, name, args) {
+        return Some(r);
+    }
     let r: RR = match name {
         // ----- MutVar# -----
         "newMutVar#" => state_result(Value::Ref(Rc::new(RefCell::new(args[0].clone())))),
@@ -447,13 +450,9 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
 
         // ----- evaluation, masking, exceptions -----
         "seq#" => rt.force(&args[0]).and_then(state_result),
-        "touch#" | "noDuplicate#" => Ok(unit_value()),
+        "touch#" => Ok(unit_value()),
         // keepAlive# x s k: the continuation runs on the state; x only has to stay alive meanwhile.
         "keepAlive#" => rt.force(&args[2]).and_then(|k| rt.apply(k, args[1].clone())),
-        "maskAsyncExceptions#" | "unmaskAsyncExceptions#" | "maskUninterruptible#" => {
-            rt.force(&args[0]).and_then(|f| rt.apply(f, args[1].clone()))
-        }
-        "getMaskingState#" => state_result(Value::Int(0)),
         "raise#" => rt.force(&args[0]).and_then(|e| Err(RtError::Thrown(e))),
         "raiseIO#" => rt.force(&args[0]).and_then(|e| Err(RtError::Thrown(e))),
         "catch#" => catch_prim(rt, args),
@@ -502,23 +501,6 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         },
         "finalizeWeak#" => Ok(con_value("Builtin.(,,)", vec![unit_value(), Value::Int(0), unit_value()])),
         "addCFinalizerToWeak#" => Ok(state_result_value(Value::Int(1))),
-
-        // ----- MVar# (the scheduler's primitives, under their GHC names) -----
-        "newMVar#" => super::prims::call(rt, "newMVar", args),
-        "takeMVar#" => super::prims::call(rt, "takeMVar", args),
-        "readMVar#" => super::prims::call(rt, "readMVar", args),
-        // putMVar# answers the state token alone, not a pair.
-        "putMVar#" => super::prims::call(rt, "putMVar", args).map(|_| unit_value()),
-
-        // ----- threads: the primops over the runtime's threads (a ThreadId# is the thread number) -----
-        "myThreadId#" => super::prims::call(rt, "myThreadId", args),
-        "fork#" => super::prims::call(rt, "forkThread", args),
-        "forkOn#" => super::prims::call(rt, "forkThread", &args[1..]),
-        "yield#" => super::prims::call(rt, "yieldThread", args).map(|_| unit_value()),
-        "delay#" => super::prims::call(rt, "threadDelay", args).map(|_| unit_value()),
-        "killThread#" => super::prims::call(rt, "throwTo", args).map(|_| unit_value()),
-        "isCurrentThreadBound#" => Ok(io_result_of(Value::Int(0))),
-        "labelThread#" => Ok(unit_value()),
 
         // ----- stable pointers: an index into the runtime's table -----
         "makeStablePtr#" => {
@@ -700,25 +682,30 @@ fn copy_into(rt: &Runtime, args: &[Cell]) -> Result<(), RtError> {
     }
 }
 
-fn catch_handle(rt: &Runtime, exc: Value, args: &[Cell]) -> RR {
-    let handler = rt.force(&args[1])?;
-    let action = rt.apply(handler, cell_of(exc))?;
-    rt.apply(action, args[2].clone())
+/// The exception value (a `SomeException`) that an error is for a handler; errors that no handler
+/// sees come back as they are.
+pub(super) fn exception_of(rt: &Runtime, e: RtError) -> Result<Value, RtError> {
+    match e {
+        RtError::Thrown(e) | RtError::Async(e) => Ok(e),
+        RtError::Error(msg) | RtError::Fail(msg) | RtError::ErrorLoc(msg, _) => match error_call(rt, &msg) {
+            Some(e) => Ok(e),
+            None => Err(RtError::Fail(msg)),
+        },
+        other => Err(other),
+    }
 }
 
-/// catch# io handler s: the action runs; an exception goes to the handler, which runs in its place.
+/// catch# io handler s: the action runs; an exception goes to the handler, which runs in its place,
+/// masked; the masking state of the `catch#` is back afterwards.
 fn catch_prim(rt: &Runtime, args: &[Cell]) -> RR {
+    let saved = super::prims_conc::mask();
     let exc = match run_io(rt, &args[0], &args[2]) {
-        Ok(v) => return Ok(v),        Err(RtError::Thrown(e)) | Err(RtError::Async(e)) => e,
-        Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) | Err(RtError::ErrorLoc(msg, _)) => {
-            match error_call(rt, &msg) {
-                Some(e) => e,
-                None => return Err(RtError::Fail(msg)),
-            }
-        }
-        Err(other) => return Err(other),
+        Ok(v) => return Ok(v),
+        Err(e) => exception_of(rt, e)?,
     };
-    let handler = rt.force(&args[1])?;
-    let action = rt.apply(handler, cell_of(exc))?;
-    rt.apply(action, args[2].clone())
+    super::prims_conc::handle(rt, saved, || {
+        let handler = rt.force(&args[1])?;
+        let action = rt.apply(handler, cell_of(exc))?;
+        rt.apply(action, args[2].clone())
+    })
 }

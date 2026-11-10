@@ -1,33 +1,134 @@
-//! Concurrency with a global interpreter lock. Each Haskell thread is an OS thread, but
-//! only the holder of the lock runs Haskell code, so the reference-counted runtime data
-//! is never touched concurrently. Threads switch when they block (an `MVar` operation
-//! that cannot proceed, or `threadDelay`), and when they finish.
+//! Concurrency in the interpreter. Each Haskell thread is an OS thread, but only the holder of the
+//! scheduler's baton runs Haskell code (see `crate::sched`), so the reference-counted runtime data
+//! is never touched concurrently. Threads switch when they block, yield, finish, or reach the end
+//! of their time slice at a safe point of the evaluator.
 
-use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::cell::{Cell as StdCell, RefCell, UnsafeCell};
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
-static GIL_HELD: Mutex<bool> = Mutex::new(false);
-static GIL_CV: Condvar = Condvar::new();
+use super::Cell;
+use crate::sched::{Interrupt, Sched, PREEMPT};
 
-pub fn gil_acquire() {
-    let mut held = GIL_HELD.lock().unwrap_or_else(|e| e.into_inner());
-    while *held {
-        held = GIL_CV.wait(held).unwrap_or_else(|e| e.into_inner());
-    }
-    *held = true;
+/// The interpreter's scheduler: it holds cells (exceptions on their way, values of `MVar`s).
+pub type S = Sched<Cell>;
+
+struct Global(UnsafeCell<Option<S>>);
+// SAFETY: the scheduler is only used by the thread holding the baton.
+unsafe impl Sync for Global {}
+
+static SCHED: Global = Global(UnsafeCell::new(None));
+
+/// The time slice of the interpreter's threads, in milliseconds.
+const SLICE_MS: u64 = 50;
+
+/// The scheduler (made at first use, by the main thread).
+pub fn sched() -> *mut S {
+    // SAFETY: only the baton holder runs this, and the reference does not outlive the call.
+    unsafe { (*SCHED.0.get()).get_or_insert_with(|| Sched::new(SLICE_MS)) as *mut S }
 }
 
-pub fn gil_release() {
-    let mut held = GIL_HELD.lock().unwrap_or_else(|e| e.into_inner());
-    *held = false;
-    GIL_CV.notify_all();
+/// Runs `f` on the scheduler. `f` must not switch threads.
+pub fn with<R>(f: impl FnOnce(&mut S) -> R) -> R {
+    // SAFETY: only the baton holder runs this, and `f` returns before any other thread runs.
+    f(unsafe { &mut *sched() })
 }
 
-/// Gives other threads a chance to run, then continues holding the lock.
+/// Gives the baton to the next thread; returns when this thread has it again. The thread has been
+/// queued or blocked in the scheduler.
+pub fn switch() {
+    // SAFETY: no reference into the scheduler is held here.
+    unsafe { S::switch(sched()) }
+}
+
+/// Lets the other threads run, then continues.
 pub fn yield_now() {
-    gil_release();
-    std::thread::sleep(Duration::from_micros(50));
-    gil_acquire();
+    with(|s| s.yield_cur());
+    switch();
+}
+
+/// What this thread must raise now, if anything.
+pub fn interrupt() -> Option<Interrupt<Cell>> {
+    with(|s| s.interrupt())
+}
+
+/// Ends this Haskell thread: the baton goes to the next one. Everything reference-counted that the
+/// OS thread held must have been dropped.
+pub fn finish() {
+    // SAFETY: no reference into the scheduler is held here.
+    unsafe { S::finish(sched()) }
+}
+
+/// Safe point in the evaluator: at the end of a time slice the other threads run; an exception
+/// thrown to this thread meanwhile is answered.
+#[inline]
+pub fn safe_point() -> Option<Interrupt<Cell>> {
+    if !PREEMPT.load(Ordering::Relaxed) {
+        return None;
+    }
+    slice_end()
+}
+
+#[cold]
+fn slice_end() -> Option<Interrupt<Cell>> {
+    // A transaction is not interrupted: its writes are in place until it commits.
+    if STM_DEPTH.with(|d| d.get()) > 0 {
+        return None;
+    }
+    PREEMPT.store(false, Ordering::Relaxed);
+    if with(|s| s.preempt()) {
+        switch();
+    }
+    interrupt()
+}
+
+thread_local! {
+    /// The transactions this thread is running (nested by `atomically#` only once, in practice).
+    static STM_DEPTH: StdCell<u32> = const { StdCell::new(0) };
+    /// The writes of the running transaction: each variable with the contents it had.
+    static STM_LOG: RefCell<Vec<(Rc<RefCell<Cell>>, Cell)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Enters (true) or leaves a transaction.
+pub fn stm_enter(enter: bool) {
+    STM_DEPTH.with(|d| d.set(if enter { d.get() + 1 } else { d.get().saturating_sub(1) }));
+}
+
+/// Whether this thread is in a transaction.
+pub fn in_stm() -> bool {
+    STM_DEPTH.with(|d| d.get()) > 0
+}
+
+/// The number of writes the running transaction has made (a mark to roll back to).
+pub fn stm_mark() -> usize {
+    STM_LOG.with(|l| l.borrow().len())
+}
+
+/// Records a write of the running transaction: the variable and its contents before.
+pub fn stm_log(var: Rc<RefCell<Cell>>, old: Cell) {
+    STM_LOG.with(|l| l.borrow_mut().push((var, old)));
+}
+
+/// Undoes the writes made after a mark.
+pub fn stm_rollback(mark: usize) {
+    STM_LOG.with(|l| {
+        let mut log = l.borrow_mut();
+        while log.len() > mark {
+            if let Some((var, old)) = log.pop() {
+                *var.borrow_mut() = old;
+            }
+        }
+    });
+}
+
+/// Forgets the writes made after a mark (they stay); answers whether there were any.
+pub fn stm_commit(mark: usize) -> bool {
+    STM_LOG.with(|l| {
+        let mut log = l.borrow_mut();
+        let wrote = log.len() > mark;
+        log.truncate(mark);
+        wrote
+    })
 }
 
 thread_local! {
@@ -57,83 +158,16 @@ pub struct Locked<T>(pub T);
 // SAFETY: values are only accessed by the thread holding the interpreter lock.
 unsafe impl<T> Send for Locked<T> {}
 
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-
-static THREAD_IDS: AtomicI64 = AtomicI64::new(2);
-
 thread_local! {
-    static CURRENT: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
+    static CURRENT: StdCell<i64> = const { StdCell::new(1) };
 }
 
-pub fn next_thread_id() -> i64 {
-    THREAD_IDS.fetch_add(1, Ordering::SeqCst)
-}
-
+/// The number of the Haskell thread this OS thread runs.
 pub fn current_thread_id() -> i64 {
     CURRENT.with(|c| c.get())
 }
 
-/// Records the id of the thread that is starting.
+/// Records the number of the thread that is starting.
 pub fn set_current(id: i64) {
     CURRENT.with(|c| c.set(id));
-}
-
-/// Threads that have been started and not finished (the main thread counts as one).
-pub static LIVE: AtomicUsize = AtomicUsize::new(1);
-
-pub fn thread_started() {
-    LIVE.fetch_add(1, Ordering::SeqCst);
-}
-
-pub fn thread_finished() {
-    LIVE.fetch_sub(1, Ordering::SeqCst);
-    let me = current_thread_id();
-    let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    p.retain(|(id, _)| *id != me);
-    PENDING_N.store(p.len(), Ordering::SeqCst);
-}
-
-/// Asynchronous exceptions posted to threads (by `throwTo`), waiting to be raised there.
-static PENDING: Mutex<Vec<(i64, Locked<super::Value>)>> = Mutex::new(Vec::new());
-static PENDING_N: AtomicUsize = AtomicUsize::new(0);
-static TICKS: AtomicUsize = AtomicUsize::new(0);
-
-/// Posts an asynchronous exception to thread `id`; it is raised when that thread next
-/// reaches a safe point or a blocking operation.
-pub fn post_exception(id: i64, exc: super::Value) {
-    let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    p.push((id, Locked(exc)));
-    PENDING_N.store(p.len(), Ordering::SeqCst);
-}
-
-/// Takes the asynchronous exception posted to the current thread, if there is one.
-pub fn take_exception() -> Option<super::Value> {
-    if PENDING_N.load(Ordering::Relaxed) == 0 {
-        return None;
-    }
-    let me = current_thread_id();
-    let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    let pos = p.iter().position(|(id, _)| *id == me)?;
-    let (_, Locked(exc)) = p.remove(pos);
-    PENDING_N.store(p.len(), Ordering::SeqCst);
-    Some(exc)
-}
-
-/// Safe point in the evaluator: lets other threads run every so often (preemption), and
-/// returns an asynchronous exception posted to this thread, if any.
-pub fn safe_point() -> Option<super::Value> {
-    if LIVE.load(Ordering::Relaxed) > 1 && TICKS.fetch_add(1, Ordering::Relaxed) & 4095 == 4095 {
-        yield_now();
-    }
-    take_exception()
-}
-
-/// Called when an MVar operation cannot proceed: lets other threads run. Returns false when
-/// no other thread exists, so the blocked operation can never complete.
-pub fn blocked_wait() -> bool {
-    if LIVE.load(Ordering::SeqCst) <= 1 {
-        return false;
-    }
-    yield_now();
-    true
 }

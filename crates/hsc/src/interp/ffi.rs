@@ -339,6 +339,13 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             ret_int(n as i64)
         })(),
         "rtsSupportsBoundThreads" => ret_int(0),
+        // A ThreadId# is the thread's number.
+        "rts_getThreadId" => int_of(rt, &args[0]).and_then(ret_int),
+        "cmp_thread" => (|| {
+            let (a, b) = (int_of(rt, &args[0])?, int_of(rt, &args[1])?);
+            ret_int(a.cmp(&b) as i64)
+        })(),
+        "rts_enableThreadAllocationLimit" | "rts_disableThreadAllocationLimit" => Ok(io_result_of(unit_value())),
         "getNumberOfProcessors" => ret_int(
             std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(1),
         ),

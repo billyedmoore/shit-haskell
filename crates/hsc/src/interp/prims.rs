@@ -2,7 +2,6 @@
 //! ones it needs; the Prelude wraps them with Haskell types.
 
 use std::io::{BufRead, Read, Write};
-use std::time::Duration;
 use std::rc::Rc;
 
 use super::bigint::{bit_length, bitwise, popcount, shift_right, test_bit, BigInt};
@@ -324,130 +323,12 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             }
             _ => Err(RtError::Fail("internal: vecUpdate of a non-vector".into())),
         },
-        "newMVar" => Ok(io_result(Value::MVar(Rc::new(RefCell::new(None))))),
         // The monotonic clock (GHC.Internal.Clock): nanoseconds since the first reading.
         "getMonotonicNSec" => {
             use std::sync::OnceLock;
             static START: OnceLock<std::time::Instant> = OnceLock::new();
             let start = START.get_or_init(std::time::Instant::now);
             Ok(io_result(int_v(start.elapsed().as_nanos() as i64)?))
-        }
-        "takeMVar" | "readMVar" => {
-            let take = name == "takeMVar";
-            let mv = match rt.force(&args[0])? {
-                Value::MVar(m) => m,
-                _ => return Err(RtError::Fail("internal: takeMVar of a non-MVar".into())),
-            };
-            loop {
-                if let Some(exc) = super::conc::take_exception() {
-                    return Err(RtError::Async(exc));
-                }
-                let current = mv.borrow().clone();
-                if let Some(cell) = current {
-                    if take {
-                        *mv.borrow_mut() = None;
-                    }
-                    let v = rt.force(&cell)?;
-                    return Ok(io_result(v));
-                }
-                if !super::conc::blocked_wait() {
-                    return Err(RtError::Error("thread blocked indefinitely in an MVar operation".into()));
-                }
-            }
-        }
-        "putMVar" => {
-            let mv = match rt.force(&args[0])? {
-                Value::MVar(m) => m,
-                _ => return Err(RtError::Fail("internal: putMVar of a non-MVar".into())),
-            };
-            loop {
-                if let Some(exc) = super::conc::take_exception() {
-                    return Err(RtError::Async(exc));
-                }
-                if mv.borrow().is_none() {
-                    *mv.borrow_mut() = Some(args[1].clone());
-                    return Ok(io_result(unit_value()));
-                }
-                if !super::conc::blocked_wait() {
-                    return Err(RtError::Error("thread blocked indefinitely in an MVar operation".into()));
-                }
-            }
-        }
-        "tryTakeMVar" => {
-            let mv = match rt.force(&args[0])? {
-                Value::MVar(m) => m,
-                _ => return Err(RtError::Fail("internal: tryTakeMVar of a non-MVar".into())),
-            };
-            let current = mv.borrow_mut().take();
-            match current {
-                Some(cell) => {
-                    let v = rt.force(&cell)?;
-                    Ok(io_result(con_value("Base.Just", vec![v])))
-                }
-                None => Ok(io_result(con_value("Base.Nothing", vec![]))),
-            }
-        }
-        "forkThread" => {
-            // Runs an IO action on a new Haskell thread. The action receives the world token.
-            let action = args[0].clone();
-            let rt_ptr = super::conc::Locked(rt as *const Runtime);
-            let payload = super::conc::Locked(action);
-            let id = super::conc::next_thread_id();
-            super::conc::thread_started();
-            std::thread::Builder::new()
-                .stack_size(4 << 30)
-                .spawn(move || {
-                    let rt_ptr = rt_ptr;
-                    let payload = payload;
-                    super::conc::set_stack_base();
-                    super::conc::gil_acquire();
-                    super::conc::set_current(id);
-                    // SAFETY: the runtime is leaked and lives for the whole process.
-                    let rt: &Runtime = unsafe { &*rt_ptr.0 };
-                    let cell = payload.0;
-                    let outcome = rt.force(&cell).and_then(|io| match io {
-                        Value::Con(_) | Value::Fun(_) => {
-                            let run = io;
-                            let unit = Rc::new(RefCell::new(super::Thunk::Done(unit_value())));
-                            rt.apply(run, unit)
-                        }
-                        _ => Err(RtError::Fail("internal: forkIO of a non-IO action".into())),
-                    });
-                    if let Err(RtError::Error(msg)) | Err(RtError::Fail(msg)) = outcome {
-                        flush_stdout();
-                        eprintln!("{}: {}", rt.prog_name, msg);
-                    }
-                    super::conc::thread_finished();
-                    super::conc::gil_release();
-                })
-                .expect("spawn Haskell thread");
-            Ok(io_result(Value::Int(id)))
-        }
-        "threadDelay" => {
-            let us = int(rt, &args[0])?.max(0) as u64;
-            super::conc::gil_release();
-            std::thread::sleep(Duration::from_micros(us));
-            super::conc::gil_acquire();
-            if let Some(exc) = super::conc::take_exception() {
-                return Err(RtError::Async(exc));
-            }
-            Ok(io_result(unit_value()))
-        }
-        "yieldThread" => {
-            super::conc::yield_now();
-            Ok(io_result(unit_value()))
-        }
-        "myThreadId" => Ok(io_result(Value::Int(super::conc::current_thread_id()))),
-        "throwTo" => {
-            // throwTo# : the target thread id, the SomeException, the world token.
-            let target = int(rt, &args[0])?;
-            let exc = rt.force(&args[1])?;
-            if target == super::conc::current_thread_id() {
-                return Err(RtError::Thrown(exc));
-            }
-            super::conc::post_exception(target, exc);
-            super::conc::yield_now();
-            Ok(io_result(unit_value()))
         }
         "traceErr" => {
             let s = rt.force_string(&args[0])?;
