@@ -100,7 +100,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             let (b2, off2) = (b, off);
             // SAFETY: the buffer is a live byte array; no collection happens during the call.
             let r = unsafe { write(fd, raw(b2, off2), n) };
-            let v = if r < 0 { -errno() } else { r as i64 };
+            let v = if r < 0 { -1 } else { r as i64 };
             ret_int(m, v)
         }
         "read" => {
@@ -109,7 +109,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             let n = int_arg(m, 2)?.max(0) as usize;
             // SAFETY: as for write.
             let r = unsafe { read(fd, raw(b, off), n) };
-            let v = if r < 0 { -errno() } else { r as i64 };
+            let v = if r < 0 { -1 } else { r as i64 };
             ret_int(m, v)
         }
         "__hsbase_MD5Init" => {
@@ -205,7 +205,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             bytes.push(0);
             // SAFETY: the path is NUL-terminated and outlives the call.
             let fd = unsafe { open(bytes.as_ptr(), flags, mode) };
-            ret_int(m, if fd < 0 { -errno() } else { fd as i64 })
+            ret_int(m, if fd < 0 { -1 } else { fd as i64 })
         }
         "fcntl" => {
             let fd = int_arg(m, 0)? as i32;
@@ -256,7 +256,30 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
         "__hscore_fd_cloexec" => ret_int(m, 1),
         "__hscore_sizeof_stat" => ret_int(m, 144),
         "__hscore_setmode" | "lockFile" | "unlockFile" => ret_int(m, 0),
-        "rtsSupportsBoundThreads" => ret_int(m, 0),
+        "rtsSupportsBoundThreads" | "rts_isThreaded" => ret_int(m, 0),
+        "base_strerror_r" => {
+            let e = int_arg(m, 0)? as i32;
+            let (b, off) = addr_arg(m, 1)?;
+            let len = int_arg(m, 2)?.max(0) as usize;
+            let text = strerror(e);
+            let n = text.len().min(len.saturating_sub(1));
+            // SAFETY: the buffer holds `len` bytes (allocaBytes in the library).
+            unsafe {
+                let p = raw(b, off);
+                std::ptr::copy_nonoverlapping(text.as_ptr(), p, n);
+                *p.add(n) = 0;
+            }
+            ret_int(m, 0)
+        }
+        // A ThreadId# is the thread's number.
+        "rts_getThreadId" => {
+            let t = int_arg(m, 0)?;
+            ret_int(m, t)
+        }
+        "cmp_thread" => {
+            let (a, b) = (int_arg(m, 0)?, int_arg(m, 1)?);
+            ret_int(m, a.cmp(&b) as i64)
+        }
         "localeEncoding" => {
             // The locale's codeset name, as a C string.
             let bytes = super::prims::bytes_object(m, b"UTF-8");
@@ -271,7 +294,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             ret_int(m, n)
         }
         "stg_sig_install" => ret_int(m, 0),
-        "rts_setMainThread" => {
+        "rts_setMainThread" | "rts_enableThreadAllocationLimit" | "rts_disableThreadAllocationLimit" => {
             let u = unit(m);
             state_pair(m, u)
         }
@@ -430,4 +453,13 @@ fn c_string(p: *mut u8) -> String {
 #[allow(dead_code)]
 fn unused() -> Word {
     con_value as usize as Word
+}
+
+/// The C library's message for an error number (as `strerror`).
+pub fn strerror(e: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(e).to_string();
+    match text.rfind(" (os error ") {
+        Some(i) => text[..i].to_string(),
+        None => text,
+    }
 }

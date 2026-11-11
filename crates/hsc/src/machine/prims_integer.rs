@@ -152,7 +152,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
                 let sign = if bits >> 63 == 1 { -1 } else { 1 };
                 let e = ((bits >> 52) & 0x7ff) as i64;
                 let frac = (bits & ((1u64 << 52) - 1)) as i64;
-                let (mt, ex) = if e == 0 { (frac, -1074) } else { (frac | (1 << 52), e - 1075) };
+                let (mt, ex) = if e == 0 { { let z = (frac as u64).leading_zeros() as i64 - 11; ((frac << z), -1074 - z) } } else { (frac | (1 << 52), e - 1075) };
                 (sign * mt, ex)
             };
             m.reserve(10);
@@ -163,18 +163,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
         "integerEncodeDouble" => {
             let a = big(m, 0)?;
             let e = int_of_arg(m, 1)?;
-            // Scaled in steps, so that the power of two does not overflow or underflow on its own.
-            let mut x = a.to_f64();
-            let mut k = e;
-            while k > 1000 {
-                x *= 2f64.powi(1000);
-                k -= 1000;
-            }
-            while k < -1000 {
-                x *= 2f64.powi(-1000);
-                k += 1000;
-            }
-            x *= 2f64.powi(k as i32);
+            let x = crate::interp::bigint::ldexp(a.to_f64(), e);
             super::prims_num::double_value(m, x)
         }
         _ => return None,

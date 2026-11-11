@@ -123,7 +123,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             // SAFETY: the slice is a live buffer borrowed for the call; the kernel reads at most n bytes.
             let r = unsafe { write(fd, data[start..end].as_ptr(), end - start) };
             if r < 0 {
-                return ret_int(-errno());
+                return ret_int(-1);
             }
             ret_int(r as i64)
         })(),
@@ -137,7 +137,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             // SAFETY: the slice is a live buffer borrowed mutably for the call; the kernel writes at most n bytes.
             let r = unsafe { read(fd, data[start..end].as_mut_ptr(), end - start) };
             if r < 0 {
-                return ret_int(-errno());
+                return ret_int(-1);
             }
             ret_int(r as i64)
         })(),
@@ -252,7 +252,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             // SAFETY: bytes is NUL-terminated and lives for the call.
             let fd = unsafe { open(bytes.as_ptr(), flags, mode) };
             if fd < 0 {
-                return ret_int(-errno());
+                return ret_int(-1);
             }
             ret_int(fd as i64)
         })(),
@@ -272,7 +272,10 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
                 }
             };
             let Ok(meta) = meta else {
-                return ret_int(-errno_or(libc_enoent()));
+                let e = errno_or(libc_enoent());
+                // SAFETY: __errno_location returns this thread's errno cell.
+                unsafe { *__errno_location() = e as i32 };
+                return ret_int(-1);
             };
             use std::os::unix::fs::MetadataExt;
             let (buf, off) = addr_of(rt, &args[1])?;
@@ -338,7 +341,18 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             let n = data[off..].iter().take_while(|&&b| b != 0).count();
             ret_int(n as i64)
         })(),
-        "rtsSupportsBoundThreads" => ret_int(0),
+        "rtsSupportsBoundThreads" | "rts_isThreaded" => ret_int(0),
+        "base_strerror_r" => (|| {
+            let e = int_of(rt, &args[0])? as i32;
+            let (buf, off) = addr_of(rt, &args[1])?;
+            let len = int_of(rt, &args[2])?.max(0) as usize;
+            let text = crate::machine::prims_ffi::strerror(e);
+            let mut data = buf.borrow_mut();
+            let n = text.len().min(len.saturating_sub(1)).min(data.len().saturating_sub(off + 1));
+            data[off..off + n].copy_from_slice(&text.as_bytes()[..n]);
+            data[off + n] = 0;
+            ret_int(0)
+        })(),
         // A ThreadId# is the thread's number.
         "rts_getThreadId" => int_of(rt, &args[0]).and_then(ret_int),
         "cmp_thread" => (|| {

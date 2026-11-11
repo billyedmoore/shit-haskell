@@ -515,7 +515,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 let sign = if bits >> 63 == 1 { -1 } else { 1 };
                 let exp = ((bits >> 52) & 0x7ff) as i64;
                 let frac = (bits & ((1u64 << 52) - 1)) as i64;
-                let (mant, e) = if exp == 0 { (frac, -1074) } else { (frac | (1 << 52), exp - 1075) };
+                let (mant, e) = if exp == 0 { { let z = (frac as u64).leading_zeros() as i64 - 11; ((frac << z), -1074 - z) } } else { (frac | (1 << 52), exp - 1075) };
                 (sign * mant, e)
             };
             Ok(con_value("Builtin.(,)", vec![integer_con(BigInt::from_i64(m)), Value::Int(e)]))
@@ -523,7 +523,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         "integerEncodeDouble" => {
             let m = integer(rt, &args[0])?.to_f64();
             let e = int(rt, &args[1])?;
-            Ok(Value::Double(m * 2f64.powi(e.clamp(-2000, 2000) as i32)))
+            Ok(Value::Double(super::bigint::ldexp(m, e)))
         }
         "bigNatIndex" => {
             let b = integer(rt, &args[0])?;
@@ -886,7 +886,7 @@ pub fn double_to_ratio(x: f64, ratio: &'static str) -> Value {
     let bits = x.to_bits();
     let exp_bits = ((bits >> 52) & 0x7ff) as i64;
     let frac = bits & ((1u64 << 52) - 1);
-    let (mant, exp) = if exp_bits == 0 { (frac, -1074) } else { (frac | (1u64 << 52), exp_bits - 1075) };
+    let (mant, exp) = if exp_bits == 0 { { let z = (frac as u64).leading_zeros() as i64 - 11; ((frac << z), -1074 - z) } } else { (frac | (1u64 << 52), exp_bits - 1075) };
     let mut num = BigInt::from_u64(mant);
     let mut den = BigInt::from_i64(1);
     if exp >= 0 {

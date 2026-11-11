@@ -85,8 +85,46 @@ fn decode_double(x: f64) -> (i64, i64) {
     let sign = if bits >> 63 == 1 { -1i64 } else { 1 };
     let exp = ((bits >> 52) & 0x7ff) as i64;
     let frac = (bits & ((1u64 << 52) - 1)) as i64;
-    let (m, e) = if exp == 0 { (frac, -1074) } else { (frac | (1 << 52), exp - 1075) };
+    let (m, e) = if exp == 0 { { let z = (frac as u64).leading_zeros() as i64 - 11; ((frac << z), -1074 - z) } } else { (frac | (1 << 52), exp - 1075) };
     (sign * m, e)
+}
+
+extern "C" {
+    fn asinh(x: f64) -> f64;
+    fn acosh(x: f64) -> f64;
+    fn atanh(x: f64) -> f64;
+}
+
+/// The C library's inverse hyperbolic functions, which GHC calls (Rust's own differ in the last bit).
+pub(crate) fn libm(name: &str, x: f64) -> f64 {
+    // SAFETY: pure functions of a double.
+    unsafe {
+        match name {
+            "asinh" => asinh(x),
+            "acosh" => acosh(x),
+            _ => atanh(x),
+        }
+    }
+}
+
+/// The bit counts, byte swaps and bit reversals of the sized words (`popCnt32#` and the like).
+pub(crate) fn bit_op(name: &str, a: u64) -> Option<i64> {
+    let (op, w) = name.strip_suffix('#').and_then(|s| {
+        let i = s.find(|c: char| c.is_ascii_digit())?;
+        Some((&s[..i], s[i..].parse::<u32>().ok()?))
+    })?;
+    if ![8, 16, 32].contains(&w) && !(op == "bitReverse" && w == 64) {
+        return None;
+    }
+    let x = if w == 64 { a } else { a & ((1u64 << w) - 1) };
+    Some(match op {
+        "popCnt" => x.count_ones() as i64,
+        "clz" => (x.leading_zeros() - (64 - w)) as i64,
+        "ctz" => x.trailing_zeros().min(w) as i64,
+        "byteSwap" if w >= 16 => (x.swap_bytes() >> (64 - w)) as i64,
+        "bitReverse" => (x.reverse_bits() >> (64 - w)) as i64,
+        _ => return None,
+    })
 }
 
 /// The Int64#, Word64# and sized (Int8# .. Word32#) operations: each is an Int# or Word# operation, with
@@ -163,6 +201,21 @@ pub(crate) fn sized_alias(name: &str) -> Option<(&'static str, Option<&'static s
                     let b = if ty == "Int" { base } else { match base { "==#" => "eqWord#", "/=#" => "neWord#", "<#" => "ltWord#", "<=#" => "leWord#", ">#" => "gtWord#", _ => "geWord#" } };
                     return Some((b, None));
                 }
+            }
+        }
+    }
+    // Bitwise operations and shifts on the sized words and ints.
+    for (op, base) in [("and", "and#"), ("or", "or#"), ("xor", "xor#"), ("not", "not#"), ("uncheckedShiftL", "uncheckedShiftL#"), ("uncheckedShiftRL", "uncheckedShiftRL#")] {
+        for w in ["8", "16", "32"] {
+            if stem == format!("{op}Word{w}") {
+                return Some((base, wwidth(w)));
+            }
+        }
+    }
+    for (op, base) in [("uncheckedShiftL", "uncheckedIShiftL#"), ("uncheckedShiftRA", "uncheckedIShiftRA#")] {
+        for w in ["8", "16", "32"] {
+            if stem == format!("{op}Int{w}") {
+                return Some((base, width(w)));
             }
         }
     }
@@ -270,10 +323,12 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "leWord#" => word(rt, &args[0]).and_then(|a| Ok(b(a <= word(rt, &args[1])?))),
         "gtWord#" => word(rt, &args[0]).and_then(|a| Ok(b(a > word(rt, &args[1])?))),
         "geWord#" => word(rt, &args[0]).and_then(|a| Ok(b(a >= word(rt, &args[1])?))),
+        n if bit_op(n, 0).is_some() => word(rt, &args[0]).map(|a| Value::Int(bit_op(n, a).unwrap_or(0))),
         "popCnt#" | "popCnt64#" => word(rt, &args[0]).map(|a| Value::Int(a.count_ones() as i64)),
         "clz#" | "clz64#" => word(rt, &args[0]).map(|a| Value::Int(a.leading_zeros() as i64)),
         "ctz#" | "ctz64#" => word(rt, &args[0]).map(|a| Value::Int(a.trailing_zeros() as i64)),
         "byteSwap#" | "byteSwap64#" => word(rt, &args[0]).map(|a| Value::Int(a.swap_bytes() as i64)),
+        "bitReverse#" => word(rt, &args[0]).map(|a| Value::Int(a.reverse_bits() as i64)),
 
         // ----- Char# -----
         "eqChar#" => chr_of(rt, &args[0]).and_then(|a| Ok(b(a == chr_of(rt, &args[1])?))),
@@ -319,9 +374,9 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "sinhDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(a.sinh())),
         "coshDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(a.cosh())),
         "tanhDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(a.tanh())),
-        "asinhDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(a.asinh())),
-        "acoshDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(a.acosh())),
-        "atanhDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(a.atanh())),
+        "asinhDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(libm(stringify!(asinh), a))),
+        "acoshDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(libm(stringify!(acosh), a))),
+        "atanhDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(libm(stringify!(atanh), a))),
         "double2Float#" => dbl(rt, &args[0]).map(|a| f32v(a as f32)),
         "float2Double#" => dbl(rt, &args[0]).map(Value::Double),
         // decodeFloat_Int# x: the single-precision mantissa (24 bits with the implicit bit) and exponent.
@@ -334,7 +389,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
                 let sign: i64 = if bits >> 31 == 1 { -1 } else { 1 };
                 let exp = ((bits >> 23) & 0xff) as i64;
                 let frac = (bits & ((1u32 << 23) - 1)) as i64;
-                let (mant, e) = if exp == 0 { (frac, -149) } else { (frac | (1 << 23), exp - 150) };
+                let (mant, e) = if exp == 0 { { let z = (frac as u32).leading_zeros() as i64 - 8; (frac << z, -149 - z) } } else { (frac | (1 << 23), exp - 150) };
                 (sign * mant, e)
             };
             con_value("Builtin.(,)", vec![Value::Int(m), Value::Int(e)])

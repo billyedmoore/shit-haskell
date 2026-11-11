@@ -1,0 +1,28 @@
+import Numeric
+import Data.Char (intToDigit)
+import Data.Ratio
+
+main :: IO ()
+main = do
+  putStrLn (showHex (255 :: Int) "" ++ " " ++ showOct (64 :: Int) "" ++ " " ++ showIntAtBase 2 intToDigit (37 :: Int) "")
+  putStrLn (showFFloat (Just 3) (3.14159 :: Double) "" ++ " " ++ showEFloat (Just 2) (12345.678 :: Double) "" ++ " " ++ showGFloat (Just 2) (0.01 :: Double) "")
+  putStrLn (showFFloat Nothing (1.0e-2 :: Double) "" ++ " " ++ showFFloat (Just 0) (2.5 :: Double) "" ++ " " ++ showFFloat (Just 1) (-0.05 :: Double) "")
+  print (fst (head (readHex "ff" :: [(Int, String)])), fst (head (readOct "777" :: [(Int, String)])), fst (head (readDec "42abc" :: [(Int, String)])))
+  print (fst (head (readFloat "2.5e3" :: [(Double, String)])), readSigned readDec "-17 rest" :: [(Int, String)])
+  print (1 / 0 :: Double, -1 / 0 :: Double, isNaN (0 / 0 :: Double), 0.1 + 0.2 :: Double, 1e-4 :: Double, 1.0e7 :: Double, 12345678.9 :: Double, 0.1 :: Double)
+  print (5.0e-324 :: Double, 1.7976931348623157e308 :: Double, 2 / 3 :: Double, 100 :: Double, 1.0e-2 :: Double, 123456.789 :: Double)
+  print (3.0e-2 :: Float, 1 / 3 :: Float, 16777216 :: Float, 1.0e10 :: Float, sqrt 2 :: Float, realToFrac (1 / 3 :: Float) :: Double)
+  print (floatDigits (1 :: Double), floatRadix (1 :: Double), floatRange (1 :: Double), decodeFloat (1.5 :: Double), significand (8 :: Double), exponent (8 :: Double))
+  print (encodeFloat 3 4 :: Double, scaleFloat 3 (1.5 :: Double), isInfinite (1e308 * 10 :: Double), isNegativeZero (-0.0 :: Double), isDenormalized (5.0e-324 :: Double))
+  print (truncate (-3.7 :: Double) :: Int, round (2.5 :: Double) :: Int, round (3.5 :: Double) :: Int, round (-2.5 :: Double) :: Int, ceiling (2.1 :: Double) :: Int, floor (-2.1 :: Double) :: Int)
+  print (properFraction (3.75 :: Double) :: (Int, Double), properFraction (-3.75 :: Double) :: (Int, Double))
+  print (3 % 4 + 1 % 4 :: Rational, numerator (6 % 8), denominator (6 % 8 :: Rational), recip (3 % 7 :: Rational), truncate (7 % 2 :: Rational) :: Int)
+  print (fromRational (1 % 3) :: Double, toRational (0.125 :: Double), approxRational (3.14159 :: Double) 0.001)
+  print (pi :: Double, exp 1 :: Double, log 10 :: Double, sin 1 :: Double, cos 1 :: Double, tan 1 :: Double, atan2 1 2 :: Double)
+  print (sqrt 2 :: Double, 2 ** 0.5 :: Double, logBase 2 1024 :: Double, asin 0.5 :: Double, acos 0.5 :: Double, atan 1 :: Double)
+  print (sinh 1 :: Double, cosh 1 :: Double, tanh 1 :: Double, asinh 1 :: Double, acosh 2 :: Double, atanh 0.5 :: Double)
+  print (2 ^ (10 :: Int) :: Int, 2 ^^ (-3 :: Int) :: Double, 10 ^ (18 :: Int) :: Int, (-2) ^ (3 :: Int) :: Int, 1.5 ^ (3 :: Int) :: Double)
+  print (minimum [2.5, 1.5, 3 :: Double], maximum [1 / 0, 3 :: Double], sum [0.1, 0.2, 0.3 :: Double], product [1.5, 2, 4 :: Double])
+  print (read "3.5" :: Double, read "1e3" :: Double, read "  42  " :: Int, read "-7" :: Int, read "0x1F" :: Int, (read "[1.5,2]" :: [Double]))
+  print (fromIntegral (3 :: Int) / 2 :: Double, realToFrac (1.5 :: Double) :: Float, fromEnum (3.7 :: Double), toEnum 65 :: Char, [1.0, 1.5 .. 3.0 :: Double])
+  print (show (-5 :: Int), showsPrec 11 (-5 :: Int) "", showsPrec 11 (-1.5 :: Double) "", show (Just (-2.0 :: Double)), show [Just 1.0e-3, Nothing :: Maybe Double])

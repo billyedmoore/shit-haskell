@@ -168,6 +168,18 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let Some(x) = d(m, 0) else { return Some(0) };
             int(m, x as i64)
         }
+        n if crate::interp::prims_ghc::bit_op(n, 0).is_some() => {
+            let Some(a) = w(m, 0) else { return Some(0) };
+            int(m, crate::interp::prims_ghc::bit_op(n, a).unwrap_or(0))
+        }
+        "bitReverse#" => {
+            let Some(a) = w(m, 0) else { return Some(0) };
+            int(m, a.reverse_bits() as i64)
+        }
+        "byteSwap#" | "byteSwap64#" => {
+            let Some(a) = w(m, 0) else { return Some(0) };
+            int(m, a.swap_bytes() as i64)
+        }
         "popCnt#" | "popCnt64#" => {
             let Some(a) = w(m, 0) else { return Some(0) };
             int(m, a.count_ones() as i64)
@@ -281,9 +293,9 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
                 "sinh" => x.sinh(),
                 "cosh" => x.cosh(),
                 "tanh" => x.tanh(),
-                "asinh" => x.asinh(),
-                "acosh" => x.acosh(),
-                "atanh" => x.atanh(),
+                "asinh" => crate::interp::prims_ghc::libm("asinh", x),
+                "acosh" => crate::interp::prims_ghc::libm("acosh", x),
+                "atanh" => crate::interp::prims_ghc::libm("atanh", x),
                 "float2Double" => x,
                 "double2Float" => x as f32 as f64,
                 _ => x,
@@ -299,7 +311,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
                 let sign = if bits >> 63 == 1 { -1 } else { 1 };
                 let e = ((bits >> 52) & 0x7ff) as i64;
                 let frac = (bits & ((1u64 << 52) - 1)) as i64;
-                let (mt, ex) = if e == 0 { (frac, -1074) } else { (frac | (1 << 52), e - 1075) };
+                let (mt, ex) = if e == 0 { { let z = (frac as u64).leading_zeros() as i64 - 11; ((frac << z), -1074 - z) } } else { (frac | (1 << 52), e - 1075) };
                 (sign * mt, ex)
             };
             m.reserve(7);
@@ -317,7 +329,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
                 let sign: i64 = if bits >> 31 == 1 { -1 } else { 1 };
                 let e = ((bits >> 23) & 0xff) as i64;
                 let frac = (bits & ((1u32 << 23) - 1)) as i64;
-                let (mt, ex) = if e == 0 { (frac, -149) } else { (frac | (1 << 23), e - 150) };
+                let (mt, ex) = if e == 0 { { let z = (frac as u32).leading_zeros() as i64 - 8; (frac << z, -149 - z) } } else { (frac | (1 << 23), e - 150) };
                 (sign * mt, ex)
             };
             m.reserve(7);

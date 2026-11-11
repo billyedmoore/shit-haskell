@@ -525,3 +525,40 @@ mod bit_tests {
         assert!(test_bit(&BigInt::from_i64(4), 2));
     }
 }
+
+/// `x * 2^e`, rounded once (to nearest, ties to even), as C's `ldexp`.
+pub fn ldexp(x: f64, e: i64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let bits = x.to_bits();
+    let neg = bits >> 63 == 1;
+    let exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    // x = m * 2^q with m an integer below 2^53.
+    let (m, q) = if exp == 0 { (frac, -1074) } else { (frac | (1 << 52), exp - 1075) };
+    // Normalise m to exactly 53 bits.
+    let shift = m.leading_zeros() as i64 - 11;
+    let (m, q) = (m << shift, q - shift);
+    let q = q.saturating_add(e.clamp(-1 << 20, 1 << 20));
+    // The biased exponent of the result if normal: m * 2^q = 1.f * 2^(q + 52).
+    let biased = q + 52 + 1023;
+    let out = if biased >= 0x7ff {
+        f64::INFINITY.to_bits()
+    } else if biased >= 1 {
+        ((biased as u64) << 52) | (m & ((1u64 << 52) - 1))
+    } else {
+        // Subnormal: the mantissa is m * 2^(q + 1074), rounded to nearest even.
+        let drop = -(q + 1074);
+        if drop > 54 {
+            0
+        } else {
+            let kept = m >> drop;
+            let rest = m & ((1u64 << drop) - 1);
+            let half = 1u64 << (drop - 1);
+            // A carry out of the fraction field makes the smallest normal number, as it should.
+            if rest > half || (rest == half && kept & 1 == 1) { kept + 1 } else { kept }
+        }
+    };
+    f64::from_bits(out | ((neg as u64) << 63))
+}
