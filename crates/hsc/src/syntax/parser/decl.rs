@@ -1087,8 +1087,23 @@ impl Parser {
         self.value_decl()
     }
 
+    /// `instance forall a b. C a => ..`: the explicit binders of an instance head (its variables
+    /// are implicitly bound anyway).
+    fn skip_instance_forall(&mut self) {
+        if self.at_varid("forall") {
+            self.bump();
+            while self.real() && !self.at_varsym(".") && !self.at_eof() {
+                self.bump();
+            }
+            if self.at_varsym(".") {
+                self.bump();
+            }
+        }
+    }
+
     fn instance_decl(&mut self, loc: Loc) -> PResult<Decl> {
         self.expect_kw(Kw::Instance)?;
+        self.skip_instance_forall();
         let context = self.try_context();
         let head = self.btype()?;
         let decls = if self.at_kw(Kw::Where) {
@@ -1110,6 +1125,7 @@ impl Parser {
         self.expect_kw(Kw::Deriving)?;
         let strategy = self.deriving_strategy();
         self.expect_kw(Kw::Instance)?;
+        self.skip_instance_forall();
         let context = self.try_context();
         let head = self.btype()?;
         Ok(Decl::Deriving(StandaloneDeriving {

@@ -48,6 +48,11 @@ pub const DATA_TO_TAG_CLASS: &str = "GHC.Magic.DataToTag";
 /// The class of `withDict`: `WithDict cls meth`, solved by the compiler (GHC.Magic.Dict).
 pub const WITH_DICT_CLASS: &str = "GHC.Magic.Dict.WithDict";
 
+/// The pseudo-class of a quantified constraint (`forall x. ctx => C t`): its one argument is the
+/// polymorphic type `Ty::Forall(xs, ctx, C t)`. Its evidence is a function from the dictionaries of
+/// `ctx` to the dictionary of `C t`.
+pub const QUANTIFIED_CLASS: &str = "%quantified";
+
 /// The class `Typeable`, whose instances the compiler builds.
 pub const TYPEABLE_CLASS: &str = "GHC.Internal.Data.Typeable.Internal.Typeable";
 
@@ -196,6 +201,26 @@ impl Checker {
     /// that still mention unsolved unification variables.
     pub fn solve(&mut self, wanteds: Vec<Wanted>) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
         self.retry_deferred()?;
+        let mut binds = Vec::new();
+        let mut pending = wanteds;
+        // Constraints set aside on unknown types are tried again when solving others (a fundep
+        // improvement, an equality) has made their types known.
+        for _round in 0..64 {
+            let before: Vec<Pred> = pending.iter().map(|w| self.metas_zonk_pred(&w.pred)).collect();
+            let (b, residual) = self.solve_round(std::mem::take(&mut pending))?;
+            binds.extend(b);
+            let progressed = residual.len() != before.len()
+                || residual.iter().zip(&before).any(|(w, p)| self.metas_zonk_pred(&w.pred) != *p);
+            pending = residual;
+            if pending.is_empty() || !progressed {
+                break;
+            }
+        }
+        Ok((binds, pending))
+    }
+
+    /// One pass of the solver over a list of wanteds.
+    fn solve_round(&mut self, wanteds: Vec<Wanted>) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
         let mut work = wanteds;
         let mut binds = Vec::new();
         let mut residual = Vec::new();
@@ -281,8 +306,29 @@ impl Checker {
                 }
                 continue;
             }
+            // A wanted quantified constraint: its head is solved under rigid variables, with its
+            // context as givens.
+            if pred.class == QUANTIFIED_CLASS {
+                let ev = self.solve_quantified(&pred, w.loc)?;
+                binds.push((w.ev.clone(), ev));
+                continue;
+            }
             if let Some(ev) = self.find_given(&pred) {
                 binds.push((w.ev.clone(), ev));
+                continue;
+            }
+            // A quantified given whose head (or a superclass of it) matches: a local instance.
+            if let Some((ev, ctx)) = self.find_quantified_given(&pred) {
+                let mut core = ev;
+                let mut evs = Vec::new();
+                for p in ctx {
+                    let e = self.fresh_name("qd");
+                    evs.push(e.clone());
+                    work.push(Wanted { pred: p, ev: e, loc: w.loc });
+                }
+                // The context's dictionaries go to the given; the superclass selection follows.
+                core = core_apply_base(core, &evs);
+                binds.push((w.ev.clone(), core));
                 continue;
             }
             match self.find_instance(&pred) {
@@ -380,6 +426,98 @@ impl Checker {
         !out.is_empty()
     }
 
+    /// Solves a wanted quantified constraint: the evidence is `\ctx-dicts -> evidence of the head`,
+    /// the head solved with fresh rigid variables and the context as givens.
+    fn solve_quantified(&mut self, pred: &Pred, loc: crate::syntax::ast::Loc) -> TR<Core> {
+        let Ty::Forall(ids, ctx, head) = self.metas.zonk(&pred.args[0]) else {
+            return self.err("internal: malformed quantified constraint");
+        };
+        let sk: Vec<Ty> = ids.iter().map(|_| self.metas.fresh_skolem("q")).collect();
+        let ctx: Vec<Pred> = ctx.iter().map(|p| super::types::subst_bound_pred(p, &ids, &sk)).collect();
+        let head = super::types::subst_bound(&head, &ids, &sk);
+        let (h, hargs) = head.split_apps();
+        let Ty::Con(class) = h else { return self.err("internal: malformed quantified constraint head") };
+        let head_pred = Pred { class: class.clone(), args: hargs.into_iter().cloned().collect() };
+        let params: Vec<String> = ctx.iter().map(|_| self.fresh_name("qg")).collect();
+        let mark = self.givens.len();
+        for (p, d) in ctx.iter().zip(&params) {
+            self.add_given(Given { pred: p.clone(), ev: Core::Var(d.clone()) });
+        }
+        let ev = self.fresh_name("qh");
+        let r = self.solve(vec![Wanted { pred: head_pred.clone(), ev: ev.clone(), loc }]);
+        self.givens.truncate(mark);
+        let (binds, residual) = r?;
+        if !residual.is_empty() {
+            let msg = format!("Could not deduce ({}) for a quantified constraint", self.show_pred(&head_pred));
+            return Err(super::TcError { loc, msg });
+        }
+        let body = Core::Let(binds, Box::new(Core::Var(ev)));
+        Ok(params.into_iter().rev().fold(body, |acc, d| Core::Lam(d, Box::new(acc))))
+    }
+
+    /// A quantified given that provides a predicate: the given's evidence with the superclass
+    /// selections to apply after its context's dictionaries (see `core_apply_base`), and that
+    /// context instantiated for the match.
+    fn find_quantified_given(&self, want: &Pred) -> Option<(Core, Vec<Pred>)> {
+        for g in self.givens.iter().rev() {
+            if g.pred.class != QUANTIFIED_CLASS {
+                continue;
+            }
+            let Ty::Forall(ids, ctx, head) = self.metas.zonk(&g.pred.args[0]) else { continue };
+            let gens: Vec<Ty> = (0..ids.len()).map(|k| Ty::Gen(k as u32)).collect();
+            let head = super::types::subst_bound(&head, &ids, &gens);
+            let (h, hargs) = head.split_apps();
+            let Ty::Con(class) = h else { continue };
+            let have = Pred { class: class.clone(), args: hargs.into_iter().cloned().collect() };
+            let mut path: Vec<(String, usize, usize)> = Vec::new();
+            if let Some(sub) = self.quantified_match(&have, want, ids.len(), &mut path, 0) {
+                let inst: Vec<Ty> = sub.into_iter().map(|s| s.unwrap_or(Ty::con("Builtin.()"))).collect();
+                let ctx: Vec<Pred> = ctx
+                    .iter()
+                    .map(|p| super::types::subst_gen_pred(&super::types::subst_bound_pred(p, &ids, &gens), &inst))
+                    .collect();
+                // The evidence: the given applied to the context (done by the caller), then the
+                // superclass selections of the path, outermost first.
+                let mut core = Core::Var(QUANTIFIED_BASE.into());
+                let mut counter = 0usize;
+                for (con, n, i) in path {
+                    let mut fresh = || {
+                        counter += 1;
+                        format!("qs%{counter}")
+                    };
+                    core = select_field(core, &con, n, i, &mut fresh);
+                }
+                return Some((core_with_base(core, g.ev.clone()), ctx));
+            }
+        }
+        None
+    }
+
+    /// Matches a pattern predicate (its quantified variables are `Gen`s) or one of its superclasses
+    /// against a wanted one; records the superclass path taken.
+    fn quantified_match(&self, have: &Pred, want: &Pred, nvars: usize, path: &mut Vec<(String, usize, usize)>, depth: usize) -> Option<Vec<Option<Ty>>> {
+        if have.class == want.class && have.args.len() == want.args.len() {
+            let mut sub: Vec<Option<Ty>> = vec![None; nvars];
+            if have.args.iter().zip(&want.args).all(|(p, t)| self.match_ty(p, &self.metas.zonk(t), &mut sub)) {
+                return Some(sub);
+            }
+        }
+        if depth > 8 {
+            return None;
+        }
+        let info = self.class(&have.class)?;
+        let n = info.nsupers() + info.methods.len();
+        for (i, sup) in info.supers.iter().enumerate() {
+            let sup_pred = Pred { class: sup.class.clone(), args: sup.args.iter().map(|t| subst_gen(t, &have.args)).collect() };
+            path.push((info.dict_con.clone(), n, i));
+            if let Some(sub) = self.quantified_match(&sup_pred, want, nvars, path, depth + 1) {
+                return Some(sub);
+            }
+            path.pop();
+        }
+        None
+    }
+
     /// Searches the givens and their superclass closures for an exact match.
     pub fn find_given(&self, want: &Pred) -> Option<Core> {
         for g in self.givens.iter().rev() {
@@ -463,6 +601,8 @@ impl Checker {
             }
             (Ty::Con(a), Ty::Con(b)) => a == b,
             (Ty::App(f1, a1), Ty::App(f2, a2)) => self.match_ty(f1, f2, sub) && self.match_ty(a1, a2, sub),
+            // A rigid variable (in a quantified given's head) matches only itself.
+            (Ty::Skol(..), _) => pat == t,
             _ => false,
         }
     }
@@ -561,5 +701,26 @@ impl Checker {
     /// A given with no Core evidence available yet, used for skolemised signatures.
     pub fn given(&mut self, pred: Pred, ev: Core) {
         self.add_given(Given { pred, ev });
+    }
+}
+
+/// The placeholder for a quantified given's evidence applied to its context, inside the superclass
+/// selections built by `find_quantified_given`.
+const QUANTIFIED_BASE: &str = "%qbase";
+
+/// The selections over the placeholder, with the given's evidence recorded beside them.
+fn core_with_base(sel: Core, given: Core) -> Core {
+    Core::Let(vec![(QUANTIFIED_BASE.into(), given)], Box::new(sel))
+}
+
+/// Applies the given's evidence (recorded by `core_with_base`) to the context dictionaries.
+fn core_apply_base(core: Core, ctx_evs: &[String]) -> Core {
+    match core {
+        Core::Let(mut bs, body) if bs.len() == 1 && bs[0].0 == QUANTIFIED_BASE => {
+            let (name, given) = bs.remove(0);
+            let applied = ctx_evs.iter().fold(given, |f, e| Core::App(Box::new(f), Box::new(Core::Var(e.clone()))));
+            Core::Let(vec![(name, applied)], body)
+        }
+        other => other,
     }
 }

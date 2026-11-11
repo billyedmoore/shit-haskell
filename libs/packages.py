@@ -43,6 +43,14 @@ PACKAGES = [
      ["-XHaskell2010", "-XNondecreasingIndentation", "-c-source=../cbits/is_ascii.c", "-c-source=../cbits/reverse.c",
       "-c-source=../cbits/utils.c", "-c-source=../cbits/measure_off.c"],
      ["array", "base", "binary", "bytestring", "deepseq", "ghc-prim", "template-haskell"]),
+    ("exceptions", "0.10.9", "hackage/exceptions-0.10.9", ["src", "LICENSE"], ["exceptions/src"], ["-XHaskell2010"],
+     ["base", "mtl", "stm", "template-haskell", "transformers"]),
+    ("os-string", "2.0.7", "hackage/os-string-2.0.7", ["System", "LICENSE"], ["os-string"], ["-XHaskell2010"],
+     ["base", "bytestring", "deepseq", "exceptions", "template-haskell"]),
+    ("filepath", "1.5.4.0", "hackage/filepath-1.5.4.0", ["System", "LICENSE"], ["filepath"], ["-XHaskell2010"],
+     ["base", "bytestring", "deepseq", "exceptions", "os-string", "template-haskell"]),
+    ("parsec", "3.1.18.0", "hackage/parsec-3.1.18.0", ["src", "LICENSE"], ["parsec/src"], ["-XHaskell2010"],
+     ["base", "bytestring", "mtl", "text"]),
 ]
 
 def vendor():

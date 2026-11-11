@@ -142,13 +142,27 @@ impl Extensions {
             }
             _ => {}
         }
-        let (enable, name) = match item.strip_prefix("No") {
-            Some(rest) if KNOWN.contains(&rest) => (false, rest),
-            _ => (true, item),
+        // Old names of extensions.
+        let canonical = |n: &str| -> String {
+            match n {
+                "PolymorphicComponents" | "Rank2Types" => "RankNTypes".into(),
+                "GeneralisedNewtypeDeriving" => "GeneralizedNewtypeDeriving".into(),
+                "RecordPuns" => "NamedFieldPuns".into(),
+                "PatternSignatures" => "ScopedTypeVariables".into(),
+                "AutoDeriveTypeable" | "NullaryTypeClasses" => "MultiParamTypeClasses".into(),
+                other => other.to_string(),
+            }
         };
-        if !KNOWN.contains(&name) {
+        let known = |n: &str| KNOWN.contains(&n) || supported_languages().iter().any(|l| l == n);
+        let (enable, name) = match item.strip_prefix("No") {
+            Some(rest) if known(&canonical(rest)) => (false, canonical(rest)),
+            _ => (true, canonical(item)),
+        };
+        // An extension GHC has is accepted, whether or not this compiler does anything with it.
+        if !known(&name) {
             return Err(format!("Unsupported extension: {item}"));
         }
+        let name = name.as_str();
         if enable {
             self.on.insert(name.to_string());
             for implied in implied_by(name) {

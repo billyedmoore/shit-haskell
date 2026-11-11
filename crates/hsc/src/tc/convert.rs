@@ -125,10 +125,15 @@ impl Checker {
     /// Converts one item of a context into predicates: a class constraint, an implicit
     /// parameter, or a constraint synonym, which may stand for several.
     pub fn convert_context_item(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Vec<Pred>> {
-        // QuantifiedConstraints are not supported: `forall x. C x` in a context is dropped.
-        if let Type::Forall(_, body) = t {
-            let _ = body;
-            return Ok(Vec::new());
+        // QuantifiedConstraints: `forall x. ctx => C t` in a signature's context is a predicate
+        // holding that polymorphic type (see `solve::QUANTIFIED_CLASS`). Elsewhere (superclasses,
+        // instance and constructor contexts) it is dropped.
+        if let Type::Forall(..) = t {
+            if !self.allow_quantified {
+                return Ok(Vec::new());
+            }
+            let ty = self.convert_type(t, tvs)?;
+            return Ok(vec![Pred { class: super::solve::QUANTIFIED_CLASS.to_string(), args: vec![ty] }]);
         }
         let mut head = t;
         while let Type::App(f, _) = head {
@@ -184,9 +189,15 @@ impl Checker {
                     cur = body;
                 }
                 Type::Qual(ctx, body) => {
-                    for c in ctx {
-                        preds.extend(self.convert_context_item(c, tvs)?);
-                    }
+                    let outer = std::mem::replace(&mut self.allow_quantified, true);
+                    let r: TR<()> = (|| {
+                        for c in ctx {
+                            preds.extend(self.convert_context_item(c, tvs)?);
+                        }
+                        Ok(())
+                    })();
+                    self.allow_quantified = outer;
+                    r?;
                     cur = body;
                 }
                 other => {
