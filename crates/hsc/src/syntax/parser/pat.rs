@@ -31,6 +31,14 @@ impl Parser {
                         }
                         Pat::Con(q, pats, loc)
                     }
+                    // The tuple constructor in prefix form, `(,) a b`: the tuple pattern.
+                    Expr::Tuple(elems, loc) if elems.iter().all(Option::is_none) && elems.len() == args.len() => {
+                        let mut pats = Vec::with_capacity(args.len());
+                        for a in args {
+                            pats.push(self.expr_to_pat(a)?);
+                        }
+                        Pat::Tuple(pats, loc)
+                    }
                     _ => return self.err("parse error in pattern"),
                 }
             }

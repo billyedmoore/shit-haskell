@@ -1323,27 +1323,12 @@ impl Checker {
         if cons.is_empty() {
             return self.err("No constructor has all these fields");
         }
-        // Bind the new values once, outside the case.
-        let mut decls = Vec::new();
-        let mut new_names: Vec<(String, String)> = Vec::new();
-        for (f, v) in fields {
-            let value = match v {
-                Some(x) => x.clone(),
-                None => var(&f.name, loc),
-            };
-            let name = self.fresh_name("upd");
-            decls.push(Decl::Fun {
-                name: name.clone(),
-                clauses: vec![Clause {
-                    pats: vec![],
-                    rhs: plain_rhs(value),
-                    loc,
-                    end: loc,
-                }],
-                loc,
-            });
-            new_names.push((f.name.clone(), name));
-        }
+        // The new values go straight into the constructor applications (only one alternative
+        // runs), so that a field of a rank-N type is checked against its polymorphic type.
+        let new_values: Vec<(String, Expr)> = fields
+            .iter()
+            .map(|(f, v)| (f.name.clone(), v.clone().unwrap_or_else(|| var(&f.name, loc))))
+            .collect();
         let mut alts = Vec::new();
         for con_key in &cons {
             let con = self.env.datacons.get(con_key).cloned().ok_or_else(|| super::TcError {
@@ -1352,9 +1337,9 @@ impl Checker {
             })?;
             let vars: Vec<String> = (0..con.arity).map(|_| self.fresh_name("uf")).collect();
             let mut args: Vec<Expr> = vars.iter().map(|v| var(v, loc)).collect();
-            for (occ, upd) in &new_names {
+            for (occ, value) in &new_values {
                 if let Some(pos) = con.fields.iter().position(|o| o == occ) {
-                    args[pos] = var(upd, loc);
+                    args[pos] = value.clone();
                 }
             }
             let con_expr = Expr::Con(split_qualified(con_key), loc);
@@ -1370,12 +1355,7 @@ impl Checker {
                 loc,
             });
         }
-        let case = Expr::Case(Box::new(e.clone()), alts, loc);
-        Ok(if decls.is_empty() {
-            case
-        } else {
-            Expr::Let(decls, Box::new(case), loc)
-        })
+        Ok(Expr::Case(Box::new(e.clone()), alts, loc))
     }
 
     fn infer_rec_con(&mut self, con: &QName, fields: &[(QName, Option<Expr>)], loc: Loc) -> TR<(Core, Ty)> {
@@ -1407,7 +1387,8 @@ impl Checker {
                 Some(v) => v.clone(),
                 None => var(&f.name, loc),
             };
-            args[pos] = Some(self.check(&value, &arg_tys[pos])?);
+            // A field of a rank-N type is checked like a constructor argument of that type.
+            args[pos] = Some(self.check_arg(&value, &arg_tys[pos])?);
         }
         let core = args.into_iter().enumerate().fold(con_core, |acc, (i, a)| {
             let a = a.unwrap_or_else(|| {

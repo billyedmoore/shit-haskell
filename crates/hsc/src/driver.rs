@@ -77,42 +77,114 @@ pub fn package_flags(dir: &Path) -> Vec<String> {
 }
 
 /// The first line of an interface file written by hsc.
-pub const IFACE_MAGIC: &str = "hsc-interface 1";
+pub const IFACE_MAGIC: &str = "hsc-interface 2";
 
-/// Reads an interface file written by `write_interface`: the module's source and its flags.
+/// The flag that marks a source as already preprocessed (the text an interface carries).
+pub const PREPROCESSED_FLAG: &str = "-hsc-preprocessed";
+
+/// hsc's cache directory for `what` (under `$XDG_CACHE_HOME/hsc` or `~/.cache/hsc`).
+pub fn cache_dir(what: &str) -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("hsc")
+        .join(what)
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    let mut ctx = [0u8; 88];
+    crate::interp::md5::init(&mut ctx);
+    crate::interp::md5::update(&mut ctx, bytes);
+    crate::interp::md5::finish(&mut ctx).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Reads an interface file written by `write_interface`: the module's source and its flags. The
+/// interface carries the module's preprocessed text (and its boot file's), since the package's
+/// build directory is gone once it is installed: the text is put in a cache file named by its
+/// contents, whose path is answered.
 pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut lines = text.lines();
-    if lines.next()? != IFACE_MAGIC {
+    let bytes = std::fs::read(path).ok()?;
+    let mut pos = 0usize;
+    let mut line = |pos: &mut usize| -> Option<String> {
+        let rest = bytes.get(*pos..)?;
+        let end = rest.iter().position(|&b| b == b'\n')?;
+        let l = String::from_utf8_lossy(&rest[..end]).into_owned();
+        *pos += end + 1;
+        Some(l)
+    };
+    if line(&mut pos)? != IFACE_MAGIC {
         return None;
     }
-    let mut source = None;
-    let mut flags = Vec::new();
-    for l in lines {
-        if let Some(v) = l.strip_prefix("source: ") {
+    let (mut module, mut source, mut flags) = (String::new(), None, Vec::new());
+    let (mut text, mut boot): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+    while let Some(l) = line(&mut pos) {
+        if let Some(v) = l.strip_prefix("module: ") {
+            module = v.to_string();
+        } else if let Some(v) = l.strip_prefix("source: ") {
             source = Some(PathBuf::from(v));
         } else if let Some(v) = l.strip_prefix("flag: ") {
             flags.push(v.to_string());
+        } else if let Some(v) = l.strip_prefix("text: ").or_else(|| l.strip_prefix("boot: ")) {
+            let n: usize = v.parse().ok()?;
+            let chunk = bytes.get(pos..pos + n)?.to_vec();
+            pos += n;
+            if l.starts_with("text") { text = Some(chunk) } else { boot = Some(chunk) }
         }
     }
-    Some((source?, flags))
+    let source = source?;
+    let Some(text) = text else { return Some((source, flags)) };
+    // The cached copy keeps the module's file name (so it is found as the module) and extension.
+    let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("hs").to_string();
+    let mut key = text.clone();
+    key.extend_from_slice(boot.as_deref().unwrap_or_default());
+    let dir = cache_dir("ifaces").join(md5_hex(&key));
+    let file = dir.join(format!("{}.{ext}", module.replace('.', "/")));
+    if !file.is_file() {
+        std::fs::create_dir_all(file.parent()?).ok()?;
+        if let Some(b) = &boot {
+            std::fs::write(file.with_extension("hs-boot"), b).ok()?;
+        }
+        // Written beside and renamed, for builds running at once.
+        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, &text).ok()?;
+        std::fs::rename(&tmp, &file).ok()?;
+    }
+    flags.push(PREPROCESSED_FLAG.to_string());
+    Some((file, flags))
 }
 
-/// Writes the interface file of a module of a package being built: hsc compiles programs from
-/// source, so it records where the source is and the flags it is compiled with. The file is left
-/// alone when it already says the same, so that its time stamp shows when the module last changed.
+/// Writes the interface file of a module of a package being built. hsc compiles programs from
+/// source, so the interface holds the module's preprocessed text and the flags it is compiled
+/// with (those of the preprocessor dropped). The file is left alone when it already says the same,
+/// so that its time stamp shows when the module last changed.
 pub fn write_interface(path: &Path, module: &str, source: &Path, flags: &[String]) -> Result<(), String> {
-    let mut text = format!("{IFACE_MAGIC}\nmodule: {module}\nsource: {}\n", source.display());
+    let pre = |p: &Path| -> Result<String, String> {
+        let src = read_source(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        preprocess_if_needed(src, p, flags)
+    };
+    let text = pre(source)?;
+    let boot_path = source.with_extension("hs-boot");
+    let boot = if boot_path.is_file() { Some(pre(&boot_path)?) } else { None };
+    let mut out = format!("{IFACE_MAGIC}\nmodule: {module}\nsource: {}\n", source.display());
     for f in flags {
-        text.push_str(&format!("flag: {f}\n"));
+        let cpp = f == "-cpp" || f == "-XCPP" || f.starts_with("-I") || f.starts_with("-D") || f.starts_with("-U")
+            || f.starts_with("-include=") || f.starts_with("-optP");
+        if !cpp {
+            out.push_str(&format!("flag: {f}\n"));
+        }
     }
-    if std::fs::read_to_string(path).is_ok_and(|t| t == text) {
+    out.push_str(&format!("text: {}\n{text}", text.len()));
+    if let Some(b) = boot {
+        out.push_str(&format!("boot: {}\n{b}", b.len()));
+    }
+    if std::fs::read_to_string(path).is_ok_and(|t| t == out) {
         return Ok(());
     }
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+    std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The default library directory: `libs/` at the project root.
@@ -432,7 +504,7 @@ pub fn read_source(path: &Path) -> std::io::Result<String> {
 /// Runs the C preprocessor on a source when its `CPP` extension is on. Includes are searched
 /// in the source's directory and then in the library's `include/` directory.
 pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Result<String, String> {
-    if !crate::syntax::cpp::wants_cpp(&src, flags) {
+    if flags.iter().any(|f| f == PREPROCESSED_FLAG) || !crate::syntax::cpp::wants_cpp(&src, flags) {
         return Ok(src);
     }
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();

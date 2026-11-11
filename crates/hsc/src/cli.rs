@@ -446,7 +446,9 @@ fn db_stack(o: &Opts) -> Vec<PathBuf> {
 
 /// The import directories of the packages a compilation can use: the closure of the packages it
 /// names, and every exposed package unless `-hide-all-packages`.
-fn package_dirs(o: &Opts) -> Result<Vec<PathBuf>, String> {
+/// The import directories of the packages in scope, and their include directories (which the C
+/// preprocessor searches, as GHC's does).
+fn package_dirs(o: &Opts) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let stack = pkg::Stack::load(&db_stack(o))?;
     let mut roots: Vec<String> = o.package_ids.clone();
     for n in &o.package_names {
@@ -468,6 +470,7 @@ fn package_dirs(o: &Opts) -> Result<Vec<PathBuf>, String> {
     }
     let pkgs = stack.closure(&roots)?;
     let mut dirs = Vec::new();
+    let mut includes = Vec::new();
     // The packages named directly come before their dependencies in the search.
     for p in pkgs.iter().rev() {
         for d in p.list("import-dirs") {
@@ -476,8 +479,14 @@ fn package_dirs(o: &Opts) -> Result<Vec<PathBuf>, String> {
                 dirs.push(d);
             }
         }
+        for d in p.list("include-dirs") {
+            let d = PathBuf::from(d);
+            if !includes.contains(&d) {
+                includes.push(d);
+            }
+        }
     }
-    Ok(dirs)
+    Ok((dirs, includes))
 }
 
 /// An input that names a source file (rather than a module).
@@ -568,7 +577,17 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
     } else {
         o
     };
-    let pkg_dirs = package_dirs(o)?;
+    let (pkg_dirs, pkg_includes) = package_dirs(o)?;
+    // The packages' include directories come after the command line's.
+    let with_includes;
+    let o = if pkg_includes.is_empty() {
+        o
+    } else {
+        let mut c = o.clone();
+        c.flags.extend(pkg_includes.iter().map(|d| format!("-I{}", d.display())));
+        with_includes = c;
+        &with_includes
+    };
     // The modules to build: the files given, and the modules named (found in the search path).
     let mut targets: Vec<(String, PathBuf)> = Vec::new();
     for inp in &hs_inputs {

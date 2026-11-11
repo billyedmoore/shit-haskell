@@ -99,30 +99,83 @@ impl Checker {
             Some(c) => c.dict_con.clone(),
             None => return Ok(None),
         };
-        let t = pred.args[0].clone();
-        let rep = match self.metas.prune(&t) {
-            Ty::App(f, x) => {
-                let (ef, ex) = (self.fresh_name("tyf"), self.fresh_name("tyx"));
-                work.push(Wanted { pred: Pred { class: TYPEABLE_CLASS.into(), args: vec![*f] }, ev: ef.clone(), loc });
-                work.push(Wanted { pred: Pred { class: TYPEABLE_CLASS.into(), args: vec![*x] }, ev: ex.clone(), loc });
-                let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrApp".into());
-                let rf = self.typeable_rep_of(&ef, &class);
-                let rx = self.typeable_rep_of(&ex, &class);
-                Core::App(Box::new(Core::App(Box::new(mk), Box::new(rf))), Box::new(rx))
+        let t = self.metas.zonk(&pred.args[0]);
+        let (head, args) = t.split_apps();
+        let head = head.clone();
+        let args: Vec<Ty> = args.into_iter().cloned().collect();
+        let mut wanted_rep = |this: &mut Self, ty: Ty, work: &mut Vec<Wanted>| -> Core {
+            let ev = this.fresh_name("tya");
+            work.push(Wanted { pred: Pred { class: TYPEABLE_CLASS.into(), args: vec![ty] }, ev: ev.clone(), loc });
+            this.typeable_rep_of(&ev, &class)
+        };
+        let rep = match &head {
+            // A function type: its own representation.
+            Ty::Con(c) if c == super::types::ARROW && args.len() == 2 => {
+                let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrFun".into());
+                let many = Core::Var("GHC.Internal.Data.Typeable.Internal.trMany".into());
+                let ra = wanted_rep(self, args[0].clone(), work);
+                let rb = wanted_rep(self, args[1].clone(), work);
+                Core::App(Box::new(Core::App(Box::new(Core::App(Box::new(mk), Box::new(many))), Box::new(ra))), Box::new(rb))
             }
+            // A type-level literal (`3`, `"s"`, `'c'`).
+            Ty::Con(c) if c.starts_with('#') && args.is_empty() => {
+                let text = &c[1..];
+                let sort = if text.starts_with('"') { 1 } else if text.starts_with('\'') { 2 } else { 0 };
+                let (s, _) = self.infer(&crate::syntax::ast::Expr::Lit(crate::syntax::ast::Lit::Str(text.to_string()), loc))?;
+                let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTypeableLit#".into());
+                Core::App(Box::new(Core::App(Box::new(mk), Box::new(Core::Lit(crate::core::Lit::Int(sort))))), Box::new(s))
+            }
+            // A constructor applied to arguments: its representation applied to theirs.
             Ty::Con(c) => {
-                let (modl, name) = match c.rfind('.') {
-                    Some(i) if i > 0 && i + 1 < c.len() => (c[..i].to_string(), c[i + 1..].to_string()),
-                    _ => ("Builtin".to_string(), c.clone()),
-                };
+                let (modl, name, arity) = self.typeable_tycon(c);
                 let (m, _) = self.infer(&crate::syntax::ast::Expr::Lit(crate::syntax::ast::Lit::Str(modl), loc))?;
                 let (n, _) = self.infer(&crate::syntax::ast::Expr::Lit(crate::syntax::ast::Lit::Str(name), loc))?;
+                let k = Core::Lit(crate::core::Lit::Int(arity.max(args.len()) as i64));
                 let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTypeableCon#".into());
-                Core::App(Box::new(Core::App(Box::new(mk), Box::new(m))), Box::new(n))
+                let mut rep = Core::App(Box::new(Core::App(Box::new(Core::App(Box::new(mk), Box::new(m))), Box::new(n))), Box::new(k));
+                for a in args {
+                    let ra = wanted_rep(self, a, work);
+                    let app = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrApp".into());
+                    rep = Core::App(Box::new(Core::App(Box::new(app), Box::new(rep))), Box::new(ra));
+                }
+                rep
+            }
+            // A variable applied to arguments: the variable's representation (a given) applied.
+            _ if !args.is_empty() => {
+                let (f, x) = match &t {
+                    Ty::App(f, x) => ((**f).clone(), (**x).clone()),
+                    _ => return Ok(None),
+                };
+                let rf = wanted_rep(self, f, work);
+                let rx = wanted_rep(self, x, work);
+                let app = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrApp".into());
+                Core::App(Box::new(Core::App(Box::new(app), Box::new(rf))), Box::new(rx))
             }
             _ => return Ok(None),
         };
         Ok(Some(Core::Con(class, vec![rep])))
+    }
+
+    /// The module, name and number of parameters of a type constructor, as its `TyCon` has them
+    /// (the built-in syntax named as GHC names it).
+    fn typeable_tycon(&self, c: &str) -> (String, String, usize) {
+        if c == super::types::LIST {
+            return ("GHC.Types".into(), "List".into(), 1);
+        }
+        if let Some(inner) = c.strip_prefix("Builtin.(").and_then(|r| r.strip_suffix(')')) {
+            if inner.is_empty() {
+                return ("GHC.Tuple".into(), "Unit".into(), 0);
+            }
+            if inner.chars().all(|ch| ch == ',') {
+                let n = inner.len() + 1;
+                return ("GHC.Tuple".into(), format!("Tuple{n}"), n);
+            }
+        }
+        let arity = self.env.tycons.get(c).map_or(0, |i| i.arity);
+        match c.rfind('.') {
+            Some(i) if i > 0 && i + 1 < c.len() => (c[..i].to_string(), c[i + 1..].to_string(), arity),
+            _ => ("Builtin".to_string(), c.to_string(), arity),
+        }
     }
 
     /// The call stack of a call to `fname` at `loc`: its frame pushed onto `base`.

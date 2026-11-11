@@ -56,6 +56,9 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
         if std::mem::take(&mut m.prim_failed) {
             return 0;
         }
+        if let Some(a) = crate::ccall::address_import(name) {
+            return super::prims_ffi::address_value(m, a);
+        }
         if let Some(f) = crate::ccall::resolve(name) {
             return super::prims_ffi::generic(m, f, &sig, ret).unwrap_or(0);
         }

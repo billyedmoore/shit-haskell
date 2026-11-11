@@ -111,6 +111,13 @@ fn ret_int(m: &mut Machine, n: i64) -> Word {
 
 /// A C function called by its address with the arguments of a foreign import (see `crate::ccall`).
 /// None when forcing an argument raised.
+/// The answer of an address import: the symbol's address, as a C call would answer a pointer.
+pub fn address_value(m: &mut Machine, a: u64) -> Word {
+    m.reserve(8);
+    let v = addr_result(m, a as *mut u8, &[]);
+    state_pair(m, v)
+}
+
 pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char) -> Option<Word> {
     let mut ints: Vec<u64> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();

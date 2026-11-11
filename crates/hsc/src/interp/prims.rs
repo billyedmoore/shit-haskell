@@ -96,6 +96,9 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         if let Some(r) = super::ffi::call(rt, sym, args) {
             return r;
         }
+        if let Some(a) = crate::ccall::address_import(name) {
+            return Ok(io_result_of(Value::Int(a as i64)));
+        }
         if let Some(f) = crate::ccall::resolve(name) {
             let r = super::ffi::generic(rt, f, sig, ret, args);
             // HSC_TRACE_CCALL: each C call made by name, with its answer.

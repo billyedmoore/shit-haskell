@@ -129,6 +129,10 @@ def write_db():
                 lines.append("    " + ", ".join(mods[i:i + 4]) + ("," if i + 4 < len(mods) else ""))
         if dirs:
             lines.append("import-dirs: " + " ".join("${pkgroot}/" + d for d in dirs))
+        # The package's include directories (its -I flags, relative to its first import directory).
+        incs = [os.path.normpath(os.path.join(dirs[0], f[2:])) for f in flags if f.startswith("-I") and dirs]
+        if incs:
+            lines.append("include-dirs: " + " ".join("${pkgroot}/" + d for d in incs))
         lines.append("depends: " + " ".join(ids[d] for d in deps))
         with open(os.path.join(db, pid + ".conf"), "w") as fh:
             fh.write("\n".join(lines) + "\n")

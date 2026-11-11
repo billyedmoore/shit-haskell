@@ -81,3 +81,7 @@ __attribute__((weak)) uintptr_t __hscore_to_uintptr(void *p) { return (uintptr_t
 __attribute__((weak)) intptr_t __hscore_to_intptr(void *p) { return (intptr_t)p; }
 __attribute__((weak)) void errorBelch2(const char *s, char *t) { fprintf(stderr, s, t); fputc('\n', stderr); }
 __attribute__((weak)) void debugBelch2(const char *s, char *t) { fprintf(stderr, s, t); }
+
+/* The RTS's capability counts (GHC.Conc's getNumCapabilities reads them): one capability. */
+__attribute__((weak)) uint32_t n_capabilities = 1;
+__attribute__((weak)) uint32_t enabled_capabilities = 1;

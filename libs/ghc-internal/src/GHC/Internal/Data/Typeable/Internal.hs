@@ -403,9 +403,19 @@ mkTrType :: TypeRep Type
 mkTrType = TrType
 
 -- | Compiler support: the representation of a type constructor, built by hsc's Typeable
--- solver from the constructor's module and name. Its kind is approximated as Type.
-mkTypeableCon# :: [Char] -> [Char] -> TypeRep a
-mkTypeableCon# modl name = mkTrCon (mkTyCon (packageOfModule modl) modl name 0 (KindRepTYPE (BoxedRep Lifted))) []
+-- solver from the constructor's module, name and number of parameters. Its kind is
+-- approximated as @Type -> .. -> Type@ (a constructor's fingerprint does not depend on it).
+mkTypeableCon# :: [Char] -> [Char] -> Int -> TypeRep a
+mkTypeableCon# modl name arity = mkTrCon (mkTyCon (packageOfModule modl) modl name 0 (arrows arity)) []
+  where
+    star = KindRepTYPE (BoxedRep Lifted)
+    arrows n = if n <= 0 then star else KindRepFun star (arrows (n - 1))
+
+-- | Compiler support: the representation of a type-level literal, from its kind (0 for a
+-- natural number, 1 for a symbol, 2 for a character) and its text as 'show' gives it.
+mkTypeableLit# :: Int -> [Char] -> TypeRep a
+mkTypeableLit# sort text = mkTrCon (mkTypeLitTyCon text kind) []
+  where kind = if sort == 0 then tcNat else if sort == 1 then tcSymbol else tcChar
 
 -- The package a type constructor's module belongs to, as GHC names it in a TyCon.
 packageOfModule :: [Char] -> [Char]

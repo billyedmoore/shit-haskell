@@ -105,6 +105,13 @@ impl Preprocessor {
         self.defs.insert(name.to_string(), Macro::Object(value.to_string()));
     }
 
+    /// Whether a macro is defined: by `#define` or `-D`, or a `MIN_VERSION_<pkg>` of a known package
+    /// (which GHC defines for the packages in scope).
+    fn is_defined(&self, name: &str) -> bool {
+        self.defs.contains_key(name)
+            || name.strip_prefix("MIN_VERSION_").is_some_and(|p| PACKAGE_VERSIONS.iter().any(|(q, _)| *q == p))
+    }
+
     /// Names the file whose text `run` reads next (the expansion of `__FILE__`).
     pub fn set_file(&mut self, file: &str) {
         self.file = file.to_string();
@@ -137,15 +144,17 @@ impl Preprocessor {
             let mut extra = 0;
             let is_directive = line.trim_start().starts_with('#');
             // A macro call may continue on the following lines, until its parentheses close.
-            while i + extra + 1 < lines.len()
-                && (line.ends_with('\\') || (!is_directive && self.open_macro_call(&line)))
-            {
-                if line.ends_with('\\') {
+            // Only a backslash that ends a physical line splices (once): the backslash before it
+            // in `\\` stays, followed by the next line.
+            let mut spliced = lines[i].ends_with('\\');
+            while i + extra + 1 < lines.len() && (spliced || (!is_directive && self.open_macro_call(&line))) {
+                if spliced {
                     line.pop();
                 } else {
                     line.push(' ');
                 }
                 extra += 1;
+                spliced = lines[i + extra].ends_with('\\');
                 // A line comment would swallow the rest of the joined line.
                 line.push_str(strip_line_comment(lines[i + extra]));
             }
@@ -167,11 +176,11 @@ impl Preprocessor {
                             conds.push((on, on, active));
                         }
                         "ifdef" => {
-                            let on = active && self.defs.contains_key(rest.trim());
+                            let on = active && self.is_defined(rest.trim());
                             conds.push((on, on, active));
                         }
                         "ifndef" => {
-                            let on = active && !self.defs.contains_key(rest.trim());
+                            let on = active && !self.is_defined(rest.trim());
                             conds.push((on, on, active));
                         }
                         "elif" => {
@@ -412,7 +421,7 @@ impl Preprocessor {
                             j += 1;
                         }
                     }
-                    with_defined.push_str(if self.defs.contains_key(&name) { " 1 " } else { " 0 " });
+                    with_defined.push_str(if self.is_defined(&name) { " 1 " } else { " 0 " });
                     i = j;
                     continue;
                 }

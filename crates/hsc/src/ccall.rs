@@ -61,6 +61,13 @@ pub fn parse_capi(name: &str) -> Option<Capi<'_>> {
 
 /// The C function a foreign primitive calls: a capi `value` import's wrapper, else the symbol (or,
 /// for a capi import of a macro, its wrapper).
+/// The address an address import (`foreign import ccall "&sym"`) names, if `prim` is one.
+pub fn address_import(prim: &str) -> Option<u64> {
+    let (_, _, sym) = parse(prim)?;
+    let sym = sym.strip_prefix('&')?;
+    lookup(sym.trim()).map(|p| p as u64)
+}
+
 pub fn resolve(prim: &str) -> Option<*mut c_void> {
     if let Some(c) = parse_capi(prim) {
         if c.value {
@@ -136,6 +143,7 @@ pub fn lookup(sym: &str) -> Option<*mut c_void> {
     match sym {
         "getProgArgv" => return Some(get_prog_argv as *mut c_void),
         "setProgArgv" => return Some(set_prog_argv as *mut c_void),
+        "getMonotonicNSec" => return Some(get_monotonic_nsec as *mut c_void),
         _ => {}
     }
     let find = |s: &str| -> Option<*mut c_void> {
@@ -271,4 +279,23 @@ extern "C" fn set_prog_argv(argc: i32, argv: *const *const std::ffi::c_char) {
         args.push(unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec());
     }
     *PROG_ARGV.lock().unwrap() = Some(make_argv(args));
+}
+
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
+
+extern "C" {
+    fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+}
+
+/// `getMonotonicNSec()`: the monotonic clock, in nanoseconds (the RTS's, for GHC.Clock).
+extern "C" fn get_monotonic_nsec() -> u64 {
+    const CLOCK_MONOTONIC: i32 = 1;
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    // SAFETY: one timespec to fill.
+    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    (ts.sec as u64) * 1_000_000_000 + ts.nsec as u64
 }
