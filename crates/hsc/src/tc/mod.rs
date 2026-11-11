@@ -83,6 +83,8 @@ pub struct Checker {
     /// The variables a signature uses in kinds (`(a :: k)`, `TYPE r`), by binding key: they stay
     /// flexible when the binding is checked (kinds are not inferred).
     pub sig_kind_vars: HashMap<String, Vec<String>>,
+    /// OverloadedStrings is on in the module being checked: string literals are `fromString`.
+    pub overloaded_strings: bool,
     /// The flexible kind variables of the signature being checked. Each clause of its body
     /// sees them afresh, as it would the rigid kind variables of a signature.
     pub flex_kinds: Vec<u32>,
@@ -143,6 +145,7 @@ impl Checker {
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),
             sig_kind_vars: HashMap::new(),
+            overloaded_strings: false,
             flex_kinds: Vec::new(),
             explicit_sigs: std::collections::HashSet::new(),
             deferred_eqs: Vec::new(),
@@ -186,9 +189,11 @@ impl Checker {
         let Some(occ) = key.strip_prefix("Base.") else {
             return key.to_string();
         };
-        // A definition of the module being checked (a class method included) comes first.
+        // A definition of the module being checked (a class method included) comes first, for the
+        // GHC library modules that define these names themselves; elsewhere a module's own `foldr`
+        // (Data.ByteString's) is not the one desugaring means.
         let own = format!("{}.{occ}", self.module);
-        if self.vars.contains_key(&own) || self.env.values.contains_key(&own) {
+        if self.module.starts_with("GHC.") && (self.vars.contains_key(&own) || self.env.values.contains_key(&own)) {
             return own;
         }
         // The real library's definition is preferred when it is loaded: a name written `Base.x`

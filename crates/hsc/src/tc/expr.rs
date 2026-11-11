@@ -153,7 +153,21 @@ impl Checker {
         spine.reverse();
         let (mut core, mut tf) = self.infer(head)?;
         let mut params = Vec::with_capacity(spine.len());
+        // Dictionaries of polymorphic results met in the middle of the spine: (number of arguments
+        // applied before them, predicates).
+        let mut mid_dicts: Vec<(usize, Vec<Pred>)> = Vec::new();
         for _ in &spine {
+            // A polymorphic result applied to further arguments (`unPut p k` with a rank-N field) is
+            // instantiated first.
+            let mut found: Vec<Pred> = Vec::new();
+            while let Ty::Forall(ids, ps, body) = self.metas.prune(&tf) {
+                let args: Vec<Ty> = ids.iter().map(|_| self.meta()).collect();
+                found.extend(ps.iter().map(|p| super::types::subst_bound_pred(p, &ids, &args)));
+                tf = super::types::subst_bound(&body, &ids, &args);
+            }
+            if !found.is_empty() {
+                mid_dicts.push((params.len(), found));
+            }
             let (arg, res) = match self.metas.prune(&tf).as_fun() {
                 Some((x, y)) => (x.clone(), y.clone()),
                 None => {
@@ -198,7 +212,12 @@ impl Checker {
         // An argument of an unlifted type is evaluated before the call, as in GHC: the primitive it
         // comes from has its effect then. It is bound by a case around the application.
         let mut eager: Vec<(String, Core)> = Vec::new();
-        for (c, p) in checked.into_iter().flatten().zip(&params) {
+        let loc0 = self.loc;
+        for (i, (c, p)) in checked.into_iter().flatten().zip(&params).enumerate() {
+            if let Some(pos) = mid_dicts.iter().position(|(k, _)| *k == i) {
+                let (_, ps) = mid_dicts.remove(pos);
+                core = self.apply_dicts(core, ps, loc0);
+            }
             let c = if !matches!(c, Core::Var(_) | Core::Lit(_)) && self.is_unlifted(p) {
                 let v = self.fresh_name("u");
                 eager.push((v.clone(), c));
@@ -497,8 +516,22 @@ impl Checker {
                         cores.push(c);
                         tys.push(t);
                     }
+                    // A component of an unlifted type (the `State#` of `(# copy# .. s, () #)`) is
+                    // evaluated when the tuple is built, as GHC evaluates unlifted expressions: it
+                    // is where the primitive has its effect.
+                    let mut eager: Vec<(String, Core)> = Vec::new();
+                    for (c, t) in cores.iter_mut().zip(&tys) {
+                        if !matches!(c, Core::Var(_) | Core::Lit(_)) && self.is_unlifted(t) {
+                            let v = self.fresh_name("ut");
+                            eager.push((v.clone(), std::mem::replace(c, Core::Var(v))));
+                        }
+                    }
                     let name = Ty::tuple_con(elems.len());
-                    Ok((Core::Con(name, cores), Ty::tuple(tys)))
+                    let mut core = Core::Con(name, cores);
+                    for (v, c) in eager.into_iter().rev() {
+                        core = Core::Case(Box::new(c), v, vec![crate::core::Alt::Default(core)]);
+                    }
+                    Ok((core, Ty::tuple(tys)))
                 } else {
                     // A tuple section: the holes become lambda parameters.
                     let mut params = Vec::new();
@@ -751,6 +784,13 @@ impl Checker {
                 Ok((Core::App(Box::new(fr), Box::new(lit)), res))
             }
             Lit::Char(c) => Ok((Core::Lit(CLit::Char(*c)), Ty::con("GHC.Types.Char"))),
+            Lit::Str(s) if self.overloaded_strings => {
+                // OverloadedStrings: `fromString "s"` at any IsString type.
+                let (fs, fty) = self.lookup_inst("GHC.Internal.Data.String.fromString")?;
+                let (arg, res) = split_fun_ty(&fty);
+                self.unify_at(&arg, &Ty::list(Ty::con("GHC.Types.Char")))?;
+                Ok((Core::App(Box::new(fs), Box::new(Core::Lit(CLit::Str(s.clone())))), res))
+            }
             Lit::Str(s) => Ok((Core::Lit(CLit::Str(s.clone())), Ty::list(Ty::con("GHC.Types.Char")))),
             Lit::Prim(p) => {
                 let (core, ty) = prim_lit(p, false);
@@ -1017,6 +1057,13 @@ impl Checker {
             Lit::Char(c) => {
                 self.unify_at(&Ty::con("GHC.Types.Char"), ty)?;
                 (Core::Lit(CLit::Char(*c)), ty.clone(), false)
+            }
+            Lit::Str(s) if self.overloaded_strings => {
+                let (fs, fty) = self.lookup_inst("GHC.Internal.Data.String.fromString")?;
+                let (arg, res) = split_fun_ty(&fty);
+                self.unify_at(&arg, &Ty::list(Ty::con("GHC.Types.Char")))?;
+                self.unify_at(&res, ty)?;
+                (Core::App(Box::new(fs), Box::new(Core::Lit(CLit::Str(s.clone())))), ty.clone(), false)
             }
             Lit::Str(s) => {
                 let str_ty = Ty::list(Ty::con("GHC.Types.Char"));

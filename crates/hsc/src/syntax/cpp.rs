@@ -354,7 +354,7 @@ impl Preprocessor {
             out.push(c);
             i += 1;
         }
-        if changed && self.defs.keys().any(|k| out.contains(k.as_str())) {
+        if changed && (out.contains("MIN_VERSION_") || self.defs.keys().any(|k| out.contains(k.as_str()))) {
             return self.expand_line(&out, depth + 1);
         }
         Ok(out)

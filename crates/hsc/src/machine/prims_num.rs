@@ -83,6 +83,25 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
                 _ => int(m, ((a as u64).wrapping_shr(b as u32)) as i64),
             }
         }
+        "timesWord2#" | "plusWord2#" | "quotRemWord2#" | "timesInt2#" | "addWordC#" | "subWordC#" => {
+            let n = if name == "quotRemWord2#" { 3 } else { 2 };
+            let mut ws = Vec::with_capacity(n);
+            for k in 0..n {
+                let Some(x) = w(m, k) else { return Some(0) };
+                ws.push(x);
+            }
+            let Some(rs) = crate::interp::prims_ghc::wide_op(name, &ws) else {
+                m.exc = m.error_value("divide by zero");
+                return Some(0);
+            };
+            m.reserve(16);
+            let objs: Vec<Word> = rs.into_iter().map(|r| int(m, r)).collect();
+            if objs.len() == 3 {
+                super::prims::con_value(m, "Builtin.(,,)", 3, &objs)
+            } else {
+                con_pair(m, objs[0], objs[1])
+            }
+        }
         "quotRemInt#" | "quotRemWord#" => {
             let (Some(a), Some(b)) = (i(m, 0), i(m, 1)) else { return Some(0) };
             if b == 0 {
@@ -301,6 +320,16 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
                 _ => x,
             };
             double_value(m, r)
+        }
+        "castDoubleToWord64#" | "castFloatToWord32#" => {
+            let Some(x) = d(m, 0) else { return Some(0) };
+            let bits = if name == "castFloatToWord32#" { (x as f32).to_bits() as u64 } else { x.to_bits() };
+            int(m, bits as i64)
+        }
+        "castWord64ToDouble#" | "castWord32ToFloat#" => {
+            let Some(a) = w(m, 0) else { return Some(0) };
+            let x = if name == "castWord32ToFloat#" { f32::from_bits(a as u32) as f64 } else { f64::from_bits(a) };
+            double_value(m, x)
         }
         "decodeDouble_Int64#" => {
             let Some(x) = d(m, 0) else { return Some(0) };

@@ -189,6 +189,32 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             unsafe { std::ptr::copy(((src + 8) as *const u8).add(so as usize), dst, n) };
             unit(m)
         }
+        "copyAddrToAddr#" | "copyAddrToAddrNonOverlapping#" => {
+            let Some(n) = int_arg(m, 2) else { return Some(0) };
+            let (Some(src), Some(dst)) = (addr_ptr(m, 0), addr_ptr(m, 1)) else { return Some(0) };
+            // SAFETY: the addresses name memory of the program; `copy` allows overlap.
+            unsafe { std::ptr::copy(src, dst, n.max(0) as usize) };
+            unit(m)
+        }
+        "setAddrRange#" => {
+            let (Some(n), Some(c)) = (int_arg(m, 1), int_arg(m, 2)) else { return Some(0) };
+            let Some(dst) = addr_ptr(m, 0) else { return Some(0) };
+            // SAFETY: as above.
+            unsafe { std::ptr::write_bytes(dst, c as u8, n.max(0) as usize) };
+            unit(m)
+        }
+        "ltAddr#" | "leAddr#" | "gtAddr#" | "geAddr#" | "neAddr#" => {
+            let (Some(x), Some(y)) = (addr_ptr(m, 0), addr_ptr(m, 1)) else { return Some(0) };
+            let (x, y) = (x as usize, y as usize);
+            let r = match name {
+                "ltAddr#" => x < y,
+                "leAddr#" => x <= y,
+                "gtAddr#" => x > y,
+                "geAddr#" => x >= y,
+                _ => x != y,
+            };
+            int_value(m, r as i64)
+        }
         "copyAddrToByteArray#" => {
             // copy addr dst dstOff n
             let (Some(_), Some(dof), Some(n)) = (force_arg(m, 1), int_arg(m, 2), int_arg(m, 3)) else { return Some(0) };
@@ -328,14 +354,20 @@ fn element(name: &str) -> Option<(usize, &'static str)> {
 /// built after the bytes are copied).
 fn element_access(m: &mut Machine, name: &str) -> Option<Word> {
     let (access, rest) = ["index", "read", "write"].iter().find_map(|a| name.strip_prefix(a).map(|r| (*a, r)))?;
-    let (elem, on_addr) = if let Some(e) = rest.strip_suffix("OffAddr#") {
-        (e, true)
+    // `Word8ArrayAs<Elem>#` and `Word8OffAddrAs<Elem>#` take a byte offset (unaligned access).
+    let (elem, on_addr, unaligned) = if let Some(e) = rest.strip_prefix("Word8ArrayAs").and_then(|r| r.strip_suffix('#')) {
+        (e, false, true)
+    } else if let Some(e) = rest.strip_prefix("Word8OffAddrAs").and_then(|r| r.strip_suffix('#')) {
+        (e, true, true)
+    } else if let Some(e) = rest.strip_suffix("OffAddr#") {
+        (e, true, false)
     } else if let Some(e) = rest.strip_suffix("Array#") {
-        (e, false)
+        (e, false, false)
     } else {
         return None;
     };
     let (width, ekind) = element(elem)?;
+    let scale = if unaligned { 1 } else { width as i64 };
     // Arguments: the array (or address), the index, and for writes the value.
     force_arg(m, 0)?;
     int_arg(m, 1)?;
@@ -345,7 +377,8 @@ fn element_access(m: &mut Machine, name: &str) -> Option<Word> {
     let target = m.args[0];
     let index = m.heap_get(m.args[1], 1) as i64;
     let (base, base_off) = if on_addr { (m.heap_get(target, 1), m.heap_get(target, 2) as i64) } else { (target, 0) };
-    let addr = (base + 8) as i64 + base_off + index * width as i64;
+    // An address without an array is a raw machine address (memory from C).
+    let addr = if base == 0 { base_off + index * scale } else { (base + 8) as i64 + base_off + index * scale };
     if access == "write" {
         let v = m.args[2];
         let bits = m.heap_get(v, 1);

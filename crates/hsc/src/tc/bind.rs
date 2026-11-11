@@ -40,6 +40,14 @@ impl Checker {
 
         // Signatures, by occurrence name.
         let mut sigs: HashMap<String, Scheme> = HashMap::new();
+        let mut sig_types: HashMap<String, crate::syntax::ast::Type> = HashMap::new();
+        for d in decls {
+            if let Decl::Sig { names, ty, .. } = d {
+                for n in names {
+                    sig_types.insert(n.clone(), ty.clone());
+                }
+            }
+        }
         for d in decls {
             if let Decl::Sig { names, ty, loc } = d {
                 self.loc = *loc;
@@ -68,7 +76,12 @@ impl Checker {
                     signed: sigs.contains_key(name),
                 }),
                 Decl::PatBind { pat, rhs, loc } => {
-                    let pat = if top { qualify_pat(pat, &module) } else { pat.clone() };
+                    // A variable of the pattern with a monomorphic signature (`w :: Word; !w = e`)
+                    // gets its type there.
+                    let pat = annotate_pat(pat, &|v: &str| {
+                        sigs.get(v).filter(|sc| sc.nvars == 0).and_then(|_| sig_types.get(v).cloned())
+                    });
+                    let pat = if top { qualify_pat(&pat, &module) } else { pat };
                     let mut keys = Vec::new();
                     crate::rename::pat_vars(&pat)
                         .into_iter()
@@ -818,5 +831,20 @@ pub fn source_span(file: &str, start: Loc, end: Loc) -> String {
         }
     } else {
         format!("{file}:({},{})-({},{})", start.line, start.col, end.line, end.col)
+    }
+}
+
+/// A pattern with its signed variables annotated (`Pat::Sig`).
+fn annotate_pat(p: &Pat, sig: &dyn Fn(&str) -> Option<crate::syntax::ast::Type>) -> Pat {
+    match p {
+        Pat::Var(v, loc) => match sig(v) {
+            Some(t) => Pat::Sig(Box::new(p.clone()), t, *loc),
+            None => p.clone(),
+        },
+        Pat::Bang(inner, loc) => Pat::Bang(Box::new(annotate_pat(inner, sig)), *loc),
+        Pat::Lazy(inner, loc) => Pat::Lazy(Box::new(annotate_pat(inner, sig)), *loc),
+        Pat::Tuple(ps, loc) => Pat::Tuple(ps.iter().map(|x| annotate_pat(x, sig)).collect(), *loc),
+        Pat::Con(q, ps, loc) => Pat::Con(q.clone(), ps.iter().map(|x| annotate_pat(x, sig)).collect(), *loc),
+        other => other.clone(),
     }
 }

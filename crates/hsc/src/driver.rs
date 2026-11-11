@@ -264,6 +264,9 @@ impl Driver {
         }
         self.loading.push(module.to_string());
         let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
+        if exts.is_on("OverloadedStrings") && module != "GHC.Internal.Data.String" && !path_text.contains("/libs/ghc-prim/") {
+            deps.push("GHC.Internal.Data.String".into());
+        }
         if exts.is_on("ImplicitPrelude") && module != "Prelude" && !deps.iter().any(|d| d == "Prelude") {
             deps.insert(0, "Prelude".into());
         }
@@ -301,6 +304,7 @@ impl Driver {
             format!("{}:{}:{}: error:\n    {}", path.display(), loc.line, loc.col, msg)
         };
         let boot = self.checker.boot;
+        self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
         let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot)
             .map_err(|e| located(e.loc, &e.msg))?;
         let binds = self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;
@@ -328,6 +332,9 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
     let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
     if exts.is_on("ImplicitPrelude") && !deps.iter().any(|x| x == "Prelude") {
         deps.insert(0, "Prelude".into());
+    }
+    if exts.is_on("OverloadedStrings") {
+        deps.push("GHC.Internal.Data.String".into());
     }
     let source = Driver::source_imports(&src);
     for dep in &deps {

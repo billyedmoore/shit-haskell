@@ -33,6 +33,9 @@ PACKAGES = [
      ["-XHaskell2010"], ["base"]),
     ("mtl", "2.3.1", "hackage/mtl-2.3.1", ["Control", "LICENSE"], ["mtl"], ["-XHaskell2010"], ["base", "transformers"]),
     ("stm", "2.5.3.1", "hackage/stm-2.5.3.1", ["Control", "LICENSE"], ["stm"], ["-XHaskell2010"], ["base", "array"]),
+    # The pure-haskell flag: the C code of bytestring is replaced by its Haskell version.
+    ("bytestring", "0.12.2.0", "hackage/bytestring-0.12.2.0", ["Data", "include", "LICENSE"], ["bytestring"],
+     ['-XHaskell2010', '-XBangPatterns', '-XDeriveDataTypeable', '-XDeriveGeneric', '-XDeriveLift', '-XFlexibleContexts', '-XFlexibleInstances', '-XLambdaCase', '-XMagicHash', '-XMultiWayIf', '-XNamedFieldPuns', '-XPatternSynonyms', '-XRankNTypes', '-XScopedTypeVariables', '-XStandaloneDeriving', '-XTupleSections', '-XTypeApplications', '-XTypeOperators', '-XUnboxedTuples', '-DPURE_HASKELL=1', '-Iinclude'], ["base", "deepseq", "ghc-prim", "template-haskell"]),
 ]
 
 def vendor():

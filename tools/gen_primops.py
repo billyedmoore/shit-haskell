@@ -108,6 +108,16 @@ def main():
         out.append(f'foreign import prim "index{name}OffAddr#" index{name}OffAddr# :: Addr# -> Int# -> {prim}')
         out.append(f'foreign import prim "read{name}OffAddr#" read{name}OffAddr# :: Addr# -> Int# -> State# s -> (# State# s, {prim} #)')
         out.append(f'foreign import prim "write{name}OffAddr#" write{name}OffAddr# :: Addr# -> Int# -> {prim} -> State# s -> State# s')
+    # The unaligned forms (GHC's AccessOps): the element at a byte offset of a Word8 array or address.
+    for name, prim, _size, _kind in ELEMENTS:
+        if name in ("Int8", "Word8"):
+            continue
+        out.append(f'foreign import prim "indexWord8ArrayAs{name}#" indexWord8ArrayAs{name}# :: ByteArray# -> Int# -> {prim}')
+        out.append(f'foreign import prim "readWord8ArrayAs{name}#" readWord8ArrayAs{name}# :: MutableByteArray# s -> Int# -> State# s -> (# State# s, {prim} #)')
+        out.append(f'foreign import prim "writeWord8ArrayAs{name}#" writeWord8ArrayAs{name}# :: MutableByteArray# s -> Int# -> {prim} -> State# s -> State# s')
+        out.append(f'foreign import prim "indexWord8OffAddrAs{name}#" indexWord8OffAddrAs{name}# :: Addr# -> Int# -> {prim}')
+        out.append(f'foreign import prim "readWord8OffAddrAs{name}#" readWord8OffAddrAs{name}# :: Addr# -> Int# -> State# s -> (# State# s, {prim} #)')
+        out.append(f'foreign import prim "writeWord8OffAddrAs{name}#" writeWord8OffAddrAs{name}# :: Addr# -> Int# -> {prim} -> State# s -> State# s')
     out.append("data TYPE r")
     out.append("data CONSTRAINT r")
     # mkApUpd0# (a bytecode-object primitive, GHCi only) is absent from the table's type form; it is

@@ -646,7 +646,8 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let (access, elem) = element_access(name).unwrap_or(("", ""));
             let (size, kind) = element_spec(elem).unwrap_or((8, "int"));
             let at = int(rt, &args[1])?;
-            let off = (at * size as i64).max(0) as usize;
+            let scale = if element_unaligned(name) { 1 } else { size as i64 };
+            let off = (at * scale).max(0) as usize;
             match (access, rt.force(&args[0])?) {
                 ("index", Value::Addr(bytes, o)) => Ok(read_element(&bytes.borrow(), o + off, size, kind)),
                 ("read", Value::Addr(bytes, o)) => Ok(io_result(read_element(&bytes.borrow(), o + off, size, kind))),
@@ -672,6 +673,25 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         "minusAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
             (Value::Addr(a, x), Value::Addr(b, y)) if Rc::ptr_eq(&a, &b) => int_v(x as i64 - y as i64),
             _ => Err(RtError::Fail("internal: minusAddr# of non-addresses".into())),
+        },
+        // Ordering of addresses into the same buffer (by offset); different buffers by their place.
+        "ltAddr#" | "leAddr#" | "gtAddr#" | "geAddr#" | "neAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
+            (Value::Addr(a, x), Value::Addr(b, y)) => {
+                let (x, y) = if Rc::ptr_eq(&a, &b) {
+                    (x as i64, y as i64)
+                } else {
+                    (Rc::as_ptr(&a) as i64, Rc::as_ptr(&b) as i64)
+                };
+                let r = match name {
+                    "ltAddr#" => x < y,
+                    "leAddr#" => x <= y,
+                    "gtAddr#" => x > y,
+                    "geAddr#" => x >= y,
+                    _ => x != y || !Rc::ptr_eq(&a, &b),
+                };
+                int_v(r as i64)
+            }
+            _ => int_v(0),
         },
         "eqAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
             (Value::Addr(a, x), Value::Addr(b, y)) => int_v((Rc::ptr_eq(&a, &b) && x == y) as i64),
@@ -1001,8 +1021,17 @@ fn sized_conversion(name: &str) -> Option<fn(i64) -> i64> {
 fn element_access(name: &str) -> Option<(&str, &str)> {
     let access = ["index", "read", "write"].into_iter().find(|a| name.starts_with(a))?;
     let rest = &name[access.len()..];
-    let elem = rest.strip_suffix("Array#").or_else(|| rest.strip_suffix("OffAddr#"))?;
+    let elem = rest
+        .strip_prefix("Word8ArrayAs")
+        .or_else(|| rest.strip_prefix("Word8OffAddrAs"))
+        .and_then(|r| r.strip_suffix('#'))
+        .or_else(|| rest.strip_suffix("Array#").or_else(|| rest.strip_suffix("OffAddr#")))?;
     element_spec(elem).map(|_| (access, elem))
+}
+
+/// Whether an element primop takes a byte offset (`readWord8ArrayAsInt32#`) rather than an index.
+fn element_unaligned(name: &str) -> bool {
+    name.contains("Word8ArrayAs") || name.contains("Word8OffAddrAs")
 }
 
 /// The width in bytes and the representation kind of an element type.

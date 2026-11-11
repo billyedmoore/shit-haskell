@@ -355,6 +355,68 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             ret_int(n as i64)
         })(),
         "rtsSupportsBoundThreads" | "rts_isThreaded" => ret_int(0),
+        // The C library's memory functions, on addresses into byte buffers.
+        "memcpy" | "memmove" => (|| {
+            let (dst, doff) = addr_of(rt, &args[0])?;
+            let (src, soff) = addr_of(rt, &args[1])?;
+            let n = int_of(rt, &args[2])?.max(0) as usize;
+            if Rc::ptr_eq(&dst, &src) {
+                let mut b = dst.borrow_mut();
+                let n = n.min(b.len().saturating_sub(soff)).min(b.len().saturating_sub(doff));
+                b.copy_within(soff..soff + n, doff);
+            } else {
+                let s = src.borrow();
+                let mut d = dst.borrow_mut();
+                let n = n.min(s.len().saturating_sub(soff)).min(d.len().saturating_sub(doff));
+                d[doff..doff + n].copy_from_slice(&s[soff..soff + n]);
+            }
+            Ok(io_result_of(Value::Addr(dst, doff)))
+        })(),
+        "memset" => (|| {
+            let (dst, doff) = addr_of(rt, &args[0])?;
+            let c = int_of(rt, &args[1])? as u8;
+            let n = int_of(rt, &args[2])?.max(0) as usize;
+            {
+                let mut d = dst.borrow_mut();
+                let end = (doff + n).min(d.len());
+                for b in d[doff.min(end)..end].iter_mut() {
+                    *b = c;
+                }
+            }
+            Ok(io_result_of(Value::Addr(dst, doff)))
+        })(),
+        "memcmp" => (|| {
+            let (a, ao) = addr_of(rt, &args[0])?;
+            let (b, bo) = addr_of(rt, &args[1])?;
+            let n = int_of(rt, &args[2])?.max(0) as usize;
+            let (x, y) = (a.borrow(), b.borrow());
+            let xs = &x[ao.min(x.len())..(ao + n).min(x.len())];
+            let ys = &y[bo.min(y.len())..(bo + n).min(y.len())];
+            ret_int(match xs.cmp(ys) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            })
+        })(),
+        "memchr" => (|| {
+            let (a, ao) = addr_of(rt, &args[0])?;
+            let c = int_of(rt, &args[1])? as u8;
+            let n = int_of(rt, &args[2])?.max(0) as usize;
+            let found = {
+                let x = a.borrow();
+                x[ao.min(x.len())..(ao + n).min(x.len())].iter().position(|&b| b == c)
+            };
+            Ok(io_result_of(match found {
+                Some(i) => Value::Addr(a, ao + i),
+                // The null pointer.
+                None => Value::Addr(Rc::new(RefCell::new(Vec::new())), 0),
+            }))
+        })(),
+        "strlen" => (|| {
+            let (a, ao) = addr_of(rt, &args[0])?;
+            let x = a.borrow();
+            ret_int(x[ao.min(x.len())..].iter().take_while(|&&b| b != 0).count() as i64)
+        })(),
         "base_strerror_r" => (|| {
             let e = int_of(rt, &args[0])? as i32;
             let (buf, off) = addr_of(rt, &args[1])?;

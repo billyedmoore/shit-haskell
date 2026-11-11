@@ -332,6 +332,21 @@ impl<'a> Renamer<'a> {
                         hidden_globals.insert(s.global.clone());
                     }
                 }
+                // `hiding (C(..))` hides every method of the class, also those the module exports on
+                // their own (Prelude's `null` is a Foldable method exported outside `Foldable(..)`).
+                for item in items {
+                    if let IEItem::Thing { name, subs: Subs::All } = item {
+                        let class = iface.exports.iter().find(|e| e.kind == EntKind::Class && e.occ() == name.name);
+                        if let Some(c) = class {
+                            let defining = self.ifaces.get(&c.global.module).and_then(|i| {
+                                i.exports.iter().find(|e| e.kind == EntKind::Class && e.global == c.global).cloned()
+                            });
+                            for s in defining.iter().flat_map(|d| d.subs.iter()) {
+                                hidden_globals.insert(s.global.clone());
+                            }
+                        }
+                    }
+                }
                 let mut out: Vec<Entity> = Vec::new();
                 for e in &iface.exports {
                     if hidden_globals.contains(&e.global) {

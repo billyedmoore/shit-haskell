@@ -107,6 +107,46 @@ pub(crate) fn libm(name: &str, x: f64) -> f64 {
     }
 }
 
+/// The double-word arithmetic primops (`timesWord2#`, `plusWord2#`, `quotRemWord2#`, `timesInt2#`,
+/// `addWordC#`, `subWordC#`): their results, from their arguments as machine words.
+pub(crate) fn wide_op(name: &str, args: &[u64]) -> Option<Vec<i64>> {
+    let a = *args.first()?;
+    let b = *args.get(1)?;
+    Some(match name {
+        "timesWord2#" => {
+            let p = (a as u128) * (b as u128);
+            vec![(p >> 64) as i64, p as u64 as i64]
+        }
+        "plusWord2#" => {
+            let p = (a as u128) + (b as u128);
+            vec![(p >> 64) as i64, p as u64 as i64]
+        }
+        "quotRemWord2#" => {
+            let d = *args.get(2)? as u128;
+            if d == 0 {
+                return None;
+            }
+            let n = ((a as u128) << 64) | b as u128;
+            vec![(n / d) as u64 as i64, (n % d) as u64 as i64]
+        }
+        "timesInt2#" => {
+            let p = (a as i64 as i128) * (b as i64 as i128);
+            let (hi, lo) = ((p >> 64) as i64, p as u64 as i64);
+            let needed = hi != (lo >> 63);
+            vec![needed as i64, hi, lo]
+        }
+        "addWordC#" => {
+            let (r, c) = a.overflowing_add(b);
+            vec![r as i64, c as i64]
+        }
+        "subWordC#" => {
+            let (r, c) = a.overflowing_sub(b);
+            vec![r as i64, c as i64]
+        }
+        _ => return None,
+    })
+}
+
 /// The bit counts, byte swaps and bit reversals of the sized words (`popCnt32#` and the like).
 pub(crate) fn bit_op(name: &str, a: u64) -> Option<i64> {
     let (op, w) = name.strip_suffix('#').and_then(|s| {
@@ -298,6 +338,16 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "plusWord#" => word(rt, &args[0]).and_then(|a| Ok(Value::Int(a.wrapping_add(word(rt, &args[1])?) as i64))),
         "minusWord#" => word(rt, &args[0]).and_then(|a| Ok(Value::Int(a.wrapping_sub(word(rt, &args[1])?) as i64))),
         "timesWord#" => word(rt, &args[0]).and_then(|a| Ok(Value::Int(a.wrapping_mul(word(rt, &args[1])?) as i64))),
+        "timesWord2#" | "plusWord2#" | "quotRemWord2#" | "timesInt2#" | "addWordC#" | "subWordC#" => (|| {
+            let n = if name == "quotRemWord2#" { 3 } else { 2 };
+            let mut ws = Vec::with_capacity(n);
+            for a in &args[..n] {
+                ws.push(word(rt, a)?);
+            }
+            let rs = wide_op(name, &ws).ok_or_else(|| RtError::Error("divide by zero".into()))?;
+            let vals: Vec<Value> = rs.into_iter().map(Value::Int).collect();
+            Ok(if vals.len() == 3 { con_value("Builtin.(,,)", vals) } else { con_value("Builtin.(,)", vals) })
+        })(),
         "quotWord#" | "remWord#" | "quotRemWord#" => (|| {
             let a = word(rt, &args[0])?;
             let d = word(rt, &args[1])?;
@@ -388,6 +438,11 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "acoshDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(libm(stringify!(acosh), a))),
         "atanhDouble#" => dbl(rt, &args[0]).map(|a| Value::Double(libm(stringify!(atanh), a))),
         "double2Float#" => dbl(rt, &args[0]).map(|a| f32v(a as f32)),
+        // Bit casts between floating and integral representations.
+        "castDoubleToWord64#" => dbl(rt, &args[0]).map(|a| Value::Int(a.to_bits() as i64)),
+        "castWord64ToDouble#" => word(rt, &args[0]).map(|w| Value::Double(f64::from_bits(w))),
+        "castFloatToWord32#" => flt(rt, &args[0]).map(|a| Value::Int(a.to_bits() as i64)),
+        "castWord32ToFloat#" => word(rt, &args[0]).map(|w| f32v(f32::from_bits(w as u32))),
         "float2Double#" => dbl(rt, &args[0]).map(Value::Double),
         // decodeFloat_Int# x: the single-precision mantissa (24 bits with the implicit bit) and exponent.
         "decodeFloat_Int#" => dbl(rt, &args[0]).map(|x| {
@@ -532,6 +587,42 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             copy_bytes(rt, args).map(|_| unit_value())
         }
         "setByteArray#" => set_bytes(rt, args).map(|_| unit_value()),
+        // Copies between byte arrays and addresses (an address is a buffer and an offset), and
+        // between addresses: (src, srcOff?, dst, dstOff?, n) by the primop's shape.
+        "copyByteArrayToAddr#" | "copyMutableByteArrayToAddr#" => (|| {
+            let (src, so) = bytes_of(rt, &args[0])?;
+            let so = so + int_arg(rt, &args[1])?.max(0) as usize;
+            let (dst, dof) = bytes_of(rt, &args[2])?;
+            let n = int_arg(rt, &args[3])?.max(0) as usize;
+            copy_buf(&src, so, &dst, dof, n);
+            Ok(unit_value())
+        })(),
+        "copyAddrToByteArray#" => (|| {
+            let (src, so) = bytes_of(rt, &args[0])?;
+            let (dst, dof) = bytes_of(rt, &args[1])?;
+            let dof = dof + int_arg(rt, &args[2])?.max(0) as usize;
+            let n = int_arg(rt, &args[3])?.max(0) as usize;
+            copy_buf(&src, so, &dst, dof, n);
+            Ok(unit_value())
+        })(),
+        "copyAddrToAddr#" | "copyAddrToAddrNonOverlapping#" => (|| {
+            let (src, so) = bytes_of(rt, &args[0])?;
+            let (dst, dof) = bytes_of(rt, &args[1])?;
+            let n = int_arg(rt, &args[2])?.max(0) as usize;
+            copy_buf(&src, so, &dst, dof, n);
+            Ok(unit_value())
+        })(),
+        "setAddrRange#" => (|| {
+            let (dst, dof) = bytes_of(rt, &args[0])?;
+            let n = int_arg(rt, &args[1])?.max(0) as usize;
+            let c = int_arg(rt, &args[2])? as u8;
+            let mut d = dst.borrow_mut();
+            let end = (dof + n).min(d.len());
+            for b in d[dof.min(end)..end].iter_mut() {
+                *b = c;
+            }
+            Ok(unit_value())
+        })(),
         "shrinkMutableByteArray#" => match (rt.force(&args[0]), rt.force(&args[1])) {
             (Ok(Value::Bytes(b)), Ok(Value::Int(n))) => {
                 b.borrow_mut().truncate(n.max(0) as usize);
@@ -604,6 +695,20 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
 }
 
 /// The bytes of a byte array argument (or an address's buffer) as a shared buffer and an offset.
+/// Copies `n` bytes between buffers (the same buffer included, overlapping or not).
+fn copy_buf(src: &Rc<RefCell<Vec<u8>>>, so: usize, dst: &Rc<RefCell<Vec<u8>>>, dof: usize, n: usize) {
+    if Rc::ptr_eq(src, dst) {
+        let mut b = src.borrow_mut();
+        let n = n.min(b.len().saturating_sub(so)).min(b.len().saturating_sub(dof));
+        b.copy_within(so..so + n, dof);
+        return;
+    }
+    let s = src.borrow();
+    let mut d = dst.borrow_mut();
+    let n = n.min(s.len().saturating_sub(so)).min(d.len().saturating_sub(dof));
+    d[dof..dof + n].copy_from_slice(&s[so..so + n]);
+}
+
 fn bytes_of(rt: &Runtime, c: &Cell) -> Result<(Rc<RefCell<Vec<u8>>>, usize), RtError> {
     match rt.force(c)? {
         Value::Bytes(b) => Ok((b, 0)),

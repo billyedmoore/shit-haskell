@@ -75,9 +75,33 @@ fn addr_arg(m: &mut Machine, k: usize) -> Option<(Word, i64)> {
 /// The raw address of a byte position (bytes object data plus offset).
 fn raw(bytes: Word, off: i64) -> *mut u8 {
     if bytes == 0 {
-        return std::ptr::null_mut();
+        // An address without an array is a raw machine address (null for the null address).
+        return off as *mut u8;
     }
     (bytes as i64 + 8 + off) as *mut u8
+}
+
+/// An `Addr#` object for a position: in the byte array of one of the arguments when it points into
+/// it (so that it follows the array when the collector moves it), else a raw address.
+fn addr_result(m: &mut Machine, p: *mut u8, candidates: &[usize]) -> Word {
+    let mut base_off: (Word, i64) = (0, p as i64);
+    for &k in candidates {
+        let Some((b, _)) = addr_arg(m, k) else { continue };
+        if b == 0 {
+            continue;
+        }
+        let start = b as i64 + 8;
+        let len = (m.heap_get(b, 0) >> 32) as i64;
+        if (p as i64) >= start && (p as i64) <= start + len {
+            base_off = (b, p as i64 - start);
+            break;
+        }
+    }
+    let a = m.alloc(3);
+    m.heap_set(a, heap::header(kind::ADDR, 2, 0));
+    m.heap_set(a + 8, base_off.0);
+    m.heap_set(a + 16, base_off.1 as Word);
+    a
 }
 
 fn ret_int(m: &mut Machine, n: i64) -> Word {
@@ -266,6 +290,69 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
         "__hscore_sizeof_stat" => ret_int(m, 144),
         "__hscore_setmode" | "lockFile" | "unlockFile" => ret_int(m, 0),
         "rtsSupportsBoundThreads" | "rts_isThreaded" => ret_int(m, 0),
+        "memcpy" | "memmove" => {
+            let (db, doff) = addr_arg(m, 0)?;
+            let (sb, soff) = addr_arg(m, 1)?;
+            let n = int_arg(m, 2)?.max(0) as usize;
+            let (d, s) = (raw(db, doff), raw(sb, soff));
+            // SAFETY: the library passes valid buffers of at least `n` bytes; `copy` allows overlap.
+            unsafe { std::ptr::copy(s, d, n) };
+            m.reserve(8);
+            let r = addr_result(m, d, &[0]);
+            state_pair(m, r)
+        }
+        "memset" => {
+            let (db, doff) = addr_arg(m, 0)?;
+            let c = int_arg(m, 1)? as u8;
+            let n = int_arg(m, 2)?.max(0) as usize;
+            let d = raw(db, doff);
+            // SAFETY: as above.
+            unsafe { std::ptr::write_bytes(d, c, n) };
+            m.reserve(8);
+            let r = addr_result(m, d, &[0]);
+            state_pair(m, r)
+        }
+        "memcmp" => {
+            let (ab, ao) = addr_arg(m, 0)?;
+            let (bb, bo) = addr_arg(m, 1)?;
+            let n = int_arg(m, 2)?.max(0) as usize;
+            // SAFETY: as above.
+            let (x, y) = unsafe { (std::slice::from_raw_parts(raw(ab, ao), n), std::slice::from_raw_parts(raw(bb, bo), n)) };
+            let r = match x.cmp(y) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            ret_int(m, r)
+        }
+        "memchr" => {
+            let (ab, ao) = addr_arg(m, 0)?;
+            let c = int_arg(m, 1)? as u8;
+            let n = int_arg(m, 2)?.max(0) as usize;
+            let p = raw(ab, ao);
+            // SAFETY: as above.
+            let found = unsafe { std::slice::from_raw_parts(p, n) }.iter().position(|&b| b == c);
+            m.reserve(8);
+            let r = match found {
+                // SAFETY: the position is inside the buffer.
+                Some(i) => addr_result(m, unsafe { p.add(i) }, &[0]),
+                None => addr_result(m, std::ptr::null_mut(), &[]),
+            };
+            state_pair(m, r)
+        }
+        "strlen" => {
+            let (ab, ao) = addr_arg(m, 0)?;
+            let mut p = raw(ab, ao);
+            let mut n = 0i64;
+            // SAFETY: the string is NUL-terminated.
+            unsafe {
+                while !p.is_null() && *p != 0 {
+                    n += 1;
+                    p = p.add(1);
+                }
+            }
+            ret_int(m, n)
+        }
         "base_strerror_r" => {
             let e = int_arg(m, 0)? as i32;
             let (b, off) = addr_arg(m, 1)?;
