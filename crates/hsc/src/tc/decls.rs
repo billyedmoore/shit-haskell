@@ -802,19 +802,51 @@ impl Checker {
                     Some(dm) => {
                         // A default with its own context gets those dictionaries at this instance.
                         let mut core = Core::App(Box::new(Core::Var(dm.clone())), Box::new(Core::Var(this.clone())));
+                        // The method's own dictionaries (`Monad f` of `m1 :: Monad f => ..`) are
+                        // parameters of the dictionary field, passed on to the default.
+                        let own: Vec<String> = mscheme.preds.iter().skip(1).map(|_| self.fresh_name("dm")).collect();
                         if let Some(ds) = info.default_schemes.get(mkey) {
                             let mut args: Vec<Ty> = head.clone();
                             while args.len() < ds.nvars as usize {
                                 args.push(self.metas.fresh(self.level));
                             }
+                            let class_level = |t: &Ty| -> bool {
+                                fn ok(t: &Ty, n: u32) -> bool {
+                                    match t {
+                                        Ty::Gen(i) => *i < n,
+                                        Ty::App(f, x) => ok(f, n) && ok(x, n),
+                                        _ => true,
+                                    }
+                                }
+                                ok(t, info.nparams as u32)
+                            };
+                            let mut used = vec![false; own.len()];
                             for p in ds.preds.iter().skip(1) {
+                                if !p.args.iter().all(|a| class_level(a)) {
+                                    let j = mscheme
+                                        .preds
+                                        .iter()
+                                        .skip(1)
+                                        .enumerate()
+                                        .position(|(j, q)| !used[j] && q.class == p.class);
+                                    if let Some(j) = j {
+                                        used[j] = true;
+                                        core = Core::App(Box::new(core), Box::new(Core::Var(own[j].clone())));
+                                        continue;
+                                    }
+                                }
                                 let pred = super::types::subst_gen_pred(p, &args);
                                 let ev = self.fresh_name("dd");
                                 self.wanted.push(super::Wanted { pred, ev: ev.clone(), loc: id.loc });
                                 core = Core::App(Box::new(core), Box::new(Core::Var(ev)));
                             }
                         }
-                        core
+                        if own.is_empty() || !info.default_schemes.contains_key(mkey) {
+                            // A default without its own signature takes the method's dictionaries itself.
+                            core
+                        } else {
+                            own.into_iter().rev().fold(core, |acc, d| Core::Lam(d, Box::new(acc)))
+                        }
                     }
                     // Exception types are identified by their type name, which stands in for Typeable.
                     None if occ == "exceptionTypeTag" => {
@@ -983,6 +1015,9 @@ impl Checker {
             Type::Tuple(elems, _) => format!("Builtin.({})", ",".repeat(elems.len().saturating_sub(1))),
             // Lists are built in, with their instances in Base.
             Type::List(..) => return Ok(Vec::new()),
+            // Unboxed tuples and sums: only Template Haskell's `Lift` derives instances for them,
+            // which need Template Haskell to be used.
+            _ if !matches!(&cls, Type::Con(q, _) if super::derive::is_stock(&q.name)) => return Ok(Vec::new()),
             _ => return self.err("Malformed standalone deriving declaration"),
         };
         // Unit and tuples are built in: their declaration is written here, so the stock

@@ -1,0 +1,4 @@
+-XHaskell2010
+-XCPP
+-XBangPatterns
+-XDeriveGeneric

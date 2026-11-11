@@ -192,16 +192,32 @@ impl Parser {
     }
 
     fn make_binding(&mut self, lhs: Expr, rhs: Rhs, loc: Loc) -> PResult<Decl> {
-        // Infix definition: `x op y = ...`.
-        if let Expr::OpChain(items, _) = &lhs {
-            if let [OpItem::Operand(l), OpItem::Op(op, _), OpItem::Operand(r)] = items.as_slice() {
-                if !is_con_op(&op.name) && op.qual.is_none() {
-                    let pats = vec![self.expr_to_pat(l.clone())?, self.expr_to_pat(r.clone())?];
-                    return Ok(Decl::Fun {
-                        name: op.name.clone(),
-                        clauses: vec![Clause { pats, rhs, loc, end: self.prev_end() }],
-                        loc,
-                    });
+        // Infix definition: `p1 op p2 = ...`, where the operands may themselves be infix patterns
+        // of constructor operators (`f :+ g <*> a :+ b = ...`): the one variable operator is defined.
+        if let Expr::OpChain(items, span) = &lhs {
+            let var_ops: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| matches!(it, OpItem::Op(op, _) if !is_con_op(&op.name)))
+                .map(|(i, _)| i)
+                .collect();
+            if let [i] = var_ops.as_slice() {
+                if let OpItem::Op(op, _) = &items[*i] {
+                    if op.qual.is_none() {
+                        let side = |part: &[OpItem]| -> Expr {
+                            match part {
+                                [OpItem::Operand(e)] => e.clone(),
+                                _ => Expr::OpChain(part.to_vec(), *span),
+                            }
+                        };
+                        let (l, r) = (side(&items[..*i]), side(&items[*i + 1..]));
+                        let pats = vec![self.expr_to_pat(l)?, self.expr_to_pat(r)?];
+                        return Ok(Decl::Fun {
+                            name: op.name.clone(),
+                            clauses: vec![Clause { pats, rhs, loc, end: self.prev_end() }],
+                            loc,
+                        });
+                    }
                 }
             }
         }
@@ -1156,7 +1172,11 @@ pub(super) fn is_con_op(name: &str) -> bool {
 impl Parser {
     /// After `pattern`: a signature `P, Q :: t`, or a synonym definition.
     fn pattern_decl(&mut self, loc: Loc) -> PResult<Decl> {
-        if matches!(self.tok(), Tok::ConId(_)) && matches!(self.peek_raw(1), Tok::Res(ROp::DColon) | Tok::Special(',')) {
+        let op_sig = *self.tok() == Tok::Special('(')
+            && matches!(self.peek_raw(1), Tok::ConSym(_))
+            && *self.peek_raw(2) == Tok::Special(')')
+            && matches!(self.peek_raw(3), Tok::Res(ROp::DColon) | Tok::Special(','));
+        if op_sig || (matches!(self.tok(), Tok::ConId(_)) && matches!(self.peek_raw(1), Tok::Res(ROp::DColon) | Tok::Special(','))) {
             let mut names = Vec::new();
             loop {
                 match self.tok().clone() {
@@ -1164,6 +1184,7 @@ impl Parser {
                         self.bump();
                         names.push(s);
                     }
+                    Tok::Special('(') => names.push(self.paren_op()?.name),
                     _ => return self.unexpected(),
                 }
                 if self.at_special(',') {
@@ -1176,15 +1197,32 @@ impl Parser {
             let ty = self.sigtype()?;
             return Ok(Decl::PatSynSig { names, ty, loc });
         }
-        let name = match self.tok().clone() {
-            Tok::ConId(s) if self.real() => {
+        // An infix synonym: `pattern x :<| xs <- ...`.
+        let infix = match (self.tok().clone(), self.peek_raw(1).clone(), self.peek_raw(2).clone()) {
+            (Tok::VarId(l), Tok::ConSym(op), Tok::VarId(r)) => {
                 self.bump();
-                s
+                self.bump();
+                self.bump();
+                Some((op, vec![l, r]))
             }
-            _ => return self.unexpected(),
+            _ => None,
         };
-        let mut args = Vec::new();
-        while self.real() {
+        let is_infix = infix.is_some();
+        let (name, mut args) = match infix {
+            Some(x) => x,
+            None => {
+                let name = match self.tok().clone() {
+                    Tok::ConId(s) if self.real() => {
+                        self.bump();
+                        s
+                    }
+                    Tok::Special('(') if matches!(self.peek_raw(1), Tok::ConSym(_)) => self.paren_op()?.name,
+                    _ => return self.unexpected(),
+                };
+                (name, Vec::new())
+            }
+        };
+        while self.real() && !is_infix {
             match self.tok().clone() {
                 Tok::VarId(v) => {
                     self.bump();

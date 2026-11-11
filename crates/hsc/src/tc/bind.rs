@@ -45,7 +45,10 @@ impl Checker {
                 self.loc = *loc;
                 let scheme = self.sig_scheme(ty, &[])?;
                 let explicit = matches!(ty, crate::syntax::ast::Type::Forall(..));
+                let mut kvs = Vec::new();
+                kind_vars_of(ty, false, &mut kvs);
                 for n in names {
+                    self.sig_kind_vars.insert(if top { format!("{module}.{n}") } else { n.clone() }, kvs.clone());
                     if explicit {
                         self.explicit_sigs.insert(if top { format!("{module}.{n}") } else { n.clone() });
                     }
@@ -229,13 +232,17 @@ impl Checker {
                     qmetas.retain(|x| x != m);
                 }
                 floated.push(w);
-            } else if !ms.is_empty() && ms.iter().all(|m| qmetas.contains(m)) {
+            } else if ms.iter().any(|m| qmetas.contains(m)) {
+                // A constraint on a generalised variable is quantified, even when it also mentions
+                // variables of the enclosing scope (`MArray a e m` with `a`, `e` from outside), as
+                // GHC does.
                 quantified.push(w);
             } else {
                 for m in &ms {
                     if self.metas.levels[*m as usize] > outer_level {
                         self.metas.levels[*m as usize] = outer_level;
                     }
+                    qmetas.retain(|x| x != m);
                 }
                 floated.push(w);
             }
@@ -319,12 +326,24 @@ impl Checker {
         self.level += 1;
         // Kind variables (`k`, `k1`, `rep`, ...) are not tracked by kind inference, so they are
         // flexible here rather than rigid: a kind-polymorphic signature is then not refused.
+        // A variable that the type or the context mentions is a type variable, whatever its name.
+        fn has_gen(t: &Ty, i: u32) -> bool {
+            match t {
+                Ty::Gen(j) => *j == i,
+                Ty::App(f, x) => has_gen(f, i) || has_gen(x, i),
+                Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => has_gen(b, i) || ps.iter().any(|p| p.args.iter().any(|a| has_gen(a, i))),
+                _ => false,
+            }
+        }
         let skolems: Vec<Ty> = scheme
             .names
             .iter()
             .take(scheme.nvars as usize)
-            .map(|n| {
-                if is_kind_var_name(n) {
+            .enumerate()
+            .map(|(i, n)| {
+                let used = has_gen(&scheme.ty, i as u32) || scheme.preds.iter().any(|p| p.args.iter().any(|a| has_gen(a, i as u32)));
+                let in_kind = self.sig_kind_vars.get(key).is_none_or(|kv| kv.contains(n));
+                if is_kind_var_name(n) && (!used || in_kind) {
                     let m = self.metas.fresh(self.level);
                     if let Ty::Meta(i) = m {
                         self.flex_kinds.push(i);
@@ -636,7 +655,8 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
             out.insert(qkey(q));
         }
         Expr::IPVar(..) => {}
-        Expr::Con(..) | Expr::Lit(..) | Expr::Wild(_) => {}
+        Expr::Con(..) | Expr::Lit(..) | Expr::Wild(_) | Expr::Quote(_, None, _) | Expr::NameQuote(..) => {}
+        Expr::Quote(_, Some(b), _) | Expr::Splice(_, b, _) => collect_expr(b, out),
         Expr::App(f, a) => {
             collect_expr(f, out);
             collect_expr(a, out);
@@ -730,6 +750,54 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
 }
 
 /// Names conventionally given to kind and representation variables in the libraries.
+/// The type variables a source type uses in kinds: in `(t :: k)`, in the kinds of `forall`
+/// binders, and as arguments of `TYPE`.
+fn kind_vars_of(t: &crate::syntax::ast::Type, in_kind: bool, out: &mut Vec<String>) {
+    use crate::syntax::ast::{Type, TypeOpItem};
+    match t {
+        Type::Var(v, _) => {
+            if in_kind && !out.contains(v) {
+                out.push(v.clone());
+            }
+        }
+        Type::App(f, x) => {
+            let under_type = matches!(f.as_ref(), Type::Con(q, _) if q.name == "TYPE" || q.name == "CONSTRAINT");
+            kind_vars_of(f, in_kind, out);
+            kind_vars_of(x, in_kind || under_type, out);
+        }
+        Type::Fun(a, b) => {
+            kind_vars_of(a, in_kind, out);
+            kind_vars_of(b, in_kind, out);
+        }
+        Type::List(e, _) => kind_vars_of(e, in_kind, out),
+        Type::Tuple(ts, _) => ts.iter().for_each(|x| kind_vars_of(x, in_kind, out)),
+        Type::Forall(binds, body) => {
+            for b in binds {
+                if let Some(k) = &b.kind {
+                    kind_vars_of(k, true, out);
+                }
+            }
+            kind_vars_of(body, in_kind, out);
+        }
+        Type::Qual(ctx, body) => {
+            ctx.iter().for_each(|x| kind_vars_of(x, in_kind, out));
+            kind_vars_of(body, in_kind, out);
+        }
+        Type::Sig(t, k) => {
+            kind_vars_of(t, in_kind, out);
+            kind_vars_of(k, true, out);
+        }
+        Type::OpChain(items, _) => {
+            for it in items {
+                if let TypeOpItem::Operand(x) = it {
+                    kind_vars_of(x, in_kind, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn is_kind_var_name(n: &str) -> bool {
     let digits = |rest: &str| rest.chars().all(|c| c.is_ascii_digit());
     match n.chars().next() {

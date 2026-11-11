@@ -582,6 +582,10 @@ impl Parser {
             self.bump();
             return Ok(IEItem::Pattern(self.qcon()?));
         }
+        if self.at_varid("pattern") && *self.peek_raw(1) == Tok::Special('(') && matches!(self.peek_raw(2), Tok::ConSym(_) | Tok::QConSym(..)) {
+            self.bump();
+            return Ok(IEItem::Pattern(self.paren_op()?));
+        }
         if self.at_special('(') {
             let name = self.paren_op()?;
             let is_con = name.name.starts_with(':');
@@ -611,6 +615,10 @@ impl Parser {
                 let mut extra = Vec::new();
                 while self.at_special(',') {
                     self.bump();
+                    if self.at_special('(') {
+                        extra.push(self.paren_op()?.name);
+                        continue;
+                    }
                     match self.tok().clone() {
                         Tok::ConId(s) | Tok::VarId(s) => {
                             self.bump();

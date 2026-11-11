@@ -37,15 +37,34 @@ pub struct Found {
     pub home: bool,
 }
 
-/// The import directories of the vendored packages, as the global package database lists them.
+/// The import directories of the packages in the global database (every one is exposed).
 pub fn default_package_dirs() -> Vec<PathBuf> {
-    let libs = default_lib_dir();
-    vec![
-        libs.join("base").join("src"),
-        libs.join("ghc-prim"),
-        libs.join("ghc-internal").join("src"),
-        libs.join("ghc-bignum").join("src"),
-    ]
+    let mut dirs = Vec::new();
+    if let Ok(db) = crate::pkg::Db::load(&crate::pkg::global_db_path()) {
+        for p in &db.packages {
+            for d in p.list("import-dirs") {
+                let d = PathBuf::from(d);
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// The flags of a package's modules found by source in an import directory: its
+/// `hsc-package.flags` file, one flag per line; relative `-I` paths are relative to the directory.
+pub fn package_flags(dir: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(dir.join("hsc-package.flags")) else { return Vec::new() };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| match l.strip_prefix("-I") {
+            Some(rel) if !Path::new(rel).is_absolute() => format!("-I{}", dir.join(rel).display()),
+            _ => l.to_string(),
+        })
+        .collect()
 }
 
 /// The first line of an interface file written by hsc.
@@ -133,7 +152,7 @@ impl Driver {
             }
             let p = d.join(format!("{stem}.hs"));
             if p.is_file() {
-                return Some(Found { path: p, flags: Vec::new(), home: false });
+                return Some(Found { path: p, flags: package_flags(d), home: false });
             }
         }
         None

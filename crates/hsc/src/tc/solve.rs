@@ -323,6 +323,22 @@ impl Checker {
             _ => return Ok(()),
         };
         for (from, to) in fundeps {
+            // A given whose determining arguments are the wanted's fixes the others (`MonadReader r m`
+            // given and `MonadReader ?r m` wanted: `?r := r`).
+            let zonked: Vec<Ty> = p.args.iter().map(|t| self.metas.zonk(t)).collect();
+            let given_match: Option<Vec<Ty>> = self.givens.iter().rev().find_map(|g| {
+                if g.pred.class != p.class || g.pred.args.len() != zonked.len() {
+                    return None;
+                }
+                let gz: Vec<Ty> = g.pred.args.iter().map(|t| self.metas.zonk(t)).collect();
+                from.iter().all(|&i| gz[i] == zonked[i]).then_some(gz)
+            });
+            if let Some(gz) = given_match {
+                for &j in &to {
+                    self.unify_at(&p.args[j], &gz[j])?;
+                }
+                continue;
+            }
             let insts: Vec<InstInfo> = self.env.instances.iter().filter(|i| i.class == p.class).cloned().collect();
             for inst in insts {
                 if inst.head.len() != p.args.len() {

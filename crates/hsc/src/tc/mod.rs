@@ -80,6 +80,9 @@ pub struct Checker {
     pub kinds: kinds::KindEnv,
     /// Type variables in scope from enclosing signatures with an explicit `forall`.
     pub scoped: Vec<(String, Ty)>,
+    /// The variables a signature uses in kinds (`(a :: k)`, `TYPE r`), by binding key: they stay
+    /// flexible when the binding is checked (kinds are not inferred).
+    pub sig_kind_vars: HashMap<String, Vec<String>>,
     /// The flexible kind variables of the signature being checked. Each clause of its body
     /// sees them afresh, as it would the rigid kind variables of a signature.
     pub flex_kinds: Vec<u32>,
@@ -139,6 +142,7 @@ impl Checker {
             callsites: HashMap::new(),
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),
+            sig_kind_vars: HashMap::new(),
             flex_kinds: Vec::new(),
             explicit_sigs: std::collections::HashSet::new(),
             deferred_eqs: Vec::new(),
@@ -252,6 +256,20 @@ impl Checker {
         if a_meta || e_meta || !(self.has_family(&a) || self.has_family(&e)) {
             return self.unify_at_raw(&a, &e);
         }
+        // A data family is injective: `F t1 .. tn ~ R u1 ..` with `R` the representation of the
+        // instance `F p1 .. pn` fixes the arguments to that instance's patterns.
+        if let Some(r) = self.data_family_injection(&a, &e).or_else(|| self.data_family_injection(&e, &a)) {
+            return r;
+        }
+        // `F as ~ F bs` for a data family: the arguments are equal.
+        if let (Some((f1, a1)), Some((f2, a2))) = (self.family_app(&a), self.family_app(&e)) {
+            if f1 == f2 && a1.len() == a2.len() && self.is_data_family(&f1) {
+                for (x, y) in a1.iter().zip(&a2) {
+                    self.unify_fam(x, y)?;
+                }
+                return Ok(());
+            }
+        }
         // A family applied to exactly its arity is stuck; extra arguments decompose as applications.
         if self.saturated_family(&a) || self.saturated_family(&e) {
             self.deferred_eqs.push((a, e, self.loc));
@@ -267,6 +285,39 @@ impl Checker {
                 Ok(())
             }
         }
+    }
+
+    /// Whether a family is a data family: its instances' right-hand sides are representation types.
+    fn is_data_family(&self, name: &str) -> bool {
+        self.env.families.get(name).is_some_and(|f| {
+            !f.equations.is_empty() && f.equations.iter().all(|q| matches!(q.rhs.split_apps().0, Ty::Con(c) if c.contains("R:")))
+        })
+    }
+
+    /// `fam ~ rep` where `fam` is a saturated data family application and `rep` is headed by the
+    /// representation type of one of its instances: the instance's patterns, instantiated, are
+    /// unified with the family's arguments and its right-hand side with `rep`.
+    fn data_family_injection(&mut self, fam: &Ty, rep: &Ty) -> Option<TR<()>> {
+        let (name, args) = self.family_app(fam)?;
+        let Ty::Con(rep_head) = self.metas.prune(rep).split_apps().0.clone() else { return None };
+        if !rep_head.contains("R:") {
+            return None;
+        }
+        let info = self.env.families.get(&name)?;
+        if args.len() != info.arity {
+            return None;
+        }
+        let eqn = info.equations.iter().find(|q| matches!(q.rhs.split_apps().0, Ty::Con(c) if *c == rep_head))?.clone();
+        let fresh: Vec<Ty> = (0..eqn.nvars).map(|_| self.meta()).collect();
+        let rhs = types::subst_gen(&eqn.rhs, &fresh);
+        let pats: Vec<Ty> = eqn.args.iter().map(|p| types::subst_gen(p, &fresh)).collect();
+        Some((|| {
+            self.unify_at_raw(&rhs, rep)?;
+            for (p, a) in pats.iter().zip(&args) {
+                self.unify_fam(a, p)?;
+            }
+            Ok(())
+        })())
     }
 
     fn unify_at_raw(&mut self, actual: &Ty, expected: &Ty) -> TR<()> {

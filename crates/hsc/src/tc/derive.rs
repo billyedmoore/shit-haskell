@@ -164,6 +164,8 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
                 "Functor" => derive_functor(checker, dd),
                 "Foldable" => derive_foldable(checker, dd),
                 "Traversable" => derive_traversable(checker, dd),
+                "Lift" => derive_lift(dd),
+                "Data" => derive_data(checker, dd),
                 // DeriveAnyClass: an instance with the class's default methods. Derived
                 // instances of unknown classes are skipped when the instance is registered.
                 _ => Vec::new(),
@@ -332,7 +334,17 @@ fn instance(module: &str, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_l
     );
     let head = Type::App(Box::new(Type::Con(class.clone(), loc)), Box::new(head_ty));
     let last = if drop_last { dd.tyvars.last().map(|t| t.name.clone()) } else { None };
-    let context = field_context(class, dd, loc, last.as_deref());
+    let mut context = field_context(class, dd, loc, last.as_deref());
+    // `Data` has `Typeable` as its superclass: each type parameter must be Typeable, as GHC infers.
+    if class.name == "Data" {
+        for tv in &kept {
+            let typeable = QName { qual: Some("GHC.Internal.Data.Typeable.Internal".into()), name: "Typeable".into() };
+            let item = Type::App(Box::new(Type::Con(typeable, loc)), Box::new(Type::Var(tv.name.clone(), loc)));
+            if !context.contains(&item) {
+                context.push(item);
+            }
+        }
+    }
     Decl::Instance(InstDecl {
         overlap: None,
         context,
@@ -763,6 +775,102 @@ fn derive_bounded(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         ];
     }
     Vec::new()
+}
+
+/// `Data` (DeriveDataTypeable): `gfoldl` and `gunfold` over the fields, `toConstr` and `dataTypeOf`
+/// from a `DataType` with one `Constr` per constructor, as GHC derives them.
+fn derive_data(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
+    let loc = dd.loc;
+    let module = checker.module.clone();
+    let dd_var = |n: &str| Expr::Var(QName { qual: Some("GHC.Internal.Data.Data".into()), name: n.into() }, loc);
+    let dd_con = |n: &str| Expr::Con(QName { qual: Some("GHC.Internal.Data.Data".into()), name: n.into() }, loc);
+    let list = |items: Vec<Expr>| Expr::List(items, loc);
+    // let ty = mkDataType "M.T" [c1, ..]; ci = mkConstr ty "Ci" [fields] Prefix in body
+    let ty_name = checker.fresh_name("ty");
+    let con_names: Vec<String> = dd.cons.iter().map(|_| checker.fresh_name("con")).collect();
+    let with_tables = |body: Expr| -> Expr {
+        let mut decls = vec![fun(
+            &ty_name,
+            vec![clause(
+                vec![],
+                app(
+                    dd_var("mkDataType"),
+                    vec![text(&format!("{module}.{}", dd.name), loc), list(con_names.iter().map(|c| local(c, loc)).collect())],
+                ),
+                loc,
+            )],
+            loc,
+        )];
+        for (c, cn) in dd.cons.iter().zip(&con_names) {
+            let fields = list(field_names(c).iter().map(|f| text(f, loc)).collect());
+            let fixity = if c.infix || is_operator(&c.name) { dd_con("Infix") } else { dd_con("Prefix") };
+            decls.push(fun(
+                cn,
+                vec![clause(vec![], app(dd_var("mkConstr"), vec![local(&ty_name, loc), text(&c.name, loc), fields, fixity]), loc)],
+                loc,
+            ));
+        }
+        Expr::Let(decls, Box::new(body), loc)
+    };
+    let k = checker.fresh_name("k");
+    let z = checker.fresh_name("z");
+    // gfoldl k z (C x1 .. xn) = (z C `k` x1) .. `k` xn
+    let mut gfoldl = Vec::new();
+    for c in &dd.cons {
+        let xs = fresh_vars(checker, "x", arity(c));
+        let pat = con_pat(&module, &c.name, xs.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc);
+        let body = xs.iter().fold(app(local(&z, loc), vec![con_expr(&module, &c.name, loc)]), |acc, x| {
+            app(local(&k, loc), vec![acc, local(x, loc)])
+        });
+        gfoldl.push(clause(vec![Pat::Var(k.clone(), loc), Pat::Var(z.clone(), loc), pat], body, loc));
+    }
+    // gunfold k z c = case constrIndex c of 1 -> k (.. (z C1)); ..
+    let cvar = checker.fresh_name("c");
+    let alts: Vec<crate::syntax::ast::Alt> = dd
+        .cons
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let body = (0..arity(c)).fold(app(local(&z, loc), vec![con_expr(&module, &c.name, loc)]), |acc, _| app(local(&k, loc), vec![acc]));
+            let pat = if i + 1 == dd.cons.len() { Pat::Wild(loc) } else { Pat::Lit(Lit::Int((i + 1).to_string()), loc) };
+            crate::syntax::ast::Alt { pat, rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() }, loc }
+        })
+        .collect();
+    let gunfold_body = Expr::Case(Box::new(app(dd_var("constrIndex"), vec![local(&cvar, loc)])), alts, loc);
+    let gunfold = clause(vec![Pat::Var(k.clone(), loc), Pat::Var(z.clone(), loc), Pat::Var(cvar.clone(), loc)], gunfold_body, loc);
+    // toConstr x = case x of C1 {} -> con1; ..
+    let xv = checker.fresh_name("x");
+    let to_alts: Vec<crate::syntax::ast::Alt> = dd
+        .cons
+        .iter()
+        .zip(&con_names)
+        .map(|(c, cn)| crate::syntax::ast::Alt {
+            pat: con_pat(&module, &c.name, (0..arity(c)).map(|_| Pat::Wild(loc)).collect(), loc),
+            rhs: Rhs { body: Body::Plain(local(cn, loc)), wheres: Vec::new() },
+            loc,
+        })
+        .collect();
+    let to_constr = with_tables(Expr::Case(Box::new(local(&xv, loc)), to_alts, loc));
+    let data_type_of = with_tables(local(&ty_name, loc));
+    let mut out = Vec::new();
+    if !dd.cons.is_empty() {
+        out.push(fun("gfoldl", gfoldl, loc));
+        out.push(fun("gunfold", vec![gunfold], loc));
+        out.push(fun("toConstr", vec![clause(vec![Pat::Var(xv, loc)], to_constr, loc)], loc));
+    }
+    out.push(fun("dataTypeOf", vec![clause(vec![Pat::Wild(loc)], data_type_of, loc)], loc));
+    out
+}
+
+/// `Lift` (DeriveLift): Template Haskell cannot run yet, so the methods are errors.
+fn derive_lift(dd: &DataDecl) -> Vec<Decl> {
+    let loc = dd.loc;
+    let err = |m: &str| {
+        let f = Expr::Var(QName { qual: Some("GHC.Internal.Err".into()), name: "errorWithoutStackTrace".into() }, loc);
+        let body = app(f, vec![text(&format!("hsc: Template Haskell's {m} cannot be run yet"), loc)]);
+        fun(m, vec![clause(vec![crate::syntax::ast::Pat::Wild(loc)], body, loc)], loc)
+    };
+    vec![err("lift"), err("liftTyped")]
 }
 
 /// `readsPrec`: each constructor is read by a list comprehension over `lex` tokens and

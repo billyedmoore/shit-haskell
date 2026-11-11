@@ -14,7 +14,7 @@ use crate::pkg;
 pub const VERSION: &str = "9.12.2";
 
 /// What the command line asks for.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Opts {
     /// Source files and module names, in order.
     pub inputs: Vec<String>,
@@ -55,13 +55,15 @@ pub struct Opts {
     /// Options for C compilations and links (`-optc`, `-optl`, `-l`, `-L`).
     pub c_opts: Vec<String>,
     pub link_opts: Vec<String>,
+    /// `-package-env`: a file, or `-` for none (None: look for one, as GHC does).
+    pub package_env: Option<String>,
 }
 
 /// Flags whose value is the next argument.
 const VALUE_FLAGS: &[&str] = &[
     "-o", "-odir", "-hidir", "-hiedir", "-stubdir", "-dumpdir", "-outputdir", "-tmpdir", "-package-db", "-package-id",
     "-package", "-hide-package", "-ignore-package", "-trust", "-distrust", "-this-unit-id", "-this-package-name",
-    "-working-dir", "-dynosuf", "-dynhisuf", "-osuf", "-hisuf", "-hcsuf", "-x", "-main-is", "-dynload", "-package-env",
+    "-working-dir", "-dynosuf", "-dynhisuf", "-osuf", "-hisuf", "-hcsuf", "-x", "-main-is", "-dynload",
     "-framework", "-framework-path", "-unit", "-hidden-module", "-reexported-module", "-this-component-id",
     "-instantiated-with", "-component-id", "-package-name", "-ghcversion-file", "-pgmc", "-pgma", "-pgml", "-pgmP",
     "-pgmF", "-pgmlo", "-pgmlc", "-pgmi", "-pgmar", "-pgmranlib", "-pgmdll", "-pgmwindres", "-pgmlibtool", "-pgmc-supports-no-pie",
@@ -184,6 +186,7 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
             "-dynosuf" => o.dynosuf = value(&mut i)?,
             "-dynhisuf" => o.dynhisuf = value(&mut i)?,
             "-package-db" => o.package_dbs.push(absolute(&value(&mut i)?)),
+            "-package-env" => o.package_env = Some(value(&mut i)?),
             "-package-id" => o.package_ids.push(value(&mut i)?),
             "-package" => o.package_names.push(value(&mut i)?),
             "-this-unit-id" => o.this_unit = Some(value(&mut i)?),
@@ -229,11 +232,8 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
             _ if a.starts_with("-optc") => o.c_opts.push(a[5..].to_string()),
             _ if a.starts_with("-optl") => o.link_opts.push(a[5..].to_string()),
             _ if a.starts_with("-l") || a.starts_with("-L") => o.link_opts.push(a.to_string()),
-            _ if a.starts_with("-package-env") || a.starts_with("-package-db=") => {
-                if let Some(db) = a.strip_prefix("-package-db=") {
-                    o.package_dbs.push(absolute(db));
-                }
-            }
+            _ if a.starts_with("-package-env=") => o.package_env = Some(a["-package-env=".len()..].to_string()),
+            _ if a.starts_with("-package-db=") => o.package_dbs.push(absolute(&a["-package-db=".len()..])),
             // Warnings, optimisation, code generation and debugging flags change nothing here.
             _ if a.starts_with('-') && a.len() > 1 => {}
             _ => o.inputs.push(a.to_string()),
@@ -370,6 +370,65 @@ fn show_string(s: &str) -> String {
     out
 }
 
+/// The package environment file in effect, as GHC finds one: `-package-env`, then `GHC_ENVIRONMENT`,
+/// then `.ghc.environment.x86_64-linux-9.12.2` in the current directory or a parent, then hsc's
+/// default environment (`~/.hsc/x86_64-linux-9.12.2/environments/default`). `-` means none.
+fn environment_file(o: &Opts) -> Option<PathBuf> {
+    let named = o.package_env.clone().or_else(|| std::env::var("GHC_ENVIRONMENT").ok());
+    if let Some(n) = named {
+        if n == "-" {
+            return None;
+        }
+        let p = PathBuf::from(&n);
+        if p.is_file() {
+            return Some(p);
+        }
+        // A bare name is an environment in the user's directory.
+        let home = std::env::var_os("HOME")?;
+        return Some(PathBuf::from(home).join(".hsc/x86_64-linux-9.12.2/environments").join(n));
+    }
+    let local = ".ghc.environment.x86_64-linux-9.12.2";
+    let mut dir = std::env::current_dir().ok();
+    while let Some(d) = dir {
+        if d.join(local).is_file() {
+            return Some(d.join(local));
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    let home = std::env::var_os("HOME")?;
+    let default = PathBuf::from(home).join(".hsc/x86_64-linux-9.12.2/environments/default");
+    default.is_file().then_some(default)
+}
+
+/// Applies a package environment file: its lines are package flags, and only the packages it names
+/// are visible (as with `-hide-all-packages`).
+fn apply_environment(o: &mut Opts) -> Result<(), String> {
+    let Some(path) = environment_file(o) else { return Ok(()) };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if o.verbosity > 0 {
+        eprintln!("Loaded package environment from {}", path.display());
+    }
+    o.hide_all = true;
+    for line in text.lines() {
+        let line = line.trim();
+        let (cmd, arg) = line.split_once(char::is_whitespace).map(|(c, a)| (c, a.trim())).unwrap_or((line, ""));
+        match cmd {
+            "clear-package-db" => {
+                o.package_dbs.clear();
+                o.no_global_db = true;
+                o.no_user_db = true;
+            }
+            "global-package-db" => o.no_global_db = false,
+            "user-package-db" => o.no_user_db = false,
+            "package-db" => o.package_dbs.push(PathBuf::from(arg)),
+            "package-id" => o.package_ids.push(arg.to_string()),
+            "package" => o.package_names.push(arg.to_string()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// The package databases a compilation reads, in order.
 fn db_stack(o: &Opts) -> Vec<PathBuf> {
     let mut dbs = Vec::new();
@@ -501,6 +560,14 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
     if o.abi_hash {
         return abi_hash(o, &search, &hs_inputs);
     }
+    let mut with_env;
+    let o = if o.package_env.as_deref() != Some("-") {
+        with_env = o.clone();
+        apply_environment(&mut with_env)?;
+        &with_env
+    } else {
+        o
+    };
     let pkg_dirs = package_dirs(o)?;
     // The modules to build: the files given, and the modules named (found in the search path).
     let mut targets: Vec<(String, PathBuf)> = Vec::new();
@@ -708,3 +775,4 @@ pub fn payload_offset(bytes: &[u8]) -> Option<usize> {
     let len = u64::from_le_bytes(len_bytes) as usize;
     (bytes.len() - 16).checked_sub(len)
 }
+

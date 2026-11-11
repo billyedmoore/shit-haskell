@@ -166,6 +166,22 @@ impl Checker {
             params.push(arg);
             tf = res;
         }
+        // A result of a polymorphic type (a rank-N field, `unQ q`) is instantiated where it is used.
+        let mut pending_dicts: Vec<Pred> = Vec::new();
+        loop {
+            match self.metas.prune(&tf) {
+                Ty::Forall(ids, ps, body) => {
+                    let args: Vec<Ty> = ids.iter().map(|_| self.meta()).collect();
+                    pending_dicts.extend(ps.iter().map(|p| super::types::subst_bound_pred(p, &ids, &args)));
+                    tf = super::types::subst_bound(&body, &ids, &args);
+                }
+                Ty::Qual(ps, body) if !spine.is_empty() => {
+                    pending_dicts.extend(ps);
+                    tf = *body;
+                }
+                _ => break,
+            }
+        }
         if let Some(ty) = expected {
             self.unify_at(&tf, ty)?;
         }
@@ -195,6 +211,8 @@ impl Checker {
         for (v, c) in eager.into_iter().rev() {
             core = Core::Case(Box::new(c), v, vec![crate::core::Alt::Default(core)]);
         }
+        let loc = self.loc;
+        let core = self.apply_dicts(core, pending_dicts, loc);
         Ok((core, tf))
     }
 
@@ -304,6 +322,56 @@ impl Checker {
                 self.err("internal: unresolved operator chain")
             }
             Expr::Lam(pats, body, loc) => self.lambda(pats, body, *loc, None),
+            Expr::Splice(true, e, loc) => {
+                // `$$(e)` in a typed quotation: `e :: Code m t` stands for a `t`.
+                self.loc = *loc;
+                let (_, te) = self.infer(e)?;
+                let m = self.meta();
+                let t = self.meta();
+                self.unify_at(&te, &Ty::apps(Ty::con("GHC.Internal.TH.Syntax.Code"), vec![m, t.clone()]))?;
+                Ok((Core::Fail("hsc: Template Haskell splices cannot be run yet".into()), t))
+            }
+            Expr::Splice(false, _, loc) => {
+                self.loc = *loc;
+                self.err("Template Haskell splices are not supported yet")
+            }
+            Expr::NameQuote(_, _, loc) => {
+                self.loc = *loc;
+                self.err("internal: a name quotation reached the type checker")
+            }
+            Expr::Quote(kind, body, loc) => {
+                // A quotation has the type GHC gives it: `Quote m => m Exp` (or `m [Dec]`, `m Type`,
+                // `m Pat`), and `Quote m => Code m t` for a typed quotation of an expression of type
+                // `t`. Running Template Haskell code is not supported yet: the value is an error.
+                self.loc = *loc;
+                const TH: &str = "GHC.Internal.TH.Syntax";
+                if self.env.classes.get(&format!("{TH}.Quote")).is_none() {
+                    return self.err("Template Haskell quotations need GHC.Internal.TH.Syntax (import Language.Haskell.TH.Syntax)");
+                }
+                let m = self.meta();
+                let ev = self.fresh_name("quote");
+                self.wanted.push(super::Wanted {
+                    pred: super::types::Pred { class: format!("{TH}.Quote"), args: vec![m.clone()] },
+                    ev,
+                    loc: *loc,
+                });
+                let ty = match (*kind, body) {
+                    ('T', Some(b)) => {
+                        let (_, t) = self.infer(b)?;
+                        Ty::apps(Ty::con(&format!("{TH}.Code")), vec![m, t])
+                    }
+                    ('e', Some(b)) => {
+                        // An untyped quotation's body is not type-checked by GHC either; its names
+                        // are resolved.
+                        let _ = b;
+                        Ty::app(m, Ty::con(&format!("{TH}.Exp")))
+                    }
+                    ('d', _) => Ty::app(m, Ty::list(Ty::con(&format!("{TH}.Dec")))),
+                    ('t', _) => Ty::app(m, Ty::con(&format!("{TH}.Type"))),
+                    _ => Ty::app(m, Ty::con(&format!("{TH}.Pat"))),
+                };
+                Ok((Core::Fail("hsc: Template Haskell quotations cannot be run yet".into()), ty))
+            }
             Expr::IPVar(name, loc) => {
                 // An implicit parameter is a wanted constraint whose evidence is its value.
                 self.loc = *loc;

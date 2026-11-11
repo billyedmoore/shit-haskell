@@ -19,6 +19,10 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             m.exc = m.args[0];
             0
         }
+        "reallyUnsafePtrEquality#" | "reallyUnsafePtrEquality" | "unsafePtrEquality#" => {
+            let same = m.args[0] == m.args[1];
+            int_value(m, same as i64)
+        }
         "noDuplicate#" | "touch#" | "realWorld#" | "proxy#" | "void#" | "labelThread#" => {
             unit(m)
         }

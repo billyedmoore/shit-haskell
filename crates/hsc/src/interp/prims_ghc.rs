@@ -324,6 +324,16 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "gtWord#" => word(rt, &args[0]).and_then(|a| Ok(b(a > word(rt, &args[1])?))),
         "geWord#" => word(rt, &args[0]).and_then(|a| Ok(b(a >= word(rt, &args[1])?))),
         n if bit_op(n, 0).is_some() => word(rt, &args[0]).map(|a| Value::Int(bit_op(n, a).unwrap_or(0))),
+        // The same cell, or the same evaluated object: a hint, so "different" is always a safe answer.
+        "reallyUnsafePtrEquality#" | "reallyUnsafePtrEquality" | "unsafePtrEquality#" => {
+            let same = std::rc::Rc::ptr_eq(&args[0], &args[1])
+                || match (&*args[0].borrow(), &*args[1].borrow()) {
+                    (Thunk::Done(Value::Con(a)), Thunk::Done(Value::Con(b))) => std::rc::Rc::ptr_eq(a, b),
+                    (Thunk::Done(Value::Fun(a)), Thunk::Done(Value::Fun(b))) => std::rc::Rc::ptr_eq(a, b),
+                    _ => false,
+                };
+            Ok(Value::Int(same as i64))
+        }
         "popCnt#" | "popCnt64#" => word(rt, &args[0]).map(|a| Value::Int(a.count_ones() as i64)),
         "clz#" | "clz64#" => word(rt, &args[0]).map(|a| Value::Int(a.leading_zeros() as i64)),
         "ctz#" | "ctz64#" => word(rt, &args[0]).map(|a| Value::Int(a.trailing_zeros() as i64)),

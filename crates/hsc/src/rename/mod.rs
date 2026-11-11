@@ -322,18 +322,29 @@ impl<'a> Renamer<'a> {
                     }
                 }
                 // Hidden names are removed both from the exports and from their sub-entities,
-                // so that hiding a method does not bring in its class's other methods.
-                let hidden_globals: HashSet<GName> = hidden.iter().map(|h| h.global.clone()).collect();
-                iface
-                    .exports
-                    .iter()
-                    .filter(|e| !hidden_globals.contains(&e.global))
-                    .map(|e| {
-                        let mut kept = e.clone();
-                        kept.subs.retain(|s| !hidden_globals.contains(&s.global));
-                        kept
-                    })
-                    .collect()
+                // so that hiding a method does not bring in its class's other methods. Hiding a
+                // type by its bare name hides the type only: its constructors stay in scope, as
+                // entities of their own (`hiding (T(..))` hides them too).
+                let mut hidden_globals: HashSet<GName> = HashSet::new();
+                for h in &hidden {
+                    hidden_globals.insert(h.global.clone());
+                    for s in &h.subs {
+                        hidden_globals.insert(s.global.clone());
+                    }
+                }
+                let mut out: Vec<Entity> = Vec::new();
+                for e in &iface.exports {
+                    if hidden_globals.contains(&e.global) {
+                        if !e.kind.is_value() {
+                            out.extend(e.subs.iter().filter(|s| s.kind.is_value() && !hidden_globals.contains(&s.global)).cloned());
+                        }
+                        continue;
+                    }
+                    let mut kept = e.clone();
+                    kept.subs.retain(|s| !hidden_globals.contains(&s.global));
+                    out.push(kept);
+                }
+                out
             }
         };
 
@@ -440,7 +451,15 @@ impl<'a> Renamer<'a> {
                             own.push(entity(EntKind::TyCon, &module, name, vec![], vec![]));
                         }
                     }
-                    let mut subs = Vec::new();
+                    // `C(..)` also names the associated families.
+                    let mut subs: Vec<Entity> = cd
+                        .decls
+                        .iter()
+                        .filter_map(|d| match d {
+                            Decl::TypeFamily { name, .. } => Some(entity(EntKind::TyCon, &module, name, vec![], vec![])),
+                            _ => None,
+                        })
+                        .collect();
                     for cdecl in &cd.decls {
                         if let Decl::Sig { names, loc, .. } = cdecl {
                             for n in names {
@@ -452,6 +471,30 @@ impl<'a> Renamer<'a> {
                     own.push(entity(EntKind::Class, &module, &cd.name, subs, vec![]));
                 }
                 _ => {}
+            }
+        }
+        // The constructors of a data instance (`R:` types) also belong to its family: `F(..)`
+        // names them, as in GHC.
+        for d in decls {
+            if let Decl::TypeInstance { name: family, equation, .. } = d {
+                let mut head = &equation.rhs;
+                while let Type::App(f, _) = head {
+                    head = f;
+                }
+                let Type::Con(rep, _) = head else { continue };
+                if !rep.name.starts_with("R:") {
+                    continue;
+                }
+                let Some(cons) = own.iter().find(|e| e.kind == EntKind::TyCon && e.occ() == rep.name).map(|e| e.subs.clone()) else {
+                    continue;
+                };
+                if let Some(fam) = own.iter_mut().find(|e| e.kind == EntKind::TyCon && e.occ() == family.name) {
+                    for c in cons {
+                        if !fam.subs.contains(&c) {
+                            fam.subs.push(c);
+                        }
+                    }
+                }
             }
         }
         self.own = own;
@@ -801,7 +844,7 @@ impl<'a> Renamer<'a> {
                 id.context = self.types(id.context)?;
                 id.head = self.ty(id.head)?;
                 let class = instance_class(&id.head);
-                let methods = class.and_then(|g| self.class_methods(&g));
+                let methods = class.as_ref().and_then(|g| self.class_methods(g));
                 let mut decls = Vec::new();
                 for d in std::mem::take(&mut id.decls) {
                     match &d {
@@ -816,6 +859,16 @@ impl<'a> Renamer<'a> {
                             }
                         }
                         _ => {}
+                    }
+                    // An associated type's equation names the family as the class does, whatever
+                    // the imports (`type Item (Set a) = a` under `instance GHC.Exts.IsList`).
+                    if let Decl::TypeInstance { name, equation, loc } = &d {
+                        if name.qual.is_none() {
+                            if let Some(g) = class.as_ref().and_then(|g| self.class_assoc(g, &name.name)) {
+                                decls.push(Decl::TypeInstance { name: g, equation: self.type_equation(equation.clone())?, loc: *loc });
+                                continue;
+                            }
+                        }
                     }
                     decls.push(match d {
                         Decl::Sig { names, ty, loc } => Decl::Sig {
@@ -902,6 +955,22 @@ impl<'a> Renamer<'a> {
         })
     }
 
+    /// An associated family of a class, by its occurrence name: its global name.
+    fn class_assoc(&self, g: &QName, occ: &str) -> Option<QName> {
+        let module = g.qual.as_deref()?;
+        let class = if module == self.module {
+            self.own.iter().find(|e| e.kind == EntKind::Class && e.occ() == g.name)
+        } else {
+            self.ifaces.values().find_map(|i| {
+                i.exports
+                    .iter()
+                    .find(|e| e.kind == EntKind::Class && e.global.module == module && e.occ() == g.name)
+            })
+        }?;
+        let sub = class.subs.iter().find(|s| s.kind == EntKind::TyCon && s.occ() == occ)?;
+        Some(QName { qual: Some(sub.global.module.clone()), name: sub.global.name.clone() })
+    }
+
     fn class_methods(&self, g: &QName) -> Option<Vec<String>> {
         let module = g.qual.as_deref()?;
         let class = if module == self.module {
@@ -913,7 +982,7 @@ impl<'a> Renamer<'a> {
                     .find(|e| e.kind == EntKind::Class && e.global.module == module && e.occ() == g.name)
             })
         }?;
-        Some(class.subs.iter().map(|s| s.occ().to_string()).collect())
+        Some(class.subs.iter().filter(|s| s.kind.is_value()).map(|s| s.occ().to_string()).collect())
     }
 
     fn tyvar_binds(&mut self, binds: Vec<TyVarBind>) -> RR<Vec<TyVarBind>> {
@@ -1125,6 +1194,49 @@ impl<'a> Renamer<'a> {
     fn expr(&mut self, e: Expr) -> RR<Expr> {
         Ok(match e {
             Expr::IPVar(name, loc) => Expr::IPVar(name, loc),
+            Expr::NameQuote(is_type, q, loc) => {
+                // `'f`, `'C`, `''T`: the TH `Name` of the global the name refers to, built by
+                // `mkNameG_v`, `mkNameG_d` or `mkNameG_tc` from its package, module and name.
+                let (fun, resolved) = if is_type {
+                    let e = self.lookup_global(&q, Ns::Type).map_err(|c| {
+                        if c.is_empty() {
+                            RnError { loc, msg: format!("Not in scope: type constructor or class ‘{}’", q.name) }
+                        } else {
+                            self.ambiguous(&q, &c, loc)
+                        }
+                    })?;
+                    ("mkNameG_tc", Some((e.global.module.clone(), e.global.name.clone())))
+                } else {
+                    let con = q.name.starts_with(|c: char| c.is_uppercase() || c == ':') || q.name == "[]";
+                    if !con && q.qual.is_none() && self.lookup_local(&q.name).is_some() {
+                        ("mkName", None)
+                    } else {
+                        let r = self.value_ref(&q, loc, con)?;
+                        (if con { "mkNameG_d" } else { "mkNameG_v" }, Some((r.qual.clone().unwrap_or_else(|| self.module.clone()), r.name.clone())))
+                    }
+                };
+                let th = |n: &str| Expr::Var(QName { qual: Some("GHC.Internal.TH.Syntax".into()), name: n.into() }, loc);
+                let lit = |s: String| Expr::Lit(Lit::Str(s), loc);
+                match resolved {
+                    None => Expr::App(Box::new(th(fun)), Box::new(lit(q.name.clone()))),
+                    Some((module, name)) => {
+                        let module = if module == "Builtin" { "GHC.Types".to_string() } else { module };
+                        let pkg = package_of_module(&module, &self.module);
+                        let f = Expr::App(Box::new(th(fun)), Box::new(lit(pkg)));
+                        let f = Expr::App(Box::new(f), Box::new(lit(module)));
+                        Expr::App(Box::new(f), Box::new(lit(name)))
+                    }
+                }
+            }
+            Expr::Splice(typed, e, loc) => Expr::Splice(typed, Box::new(self.expr(*e)?), loc),
+            Expr::Quote(kind, body, loc) => {
+                // The names in a quoted expression are resolved as in any expression.
+                let body = match body {
+                    Some(b) => Some(Box::new(self.expr(*b)?)),
+                    None => None,
+                };
+                Expr::Quote(kind, body, loc)
+            }
             Expr::Var(q, loc) => Expr::Var(self.value_ref(&q, loc, false)?, loc),
             Expr::Con(q, loc) => {
                 let cq = self.value_ref(&q, loc, true)?;
@@ -1483,12 +1595,28 @@ impl<'a> Renamer<'a> {
                 }
                 let bin = |op: QName, l: Loc, a: Pat, b: Pat| Pat::Con(op, vec![a, b], l);
                 let neg = |_: Loc, p: Pat| p;
-                resolve(toks, &bin, &neg).map_err(|e| RnError {
+                let resolved = resolve(toks, &bin, &neg).map_err(|e| RnError {
                     loc: if e.loc == Loc::default() { loc } else { e.loc },
                     msg: e.msg,
-                })?
+                })?;
+                // Infix uses of pattern synonyms (`x :<| xs`) are expanded like prefix ones.
+                self.expand_infix_patsyns(resolved)
             }
         })
+    }
+
+    /// Expands the pattern synonyms at the binary nodes of a resolved infix pattern.
+    fn expand_infix_patsyns(&self, p: Pat) -> Pat {
+        match p {
+            Pat::Con(q, args, loc) if args.len() == 2 => {
+                let args: Vec<Pat> = args.into_iter().map(|a| self.expand_infix_patsyns(a)).collect();
+                match self.patsyn_of(&q) {
+                    Some(def) if def.params.len() == 2 => subst_pat(&def.pat, &def.params, &args),
+                    _ => Pat::Con(q, args, loc),
+                }
+            }
+            other => other,
+        }
     }
 
     fn pats(&mut self, ps: Vec<Pat>, mode: BindMode) -> RR<Vec<Pat>> {
@@ -1869,6 +1997,23 @@ fn builder_decls(name: &str, args: &[String], pat: &Pat, dir: &PatSynDir, loc: L
                         clauses: vec![Clause { pats: pats.clone(), rhs: rhs.clone(), loc: *loc, end: *loc }],
                         loc: *loc,
                     }),
+                    // An infix builder `x :<| xs = ..`: the operands are its arguments.
+                    Decl::PatBind { pat: Pat::OpChain(items, _), rhs, loc }
+                        if items.len() == 3 && matches!(&items[1], PatOpItem::Op(q, _) if q.name == *name) =>
+                    {
+                        let pats: Vec<Pat> = [&items[0], &items[2]]
+                            .iter()
+                            .filter_map(|it| match it {
+                                PatOpItem::Operand(p) => Some(p.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        funs.push(Decl::Fun {
+                            name: fname.clone(),
+                            clauses: vec![Clause { pats, rhs: rhs.clone(), loc: *loc, end: *loc }],
+                            loc: *loc,
+                        })
+                    }
                     other => {
                         return Err(RnError {
                             loc: decl_loc(other),
@@ -1939,5 +2084,23 @@ fn subst_pat(p: &Pat, params: &[String], args: &[Pat]) -> Pat {
         Pat::Bang(q, loc) => Pat::Bang(Box::new(s(q)), *loc),
         Pat::Sig(q, t, loc) => Pat::Sig(Box::new(s(q)), t.clone(), *loc),
         Pat::View(e, q, loc) => Pat::View(e.clone(), Box::new(s(q)), *loc),
+    }
+}
+
+/// The package a module belongs to, for Template Haskell names: the vendored GHC packages by
+/// their module prefixes, `main` for the module being compiled and others.
+fn package_of_module(module: &str, current: &str) -> String {
+    const PRIM: &[&str] = &["GHC.Types", "GHC.Classes", "GHC.CString", "GHC.Prim", "GHC.Tuple", "GHC.Magic", "GHC.PrimopWrappers"];
+    if module == current {
+        return "main".into();
+    }
+    if module.starts_with("GHC.Internal.") {
+        "ghc-internal".into()
+    } else if PRIM.iter().any(|p| module == *p || module.starts_with(&format!("{p}."))) {
+        "ghc-prim".into()
+    } else if module.starts_with("GHC.Num.") {
+        "ghc-bignum".into()
+    } else {
+        "base".into()
     }
 }

@@ -289,6 +289,13 @@ pub enum Expr {
     AsPat(String, Box<Expr>, Loc),
     LazyPat(Box<Expr>, Loc),
     BangPat(Box<Expr>, Loc),
+    /// A Template Haskell quotation: 'e' `[| e |]`, 'T' `[|| e ||]` (with their expressions),
+    /// 'd' `[d| .. |]`, 't' `[t| .. |]`, 'p' `[p| .. |]`.
+    Quote(char, Option<Box<Expr>>, Loc),
+    /// A Template Haskell name quotation: `'f`, `'Con` (false) or `''T` (true).
+    NameQuote(bool, QName, Loc),
+    /// A Template Haskell splice: `$(e)`, `$x` (false) or `$$(e)` (true, typed).
+    Splice(bool, Box<Expr>, Loc),
 }
 
 impl Expr {
@@ -318,7 +325,10 @@ impl Expr {
             | Expr::Wild(l)
             | Expr::AsPat(_, _, l)
             | Expr::LazyPat(_, l)
-            | Expr::BangPat(_, l) => *l,
+            | Expr::BangPat(_, l)
+            | Expr::Quote(_, _, l)
+            | Expr::NameQuote(_, _, l)
+            | Expr::Splice(_, _, l) => *l,
             Expr::App(f, _) => f.loc(),
             Expr::ArithSeq { loc, .. } | Expr::RecCon { loc, .. } => *loc,
         }

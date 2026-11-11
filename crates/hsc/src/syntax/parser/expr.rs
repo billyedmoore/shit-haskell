@@ -78,7 +78,7 @@ impl Parser {
         let loc = self.loc();
         let q = match self.tok().clone() {
             Tok::VarSym(s) => {
-                if s == "!" && self.is_prefix_occurrence() {
+                if (s == "!" && self.is_prefix_occurrence()) || self.at_splice() {
                     return None;
                 }
                 // `#)` closes an unboxed tuple.
@@ -131,6 +131,20 @@ impl Parser {
             Tok::VarId(v) => Some(v.clone()),
             _ => None,
         }
+    }
+
+    /// Whether Template Haskell's quotation syntax is on.
+    fn th_quotes(&self) -> bool {
+        self.exts.is_on("TemplateHaskell") || self.exts.is_on("TemplateHaskellQuotes")
+    }
+
+    /// A splice `$(`, `$x`, `$$(`: the operator written as a prefix, with Template Haskell on.
+    fn at_splice(&self) -> bool {
+        self.real()
+            && self.th_quotes()
+            && matches!(self.tok(), Tok::VarSym(s) if s == "$" || s == "$$")
+            && self.is_prefix_occurrence()
+            && matches!(self.peek_raw(1), Tok::Special('(') | Tok::VarId(_) | Tok::QVarId(..))
     }
 
     fn is_prefix_occurrence(&self) -> bool {
@@ -285,7 +299,13 @@ impl Parser {
             | Tok::Prim(_)
             | Tok::Special('(' | '[')
             | Tok::Kw(Kw::Underscore) => true,
-            Tok::VarSym(s) => (s == "!" && self.is_prefix_occurrence()) || (s == "?" && self.at_implicit_param().is_some()),
+            Tok::VarSym(s) => {
+                (s == "!" && self.is_prefix_occurrence())
+                    || (s == "?" && self.at_implicit_param().is_some())
+                    || self.at_splice()
+            }
+            Tok::QuoteOpen(_) => true,
+            Tok::Special('\'') => self.th_quotes(),
             Tok::Res(ROp::Tilde) => self.is_prefix_occurrence(),
             _ => false,
         }
@@ -380,6 +400,87 @@ impl Parser {
             return Ok(Expr::IPVar(name, loc));
         }
         match self.tok().clone() {
+            Tok::VarSym(s) if self.at_splice() => {
+                let typed = s == "$$";
+                self.bump();
+                let inner = if self.at_special('(') {
+                    self.bump();
+                    let e = self.expr()?;
+                    self.expect_special(')')?;
+                    e
+                } else {
+                    let l = self.loc();
+                    let q = match self.tok().clone() {
+                        Tok::VarId(v) => QName::unqual(v),
+                        Tok::QVarId(m, v) => QName { qual: Some(m), name: v },
+                        _ => return self.unexpected(),
+                    };
+                    self.bump();
+                    Expr::Var(q, l)
+                };
+                Ok(Expr::Splice(typed, Box::new(inner), loc))
+            }
+            Tok::Special('\'') if self.th_quotes() => {
+                self.bump();
+                let is_type = self.at_special('\'');
+                if is_type {
+                    self.bump();
+                }
+                let q = match self.tok().clone() {
+                    Tok::VarId(s) | Tok::ConId(s) => QName::unqual(s),
+                    Tok::QVarId(m, s) | Tok::QConId(m, s) => QName { qual: Some(m), name: s },
+                    Tok::Special('(') => {
+                        self.bump();
+                        let q = match self.tok().clone() {
+                            Tok::VarSym(s) | Tok::ConSym(s) => QName::unqual(s),
+                            Tok::QVarSym(m, s) | Tok::QConSym(m, s) => QName { qual: Some(m), name: s },
+                            _ => return self.unexpected(),
+                        };
+                        self.bump();
+                        if !self.at_special(')') {
+                            return self.unexpected();
+                        }
+                        q
+                    }
+                    Tok::Special('[') if self.peek_raw(1) == &Tok::Special(']') => {
+                        self.bump();
+                        QName::unqual("[]".to_string())
+                    }
+                    _ => return self.unexpected(),
+                };
+                self.bump();
+                Ok(Expr::NameQuote(is_type, q, loc))
+            }
+            Tok::QuoteOpen(kind) => {
+                self.bump();
+                if kind == 'e' || kind == 'T' {
+                    let body = self.expr()?;
+                    if !matches!(self.tok(), Tok::QuoteClose(t) if *t == (kind == 'T')) {
+                        return self.unexpected();
+                    }
+                    self.bump();
+                    return Ok(Expr::Quote(kind, Some(Box::new(body)), loc));
+                }
+                // Declaration, type and pattern quotations are not looked into (yet): their tokens
+                // are skipped, nested brackets included.
+                let mut depth = 1;
+                loop {
+                    match self.tok() {
+                        Tok::QuoteOpen(_) => depth += 1,
+                        Tok::QuoteClose(_) => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Tok::Eof => return self.err("unterminated quotation bracket"),
+                        _ => {}
+                    }
+                    self.pos += 1;
+                }
+                self.pos += 1;
+                Ok(Expr::Quote(kind, None, loc))
+            }
             Tok::VarId(s) => {
                 self.bump();
                 if self.at_res(ROp::At) && !self.raw().space_before {

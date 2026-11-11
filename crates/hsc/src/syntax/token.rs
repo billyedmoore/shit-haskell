@@ -129,6 +129,11 @@ pub enum Tok {
     Res(ROp),
     /// One of `( ) , ; [ ] ` { }`.
     Special(char),
+    /// A Template Haskell quotation bracket: `[|` or `[e|` ('e'), `[d|`, `[t|`, `[p|`, and `[||`
+    /// ('T', typed).
+    QuoteOpen(char),
+    /// `|]`, or `||]` when typed.
+    QuoteClose(bool),
     Eof,
 }
 
@@ -147,6 +152,10 @@ impl Tok {
             Tok::Kw(k) => k.text().to_string(),
             Tok::Res(r) => r.text().to_string(),
             Tok::Special(c) => c.to_string(),
+            Tok::QuoteOpen('e') => "[|".to_string(),
+            Tok::QuoteOpen('T') => "[||".to_string(),
+            Tok::QuoteOpen(k) => format!("[{k}|"),
+            Tok::QuoteClose(typed) => if *typed { "||]" } else { "|]" }.to_string(),
             Tok::Eof => "end of input".to_string(),
         }
     }

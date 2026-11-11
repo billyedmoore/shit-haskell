@@ -30,7 +30,7 @@ const PREDEFINED: &[(&str, &str)] = &[
 
 /// Versions of the boot packages that `MIN_VERSION_<pkg>(a,b,c)` compares against.
 const PACKAGE_VERSIONS: &[(&str, [u32; 3])] = &[
-    ("base", [4, 21, 2]),
+    ("base", [4, 21, 0]),
     ("ghc_prim", [0, 13, 0]),
     ("ghc", [9, 12, 2]),
     ("containers", [0, 7, 0]),
@@ -38,8 +38,24 @@ const PACKAGE_VERSIONS: &[(&str, [u32; 3])] = &[
     ("text", [2, 1, 2]),
     ("mtl", [2, 3, 1]),
     ("transformers", [0, 6, 1]),
-    ("deepseq", [1, 5, 0]),
+    ("deepseq", [1, 5, 1]),
     ("array", [0, 5, 8]),
+    ("template_haskell", [2, 23, 0]),
+    ("stm", [2, 5, 3]),
+    ("pretty", [1, 1, 3]),
+    ("filepath", [1, 5, 4]),
+    ("os_string", [2, 0, 7]),
+    ("exceptions", [0, 10, 9]),
+    ("binary", [0, 8, 9]),
+    ("parsec", [3, 1, 18]),
+    ("directory", [1, 3, 9]),
+    ("unix", [2, 8, 6]),
+    ("time", [1, 14, 0]),
+    ("process", [1, 6, 25]),
+    ("ghc_boot_th", [9, 12, 2]),
+    ("file_io", [0, 1, 5]),
+    ("ghc_internal", [9, 1202, 0]),
+    ("ghc_bignum", [1, 3, 0]),
 ];
 
 const DIRECTIVES: &[&str] = &[
@@ -172,7 +188,13 @@ impl Preprocessor {
                             let name = rest.trim().trim_matches(|c| c == '"' || c == '<' || c == '>');
                             let text = self.find_include(name, dir)?;
                             let inner_dir = text.0.parent().unwrap_or(dir).to_path_buf();
-                            self.process(&text.1, &inner_dir, out, depth + 1)?;
+                            // A header that only defines macros adds no lines, so the lines of the
+                            // source keep their numbers (as GHC's line markers keep them).
+                            let mut inner = String::new();
+                            self.process(&text.1, &inner_dir, &mut inner, depth + 1)?;
+                            if inner.lines().any(|l| !l.trim().is_empty()) {
+                                out.push_str(&inner);
+                            }
                         }
                         "error" if active => return Err(format!("#error {}", rest.trim())),
                         _ => {}

@@ -322,6 +322,11 @@ impl Lexer {
         match c {
             '"' => return self.lex_string(),
             '\'' => {
+                // `''T` is Template Haskell's quote of a type name: two ticks.
+                if self.peek(1) == Some('\'') && self.peek(2).is_some_and(|c| c.is_uppercase() || c == '(' || c == '[') {
+                    self.bump();
+                    return Ok(Tok::Special('\''));
+                }
                 // A quote that cannot open a character literal is a promotion tick (DataKinds).
                 let promoted = self.peek(1).is_some_and(|c| c.is_alphabetic() || c == '[' || c == '(' || c == ':')
                     && self.peek(2) != Some('\'');
