@@ -9,14 +9,21 @@ use super::heap::{self, kind, Heap, Word};
 /// (and a quarter of its size more), growing if the live data leaves too little.
 pub fn collect(heap: &mut Heap, roots: &mut [Word], need: usize) {
     let mut space = std::mem::take(&mut heap.from);
-    let mut capacity = space.len();
+    // The new space holds three times the data live at the last collection (as GHC sizes its old
+    // generation at twice the live data), so that a large live set is not copied over and over.
+    let mut capacity = space.len().max(heap.last_live * 3 + need);
     let pinned = std::mem::take(&mut heap.pinned);
+    let bounds = (pinned.keys().min().copied().unwrap_or(1), pinned.keys().max().copied().unwrap_or(0));
     let mut reached: std::collections::HashSet<Word> = std::collections::HashSet::new();
-    let (mut to, mut live) = copy(&mut space, roots, capacity, &pinned, &mut reached);
+    // The space left by the previous collection is reused when it is large enough: a fresh one
+    // would be zeroed page by page.
+    let spare = std::mem::take(&mut heap.to);
+    let (mut to, mut live) = copy(&mut space, roots, capacity, &pinned, bounds, &mut reached, spare);
+    capacity = to.len();
     while capacity - live < need + capacity / 4 {
         // Too little room: copy again into a larger space (the live data is all in `to`).
         capacity = (capacity * 2).max(live + need + capacity / 4);
-        let (bigger, l) = copy(&mut to, roots, capacity, &pinned, &mut reached);
+        let (bigger, l) = copy(&mut to, roots, capacity, &pinned, bounds, &mut reached, Vec::new());
         to = bigger;
         live = l;
     }
@@ -32,30 +39,39 @@ pub fn collect(heap: &mut Heap, roots: &mut [Word], need: usize) {
     }
     heap.pinned = kept;
     heap.pinned_since_gc = 0;
+    heap.last_live = live;
+    heap.to = space;
     heap.from = to;
     heap.hp = live;
     heap.collections += 1;
+    // HSC_GC_STATS: one line per collection.
+    static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *STATS.get_or_init(|| std::env::var_os("HSC_GC_STATS").is_some()) {
+        eprintln!("gc {}: live {} words, space {} words, need {}", heap.collections, live, heap.from.len(), need);
+    }
 }
 
-/// Copies everything reachable from `roots` out of `src` into a new space of `capacity` words.
-/// Returns the new space and the number of live words. The roots are updated in place; `src` is
-/// left with forwarding pointers.
+/// Copies everything reachable from `roots` out of `src` into a new space of `capacity` words
+/// (`spare` when it is at least that large). Returns the new space and the number of live words.
+/// The roots are updated in place; `src` is left with forwarding pointers.
 fn copy(
     src: &mut [Word],
     roots: &mut [Word],
     capacity: usize,
     pinned: &std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
+    bounds: (Word, Word),
     reached: &mut std::collections::HashSet<Word>,
+    spare: Vec<Word>,
 ) -> (Vec<Word>, usize) {
-    let mut dst: Vec<Word> = vec![0; capacity];
+    let mut dst: Vec<Word> = if spare.len() >= capacity { spare } else { vec![0; capacity] };
     let mut free = 0usize;
     let base = src.as_ptr() as Word;
     let limit = base + (src.len() as Word) * 8;
+    let pin = Pinned { map: pinned, bounds };
     for r in roots.iter_mut() {
-        *r = evacuate(src, &mut dst, &mut free, *r, base, limit, pinned, reached);
+        *r = evacuate(src, &mut dst, &mut free, *r, base, limit, &pin, reached);
     }
     // Cheney scan: the copied objects, in the order they were copied, give up their pointers.
-    let dst_base = dst.as_ptr() as Word;
     let mut scan = 0usize;
     while scan < free {
         let h = dst[scan];
@@ -64,12 +80,17 @@ fn copy(
         for i in first..first + count {
             let v = dst[scan + i];
             // Pointers in `dst` are into `src` (the from-space), never into `dst`, until copied.
-            dst[scan + i] = evacuate(src, &mut dst, &mut free, v, base, limit, pinned, reached);
+            dst[scan + i] = evacuate(src, &mut dst, &mut free, v, base, limit, &pin, reached);
         }
         scan += total;
     }
-    let _ = dst_base;
     (dst, free)
+}
+
+/// The pinned objects, with the range of their addresses (a quick test for most pointers).
+struct Pinned<'a> {
+    map: &'a std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
+    bounds: (Word, Word),
 }
 
 /// Copies the object `v` (if it is a pointer into the source space) into `dst`, leaving a
@@ -82,12 +103,12 @@ fn evacuate(
     v: Word,
     base: Word,
     limit: Word,
-    pinned: &std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
+    pinned: &Pinned,
     reached: &mut std::collections::HashSet<Word>,
 ) -> Word {
     if v < base || v >= limit {
         // A pinned object stays where it is (it holds no pointers); it is only marked as reached.
-        if pinned.contains_key(&v) {
+        if v >= pinned.bounds.0 && v <= pinned.bounds.1 && pinned.map.contains_key(&v) {
             reached.insert(v);
         }
         return v;
@@ -96,6 +117,16 @@ fn evacuate(
     let h = src[from_index];
     if heap::kind_of(h) == kind::FORWARD {
         return src[from_index + 1];
+    }
+    // An indirection (an updated thunk) is replaced by what it points to.
+    if heap::kind_of(h) == kind::IND {
+        let target = src[from_index + 1];
+        if target != v {
+            let new_addr = evacuate(src, dst, free, target, base, limit, pinned, reached);
+            src[from_index] = kind::FORWARD as Word;
+            src[from_index + 1] = new_addr;
+            return new_addr;
+        }
     }
     let total = heap::total_words(h);
     let new_index = *free;

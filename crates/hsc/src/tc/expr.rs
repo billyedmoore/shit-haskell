@@ -151,6 +151,17 @@ impl Checker {
             head = f.as_ref();
         }
         spine.reverse();
+        // `f $ x` is `f x`, as GHC types and desugars it: no thunk for the argument of `$`, and
+        // `f` may be polymorphic (`runST $ do ..`).
+        if let Expr::Var(q, _) = head {
+            if spine.len() >= 2 && qkey(q) == "GHC.Internal.Base.$" {
+                let mut direct = Expr::App(Box::new(spine[0].clone()), Box::new(spine[1].clone()));
+                for a in &spine[2..] {
+                    direct = Expr::App(Box::new(direct), Box::new((*a).clone()));
+                }
+                return self.infer_spine(&direct, expected);
+            }
+        }
         let (mut core, mut tf) = self.infer(head)?;
         let mut params = Vec::with_capacity(spine.len());
         // Dictionaries of polymorphic results met in the middle of the spine: (number of arguments

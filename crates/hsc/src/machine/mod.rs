@@ -303,7 +303,144 @@ impl Machine {
         }
         self.hp = self.heap.addr(self.heap.hp);
         self.hplim = self.heap.addr(self.heap.from.len());
+        if std::env::var_os("HSC_GC_CENSUS").is_some() {
+            self.census();
+        }
         assert!(self.hp + (need as Word) * 8 <= self.hplim, "heap exhausted");
+    }
+
+    /// HSC_GC_CENSUS: the live objects by kind, and the functions, thunks and constructors by
+    /// code or name (printed after each collection, for finding space leaks).
+    fn census(&self) {
+        let mut kinds: std::collections::HashMap<u8, (usize, usize)> = std::collections::HashMap::new();
+        let mut codes: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
+        let mut i = 0;
+        while i < self.heap.hp {
+            let h = self.heap.from[i];
+            let total = heap::total_words(h);
+            let e = kinds.entry(heap::kind_of(h)).or_default();
+            e.0 += 1;
+            e.1 += total;
+            let key = match heap::kind_of(h) {
+                kind::FUN | kind::THUNK => format!("{} {}", if heap::kind_of(h) == kind::FUN { "fun" } else { "thunk" }, self.body_name(self.heap.from[i + 1])),
+                kind::CON => format!("con {}", self.con_name(self.heap.addr(i))),
+                kind::PAP => format!("pap of {} args", heap::size_of(h).saturating_sub(1)),
+                _ => String::new(),
+            };
+            if !key.is_empty() {
+                let c = codes.entry(key).or_default();
+                c.0 += 1;
+                c.1 += total;
+            }
+            i += total;
+        }
+        // HSC_GC_RETAINER=<name>: the chain of objects that retain one object of that name.
+        if let Some(want) = std::env::var_os("HSC_GC_RETAINER").map(|v| v.to_string_lossy().into_owned()) {
+            let name_of = |i: usize| -> String {
+                let h = self.heap.from[i];
+                match heap::kind_of(h) {
+                    kind::FUN | kind::THUNK => format!("{} {}", if heap::kind_of(h) == kind::FUN { "fun" } else { "thunk" }, self.body_name(self.heap.from[i + 1])),
+                    kind::CON => format!("con {}", self.con_name(self.heap.addr(i))),
+                    k => format!("kind {k}"),
+                }
+            };
+            let mut parent: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            let mut target = None;
+            let mut i = 0;
+            while i < self.heap.hp {
+                let h = self.heap.from[i];
+                let total = heap::total_words(h);
+                let (first, count) = heap::pointer_fields(h);
+                for f in first..first + count {
+                    let v = self.heap.from[i + f];
+                    if self.heap.contains(v) {
+                        parent.entry(self.heap.index(v)).or_insert(i);
+                    }
+                }
+                if target.is_none() && name_of(i).contains(&want) {
+                    target = Some(i);
+                }
+                i += total;
+            }
+            let mut cur = target;
+            let mut seen = std::collections::HashSet::new();
+            let mut chain = Vec::new();
+            while let Some(c) = cur {
+                if !seen.insert(c) {
+                    chain.push(format!("(cycle back to {})", name_of(c)));
+                    break;
+                }
+                chain.push(name_of(c));
+                cur = parent.get(&c).copied();
+            }
+            eprintln!("  retainer chain of {} objects; its first 12 and last 25:", chain.len());
+            for c in chain.iter().take(12) {
+                eprintln!("  retained by: {c}");
+            }
+            eprintln!("  ...");
+            for c in chain.iter().skip(chain.len().saturating_sub(25)) {
+                eprintln!("  retained by: {c}");
+            }
+        }
+        let mut ks: Vec<_> = kinds.into_iter().collect();
+        ks.sort_by_key(|(_, (_, w))| std::cmp::Reverse(*w));
+        for (k, (n, w)) in ks {
+            eprintln!("  kind {k}: {n} objects, {w} words");
+        }
+        let mut cs: Vec<_> = codes.into_iter().collect();
+        cs.sort_by_key(|(_, (_, w))| std::cmp::Reverse(*w));
+        for (c, (n, w)) in cs.into_iter().take(20) {
+            eprintln!("  {c}: {n} objects, {w} words");
+        }
+        let stack_top = self.stack.as_ptr() as Word + (self.stack.len() as Word) * 8;
+        eprintln!("  stack: {} words", stack_top.saturating_sub(self.sp) / 8);
+        // The frames on the stack, by kind and body.
+        let mut frames: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut p = self.sp + 8 * self.top;
+        loop {
+            let ret = unsafe { *(p as *const Word) };
+            if ret == 0 {
+                break;
+            }
+            let fkind = unsafe { *((ret - 16) as *const Word) };
+            let size = unsafe { *((ret - 8) as *const Word) };
+            p += 8;
+            use crate::native::codegen::frame;
+            let what = match fkind {
+                frame::BODY => {
+                    p += 8 * size;
+                    "body"
+                }
+                frame::UPDATE => {
+                    let t = unsafe { *(p as *const Word) };
+                    p += 8;
+                    let h = unsafe { *(t as *const Word) };
+                    let name = if heap::kind_of(h) == kind::THUNK {
+                        self.body_name(unsafe { *((t + 8) as *const Word) })
+                    } else {
+                        format!("kind {}", heap::kind_of(h))
+                    };
+                    *frames.entry(format!("update of {name}")).or_default() += 1;
+                    continue;
+                }
+                frame::CATCH | frame::MASK => {
+                    p += 8;
+                    "catch/mask"
+                }
+                frame::APPLY => {
+                    let n = unsafe { *(p as *const Word) };
+                    p += 8 * (1 + n);
+                    "apply"
+                }
+                _ => break,
+            };
+            *frames.entry(format!("{what} {}", self.body_name(ret))).or_default() += 1;
+        }
+        let mut fs: Vec<_> = frames.into_iter().collect();
+        fs.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (f, n) in fs.into_iter().take(12) {
+            eprintln!("  frame {f}: {n}");
+        }
     }
 
     /// The bodies of the frames on the stack, innermost first (for diagnostics).

@@ -89,6 +89,8 @@ pub struct Heap {
     pub pinned: std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
     /// Bytes of pinned objects allocated since the last collection (which triggers one when large).
     pub pinned_since_gc: usize,
+    /// The live words after the last collection (the next space is sized from it).
+    pub last_live: usize,
 }
 
 impl Heap {
@@ -100,6 +102,7 @@ impl Heap {
             collections: 0,
             pinned: std::collections::HashMap::new(),
             pinned_since_gc: 0,
+            last_live: 0,
         }
     }
 
