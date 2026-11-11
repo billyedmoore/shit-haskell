@@ -116,7 +116,11 @@ pub extern "C" fn hsc_native_main(table: *const NativeTable) -> i32 {
             // SAFETY: the object's `main` passes the table generated for this program.
             unsafe { run(t as *const NativeTable) }
         })
-        .map(|h| h.join().unwrap_or(1))
+        .map(|h| {
+            // This thread only waits: signals go to the program's threads.
+            crate::signals::block_all();
+            h.join().unwrap_or(1)
+        })
         .unwrap_or(1)
 }
 

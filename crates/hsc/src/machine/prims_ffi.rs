@@ -296,7 +296,8 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
         // System.Mem: a collection now.
         "performGC" | "performMajorGC" | "performBlockingMajorGC" => {
             m.collect(0);
-            unit(m)
+            let u = unit(m);
+            state_pair(m, u)
         }
         "getppid" => {
             // SAFETY: no arguments.

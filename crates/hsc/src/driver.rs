@@ -557,6 +557,8 @@ pub fn run_binds_code(binds: Vec<crate::core::TopBind>, prog_name: String) -> i3
             crate::interp::run_main(&rt)
         })
         .expect("spawn interpreter thread");
+    // This thread only waits: signals go to the program's threads.
+    crate::signals::block_all();
     handle.join().unwrap_or(1)
 }
 

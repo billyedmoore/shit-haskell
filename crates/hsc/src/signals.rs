@@ -81,6 +81,23 @@ extern "C" fn handler(sig: i32, info: *const u8, _ctx: *const u8) {
     crate::sched::PREEMPT.store(true, Ordering::Relaxed);
 }
 
+extern "C" {
+    fn pthread_sigmask(how: i32, set: *const [u64; 16], old: *mut [u64; 16]) -> i32;
+    fn sigfillset(set: *mut [u64; 16]) -> i32;
+}
+
+/// Blocks every signal in the calling OS thread: the runtime's own threads (the one waiting for
+/// the program, the ticker) take none, so a signal goes to a thread running Haskell code, as in
+/// GHC's single-threaded runtime, and `blockSignals` there keeps it pending.
+pub fn block_all() {
+    let mut set = [0u64; 16];
+    // SAFETY: a full set, applied to this thread only.
+    unsafe {
+        sigfillset(&mut set);
+        pthread_sigmask(0, &set, std::ptr::null_mut());
+    }
+}
+
 extern "C" fn empty_handler(_sig: i32) {}
 
 /// At start-up, as GHC's RTS: SIGPIPE gets a handler that does nothing, so that a write to a

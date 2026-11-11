@@ -277,6 +277,7 @@ impl<V> Sched<V> {
         let slice = self.slice;
         TICKER.call_once(|| {
             let _ = std::thread::Builder::new().name("hsc-ticker".into()).spawn(move || loop {
+                crate::signals::block_all();
                 std::thread::sleep(slice);
                 PREEMPT.store(true, Ordering::Relaxed);
             });
