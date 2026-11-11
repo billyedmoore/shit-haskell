@@ -117,6 +117,16 @@ impl Checker {
                 derived.extend(self.standalone_derive(sd)?);
             }
         }
+        // The associated type equations of derived instances (`Rep T` of a derived Generic).
+        for d in &derived {
+            if let Decl::Instance(id) = d {
+                for x in &id.decls {
+                    if let Decl::TypeInstance { name, equation, .. } = x {
+                        self.add_family_equation(&global_tycon_name(name), &equation.args, &equation.rhs, equation.loc)?;
+                    }
+                }
+            }
+        }
 
         // 3. Classes: dictionary layout, selectors, and default-method names.
         let mut class_decls: Vec<&ClassDecl> = Vec::new();
@@ -856,6 +866,8 @@ impl Checker {
         // Methods.
         let mut fields: Vec<Core> = super_vars;
         let mut method_binds: Vec<(String, Core)> = Vec::new();
+        // What the defaults need is solved here, while the instance context is given.
+        let outer_wanted = std::mem::take(&mut self.wanted);
         for (mkey, mscheme) in &info.methods {
             let occ = super::types::unqualify(mkey).to_string();
             let impl_decl = id.decls.iter().find_map(|d| match d {
@@ -935,6 +947,10 @@ impl Checker {
             };
             fields.push(field);
         }
+        let default_wanted = std::mem::replace(&mut self.wanted, outer_wanted);
+        let (db, residual) = self.solve(default_wanted)?;
+        method_binds.extend(db);
+        self.wanted.extend(residual);
         self.scoped.truncate(scope_len);
         self.givens.truncate(givens_len);
 

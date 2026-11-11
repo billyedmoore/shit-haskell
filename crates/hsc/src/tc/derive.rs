@@ -151,7 +151,9 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
             };
             let name = class_qname.name.clone();
             // Newtype deriving is handled by the dictionary alias in the checker.
-            if d.strategy == Some(Strategy::Newtype) || (dd.newtype && !is_stock(&name) && d.strategy.is_none()) {
+            // Generic, Data and Lift are derived the stock way for newtypes too.
+            let stock_for_newtype = is_stock(&name) || matches!(name.as_str(), "Generic" | "Generic1" | "Data" | "Lift");
+            if d.strategy == Some(Strategy::Newtype) || (dd.newtype && !stock_for_newtype && d.strategy.is_none()) {
                 continue;
             }
             let derived = match name.as_str() {
@@ -166,12 +168,14 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
                 "Traversable" => derive_traversable(checker, dd),
                 "Lift" => derive_lift(dd),
                 "Data" => derive_data(checker, dd),
+                "Generic" => derive_generic(checker, dd, false),
+                "Generic1" => derive_generic(checker, dd, true),
                 // DeriveAnyClass: an instance with the class's default methods. Derived
                 // instances of unknown classes are skipped when the instance is registered.
                 _ => Vec::new(),
             };
             // Constructor classes are derived for the type constructor without its last parameter.
-            let drop_last = matches!(name.as_str(), "Functor" | "Foldable" | "Traversable");
+            let drop_last = matches!(name.as_str(), "Functor" | "Foldable" | "Traversable" | "Generic1");
             let mut inst = instance(&checker.module, dd, &class_qname, derived, drop_last);
             if let Decl::Instance(id) = &mut inst {
                 id.overlap = Some(DERIVED_MARK.into());
@@ -211,6 +215,30 @@ fn field_context(class: &QName, dd: &DataDecl, loc: Loc, last: Option<&str>) -> 
                     out.push(item);
                 }
             });
+        }
+    }
+    out
+}
+
+/// A derived `Generic1` instance needs `Functor f` for each composition `f :.: ..` whose outer
+/// functor is headed by a type variable (the conversions map over it).
+fn generic1_context(dd: &DataDecl, loc: Loc, last: Option<&str>) -> Vec<Type> {
+    fn walk(r: &FieldRep, loc: Loc, out: &mut Vec<Type>) {
+        if let FieldRep::Comp(f, inner) = r {
+            if matches!(spine(f).0, Type::Var(..)) {
+                let functor = QName { qual: Some("GHC.Internal.Base".into()), name: "Functor".into() };
+                let item = Type::App(Box::new(Type::Con(functor, loc)), Box::new(f.clone()));
+                if !out.contains(&item) {
+                    out.push(item);
+                }
+            }
+            walk(inner, loc, out);
+        }
+    }
+    let mut out = Vec::new();
+    for c in &dd.cons {
+        for t in field_types(c) {
+            walk(&field_rep(&t, last), loc, &mut out);
         }
     }
     out
@@ -334,7 +362,12 @@ fn instance(module: &str, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_l
     );
     let head = Type::App(Box::new(Type::Con(class.clone(), loc)), Box::new(head_ty));
     let last = if drop_last { dd.tyvars.last().map(|t| t.name.clone()) } else { None };
-    let mut context = field_context(class, dd, loc, last.as_deref());
+    // A Generic instance needs nothing of its fields' types.
+    let mut context = match class.name.as_str() {
+        "Generic" => Vec::new(),
+        "Generic1" => generic1_context(dd, loc, last.as_deref()),
+        _ => field_context(class, dd, loc, last.as_deref()),
+    };
     // `Data` has `Typeable` as its superclass: each type parameter must be Typeable, as GHC infers.
     if class.name == "Data" {
         for tv in &kept {
@@ -777,6 +810,253 @@ fn derive_bounded(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
     Vec::new()
 }
 
+/// A balanced binary tree over items, as GHC builds the sums and products of a representation: the
+/// first half on the left.
+fn balanced<T: Clone>(items: &[T], leaf: &dyn Fn(&T) -> Type, node: &dyn Fn(Type, Type) -> Type, empty: Type) -> Type {
+    match items.len() {
+        0 => empty,
+        1 => leaf(&items[0]),
+        n => {
+            let (l, r) = items.split_at(n / 2);
+            node(balanced(l, leaf, node, empty.clone()), balanced(r, leaf, node, empty))
+        }
+    }
+}
+
+/// The injections (L1/R1, false for left) of constructor `i` of `n` in a balanced sum.
+fn sum_path(n: usize, i: usize) -> Vec<bool> {
+    if n <= 1 {
+        return Vec::new();
+    }
+    let l = n / 2;
+    let mut out = Vec::new();
+    if i < l {
+        out.push(false);
+        out.extend(sum_path(l, i));
+    } else {
+        out.push(true);
+        out.extend(sum_path(n - l, i - l));
+    }
+    out
+}
+
+/// How a field is represented by Generic1, relative to the last type parameter `v`: `v` itself
+/// (`Par1`), a type not mentioning it (`Rec0`), `f v` (`Rec1 f`), or `f t` where `t` mentions it
+/// (`f :.: rep t`, built with `fmap`).
+#[derive(Clone)]
+enum FieldRep {
+    Par,
+    Rec0(Type),
+    Rec1(Type),
+    Comp(Type, Box<FieldRep>),
+}
+
+fn field_rep(t: &Type, last: Option<&str>) -> FieldRep {
+    let Some(v) = last else { return FieldRep::Rec0(t.clone()) };
+    if matches!(t, Type::Var(x, _) if x == v) {
+        return FieldRep::Par;
+    }
+    if !mentions(t, v) {
+        return FieldRep::Rec0(t.clone());
+    }
+    // The built-in syntax: `[t]` is `[] t`, `(x, .., t)` is `(,..) x .. t`.
+    let desugared;
+    let t = match t {
+        Type::List(e, l) => {
+            desugared = Type::App(Box::new(Type::Con(QName { qual: Some("Builtin".into()), name: "[]".into() }, *l)), e.clone());
+            &desugared
+        }
+        Type::Fun(a, r) => {
+            let arrow = Type::Con(QName { qual: Some("Builtin".into()), name: "->".into() }, Loc::default());
+            desugared = Type::App(Box::new(Type::App(Box::new(arrow), a.clone())), r.clone());
+            &desugared
+        }
+        Type::Tuple(ts, l) if ts.len() >= 2 => {
+            let con = Type::Con(QName { qual: Some("Builtin".into()), name: format!("({})", ",".repeat(ts.len() - 1)) }, *l);
+            desugared = ts.iter().fold(con, |acc, x| Type::App(Box::new(acc), Box::new(x.clone())));
+            &desugared
+        }
+        _ => t,
+    };
+    if let Type::App(f, a) = t {
+        if !mentions(f, v) {
+            if matches!(a.as_ref(), Type::Var(x, _) if x == v) {
+                return FieldRep::Rec1((**f).clone());
+            }
+            return FieldRep::Comp((**f).clone(), Box::new(field_rep(a, last)));
+        }
+    }
+    // A shape Generic1 cannot represent (the parameter under a function arrow, say): as a constant.
+    FieldRep::Rec0(t.clone())
+}
+
+/// `Generic` and `Generic1` (DeriveGeneric): `Rep`/`Rep1` with GHC's metadata (`MetaData`,
+/// `MetaCons`, `MetaSel`), balanced sums of constructors and products of fields, and the conversions
+/// `from`/`to` (`from1`/`to1`).
+fn derive_generic(checker: &mut Checker, dd: &DataDecl, one: bool) -> Vec<Decl> {
+    let loc = dd.loc;
+    let module = checker.module.clone();
+    const G: &str = "GHC.Internal.Generics";
+    let gty = |n: &str| Type::Con(QName { qual: Some(G.into()), name: n.into() }, loc);
+    let prom = |m: &str, n: &str| Type::Con(QName { qual: Some(m.into()), name: format!("'{n}") }, loc);
+    let sym = |s: &str| Type::Lit(Lit::Str(s.to_string()), loc);
+    let tapp = |f: Type, args: Vec<Type>| args.into_iter().fold(f, |acc, a| Type::App(Box::new(acc), Box::new(a)));
+    let pkg = if module.starts_with("GHC.Internal.") { "ghc-internal" } else { "main" };
+    let bool_ty = |b: bool| prom("GHC.Types", if b { "True" } else { "False" });
+    let last: Option<String> = if one { dd.tyvars.last().map(|t| t.name.clone()) } else { None };
+    fn rep_ty(r: &FieldRep, gty: &dyn Fn(&str) -> Type, tapp: &dyn Fn(Type, Vec<Type>) -> Type) -> Type {
+        match r {
+            FieldRep::Par => gty("Par1"),
+            FieldRep::Rec0(t) => tapp(gty("Rec0"), vec![t.clone()]),
+            FieldRep::Rec1(f) => tapp(gty("Rec1"), vec![f.clone()]),
+            FieldRep::Comp(f, inner) => tapp(gty(":.:"), vec![f.clone(), rep_ty(inner, gty, tapp)]),
+        }
+    }
+    // Rep
+    let con_rep = |c: &ConDecl| -> Type {
+        let names = field_names(c);
+        let fields = field_types(c);
+        let stricts: Vec<bool> = match &c.fields {
+            ConFields::Positional(fs) => fs.iter().map(|f| f.strict).collect(),
+            ConFields::Record(groups) => groups.iter().flat_map(|(ns, f)| ns.iter().map(move |_| f.strict)).collect(),
+        };
+        let sels: Vec<(Option<String>, FieldRep, bool)> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (names.get(i).cloned(), field_rep(t, last.as_deref()), stricts.get(i).copied().unwrap_or(false)))
+            .collect();
+        let leaf = |(name, r, strict): &(Option<String>, FieldRep, bool)| -> Type {
+            let sel_name = match name {
+                Some(n) => tapp(prom("GHC.Internal.Maybe", "Just"), vec![sym(n)]),
+                None => prom("GHC.Internal.Maybe", "Nothing"),
+            };
+            let meta = tapp(
+                prom(G, "MetaSel"),
+                vec![
+                    sel_name,
+                    prom(G, "NoSourceUnpackedness"),
+                    prom(G, if *strict { "SourceStrict" } else { "NoSourceStrictness" }),
+                    prom(G, if *strict { "DecidedStrict" } else { "DecidedLazy" }),
+                ],
+            );
+            tapp(gty("S1"), vec![meta, rep_ty(r, &gty, &tapp)])
+        };
+        let node = |a: Type, b: Type| tapp(gty(":*:"), vec![a, b]);
+        let prod = balanced(&sels, &leaf, &node, gty("U1"));
+        let fixity = if c.infix || is_operator(&c.name) {
+            tapp(prom(G, "InfixI"), vec![prom(G, "LeftAssociative"), Type::Lit(Lit::Int("9".into()), loc)])
+        } else {
+            prom(G, "PrefixI")
+        };
+        let record = matches!(c.fields, ConFields::Record(_));
+        let meta = tapp(prom(G, "MetaCons"), vec![sym(&c.name), fixity, bool_ty(record)]);
+        tapp(gty("C1"), vec![meta, prod])
+    };
+    let sum = balanced(&dd.cons, &con_rep, &|a, b| tapp(gty(":+:"), vec![a, b]), gty("V1"));
+    let meta = tapp(prom(G, "MetaData"), vec![sym(&dd.name), sym(&module), sym(pkg), bool_ty(dd.newtype)]);
+    let rep = tapp(gty("D1"), vec![meta, sum]);
+    let kept = if one { &dd.tyvars[..dd.tyvars.len().saturating_sub(1)] } else { &dd.tyvars[..] };
+    let head = kept.iter().fold(
+        Type::Con(QName { qual: Some(module.clone()), name: dd.name.clone() }, loc),
+        |acc, tv| Type::App(Box::new(acc), Box::new(Type::Var(tv.name.clone(), loc))),
+    );
+    let rep_inst = Decl::TypeInstance {
+        name: QName { qual: Some(G.into()), name: if one { "Rep1" } else { "Rep" }.into() },
+        equation: crate::syntax::ast::TypeEquation { args: vec![head], rhs: rep, loc },
+        loc,
+    };
+    // The conversions.
+    let gcon = |n: &str| QName { qual: Some(G.into()), name: n.into() };
+    let gvar = |n: &str| Expr::Var(QName { qual: Some(G.into()), name: n.into() }, loc);
+    let fmap = || base_var("fmap", loc);
+    // The representation of a field value, and back.
+    fn wrap(r: &FieldRep, e: Expr, checker: &mut Checker, loc: Loc, gcon: &dyn Fn(&str) -> QName, fmap: &dyn Fn() -> Expr) -> Expr {
+        match r {
+            FieldRep::Par => app(Expr::Con(gcon("Par1"), loc), vec![e]),
+            FieldRep::Rec0(_) => app(Expr::Con(gcon("K1"), loc), vec![e]),
+            FieldRep::Rec1(_) => app(Expr::Con(gcon("Rec1"), loc), vec![e]),
+            FieldRep::Comp(_, inner) => {
+                let z = checker.fresh_name("gz");
+                let body = wrap(inner, local(&z, loc), checker, loc, gcon, fmap);
+                let f = Expr::Lam(vec![Pat::Var(z, loc)], Box::new(body), loc);
+                app(Expr::Con(gcon("Comp1"), loc), vec![app(fmap(), vec![f, e])])
+            }
+        }
+    }
+    fn unwrap(r: &FieldRep, e: Expr, checker: &mut Checker, loc: Loc, gvar: &dyn Fn(&str) -> Expr, fmap: &dyn Fn() -> Expr) -> Expr {
+        match r {
+            FieldRep::Par => app(gvar("unPar1"), vec![e]),
+            FieldRep::Rec0(_) => app(gvar("unK1"), vec![e]),
+            FieldRep::Rec1(_) => app(gvar("unRec1"), vec![e]),
+            FieldRep::Comp(_, inner) => {
+                let z = checker.fresh_name("gz");
+                let body = unwrap(inner, local(&z, loc), checker, loc, gvar, fmap);
+                let f = Expr::Lam(vec![Pat::Var(z, loc)], Box::new(body), loc);
+                app(fmap(), vec![f, app(gvar("unComp1"), vec![e])])
+            }
+        }
+    }
+    // The product of the fields' representations: M1 r :*: ..; and its pattern, binding each r.
+    fn prod_expr(items: &[Expr], loc: Loc, gcon: &dyn Fn(&str) -> QName) -> Expr {
+        match items.len() {
+            0 => Expr::Con(gcon("U1"), loc),
+            1 => app(Expr::Con(gcon("M1"), loc), vec![items[0].clone()]),
+            k => {
+                let (l, r) = items.split_at(k / 2);
+                app(Expr::Con(gcon(":*:"), loc), vec![prod_expr(l, loc, gcon), prod_expr(r, loc, gcon)])
+            }
+        }
+    }
+    fn prod_pat(vars: &[String], loc: Loc, gcon: &dyn Fn(&str) -> QName) -> Pat {
+        match vars.len() {
+            0 => Pat::Con(gcon("U1"), vec![], loc),
+            1 => Pat::Con(gcon("M1"), vec![Pat::Var(vars[0].clone(), loc)], loc),
+            k => {
+                let (l, r) = vars.split_at(k / 2);
+                Pat::Con(gcon(":*:"), vec![prod_pat(l, loc, gcon), prod_pat(r, loc, gcon)], loc)
+            }
+        }
+    }
+    let n = dd.cons.len();
+    let mut from_alts = Vec::new();
+    let mut to_alts = Vec::new();
+    for (i, c) in dd.cons.iter().enumerate() {
+        let reps: Vec<FieldRep> = field_types(c).iter().map(|t| field_rep(t, last.as_deref())).collect();
+        let vars = fresh_vars(checker, "g", reps.len());
+        let reprs = fresh_vars(checker, "gr", reps.len());
+        let wrapped: Vec<Expr> = reps.iter().zip(&vars).map(|(r, v)| wrap(r, local(v, loc), checker, loc, &gcon, &fmap)).collect();
+        let path = sum_path(n, i);
+        let mut e = app(Expr::Con(gcon("M1"), loc), vec![prod_expr(&wrapped, loc, &gcon)]);
+        let mut p = Pat::Con(gcon("M1"), vec![prod_pat(&reprs, loc, &gcon)], loc);
+        for right in path.iter().rev() {
+            let inj = if *right { "R1" } else { "L1" };
+            e = app(Expr::Con(gcon(inj), loc), vec![e]);
+            p = Pat::Con(gcon(inj), vec![p], loc);
+        }
+        let con_p = con_pat(&module, &c.name, vars.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc);
+        let args: Vec<Expr> = reps.iter().zip(&reprs).map(|(r, v)| unwrap(r, local(v, loc), checker, loc, &gvar, &fmap)).collect();
+        let con_e = app(con_expr(&module, &c.name, loc), args);
+        from_alts.push(crate::syntax::ast::Alt { pat: con_p, rhs: Rhs { body: Body::Plain(e), wheres: Vec::new() }, loc });
+        to_alts.push(crate::syntax::ast::Alt { pat: p, rhs: Rhs { body: Body::Plain(con_e), wheres: Vec::new() }, loc });
+    }
+    let x = checker.fresh_name("gx");
+    let r = checker.fresh_name("gr");
+    let (from_name, to_name) = if one { ("from1", "to1") } else { ("from", "to") };
+    let mut out = vec![rep_inst];
+    if n == 0 {
+        // No constructors: both directions are the empty case.
+        let empty = |v: &str| Expr::Case(Box::new(local(v, loc)), Vec::new(), loc);
+        out.push(fun(from_name, vec![clause(vec![Pat::Var(x.clone(), loc)], app(Expr::Con(gcon("M1"), loc), vec![empty(&x)]), loc)], loc));
+        out.push(fun(to_name, vec![clause(vec![Pat::Con(gcon("M1"), vec![Pat::Var(r.clone(), loc)], loc)], empty(&r), loc)], loc));
+        return out;
+    }
+    let from_body = app(Expr::Con(gcon("M1"), loc), vec![Expr::Case(Box::new(local(&x, loc)), from_alts, loc)]);
+    let to_body = Expr::Case(Box::new(local(&r, loc)), to_alts, loc);
+    out.push(fun(from_name, vec![clause(vec![Pat::Var(x, loc)], from_body, loc)], loc));
+    out.push(fun(to_name, vec![clause(vec![Pat::Con(gcon("M1"), vec![Pat::Var(r, loc)], loc)], to_body, loc)], loc));
+    out
+}
+
 /// `Data` (DeriveDataTypeable): `gfoldl` and `gunfold` over the fields, `toConstr` and `dataTypeOf`
 /// from a `DataType` with one `Constr` per constructor, as GHC derives them.
 fn derive_data(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
@@ -1145,7 +1425,9 @@ fn fold_inner(checker: &mut Checker, arg: &Type, last: &str, f: &str, x: Expr, a
     let a2 = checker.fresh_name("acc");
     let step = fold_expr(checker, arg, last, f, local(&y, loc), local(&a2, loc), loc);
     let lam = Expr::Lam(vec![Pat::Var(y, loc), Pat::Var(a2, loc)], Box::new(step), loc);
-    app(base_var("foldr", loc), vec![lam, acc, x])
+    // The class method (`Base.foldr` is the list function of GHC.Base).
+    let foldr = Expr::Var(QName { qual: Some("GHC.Internal.Data.Foldable".into()), name: "foldr".into() }, loc);
+    app(foldr, vec![lam, acc, x])
 }
 
 fn derive_foldable(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
