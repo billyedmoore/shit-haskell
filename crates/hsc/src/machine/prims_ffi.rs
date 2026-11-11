@@ -118,7 +118,7 @@ pub fn address_value(m: &mut Machine, a: u64) -> Word {
     state_pair(m, v)
 }
 
-pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char) -> Option<Word> {
+pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char, safe: bool) -> Option<Word> {
     let mut ints: Vec<u64> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();
     let classes: Vec<char> = sig.chars().collect();
@@ -145,7 +145,12 @@ pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char) 
     // The arrays passed, for pointers the function answers into them (they move with the collector).
     let pointer_args: Vec<usize> = (0..classes.len()).collect();
     // SAFETY: the foreign import declares the function's type; no collection happens during the call.
-    let answer = unsafe { crate::ccall::call(f, &ints, &floats, ret) };
+    // A safe call lets the other threads run meanwhile.
+    let answer = if safe {
+        super::conc::foreign_call(m, || unsafe { crate::ccall::call(f, &ints, &floats, ret) })
+    } else {
+        unsafe { crate::ccall::call(f, &ints, &floats, ret) }
+    };
     m.reserve(16);
     let value = match (answer, ret) {
         (_, 'v') => unit(m),

@@ -50,6 +50,13 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
     // A foreign C call: the runtime's own version of the function, else the C function itself.
     if let Some((sig, ret, sym)) = crate::ccall::parse(name) {
         let (sig, sym) = (sig.to_string(), sym.to_string());
+        // A safe call of a C function goes to C (so that other threads run meanwhile), not to the
+        // runtime's own version of it.
+        if crate::ccall::is_safe(name) {
+            if let Some(f) = crate::ccall::resolve(name) {
+                return super::prims_ffi::generic(m, f, &sig, ret, true).unwrap_or(0);
+            }
+        }
         if let Some(r) = super::prims_ffi::run(m, &sym, nargs) {
             return r;
         }
@@ -60,7 +67,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
             return super::prims_ffi::address_value(m, a);
         }
         if let Some(f) = crate::ccall::resolve(name) {
-            return super::prims_ffi::generic(m, f, &sig, ret).unwrap_or(0);
+            return super::prims_ffi::generic(m, f, &sig, ret, crate::ccall::is_safe(name)).unwrap_or(0);
         }
         return run(m, &sym, nargs);
     }

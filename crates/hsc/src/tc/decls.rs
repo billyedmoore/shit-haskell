@@ -613,7 +613,9 @@ impl Checker {
         };
         let key = format!("{}.{name}", self.module);
         // The C entity: an optional `static`, an optional header (`HsBase.h`), then the symbol.
-        let capi = entity.is_some_and(|e| e.starts_with("%capi"));
+        let capi = entity.is_some_and(|e| e.split_whitespace().any(|w| w == "%capi"));
+        // A safe call is marked with a leading `!`: the runtime lets other threads run during it.
+        let safe = !entity.is_some_and(|e| e.split_whitespace().any(|w| w == "%unsafe"));
         let header = entity
             .and_then(|e| e.split_whitespace().find(|w| w.ends_with(".h")).map(str::to_string))
             .unwrap_or_default();
@@ -621,7 +623,7 @@ impl Checker {
         let prim = entity
             .and_then(|e| {
                 e.split_whitespace()
-                    .filter(|w| *w != "static" && *w != "%capi" && *w != "value" && !w.ends_with(".h"))
+                    .filter(|w| *w != "static" && *w != "%capi" && *w != "%unsafe" && *w != "value" && !w.ends_with(".h"))
                     .last()
                     .map(str::to_string)
             })
@@ -669,12 +671,13 @@ impl Checker {
                 })
                 .collect();
             let ret = value_ty.as_ref().map(|v| self.ffi_class(v)).unwrap_or('v');
+            let mark = if safe && !value && !prim.starts_with('&') { "!" } else { "" };
             if capi {
                 // The arguments keep their C classes (pointers apart), for the C wrapper.
                 let full: String = arg_tys.iter().map(|a| self.ffi_class(a)).collect();
-                format!("capi:{full}>{ret}:{prim}:{header}:{}", if value { "value" } else { "" })
+                format!("{mark}capi:{full}>{ret}:{prim}:{header}:{}", if value { "value" } else { "" })
             } else {
-                format!("ccall:{args}>{ret}:{prim}")
+                format!("{mark}ccall:{args}>{ret}:{prim}")
             }
         };
         // The runtime answers a C call with the (# state, value #) pair; a pure call takes the value.

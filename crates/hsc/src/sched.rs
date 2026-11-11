@@ -84,6 +84,8 @@ pub enum Why {
     Delay,
     /// The delivery of an exception thrown to this (masked) thread.
     Throw(Tid),
+    /// The end of a safe foreign call, made without the baton.
+    Foreign,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -156,6 +158,31 @@ pub struct Sched<V> {
     next_key: u64,
     baton: Arc<Baton>,
     slice: Duration,
+    /// The threads whose safe foreign calls have returned, waiting to be queued (they do not hold
+    /// the baton, so they leave their number here), and the condition the idle scheduler waits on.
+    returned: Arc<(Mutex<Vec<Tid>>, Condvar)>,
+    /// The threads in safe foreign calls.
+    in_foreign: usize,
+}
+
+/// What a thread in a safe foreign call needs to come back: see `Sched::enter_foreign`.
+pub struct ForeignReturn {
+    baton: Arc<Baton>,
+    returned: Arc<(Mutex<Vec<Tid>>, Condvar)>,
+    me: Tid,
+    cv: Arc<Condvar>,
+}
+
+impl ForeignReturn {
+    /// Back from C: the thread asks to be queued and waits for its turn.
+    pub fn wait(self) {
+        {
+            let (list, cv) = &*self.returned;
+            list.lock().unwrap_or_else(|e| e.into_inner()).push(self.me);
+            cv.notify_all();
+        }
+        self.baton.wait(self.me, &self.cv);
+    }
 }
 
 impl<V> Sched<V> {
@@ -174,6 +201,8 @@ impl<V> Sched<V> {
             next_key: 1,
             baton: Arc::new(Baton { turn: Mutex::new(1) }),
             slice: Duration::from_millis(slice_ms),
+            returned: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
+            in_foreign: 0,
         }
     }
 
@@ -345,6 +374,8 @@ impl<V> Sched<V> {
     /// Takes a blocked thread out of what it waits in and makes it runnable.
     fn unblock(&mut self, t: Tid, why: Why) {
         match why {
+            // A thread in C comes back by itself; what was thrown to it waits for it.
+            Why::Foreign => return,
             Why::MVar(key) | Why::MVarRead(key) => {
                 if let Some(q) = self.waits.get_mut(&key) {
                     q.retain(|w| w.thread != t);
@@ -442,11 +473,52 @@ impl<V> Sched<V> {
             Some(State::Blocked(Why::Stm)) => 6,
             Some(State::Blocked(Why::Delay)) => 5,
             Some(State::Blocked(Why::Throw(_))) => 12,
+            Some(State::Blocked(Why::Foreign)) => 10,
         }
+    }
+
+    /// Queues the threads back from safe foreign calls.
+    fn take_returned(&mut self) {
+        if self.in_foreign == 0 {
+            return;
+        }
+        let back: Vec<Tid> = std::mem::take(&mut *self.returned.0.lock().unwrap_or_else(|e| e.into_inner()));
+        for t in back {
+            self.in_foreign = self.in_foreign.saturating_sub(1);
+            if let Some(th) = self.threads.get_mut(&t) {
+                th.state = State::Ready;
+                self.runq.push_back(t);
+            }
+        }
+    }
+
+    /// Before a safe foreign call: when another thread can run, the running one gives it the baton
+    /// for the time of the call, and the answer says how to come back. None when nothing else can
+    /// run (the call is made with the baton).
+    ///
+    /// # Safety
+    /// As for `switch`; after it the caller must not touch the scheduler (or the heap) until
+    /// `ForeignReturn::wait` has given the turn back.
+    pub unsafe fn enter_foreign(this: *mut Sched<V>) -> Option<ForeignReturn> {
+        let s = &mut *this;
+        s.wake_due();
+        let next = s.runq.pop_front()?;
+        let me = s.cur;
+        let my_cv = s.threads.get(&me)?.cv.clone();
+        let next_cv = s.threads.get(&next)?.cv.clone();
+        if let Some(t) = s.threads.get_mut(&me) {
+            t.state = State::Blocked(Why::Foreign);
+        }
+        s.in_foreign += 1;
+        s.cur = next;
+        let back = ForeignReturn { baton: s.baton.clone(), returned: s.returned.clone(), me, cv: my_cv };
+        s.baton.pass(next, &next_cv);
+        Some(back)
     }
 
     /// Moves the sleepers whose time has come to the run queue, earliest first.
     fn wake_due(&mut self) {
+        self.take_returned();
         if self.sleepers.is_empty() {
             return;
         }
@@ -483,6 +555,7 @@ impl<V> Sched<V> {
                 .threads
                 .iter()
                 .filter_map(|(id, t)| match t.state {
+                    State::Blocked(Why::Foreign) => None,
                     State::Blocked(why) => Some((*id, why)),
                     State::Ready => None,
                 })
@@ -504,7 +577,25 @@ impl<V> Sched<V> {
             if let Some(t) = self.runq.pop_front() {
                 return t;
             }
-            if let Some(first) = self.sleepers.iter().map(|s| s.0).min() {
+            let first = self.sleepers.iter().map(|s| s.0).min();
+            if self.in_foreign > 0 {
+                // Threads are in C: wait for one to come back (or for the next sleeper).
+                let (list, cv) = &*self.returned;
+                let guard = list.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.is_empty() {
+                    match first {
+                        Some(t) => {
+                            let wait = t.saturating_duration_since(Instant::now());
+                            drop(cv.wait_timeout(guard, wait));
+                        }
+                        None => {
+                            drop(cv.wait(guard));
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(first) = first {
                 let now = Instant::now();
                 if first > now {
                     std::thread::sleep(first - now);

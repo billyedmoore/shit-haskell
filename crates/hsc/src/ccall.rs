@@ -27,11 +27,16 @@ const RTLD_NOW: i32 = 2;
 const RTLD_GLOBAL: i32 = 0x100;
 
 /// The parts of a `ccall:` primitive name: argument letters, result letter, symbol.
+/// Whether a C call is safe (`!` before its name): other threads may run while it is in C.
+pub fn is_safe(name: &str) -> bool {
+    name.starts_with('!')
+}
+
 pub fn parse(name: &str) -> Option<(&str, char, &str)> {
     if let Some(c) = parse_capi(name) {
         return Some((c.args, c.ret, c.symbol));
     }
-    let rest = name.strip_prefix("ccall:")?;
+    let rest = name.trim_start_matches('!').strip_prefix("ccall:")?;
     let (sig, sym) = rest.split_once(':')?;
     let (args, ret) = sig.split_once('>')?;
     Some((args, ret.chars().next().unwrap_or('v'), sym))
@@ -49,7 +54,7 @@ pub struct Capi<'a> {
 }
 
 pub fn parse_capi(name: &str) -> Option<Capi<'_>> {
-    let rest = name.strip_prefix("capi:")?;
+    let rest = name.trim_start_matches('!').strip_prefix("capi:")?;
     let mut it = rest.splitn(4, ':');
     let sig = it.next()?;
     let symbol = it.next()?;

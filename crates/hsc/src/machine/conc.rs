@@ -105,6 +105,32 @@ impl Ctx {
 ///
 /// The machine is only reached through the pointer: other threads change it meanwhile.
 #[inline(never)]
+/// Runs a safe foreign call: when another thread can run, it has the baton (and the machine)
+/// while this one is in C, and this thread's context is saved and restored around it.
+pub fn foreign_call<R>(m: &mut Machine, call: impl FnOnce() -> R) -> R {
+    let mp: *mut Machine = m;
+    // SAFETY: the caller holds the baton; while another thread runs, this one touches neither the
+    // machine nor the scheduler (the call only uses the C arguments it was given).
+    unsafe {
+        if !(*mp).sched.multi() {
+            return call();
+        }
+        let me = (*mp).sched.current();
+        let ctx = Ctx::save(&mut *mp);
+        (*mp).suspended.insert(me, ctx);
+        let s: *mut Sched<Word> = &mut (*mp).sched;
+        let back = Sched::enter_foreign(s);
+        let r = call();
+        if let Some(back) = back {
+            back.wait();
+        }
+        if let Some(ctx) = (*mp).suspended.remove(&me) {
+            ctx.restore(&mut *mp, me);
+        }
+        r
+    }
+}
+
 pub fn switch(mp: *mut Machine) {
     // SAFETY: the caller holds the baton; the machine outlives every thread.
     unsafe {

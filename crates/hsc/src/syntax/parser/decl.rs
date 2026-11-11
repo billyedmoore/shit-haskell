@@ -1184,7 +1184,11 @@ impl Parser {
         {
             self.bump();
         }
+        // An unsafe call keeps the runtime to itself; a safe one (the default) lets other threads
+        // run while it is in C: `%unsafe` marks the former in the entity.
+        let mut unsafe_call = false;
         if self.at_varid("safe") || self.at_varid("unsafe") || self.at_varid("interruptible") {
+            unsafe_call = self.at_varid("unsafe");
             self.bump();
         }
         let entity = match self.tok().clone() {
@@ -1197,6 +1201,7 @@ impl Parser {
         let name = self.binder_name()?;
         // A capi import is called through a C wrapper (it may name a macro): `%capi` marks it.
         let entity = if capi { Some(format!("%capi {}", entity.unwrap_or_else(|| name.clone()))) } else { entity };
+        let entity = if unsafe_call && !prim { Some(format!("%unsafe {}", entity.unwrap_or_else(|| name.clone()))) } else { entity };
         self.expect_res(ROp::DColon)?;
         let ty = self.sigtype()?;
         Ok(Decl::Foreign {

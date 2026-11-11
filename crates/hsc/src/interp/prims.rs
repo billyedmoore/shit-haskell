@@ -93,6 +93,12 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
 fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
     // A foreign C call: the runtime's own version of the function, else the C function itself.
     if let Some((sig, ret, sym)) = crate::ccall::parse(name) {
+        // A safe call of a C function goes to C (other threads run meanwhile).
+        if crate::ccall::is_safe(name) {
+            if let Some(f) = crate::ccall::resolve(name) {
+                return super::ffi::generic(rt, f, sig, ret, args, true);
+            }
+        }
         if let Some(r) = super::ffi::call(rt, sym, args) {
             return r;
         }
@@ -100,7 +106,7 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             return Ok(io_result_of(Value::Int(a as i64)));
         }
         if let Some(f) = crate::ccall::resolve(name) {
-            let r = super::ffi::generic(rt, f, sig, ret, args);
+            let r = super::ffi::generic(rt, f, sig, ret, args, crate::ccall::is_safe(name));
             // HSC_TRACE_CCALL: each C call made by name, with its answer.
             if std::env::var_os("HSC_TRACE_CCALL").is_some() {
                 let shown = match &r {

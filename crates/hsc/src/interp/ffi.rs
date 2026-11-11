@@ -110,7 +110,7 @@ fn stat_field(rt: &Runtime, c: &Cell, at: usize, width: usize) -> RR {
 /// A pointer argument is the address of its buffer's bytes; a pointer the function answers is an
 /// address into one of the argument buffers when it points into one, the null address when null,
 /// and otherwise the raw address as a number.
-pub fn generic(rt: &Runtime, f: *mut std::ffi::c_void, sig: &str, ret: char, args: &[Cell]) -> RR {
+pub fn generic(rt: &Runtime, f: *mut std::ffi::c_void, sig: &str, ret: char, args: &[Cell], safe: bool) -> RR {
     let mut ints: Vec<u64> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();
     // The buffers passed (kept alive through the call), with their start addresses and lengths.
@@ -166,7 +166,18 @@ pub fn generic(rt: &Runtime, f: *mut std::ffi::c_void, sig: &str, ret: char, arg
         }
     }
     // SAFETY: the foreign import declares the function's type; the buffers outlive the call.
-    let answer = unsafe { crate::ccall::call(f, &ints, &floats, ret) };
+    // A safe call lets the other threads run meanwhile.
+    let answer = if safe && super::conc::with(|s| s.multi()) {
+        // SAFETY: no reference into the scheduler is held across the call.
+        let back = unsafe { super::conc::S::enter_foreign(super::conc::sched()) };
+        let a = unsafe { crate::ccall::call(f, &ints, &floats, ret) };
+        if let Some(back) = back {
+            back.wait();
+        }
+        a
+    } else {
+        unsafe { crate::ccall::call(f, &ints, &floats, ret) }
+    };
     let value = match (answer, ret) {
         (_, 'v') => unit_value(),
         (crate::ccall::Answer::Double(d), _) => Value::Double(d),

@@ -684,7 +684,7 @@ pub fn capi_source(binds: &[TopBind], flags: &[String]) -> Result<Option<(PathBu
         use crate::core::{Alt, Core};
         match c {
             Core::Prim(n, args) => {
-                if n.starts_with("capi:") && !out.contains(n) {
+                if n.trim_start_matches('!').starts_with("capi:") && !out.contains(n) {
                     out.push(n.clone());
                 }
                 args.iter().for_each(|a| walk(a, out));
