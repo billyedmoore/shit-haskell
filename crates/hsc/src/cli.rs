@@ -48,6 +48,8 @@ pub struct Opts {
     pub dump_ast: bool,
     pub dump_core: bool,
     pub preprocess_only: bool,
+    /// `--abi-hash`: print a hash of the named modules' interfaces.
+    pub abi_hash: bool,
     /// An information mode (`--info` and the like) answers by itself.
     pub info: Option<String>,
     /// Options for C compilations and links (`-optc`, `-optl`, `-l`, `-L`).
@@ -159,6 +161,7 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
             "--print-global-package-db" => o.info = Some("global-db".into()),
             "--print-project-git-commit-id" => o.info = Some("git".into()),
             "--print-booter-version" => o.info = Some("booter".into()),
+            "--abi-hash" => o.abi_hash = true,
             "--run" => o.run = true,
             "--dump-ast" => o.dump_ast = true,
             "--dump-core" => o.dump_core = true,
@@ -495,6 +498,9 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
         Some(dirs) => dirs.clone(),
         None => vec![PathBuf::from(".")],
     };
+    if o.abi_hash {
+        return abi_hash(o, &search, &hs_inputs);
+    }
     let pkg_dirs = package_dirs(o)?;
     // The modules to build: the files given, and the modules named (found in the search path).
     let mut targets: Vec<(String, PathBuf)> = Vec::new();
@@ -546,6 +552,31 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
         }
         write_outputs(o, &m, &path)?;
     }
+    Ok(0)
+}
+
+/// `--abi-hash`: a hash of the modules' interfaces. An interface of hsc is its module's source and
+/// flags, so the hash is over those (the interface files written in `hidir`, or the sources).
+fn abi_hash(o: &Opts, search: &[PathBuf], modules: &[&String]) -> Result<i32, String> {
+    let hi_dir = o.hidir.clone().or_else(|| o.odir.clone());
+    let d = driver::Driver::new(search.to_vec(), Vec::new(), o.flags.clone());
+    let mut ctx = [0u8; 88];
+    crate::interp::md5::init(&mut ctx);
+    for m in modules {
+        let iface = hi_dir.as_ref().map(|h| h.join(format!("{}.{}", m.replace('.', "/"), o.hisuf)));
+        let source = match iface.as_ref().and_then(|i| driver::read_interface(i)) {
+            Some((src, _)) => src,
+            None => d.find_module(m).map(|f| f.path).ok_or_else(|| format!("Could not find module ‘{m}’"))?,
+        };
+        let text = std::fs::read(&source).map_err(|e| format!("{}: {e}", source.display()))?;
+        crate::interp::md5::update(&mut ctx, m.as_bytes());
+        crate::interp::md5::update(&mut ctx, &text);
+    }
+    for f in &o.flags {
+        crate::interp::md5::update(&mut ctx, f.as_bytes());
+    }
+    let digest = crate::interp::md5::finish(&mut ctx);
+    println!("{}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>());
     Ok(0)
 }
 
