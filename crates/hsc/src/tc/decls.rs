@@ -616,6 +616,7 @@ impl Checker {
         let capi = entity.is_some_and(|e| e.split_whitespace().any(|w| w == "%capi"));
         // A safe call is marked with a leading `!`: the runtime lets other threads run during it.
         let safe = !entity.is_some_and(|e| e.split_whitespace().any(|w| w == "%unsafe"));
+        let interruptible = entity.is_some_and(|e| e.split_whitespace().any(|w| w == "%interruptible"));
         let header = entity
             .and_then(|e| e.split_whitespace().find(|w| w.ends_with(".h")).map(str::to_string))
             .unwrap_or_default();
@@ -623,7 +624,7 @@ impl Checker {
         let prim = entity
             .and_then(|e| {
                 e.split_whitespace()
-                    .filter(|w| *w != "static" && *w != "%capi" && *w != "%unsafe" && *w != "value" && !w.ends_with(".h"))
+                    .filter(|w| *w != "static" && *w != "%capi" && *w != "%unsafe" && *w != "%interruptible" && *w != "value" && !w.ends_with(".h"))
                     .last()
                     .map(str::to_string)
             })
@@ -671,7 +672,13 @@ impl Checker {
                 })
                 .collect();
             let ret = value_ty.as_ref().map(|v| self.ffi_class(v)).unwrap_or('v');
-            let mark = if safe && !value && !prim.starts_with('&') { "!" } else { "" };
+            let mark = if !safe || value || prim.starts_with('&') {
+                ""
+            } else if interruptible {
+                "!!"
+            } else {
+                "!"
+            };
             if capi {
                 // The arguments keep their C classes (pointers apart), for the C wrapper.
                 let full: String = arg_tys.iter().map(|a| self.ffi_class(a)).collect();

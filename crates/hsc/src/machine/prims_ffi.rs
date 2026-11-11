@@ -8,6 +8,7 @@ use super::prims_mem::{state_pair, unit};
 use super::Machine;
 
 extern "C" {
+    fn fork() -> i32;
     fn isatty(fd: i32) -> i32;
     fn write(fd: i32, buf: *const u8, n: usize) -> isize;
     fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
@@ -119,6 +120,12 @@ pub fn address_value(m: &mut Machine, a: u64) -> Word {
 }
 
 pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char, safe: bool) -> Option<Word> {
+    generic_call(m, f, sig, ret, safe, false)
+}
+
+/// A C call by its signature; a safe call lets the other threads run, and an interruptible one
+/// can be woken by an exception thrown to the thread.
+pub fn generic_call(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char, safe: bool, interruptible: bool) -> Option<Word> {
     let mut ints: Vec<u64> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();
     let classes: Vec<char> = sig.chars().collect();
@@ -147,7 +154,13 @@ pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char, 
     // SAFETY: the foreign import declares the function's type; no collection happens during the call.
     // A safe call lets the other threads run meanwhile.
     let answer = if safe {
-        super::conc::foreign_call(m, || unsafe { crate::ccall::call(f, &ints, &floats, ret) })
+        let a = super::conc::foreign_call(m, interruptible, || unsafe { crate::ccall::call(f, &ints, &floats, ret) });
+        // An exception thrown to the thread during the call is raised as it returns (its result
+        // is dropped), as GHC raises it on resuming the thread.
+        if super::conc::check(m) {
+            return Some(0);
+        }
+        a
     } else {
         unsafe { crate::ccall::call(f, &ints, &floats, ret) }
     };
@@ -259,6 +272,26 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
         "getpid" => {
             // SAFETY: no arguments.
             ret_int(m, unsafe { getpid() } as i64)
+        }
+        // forkProcess(stable): the child runs the IO action, flushes the standard handles and exits;
+        // the parent answers the child's process id.
+        "forkProcess" => {
+            let idx = int_arg(m, 0)? as usize;
+            let action = m.stable.get(idx).copied().unwrap_or(0);
+            // SAFETY: fork has no arguments; the child continues on this thread alone.
+            let pid = unsafe { fork() };
+            if pid == 0 {
+                m.sched.only_current();
+                m.suspended.clear();
+                let _ = m.apply_nested(action, &[0]);
+                if let Some(g) = m.rts_global("GHC.Internal.TopHandler.flushStdHandles") {
+                    if let Some(f) = m.force(g) {
+                        let _ = m.apply_nested(f, &[0]);
+                    }
+                }
+                std::process::exit(0);
+            }
+            ret_int(m, pid as i64)
         }
         // System.Mem: a collection now.
         "performGC" | "performMajorGC" | "performBlockingMajorGC" => {
@@ -426,7 +459,6 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             let n = std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(1);
             ret_int(m, n)
         }
-        "stg_sig_install" => ret_int(m, 0),
         "rts_setMainThread" | "rts_enableThreadAllocationLimit" | "rts_disableThreadAllocationLimit" => {
             let u = unit(m);
             state_pair(m, u)

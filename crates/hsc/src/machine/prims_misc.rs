@@ -76,6 +76,12 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             let n = int_value(m, 1);
             state_pair(m, n)
         }
+        // A C finalizer is attached (weak pointers are never collected here, so it never runs):
+        // the answer is 1, attached.
+        "addCFinalizerToWeak#" => {
+            let n = int_value(m, 1);
+            state_pair(m, n)
+        }
         "mkWeakNoFinalizer#" | "mkWeak#" => {
             // The weak pointer is the key's value, kept alive: a REF-shaped object holding the value.
             let v = m.args[1];

@@ -13,7 +13,7 @@ use super::prims::int_of;
 use super::{new_cell, unit_value, Cell, ConVal, RR, Runtime, RtError, Thunk, Value};
 use crate::sched::{Interrupt, Thrown, WaitKind};
 
-fn unit_cell() -> Cell {
+pub fn unit_cell() -> Cell {
     new_cell(Thunk::Done(unit_value()))
 }
 
@@ -177,7 +177,7 @@ pub fn handle(rt: &Runtime, saved: u8, run: impl FnOnce() -> RR) -> RR {
 }
 
 /// Starts a Haskell thread on an OS thread of its own; it runs when the scheduler gives it the turn.
-fn fork(rt: &Runtime, action: &Cell) -> RR {
+pub fn fork(rt: &Runtime, action: &Cell) -> RR {
     let (id, baton, cv) = conc::with(|s| s.spawn());
     let rt_ptr = Locked(rt as *const Runtime);
     let payload = Locked(action.clone());

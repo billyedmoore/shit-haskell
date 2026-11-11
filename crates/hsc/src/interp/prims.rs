@@ -96,7 +96,7 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         // A safe call of a C function goes to C (other threads run meanwhile).
         if crate::ccall::is_safe(name) {
             if let Some(f) = crate::ccall::resolve(name) {
-                return super::ffi::generic(rt, f, sig, ret, args, true);
+                return super::ffi::generic_call(rt, f, sig, ret, args, true, crate::ccall::is_interruptible(name));
             }
         }
         if let Some(r) = super::ffi::call(rt, sym, args) {

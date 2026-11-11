@@ -37,8 +37,38 @@ pub fn with<R>(f: impl FnOnce(&mut S) -> R) -> R {
 /// Gives the baton to the next thread; returns when this thread has it again. The thread has been
 /// queued or blocked in the scheduler.
 pub fn switch() {
-    // SAFETY: no reference into the scheduler is held here.
-    unsafe { S::switch(sched()) }
+    loop {
+        start_signal_handlers();
+        // SAFETY: no reference into the scheduler is held here.
+        unsafe { S::switch(sched()) }
+        if !with(|s| s.take_signal_wake()) {
+            break;
+        }
+    }
+}
+
+/// The program's runtime (for starting signal handlers from the scheduler).
+static RUNTIME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_runtime(rt: &super::Runtime) {
+    RUNTIME.store(rt as *const super::Runtime as usize, Ordering::Relaxed);
+}
+
+/// Signals have arrived: a thread runs their Haskell handlers (`hscRunPendingSignals`).
+pub fn start_signal_handlers() {
+    if !crate::signals::pending() {
+        return;
+    }
+    let p = RUNTIME.load(Ordering::Relaxed) as *const super::Runtime;
+    if p.is_null() {
+        return;
+    }
+    crate::signals::taken();
+    // SAFETY: the runtime lives as long as the program.
+    let rt = unsafe { &*p };
+    if let Some(g) = rt.global("GHC.Internal.Conc.Signal.hscRunPendingSignals") {
+        let _ = super::prims_conc::fork(rt, &g);
+    }
 }
 
 /// Lets the other threads run, then continues.
@@ -76,6 +106,7 @@ fn slice_end() -> Option<Interrupt<Cell>> {
         return None;
     }
     PREEMPT.store(false, Ordering::Relaxed);
+    start_signal_handlers();
     if with(|s| s.preempt()) {
         switch();
     }

@@ -107,7 +107,7 @@ impl Ctx {
 #[inline(never)]
 /// Runs a safe foreign call: when another thread can run, it has the baton (and the machine)
 /// while this one is in C, and this thread's context is saved and restored around it.
-pub fn foreign_call<R>(m: &mut Machine, call: impl FnOnce() -> R) -> R {
+pub fn foreign_call<R>(m: &mut Machine, interruptible: bool, call: impl FnOnce() -> R) -> R {
     let mp: *mut Machine = m;
     // SAFETY: the caller holds the baton; while another thread runs, this one touches neither the
     // machine nor the scheduler (the call only uses the C arguments it was given).
@@ -119,7 +119,7 @@ pub fn foreign_call<R>(m: &mut Machine, call: impl FnOnce() -> R) -> R {
         let ctx = Ctx::save(&mut *mp);
         (*mp).suspended.insert(me, ctx);
         let s: *mut Sched<Word> = &mut (*mp).sched;
-        let back = Sched::enter_foreign(s);
+        let back = Sched::enter_foreign(s, interruptible);
         let r = call();
         if let Some(back) = back {
             back.wait();
@@ -134,14 +134,32 @@ pub fn foreign_call<R>(m: &mut Machine, call: impl FnOnce() -> R) -> R {
 pub fn switch(mp: *mut Machine) {
     // SAFETY: the caller holds the baton; the machine outlives every thread.
     unsafe {
-        let me = (*mp).sched.current();
-        let ctx = Ctx::save(&mut *mp);
-        (*mp).suspended.insert(me, ctx);
-        let s: *mut Sched<Word> = &mut (*mp).sched;
-        Sched::switch(s);
-        if let Some(ctx) = (*mp).suspended.remove(&me) {
-            ctx.restore(&mut *mp, me);
+        loop {
+            start_signal_handlers(&mut *mp);
+            let me = (*mp).sched.current();
+            let ctx = Ctx::save(&mut *mp);
+            (*mp).suspended.insert(me, ctx);
+            let s: *mut Sched<Word> = &mut (*mp).sched;
+            Sched::switch(s);
+            if let Some(ctx) = (*mp).suspended.remove(&me) {
+                ctx.restore(&mut *mp, me);
+            }
+            if !(*mp).sched.take_signal_wake() {
+                break;
+            }
         }
+    }
+}
+
+/// Signals have arrived: a thread runs their Haskell handlers (`hscRunPendingSignals`).
+pub fn start_signal_handlers(m: &mut Machine) {
+    if !crate::signals::pending() {
+        return;
+    }
+    crate::signals::taken();
+    let Some(g) = m.rts_global("GHC.Internal.Conc.Signal.hscRunPendingSignals") else { return };
+    if let Some(action) = m.force(g) {
+        fork(m, action);
     }
 }
 
@@ -194,6 +212,7 @@ pub fn safe_point(mp: *mut Machine) -> bool {
             return false;
         }
         PREEMPT.store(false, Ordering::Relaxed);
+        start_signal_handlers(&mut *mp);
         if (*mp).sched.preempt() {
             switch(mp);
         }

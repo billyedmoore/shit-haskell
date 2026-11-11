@@ -10,6 +10,7 @@ use super::prims::io_result_of;
 use super::{unit_value, Cell, RR, Runtime, RtError, Value};
 
 extern "C" {
+    fn fork() -> i32;
     fn isatty(fd: i32) -> i32;
     fn write(fd: i32, buf: *const u8, n: usize) -> isize;
     fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
@@ -111,6 +112,12 @@ fn stat_field(rt: &Runtime, c: &Cell, at: usize, width: usize) -> RR {
 /// address into one of the argument buffers when it points into one, the null address when null,
 /// and otherwise the raw address as a number.
 pub fn generic(rt: &Runtime, f: *mut std::ffi::c_void, sig: &str, ret: char, args: &[Cell], safe: bool) -> RR {
+    generic_call(rt, f, sig, ret, args, safe, false)
+}
+
+/// A C call by its signature; a safe call lets the other threads run, and an interruptible one
+/// can be woken by an exception thrown to the thread.
+pub fn generic_call(rt: &Runtime, f: *mut std::ffi::c_void, sig: &str, ret: char, args: &[Cell], safe: bool, interruptible: bool) -> RR {
     let mut ints: Vec<u64> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();
     // The buffers passed (kept alive through the call), with their start addresses and lengths.
@@ -169,10 +176,14 @@ pub fn generic(rt: &Runtime, f: *mut std::ffi::c_void, sig: &str, ret: char, arg
     // A safe call lets the other threads run meanwhile.
     let answer = if safe && super::conc::with(|s| s.multi()) {
         // SAFETY: no reference into the scheduler is held across the call.
-        let back = unsafe { super::conc::S::enter_foreign(super::conc::sched()) };
+        let back = unsafe { super::conc::S::enter_foreign(super::conc::sched(), interruptible) };
         let a = unsafe { crate::ccall::call(f, &ints, &floats, ret) };
         if let Some(back) = back {
             back.wait();
+            // An exception thrown to the thread during the call is raised as it returns.
+            if let Some(i) = super::conc::interrupt() {
+                return Err(super::prims_conc::interrupt_error(rt, i));
+            }
         }
         a
     } else {
@@ -289,7 +300,6 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             }
             Ok(io_result_of(unit_value()))
         }
-        "stg_sig_install" => ret_int(0),
         // The RTS's exit: standard output is flushed, then the process ends with the code. A
         // signal exit ends the process with the conventional 128 + signal status.
         "shutdownHaskellAndExit" => int_of(rt, &args[0]).map(|code| {
@@ -515,6 +525,28 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             // SAFETY: getpid has no arguments.
             ret_int(unsafe { getpid() } as i64)
         }
+        // forkProcess(stable): the child runs the IO action, flushes the standard handles and exits.
+        "forkProcess" => (|| {
+            let idx = int_of(rt, &args[0])? as usize;
+            let action = rt.stable.borrow().get(idx).cloned().flatten();
+            // SAFETY: fork has no arguments; the child continues on this thread alone.
+            let pid = unsafe { fork() };
+            if pid == 0 {
+                super::conc::with(|s| s.only_current());
+                if let Some(a) = action {
+                    if let Ok(f) = rt.force(&a) {
+                        let _ = rt.apply(f, super::prims_conc::unit_cell());
+                    }
+                }
+                if let Some(g) = rt.global("GHC.Internal.TopHandler.flushStdHandles") {
+                    if let Ok(f) = rt.force(&g) {
+                        let _ = rt.apply(f, super::prims_conc::unit_cell());
+                    }
+                }
+                std::process::exit(0);
+            }
+            ret_int(pid as i64)
+        })(),
         // System.Mem: memory is reference counted, so there is nothing to collect.
         "performGC" | "performMajorGC" | "performBlockingMajorGC" => Ok(io_result_of(unit_value())),
         "getppid" => {

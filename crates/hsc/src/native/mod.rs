@@ -19,6 +19,8 @@ pub const RTS_GLOBALS: &[&str] = &[
     "GHC.Internal.Exception.errorCallException",
     "GHC.Internal.IO.Exception.blockedIndefinitelyOnMVar",
     "GHC.Internal.IO.Exception.blockedIndefinitelyOnSTM",
+    "GHC.Internal.TopHandler.flushStdHandles",
+    "GHC.Internal.Conc.Signal.hscRunPendingSignals",
 ];
 
 /// The constructors the runtime builds: each has an id in every program.

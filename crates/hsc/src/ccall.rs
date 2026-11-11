@@ -32,6 +32,12 @@ pub fn is_safe(name: &str) -> bool {
     name.starts_with('!')
 }
 
+/// Whether a C call is interruptible (`!!` before its name): an exception thrown to the calling
+/// thread interrupts its system call.
+pub fn is_interruptible(name: &str) -> bool {
+    name.starts_with("!!")
+}
+
 pub fn parse(name: &str) -> Option<(&str, char, &str)> {
     if let Some(c) = parse_capi(name) {
         return Some((c.args, c.ret, c.symbol));
@@ -149,6 +155,9 @@ pub fn lookup(sym: &str) -> Option<*mut c_void> {
         "getProgArgv" => return Some(get_prog_argv as *mut c_void),
         "setProgArgv" => return Some(set_prog_argv as *mut c_void),
         "getMonotonicNSec" => return Some(get_monotonic_nsec as *mut c_void),
+        "stg_sig_install" => return Some(crate::signals::stg_sig_install as *mut c_void),
+        "hsc_next_signal" => return Some(crate::signals::hsc_next_signal as *mut c_void),
+        "hsc_signal_info" => return Some(crate::signals::hsc_signal_info as *mut c_void),
         _ => {}
     }
     let find = |s: &str| -> Option<*mut c_void> {

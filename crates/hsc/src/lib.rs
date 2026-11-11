@@ -13,5 +13,6 @@ pub mod native;
 pub mod pkg;
 pub mod rename;
 pub mod sched;
+pub mod signals;
 pub mod syntax;
 pub mod tc;

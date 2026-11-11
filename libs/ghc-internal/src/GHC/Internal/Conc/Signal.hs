@@ -7,6 +7,7 @@ module GHC.Internal.Conc.Signal
         , setHandler
         , runHandlers
         , runHandlersPtr
+        , hscRunPendingSignals
         ) where
 
 import GHC.Internal.Control.Concurrent.MVar (MVar, newMVar, withMVar)
@@ -78,6 +79,22 @@ runHandlersPtr :: Ptr Word8 -> Signal -> IO ()
 runHandlersPtr p s = do
   fp <- newForeignPtr finalizerFree p
   runHandlers fp s
+
+-- | hsc's runtime runs this in a new thread when signals have arrived: each signal's handlers
+-- run (in threads of their own, as 'runHandlers' starts them) with a copy of its @siginfo_t@.
+hscRunPendingSignals :: IO ()
+hscRunPendingSignals = do
+  r <- hsc_next_signal
+  if r < 0
+    then return ()
+    else do
+      p <- hsc_signal_info
+      runHandlersPtr p (fromIntegral r)
+      hscRunPendingSignals
+
+-- The next signal that arrived (-1 when none), and the copy of its siginfo_t it leaves.
+foreign import ccall unsafe "hsc_next_signal" hsc_next_signal :: IO CInt
+foreign import ccall unsafe "hsc_signal_info" hsc_signal_info :: IO (Ptr Word8)
 
 -- Machinery needed to ensure that we only have one copy of certain
 -- CAFs in this module even when the base package is present twice, as

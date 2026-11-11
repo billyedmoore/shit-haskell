@@ -54,7 +54,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
         // runtime's own version of it.
         if crate::ccall::is_safe(name) {
             if let Some(f) = crate::ccall::resolve(name) {
-                return super::prims_ffi::generic(m, f, &sig, ret, true).unwrap_or(0);
+                return super::prims_ffi::generic_call(m, f, &sig, ret, true, crate::ccall::is_interruptible(name)).unwrap_or(0);
             }
         }
         if let Some(r) = super::prims_ffi::run(m, &sym, nargs) {

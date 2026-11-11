@@ -142,6 +142,10 @@ struct Thread<V> {
     interrupted: bool,
     /// Found blocked for ever: the exception to raise is this one, whatever the masking state.
     marker: Option<Why>,
+    /// In a foreign call: the OS thread making it, and whether the call is interruptible (an
+    /// exception thrown to the thread then interrupts the system call with a signal).
+    os_thread: u64,
+    interruptible: bool,
 }
 
 pub struct Sched<V> {
@@ -163,17 +167,29 @@ pub struct Sched<V> {
     returned: Arc<(Mutex<Vec<Tid>>, Condvar)>,
     /// The threads in safe foreign calls.
     in_foreign: usize,
+    /// Set when the scheduler had nothing to run but signals had arrived: the switching thread
+    /// starts their handlers (see `take_signal_wake`).
+    signal_wake: bool,
 }
 
+extern "C" {
+    fn pthread_self() -> u64;
+    fn pthread_kill(thread: u64, sig: i32) -> i32;
+}
+
+/// The turn of nobody: the baton is free (a thread in C gave it up with nothing to run). A waiting
+/// thread claims it and makes the scheduling decision (see `Sched::wait_turn`).
+const FREE: Tid = 0;
+
 /// What a thread in a safe foreign call needs to come back: see `Sched::enter_foreign`.
-pub struct ForeignReturn {
-    baton: Arc<Baton>,
+pub struct ForeignReturn<V> {
+    sched: *mut Sched<V>,
     returned: Arc<(Mutex<Vec<Tid>>, Condvar)>,
     me: Tid,
     cv: Arc<Condvar>,
 }
 
-impl ForeignReturn {
+impl<V> ForeignReturn<V> {
     /// Back from C: the thread asks to be queued and waits for its turn.
     pub fn wait(self) {
         {
@@ -181,13 +197,15 @@ impl ForeignReturn {
             list.lock().unwrap_or_else(|e| e.into_inner()).push(self.me);
             cv.notify_all();
         }
-        self.baton.wait(self.me, &self.cv);
+        // SAFETY: the scheduler outlives every thread; it is touched only with the turn.
+        unsafe { Sched::wait_turn(self.sched, self.me, &self.cv) };
     }
 }
 
 impl<V> Sched<V> {
     /// A scheduler with the main thread running; `slice_ms` is the time slice.
     pub fn new(slice_ms: u64) -> Sched<V> {
+        crate::signals::init();
         let mut threads = HashMap::new();
         threads.insert(1, Self::thread(0));
         Sched {
@@ -203,6 +221,7 @@ impl<V> Sched<V> {
             slice: Duration::from_millis(slice_ms),
             returned: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
             in_foreign: 0,
+            signal_wake: false,
         }
     }
 
@@ -215,7 +234,26 @@ impl<V> Sched<V> {
             handoff: None,
             interrupted: false,
             marker: None,
+            os_thread: 0,
+            interruptible: false,
         }
+    }
+
+    /// Whether the last switch came back only so that signal handlers are started (the thread is
+    /// still blocked: it starts them and switches again).
+    pub fn take_signal_wake(&mut self) -> bool {
+        std::mem::take(&mut self.signal_wake)
+    }
+
+    /// In the child of a fork: only the running thread exists (the other OS threads are gone).
+    pub fn only_current(&mut self) {
+        let me = self.cur;
+        self.threads.retain(|t, _| *t == me);
+        self.runq.clear();
+        self.sleepers.clear();
+        self.waits.clear();
+        self.stm_waiters.clear();
+        self.in_foreign = 0;
     }
 
     /// The running thread.
@@ -411,6 +449,12 @@ impl<V> Sched<V> {
         };
         if t.mask == 0 || (t.mask == 2 && blocked.is_some()) {
             t.pending.push_back((exc, None));
+            // A thread in an interruptible foreign call is woken from its system call (EINTR), as
+            // GHC's RTS does, with SIGPIPE (whose handler does nothing).
+            if blocked == Some(Why::Foreign) && t.interruptible && t.os_thread != 0 {
+                // SAFETY: the OS thread exists while its Haskell thread is in the call.
+                unsafe { pthread_kill(t.os_thread, 13) };
+            }
             if let Some(why) = blocked {
                 t.interrupted = true;
                 self.unblock(target, why);
@@ -499,21 +543,71 @@ impl<V> Sched<V> {
     /// # Safety
     /// As for `switch`; after it the caller must not touch the scheduler (or the heap) until
     /// `ForeignReturn::wait` has given the turn back.
-    pub unsafe fn enter_foreign(this: *mut Sched<V>) -> Option<ForeignReturn> {
+    pub unsafe fn enter_foreign(this: *mut Sched<V>, interruptible: bool) -> Option<ForeignReturn<V>> {
         let s = &mut *this;
         s.wake_due();
-        let next = s.runq.pop_front()?;
         let me = s.cur;
         let my_cv = s.threads.get(&me)?.cv.clone();
-        let next_cv = s.threads.get(&next)?.cv.clone();
+        // With nothing to run now, the baton is left free: a sleeper whose time comes, or this
+        // thread when it is back, claims it.
+        let next = s.runq.pop_front().unwrap_or(FREE);
+        let next_cv = if next == FREE { my_cv.clone() } else { s.threads.get(&next)?.cv.clone() };
         if let Some(t) = s.threads.get_mut(&me) {
             t.state = State::Blocked(Why::Foreign);
+            t.interruptible = interruptible;
+            t.os_thread = pthread_self();
         }
         s.in_foreign += 1;
         s.cur = next;
-        let back = ForeignReturn { baton: s.baton.clone(), returned: s.returned.clone(), me, cv: my_cv };
+        let back = ForeignReturn { sched: this, returned: s.returned.clone(), me, cv: my_cv };
         s.baton.pass(next, &next_cv);
         Some(back)
+    }
+
+    /// Waits for the turn of thread `me`. Meanwhile, when the baton is free, this thread claims it
+    /// and makes the scheduling decision: the threads back from C are queued, the sleepers whose
+    /// time has come woken, and the next runnable thread gets the turn (this one, or another);
+    /// with nothing runnable, the baton is free again.
+    ///
+    /// # Safety
+    /// As for `switch`.
+    pub unsafe fn wait_turn(this: *mut Sched<V>, me: Tid, cv: &Condvar) {
+        let baton = (*this).baton.clone();
+        loop {
+            {
+                let mut turn = baton.turn.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if *turn == me {
+                        return;
+                    }
+                    if *turn == FREE {
+                        *turn = me;
+                        break;
+                    }
+                    turn = cv.wait_timeout(turn, Duration::from_millis(5)).unwrap_or_else(|e| e.into_inner()).0;
+                }
+            }
+            // This thread has the turn (the scheduler is its own until it passes it on).
+            let s = &mut *this;
+            s.wake_due();
+            match s.runq.pop_front() {
+                Some(next) if next == me => {
+                    s.cur = me;
+                    return;
+                }
+                Some(next) => {
+                    s.cur = next;
+                    if let Some(ncv) = s.threads.get(&next).map(|t| t.cv.clone()) {
+                        baton.pass(next, &ncv);
+                    }
+                }
+                None => {
+                    s.cur = FREE;
+                    *baton.turn.lock().unwrap_or_else(|e| e.into_inner()) = FREE;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
     }
 
     /// Moves the sleepers whose time has come to the run queue, earliest first.
@@ -577,6 +671,11 @@ impl<V> Sched<V> {
             if let Some(t) = self.runq.pop_front() {
                 return t;
             }
+            // Signals arrived and nothing can run: the switching thread starts their handlers.
+            if crate::signals::pending() && self.threads.contains_key(&self.cur) {
+                self.signal_wake = true;
+                return self.cur;
+            }
             let first = self.sleepers.iter().map(|s| s.0).min();
             if self.in_foreign > 0 {
                 // Threads are in C: wait for one to come back (or for the next sleeper).
@@ -598,7 +697,7 @@ impl<V> Sched<V> {
             if let Some(first) = first {
                 let now = Instant::now();
                 if first > now {
-                    std::thread::sleep(first - now);
+                    std::thread::sleep((first - now).min(Duration::from_millis(10)));
                 }
                 continue;
             }
@@ -632,7 +731,7 @@ impl<V> Sched<V> {
             }
         };
         baton.pass(next, &next_cv);
-        baton.wait(me, &my_cv);
+        Self::wait_turn(this, me, &my_cv);
     }
 
     /// Ends the running thread: the throwers blocked on it continue, and the baton goes to the next
