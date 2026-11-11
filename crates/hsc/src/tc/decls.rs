@@ -29,9 +29,14 @@ impl Checker {
             }
         }
         for d in &family_decls {
-            if let Decl::TypeFamily { name, params, equations, .. } = d {
+            if let Decl::TypeFamily { name, params, equations, injective, .. } = d {
                 let key = format!("{}.{name}", self.module);
                 self.register_family(&key, params.len(), equations.is_some());
+                let positions: Vec<usize> =
+                    params.iter().enumerate().filter(|(_, p)| injective.contains(&p.name)).map(|(i, _)| i).collect();
+                if let Some(f) = self.env.families.get_mut(&key) {
+                    f.injective = positions;
+                }
             }
         }
 
@@ -108,6 +113,20 @@ impl Checker {
                     (self.module.clone(), dd.clone()),
                 );
                 derived.extend(self.derive_instances(dd)?);
+            }
+        }
+
+        // 3. Classes: dictionary layout, selectors, and default-method names.
+        let mut class_decls: Vec<&ClassDecl> = Vec::new();
+        for d in decls {
+            if let Decl::Class(cd) = d {
+                self.class_header(cd)?;
+                class_decls.push(cd);
+            }
+        }
+        // Newtype deriving and standalone deriving, once this module's classes are known.
+        for d in decls {
+            if let Decl::Data(dd) = d {
                 self.register_newtype_deriving(dd)?;
             }
         }
@@ -125,15 +144,6 @@ impl Checker {
                         self.add_family_equation(&global_tycon_name(name), &equation.args, &equation.rhs, equation.loc)?;
                     }
                 }
-            }
-        }
-
-        // 3. Classes: dictionary layout, selectors, and default-method names.
-        let mut class_decls: Vec<&ClassDecl> = Vec::new();
-        for d in decls {
-            if let Decl::Class(cd) = d {
-                self.class_header(cd)?;
-                class_decls.push(cd);
             }
         }
 

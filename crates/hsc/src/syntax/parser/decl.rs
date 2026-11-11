@@ -486,15 +486,13 @@ impl Parser {
             self.bump();
             self.sigtype()?;
         }
-        // TypeFamilyDependencies: `= r | r -> a` names the result and an injectivity clause.
-        // Injectivity is not checked, so the clause is skipped.
+        // TypeFamilyDependencies: `= r | r -> a` names the result and the parameters it determines.
+        let mut injective = Vec::new();
         if self.at_res(ROp::Eq) {
             self.bump();
             self.atype()?;
             if self.at_res(ROp::Bar) {
-                while self.real() && !self.at_kw(Kw::Where) {
-                    self.bump();
-                }
+                injective = self.injectivity();
             }
         }
         let equations = if top && self.at_kw(Kw::Where) {
@@ -507,8 +505,26 @@ impl Parser {
             name,
             params,
             equations,
+            injective,
             loc,
         })
+    }
+
+    /// `| r -> a b`, at the bar: the parameters named after the arrow.
+    fn injectivity(&mut self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut after_arrow = false;
+        while self.real() && !self.at_kw(Kw::Where) {
+            if self.at_res(ROp::RArrow) {
+                after_arrow = true;
+            } else if after_arrow {
+                if let Tok::VarId(v) = self.tok().clone() {
+                    names.push(v.to_string());
+                }
+            }
+            self.bump();
+        }
+        names
     }
 
     /// `type instance F t1 .. tn = rhs`, after `type instance`.
@@ -1055,6 +1071,16 @@ impl Parser {
             }
             let head = self.btype()?;
             if self.at_res(ROp::Eq) {
+                // `type F a = (r :: k) | r -> a` (TypeFamilyDependencies) declares an injective
+                // family with a named result; injectivity is not checked, so the clause is skipped.
+                let save = (self.pos, self.ctx.clone(), self.semi_done);
+                self.bump();
+                if self.atype().is_ok() && self.at_res(ROp::Bar) {
+                    let injective = self.injectivity();
+                    let (name, params) = self.decl_head(head)?;
+                    return Ok(Decl::TypeFamily { name, params, equations: None, injective, loc });
+                }
+                (self.pos, self.ctx, self.semi_done) = save;
                 let (name, equation) = self.equation_from(head, loc)?;
                 return Ok(Decl::TypeInstance {
                     name,
@@ -1071,6 +1097,7 @@ impl Parser {
                 name,
                 params,
                 equations: None,
+                injective: Vec::new(),
                 loc,
             });
         }

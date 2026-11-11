@@ -952,6 +952,7 @@ impl<'a> Renamer<'a> {
                 name,
                 params,
                 equations,
+                injective,
                 loc,
             } => {
                 let equations = match equations {
@@ -966,6 +967,7 @@ impl<'a> Renamer<'a> {
                     name,
                     params,
                     equations,
+                    injective,
                     loc,
                 }
             }
@@ -1726,11 +1728,31 @@ impl<'a> Renamer<'a> {
 
     // ----- exports ----------------------------------------------------------
 
+    /// All the children of a type or class (its constructors, fields or methods), as its defining
+    /// module (or any other) exports them, beyond the ones an import brought into scope.
+    fn all_children(&self, e: &Entity) -> Vec<Entity> {
+        let mut out = e.subs.clone();
+        let defining = self.ifaces.get(&e.global.module).into_iter();
+        for iface in defining.chain(self.ifaces.values()) {
+            for x in iface.exports.iter().filter(|x| x.global == e.global) {
+                for c in &x.subs {
+                    if !out.iter().any(|o| o.global == c.global) {
+                        out.push(c.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn compute_exports(&self, exports: &Option<Vec<IEItem>>, loc: Loc) -> RR<Vec<Entity>> {
         let Some(items) = exports else {
             return Ok(self.own.clone());
         };
         let mut out: Vec<Entity> = Vec::new();
+        // The exported types and classes with all their children, so that a child exported on its
+        // own (`StateT(StateT), runStateT`) is still one of its parent's (imported by `StateT(..)`).
+        let mut parents: Vec<(GName, Vec<Entity>)> = Vec::new();
         for item in items {
             match item {
                 IEItem::Var(q) if q.qual.is_none() && is_builtin_tycon(&q.name) => {}
@@ -1757,6 +1779,7 @@ impl<'a> Renamer<'a> {
                             format!("Ambiguous occurrence ‘{}’", display_qname(name))
                         },
                     })?;
+                    parents.push((e.global.clone(), self.all_children(&e)));
                     let mut with_subs = e.clone();
                     with_subs.subs = match subs {
                         Subs::None => Vec::new(),
@@ -1770,12 +1793,20 @@ impl<'a> Renamer<'a> {
                             }
                             all
                         }
-                        Subs::Some(names) => e
-                            .subs
-                            .iter()
-                            .filter(|s| names.contains(&s.global.name))
-                            .cloned()
-                            .collect(),
+                        Subs::Some(names) => {
+                            let mut some: Vec<Entity> =
+                                e.subs.iter().filter(|s| names.contains(&s.global.name)).cloned().collect();
+                            // A name that is not one of the type's own is a pattern synonym bundled
+                            // with it (`ByteString(BS, PS)`).
+                            for n in names {
+                                if !some.iter().any(|s| s.global.name == *n) {
+                                    if let Ok(s) = self.lookup_global(&QName::unqual(n.clone()), Ns::Value) {
+                                        some.push(s);
+                                    }
+                                }
+                            }
+                            some
+                        }
                     };
                     out.push(with_subs);
                 }
@@ -1802,6 +1833,18 @@ impl<'a> Renamer<'a> {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+        let alone: Vec<Entity> = out.iter().filter(|e| e.kind.is_value()).cloned().collect();
+        for (parent, children) in &parents {
+            for v in &alone {
+                if children.iter().any(|c| c.global == v.global) {
+                    if let Some(t) = out.iter_mut().find(|t| t.global == *parent && !t.kind.is_value()) {
+                        if !t.subs.iter().any(|c| c.global == v.global) {
+                            t.subs.push(v.clone());
                         }
                     }
                 }

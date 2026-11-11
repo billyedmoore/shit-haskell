@@ -319,8 +319,17 @@ impl Metas {
     pub fn unify_refine(&mut self, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         let a = self.prune(a);
         let b = self.prune(b);
-        // An irreducible family application cannot be refined; its equality is not used.
+        // A rigid variable equal to an irreducible family application stands for it (`g ~ F a`).
+        // Otherwise a family application cannot be refined, and its equality is not used.
         if self.is_family_app(&a) || self.is_family_app(&b) {
+            match (&a, &b) {
+                (Ty::Skol(x, _), t) | (t, Ty::Skol(x, _)) if !self.is_family_app(&Ty::Skol(*x, String::new())) => {
+                    if !matches!(t, Ty::Skol(..)) {
+                        self.skol_binds.insert(*x, t.clone());
+                    }
+                }
+                _ => {}
+            }
             return Ok(());
         }
         match (&a, &b) {

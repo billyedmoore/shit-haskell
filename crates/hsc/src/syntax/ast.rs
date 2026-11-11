@@ -164,6 +164,8 @@ pub enum Decl {
         name: String,
         params: Vec<TyVarBind>,
         equations: Option<Vec<TypeEquation>>,
+        /// The parameters an injectivity annotation (`= r | r -> a b`) names.
+        injective: Vec<String>,
         loc: Loc,
     },
     /// An equation of an open family: `type instance F t1 .. tn = rhs`.

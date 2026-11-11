@@ -255,6 +255,11 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             // SAFETY: no arguments.
             ret_int(m, unsafe { getpid() } as i64)
         }
+        // System.Mem: a collection now.
+        "performGC" | "performMajorGC" | "performBlockingMajorGC" => {
+            m.collect(0);
+            unit(m)
+        }
         "getppid" => {
             // SAFETY: no arguments.
             ret_int(m, unsafe { getppid() } as i64)

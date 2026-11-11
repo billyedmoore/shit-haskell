@@ -242,6 +242,7 @@ impl Checker {
                 arity,
                 closed,
                 equations: Vec::new(),
+                injective: Vec::new(),
             },
         );
     }

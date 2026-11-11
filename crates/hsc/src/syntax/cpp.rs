@@ -68,6 +68,9 @@ pub struct Preprocessor {
     include_dirs: Vec<PathBuf>,
     /// The file being read, for `__FILE__`.
     file: String,
+    /// The packages in scope and their versions, for `MIN_VERSION_<pkg>` (GHC defines it for the
+    /// visible packages); None for the boot packages' table.
+    versions: Option<HashMap<String, [u32; 3]>>,
 }
 
 /// Whether a source needs the preprocessor: the `CPP` extension is on by flag or pragma.
@@ -97,7 +100,7 @@ impl Preprocessor {
             .iter()
             .map(|(k, v)| (k.to_string(), Macro::Object(v.to_string())))
             .collect();
-        Preprocessor { defs, include_dirs, file: String::new() }
+        Preprocessor { defs, include_dirs, file: String::new(), versions: None }
     }
 
     /// Defines an object-like macro (`-D`).
@@ -108,8 +111,24 @@ impl Preprocessor {
     /// Whether a macro is defined: by `#define` or `-D`, or a `MIN_VERSION_<pkg>` of a known package
     /// (which GHC defines for the packages in scope).
     fn is_defined(&self, name: &str) -> bool {
-        self.defs.contains_key(name)
-            || name.strip_prefix("MIN_VERSION_").is_some_and(|p| PACKAGE_VERSIONS.iter().any(|(q, _)| *q == p))
+        self.defs.contains_key(name) || name.strip_prefix("MIN_VERSION_").is_some_and(|p| self.package_version(p).is_some())
+    }
+
+    /// Records a package in scope (`-hsc-pkgver=name:1.2.3`): then only those packages have
+    /// `MIN_VERSION_` macros.
+    pub fn add_package_version(&mut self, name: &str, version: &str) {
+        let mut v = [0u32; 3];
+        for (k, part) in version.split('.').take(3).enumerate() {
+            v[k] = part.parse().unwrap_or(0);
+        }
+        self.versions.get_or_insert_with(HashMap::new).insert(name.replace('-', "_"), v);
+    }
+
+    fn package_version(&self, pkg: &str) -> Option<[u32; 3]> {
+        match &self.versions {
+            Some(m) => m.get(pkg).copied(),
+            None => PACKAGE_VERSIONS.iter().find(|(p, _)| *p == pkg).map(|(_, v)| *v),
+        }
     }
 
     /// Names the file whose text `run` reads next (the expansion of `__FILE__`).
@@ -367,7 +386,7 @@ impl Preprocessor {
                         }
                     }
                 }
-                if let Some(v) = min_version(&word, &chars, &mut i) {
+                if let Some(v) = min_version(&word, &chars, &mut i, &|p| self.package_version(p)) {
                     out.push_str(if v { "1" } else { "0" });
                     changed = true;
                     continue;
@@ -605,9 +624,9 @@ fn strip_c_comments(line: &str, in_comment: &mut bool) -> String {
 }
 
 /// `MIN_VERSION_pkg(a,b,c)`: whether the boot package version is at least a.b.c.
-fn min_version(word: &str, chars: &[char], i: &mut usize) -> Option<bool> {
+fn min_version(word: &str, chars: &[char], i: &mut usize, version_of: &dyn Fn(&str) -> Option<[u32; 3]>) -> Option<bool> {
     let pkg = word.strip_prefix("MIN_VERSION_")?;
-    let (_, version) = PACKAGE_VERSIONS.iter().find(|(p, _)| *p == pkg)?;
+    let version = version_of(pkg)?;
     let mut j = *i;
     if j >= chars.len() || chars[j] != '(' {
         return None;

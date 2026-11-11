@@ -12,7 +12,7 @@ ref = os.path.join(here, "..", "ref")
 
 # name, version, origin (under ref/), copied entries, import dirs, flags, dependencies
 PACKAGES = [
-    ("rts", "1.0.2", None, [], [], [], []),
+    ("rts", "1.0.2", None, [], [], ["-Iinclude"], []),
     ("ghc-prim", "0.13.0", None, [], ["ghc-prim"], [], ["rts"]),
     ("ghc-bignum", "1.3", None, [], ["ghc-bignum/src"], [], ["ghc-prim"]),
     ("ghc-internal", "9.1202.0", None, [], ["ghc-internal/src"],
@@ -130,7 +130,7 @@ def write_db():
         if dirs:
             lines.append("import-dirs: " + " ".join("${pkgroot}/" + d for d in dirs))
         # The package's include directories (its -I flags, relative to its first import directory).
-        incs = [os.path.normpath(os.path.join(dirs[0], f[2:])) for f in flags if f.startswith("-I") and dirs]
+        incs = [os.path.normpath(os.path.join(dirs[0] if dirs else ".", f[2:])) for f in flags if f.startswith("-I")]
         if incs:
             lines.append("include-dirs: " + " ".join("${pkgroot}/" + d for d in incs))
         lines.append("depends: " + " ".join(ids[d] for d in deps))

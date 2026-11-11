@@ -448,7 +448,7 @@ fn db_stack(o: &Opts) -> Vec<PathBuf> {
 /// names, and every exposed package unless `-hide-all-packages`.
 /// The import directories of the packages in scope, and their include directories (which the C
 /// preprocessor searches, as GHC's does).
-fn package_dirs(o: &Opts) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+fn package_dirs(o: &Opts) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<String>), String> {
     let stack = pkg::Stack::load(&db_stack(o))?;
     let mut roots: Vec<String> = o.package_ids.clone();
     for n in &o.package_names {
@@ -469,6 +469,16 @@ fn package_dirs(o: &Opts) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
         roots.retain(|r| r != me);
     }
     let pkgs = stack.closure(&roots)?;
+    // The packages in scope (not their dependencies) have MIN_VERSION_ macros.
+    let mut visible = Vec::new();
+    for r in &roots {
+        if let Some(p) = stack.by_id(r) {
+            let flag = format!("-hsc-pkgver={}:{}", p.name(), p.version());
+            if !visible.contains(&flag) {
+                visible.push(flag);
+            }
+        }
+    }
     let mut dirs = Vec::new();
     let mut includes = Vec::new();
     // The packages named directly come before their dependencies in the search.
@@ -485,8 +495,25 @@ fn package_dirs(o: &Opts) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
                 includes.push(d);
             }
         }
+        // A package built by a build tool keeps its C code in its library archive.
+        for lib in p.list("hs-libraries") {
+            for d in p.list("library-dirs") {
+                let a = PathBuf::from(&d).join(format!("lib{lib}.a"));
+                let flag = format!("-hsc-archive={}", a.display());
+                if a.is_file() && !visible.contains(&flag) {
+                    visible.push(flag);
+                    break;
+                }
+            }
+        }
+        for lib in p.list("extra-libraries") {
+            let flag = format!("-hsc-lib={lib}");
+            if !visible.contains(&flag) {
+                visible.push(flag);
+            }
+        }
     }
-    Ok((dirs, includes))
+    Ok((dirs, includes, visible))
 }
 
 /// An input that names a source file (rather than a module).
@@ -530,10 +557,16 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
     // C inputs go to the C compiler.
     let c_inputs: Vec<&String> = o.inputs.iter().filter(|i| is_c_input(i)).collect();
     for c in &c_inputs {
-        let out = match (&o.output, o.no_link) {
-            (Some(out), true) if c_inputs.len() == 1 => PathBuf::from(out),
-            _ => out_path(&o.odir, &Path::new(c.as_str()).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), Path::new(c.as_str()), &o.osuf),
+        // A C file's object keeps its path under the output directory (`cbits/a.c` gives
+        // `odir/cbits/a.o`), as GHC places it.
+        let out = match (&o.output, o.no_link, &o.odir) {
+            (Some(out), true, _) if c_inputs.len() == 1 => PathBuf::from(out),
+            (_, _, Some(dir)) if Path::new(c.as_str()).is_relative() => dir.join(Path::new(c.as_str()).with_extension(&o.osuf)),
+            _ => Path::new(c.as_str()).with_extension(&o.osuf),
         };
+        if let Some(d) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
         let st = std::process::Command::new("gcc")
             .arg("-c")
             .arg(c.as_str())
@@ -541,6 +574,8 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
             .arg(&out)
             .args(&o.c_opts)
             .args(o.flags.iter().filter(|f| f.starts_with("-I") || f.starts_with("-D")))
+            // The RTS headers (HsFFI.h), as GHC passes its own include directory.
+            .arg(format!("-I{}", driver::default_lib_dir().join("include").display()))
             .status()
             .map_err(|e| format!("gcc: {e}"))?;
         if !st.success() {
@@ -577,14 +612,14 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
     } else {
         o
     };
-    let (pkg_dirs, pkg_includes) = package_dirs(o)?;
-    // The packages' include directories come after the command line's.
+    let (pkg_dirs, pkg_includes, visible) = package_dirs(o)?;
+    // The packages' include directories come after the command line's; the versions of the
+    // packages in scope are the preprocessor's MIN_VERSION_ macros.
     let with_includes;
-    let o = if pkg_includes.is_empty() {
-        o
-    } else {
+    let o = {
         let mut c = o.clone();
         c.flags.extend(pkg_includes.iter().map(|d| format!("-I{}", d.display())));
+        c.flags.extend(visible);
         with_includes = c;
         &with_includes
     };
@@ -737,8 +772,19 @@ fn build_program(
     }
     let out = exe.display().to_string();
     let mut c_sources = d.c_sources.clone();
-    if let Some(stub) = driver::capi_source(&binds, &d.c_flags)? {
+    // The capi wrappers include the packages' headers: their include directories are searched.
+    let mut capi_flags = d.c_flags.clone();
+    capi_flags.extend(o.flags.iter().filter(|f| f.starts_with("-I")).cloned());
+    if let Some(stub) = driver::capi_source(&binds, &capi_flags)? {
         c_sources.push(stub);
+    }
+    // The C code of the packages' library archives, and the C libraries they need.
+    for f in &o.flags {
+        if let Some(a) = f.strip_prefix("-hsc-archive=") {
+            c_sources.push((PathBuf::from(a), Vec::new()));
+        } else if let Some(l) = f.strip_prefix("-hsc-lib=") {
+            c_sources.push((PathBuf::from(format!("-l{l}")), Vec::new()));
+        }
     }
     // The RTS functions library C code calls (include/Rts.h) and base's C helpers: their (weak)
     // definitions, in every program.

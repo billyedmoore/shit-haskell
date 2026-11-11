@@ -69,14 +69,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// Makes `ghc` and `ghc-pkg` links to hsc and hsc-pkg in a directory: build tools find the package
-/// tool from the compiler's name (`cabal build -w DIR/ghc`).
+/// Makes `ghc`, `ghc-pkg` and `hsc2hs` links to hsc, hsc-pkg and hsc-hsc2hs in a directory: build
+/// tools find the other tools from the compiler's name (`cabal build -w DIR/ghc`).
 fn install_shims(dir: &str) -> ExitCode {
     let result = (|| -> std::io::Result<()> {
         let me = std::fs::canonicalize(std::env::current_exe()?)?;
         let pkg = me.with_file_name("hsc-pkg");
+        let hsc2hs = me.with_file_name("hsc-hsc2hs");
         std::fs::create_dir_all(dir)?;
-        for (name, target) in [("ghc", &me), ("ghc-pkg", &pkg)] {
+        for (name, target) in [("ghc", &me), ("ghc-pkg", &pkg), ("hsc2hs", &hsc2hs)] {
             let link = Path::new(dir).join(name);
             let _ = std::fs::remove_file(&link);
             std::os::unix::fs::symlink(target, &link)?;

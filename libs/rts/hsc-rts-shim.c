@@ -85,3 +85,6 @@ __attribute__((weak)) void debugBelch2(const char *s, char *t) { fprintf(stderr,
 /* The RTS's capability counts (GHC.Conc's getNumCapabilities reads them): one capability. */
 __attribute__((weak)) uint32_t n_capabilities = 1;
 __attribute__((weak)) uint32_t enabled_capabilities = 1;
+
+/* The signal the RTS's interval timer uses (System.Posix.Signals blocks it around some calls). */
+__attribute__((weak)) int rtsTimerSignal(void) { return SIGVTALRM; }

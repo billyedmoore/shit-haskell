@@ -291,6 +291,9 @@ fn program(parts: &[Part]) -> Result<String, String> {
 
 /// Translates a `.hsc` file into Haskell source, compiling and running the C program with the C
 /// compiler's `flags` (`-I`, `-D`). The result is cached by the source and flags.
+/// The prefix of a flag that goes to the C compiler as it is (`--cflag` of the hsc2hs command).
+pub const CFLAG_PREFIX: &str = "-hsc2hs-cflag=";
+
 pub fn translate(path: &Path, flags: &[String]) -> Result<PathBuf, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut key = src.clone();
@@ -328,6 +331,8 @@ pub fn translate(path: &Path, flags: &[String]) -> Result<PathBuf, String> {
     for f in flags {
         if f.starts_with("-I") || f.starts_with("-D") {
             cmd.arg(f);
+        } else if let Some(c) = f.strip_prefix(CFLAG_PREFIX) {
+            cmd.arg(c);
         }
     }
     let o = cmd.output().map_err(|e| format!("gcc: {e}"))?;

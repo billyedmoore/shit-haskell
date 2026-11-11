@@ -169,7 +169,8 @@ pub fn write_interface(path: &Path, module: &str, source: &Path, flags: &[String
     let mut out = format!("{IFACE_MAGIC}\nmodule: {module}\nsource: {}\n", source.display());
     for f in flags {
         let cpp = f == "-cpp" || f == "-XCPP" || f.starts_with("-I") || f.starts_with("-D") || f.starts_with("-U")
-            || f.starts_with("-include=") || f.starts_with("-optP");
+            || f.starts_with("-include=") || f.starts_with("-optP") || f.starts_with("-hsc-pkgver=")
+            || f.starts_with("-hsc-archive=") || f.starts_with("-hsc-lib=");
         if !cpp {
             out.push_str(&format!("flag: {f}\n"));
         }
@@ -518,6 +519,8 @@ pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Resul
             pp.define_macro(name, value);
         } else if let Some(name) = f.strip_prefix("-U") {
             pp.undefine(name);
+        } else if let Some((name, ver)) = f.strip_prefix("-hsc-pkgver=").and_then(|v| v.split_once(':')) {
+            pp.add_package_version(name, ver);
         } else if let Some(file) = f.strip_prefix("-include=") {
             prelude.push_str(&format!("#include \"{file}\"\n"));
         }
@@ -579,6 +582,29 @@ pub fn run_payload_bytes(payload: Vec<u8>) -> i32 {
 pub fn compile_c_sources(sources: &[(PathBuf, Vec<String>)], dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for (i, (src, flags)) in sources.iter().enumerate() {
+        // A C library to link (`-lm`) is passed on as it is.
+        if src.to_string_lossy().starts_with("-l") {
+            out.push(src.clone());
+            continue;
+        }
+        // A library archive: its objects, all of them (the program finds its C functions by name).
+        if src.extension().is_some_and(|e| e == "a") {
+            let sub = dir.join(format!("a{i}"));
+            std::fs::create_dir_all(&sub).map_err(|e| format!("{}: {e}", sub.display()))?;
+            let abs = std::fs::canonicalize(src).map_err(|e| format!("{}: {e}", src.display()))?;
+            let st = std::process::Command::new("ar").arg("x").arg(&abs).current_dir(&sub).status().map_err(|e| format!("ar: {e}"))?;
+            if !st.success() {
+                return Err(format!("ar failed on {}", src.display()));
+            }
+            let mut objs: Vec<PathBuf> = std::fs::read_dir(&sub)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "o"))
+                .collect();
+            objs.sort();
+            out.extend(objs);
+            continue;
+        }
         let obj = dir.join(format!("c{i}-{}.o", src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
         let mut cmd = std::process::Command::new("gcc");
         cmd.args(["-c", "-O2", "-fPIC", "-w"]).arg(src).arg("-o").arg(&obj);
@@ -610,7 +636,11 @@ pub fn c_sources_library(sources: &[(PathBuf, Vec<String>)]) -> Result<Option<Pa
     }
     let mut key = String::new();
     for (src, flags) in sources {
-        let text = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        let text = if src.to_string_lossy().starts_with("-l") {
+            Vec::new()
+        } else {
+            std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?
+        };
         key.push_str(&format!("{}\n{}\n{}\n", src.display(), flags.join(" "), text.len()));
         key.push_str(&String::from_utf8_lossy(&text));
     }

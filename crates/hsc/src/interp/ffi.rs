@@ -504,6 +504,8 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             // SAFETY: getpid has no arguments.
             ret_int(unsafe { getpid() } as i64)
         }
+        // System.Mem: memory is reference counted, so there is nothing to collect.
+        "performGC" | "performMajorGC" | "performBlockingMajorGC" => Ok(io_result_of(unit_value())),
         "getppid" => {
             // SAFETY: getppid has no arguments.
             ret_int(unsafe { getppid() } as i64)

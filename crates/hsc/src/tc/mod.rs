@@ -272,6 +272,13 @@ impl Checker {
         if let Some(r) = self.data_family_injection(&a, &e).or_else(|| self.data_family_injection(&e, &a)) {
             return r;
         }
+        // An injective family equal to a constructor type: the one equation whose right-hand side
+        // has that constructor fixes the injective arguments; the equation itself is checked later.
+        if let Some(r) = self.injective_improvement(&a, &e).or_else(|| self.injective_improvement(&e, &a)) {
+            r?;
+            self.deferred_eqs.push((a, e, self.loc));
+            return Ok(());
+        }
         // `F as ~ F bs` for a data family: the arguments are equal.
         if let (Some((f1, a1)), Some((f2, a2))) = (self.family_app(&a), self.family_app(&e)) {
             if f1 == f2 && a1.len() == a2.len() && self.is_data_family(&f1) {
@@ -279,6 +286,20 @@ impl Checker {
                     self.unify_fam(x, y)?;
                 }
                 return Ok(());
+            }
+            // An injective family (`= r | r -> a`): equal results have equal injective arguments.
+            let injective = if f1 == f2 && a1.len() == a2.len() {
+                self.env.families.get(&f1).map(|f| f.injective.clone()).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !injective.is_empty() {
+                for &i in &injective {
+                    self.unify_fam(&a1[i], &a2[i])?;
+                }
+                if injective.len() == a1.len() {
+                    return Ok(());
+                }
             }
         }
         // A family applied to exactly its arity is stuck; extra arguments decompose as applications.
@@ -308,6 +329,48 @@ impl Checker {
     /// `fam ~ rep` where `fam` is a saturated data family application and `rep` is headed by the
     /// representation type of one of its instances: the instance's patterns, instantiated, are
     /// unified with the family's arguments and its right-hand side with `rep`.
+    /// `F as ~ T ..` for an injective family `F` (TypeFamilyDependencies) and a constructor type:
+    /// when one equation's right-hand side is headed by `T`, its patterns at the injective
+    /// positions are unified with the arguments.
+    fn injective_improvement(&mut self, fam: &Ty, other: &Ty) -> Option<TR<()>> {
+        let (name, args) = self.family_app(fam)?;
+        let other = self.metas.prune(other);
+        let Ty::Con(head) = other.split_apps().0.clone() else { return None };
+        if self.env.families.contains_key(&head) {
+            return None;
+        }
+        let info = self.env.families.get(&name)?;
+        if info.injective.is_empty() || args.len() != info.arity {
+            return None;
+        }
+        let candidates: Vec<env::FamEqn> =
+            info.equations.iter().filter(|q| matches!(q.rhs.split_apps().0, Ty::Con(c) if *c == head)).cloned().collect();
+        let [eqn] = candidates.as_slice() else { return None };
+        let injective = info.injective.clone();
+        let fresh: Vec<Ty> = (0..eqn.nvars).map(|_| self.meta()).collect();
+        let rhs = types::subst_gen(&eqn.rhs, &fresh);
+        let pats: Vec<Ty> = eqn.args.iter().map(|p| types::subst_gen(p, &fresh)).collect();
+        // Already determined: nothing to improve (so that the equation is not deferred forever).
+        if injective.iter().all(|&i| !self.has_metas(&args[i])) {
+            return None;
+        }
+        Some((|| {
+            self.unify_at_raw(&rhs, &other)?;
+            for &i in &injective {
+                self.unify_fam(&args[i], &pats[i])?;
+            }
+            Ok(())
+        })())
+    }
+
+    fn has_metas(&self, t: &Ty) -> bool {
+        match self.metas.prune(t) {
+            Ty::Meta(_) => true,
+            Ty::App(f, x) => self.has_metas(&f) || self.has_metas(&x),
+            _ => false,
+        }
+    }
+
     fn data_family_injection(&mut self, fam: &Ty, rep: &Ty) -> Option<TR<()>> {
         let (name, args) = self.family_app(fam)?;
         let Ty::Con(rep_head) = self.metas.prune(rep).split_apps().0.clone() else { return None };

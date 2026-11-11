@@ -88,6 +88,8 @@ pub struct FamilyInfo {
     /// Closed families try their equations in order.
     pub closed: bool,
     pub equations: Vec<FamEqn>,
+    /// The positions of the parameters the result determines (TypeFamilyDependencies).
+    pub injective: Vec<usize>,
 }
 
 #[derive(Default)]
