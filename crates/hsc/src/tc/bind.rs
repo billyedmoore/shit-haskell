@@ -439,22 +439,76 @@ impl Checker {
         }
     }
 
+    /// Peels the quantifiers and contexts off a type: each variable becomes rigid and each
+    /// predicate a dictionary parameter (appended to `binders`, its predicate to `given_dicts`).
+    /// Answers the type under them.
+    pub(super) fn peel_polymorphic(&mut self, mut cur: Ty, binders: &mut Vec<String>, given_dicts: &mut Vec<(Pred, String)>) -> Ty {
+        loop {
+            match self.metas.prune(&cur) {
+                Ty::Forall(ids, preds, body) => {
+                    let sk: Vec<Ty> = ids.iter().map(|_| self.metas.fresh_skolem("r")).collect();
+                    for p in &preds {
+                        let d = self.fresh_name("dq");
+                        given_dicts.push((super::types::subst_bound_pred(p, &ids, &sk), d.clone()));
+                        binders.push(d);
+                    }
+                    cur = super::types::subst_bound(&body, &ids, &sk);
+                }
+                Ty::Qual(preds, body) => {
+                    for p in &preds {
+                        let d = self.fresh_name("dq");
+                        given_dicts.push((p.clone(), d.clone()));
+                        binders.push(d);
+                    }
+                    cur = (*body).clone();
+                }
+                _ => return cur,
+            }
+        }
+    }
+
     pub fn fun_clauses(&mut self, clauses: &[Clause], ty: &Ty, name: &str) -> TR<Core> {
         let arity = clauses.first().map(|c| c.pats.len()).unwrap_or(0);
         if arity == 0 {
             let clause = clauses.first().expect("at least one clause");
             self.loc = clause.loc;
-            let body = self.rhs_body(&clause.rhs, ty)?;
+            // A polymorphic or constrained type (`x :: GenericQ Int` with its forall inside the
+            // synonym): the body is checked at its rigid instance, with its dictionaries given.
+            let mut binders = Vec::new();
+            let mut given_dicts = Vec::new();
+            let ty = self.peel_polymorphic(ty.clone(), &mut binders, &mut given_dicts);
+            let givens_len = self.givens.len();
+            for (p, d) in &given_dicts {
+                self.add_given(Given { pred: p.clone(), ev: Core::Var(d.clone()) });
+            }
+            let outer = if given_dicts.is_empty() { None } else { Some(std::mem::take(&mut self.wanted)) };
+            let body = self.rhs_body(&clause.rhs, &ty)?;
             let mut fresh = |b: &str| self.fresh_name(b);
-            return Ok(compile_body(
+            let mut core = compile_body(
                 &body,
                 Core::Fail(format!("Non-exhaustive guards in {}", super::types::unqualify(name))),
                 &mut fresh,
-            ));
+            );
+            if let Some(outer) = outer {
+                let inner = std::mem::replace(&mut self.wanted, outer);
+                let (binds, residual) = self.solve(inner)?;
+                self.wanted.extend(residual);
+                core = wrap_let(binds, core);
+            }
+            self.givens.truncate(givens_len);
+            return Ok(binders.into_iter().rev().fold(core, |acc, s| Core::Lam(s, Box::new(acc))));
         }
         let mut arg_tys = Vec::with_capacity(arity);
         let mut cur = ty.clone();
-        for _ in 0..arity {
+        let scruts: Vec<String> = (0..arity).map(|_| self.fresh_name("arg")).collect();
+        // The lambdas of the function in order: its arguments, and the dictionaries of a
+        // polymorphic or constrained type met between them (`f g x` at `A -> forall a. C a => a -> B`
+        // takes the dictionary before `x`), whose variables are rigid in the clauses.
+        let mut binders: Vec<String> = Vec::with_capacity(arity);
+        let mut given_dicts: Vec<(Pred, String)> = Vec::new();
+        for k in 0..arity {
+            cur = self.peel_polymorphic(cur, &mut binders, &mut given_dicts);
+            binders.push(scruts[k].clone());
             let split = self.metas.prune(&cur).as_fun().map(|(a, r)| (a.clone(), r.clone()));
             let (a, r) = match split {
                 Some(p) => p,
@@ -468,8 +522,15 @@ impl Checker {
             arg_tys.push(a);
             cur = r;
         }
+        // A polymorphic or constrained result after the arguments: the same (the body is checked at
+        // its rigid instance, with its dictionaries given).
+        cur = self.peel_polymorphic(cur, &mut binders, &mut given_dicts);
         let res = cur;
-        let scruts: Vec<String> = (0..arity).map(|_| self.fresh_name("arg")).collect();
+        let givens_len = self.givens.len();
+        for (p, d) in &given_dicts {
+            self.add_given(Given { pred: p.clone(), ev: Core::Var(d.clone()) });
+        }
+        let outer = if given_dicts.is_empty() { None } else { Some(std::mem::take(&mut self.wanted)) };
         let mut rows = Vec::with_capacity(clauses.len());
         for c in clauses {
             self.loc = c.loc;
@@ -487,8 +548,16 @@ impl Checker {
             &format!("function {}", super::types::unqualify(name)),
         );
         let mut fresh = |b: &str| self.fresh_name(b);
-        let matched = compile_rows(&scruts, &rows, failure, &mut fresh);
-        Ok(scruts.into_iter().rev().fold(matched, |acc, s| Core::Lam(s, Box::new(acc))))
+        let mut matched = compile_rows(&scruts, &rows, failure, &mut fresh);
+        // What the clauses need of those dictionaries is solved while they are given.
+        if let Some(outer) = outer {
+            let inner = std::mem::replace(&mut self.wanted, outer);
+            let (binds, residual) = self.solve(inner)?;
+            self.wanted.extend(residual);
+            matched = wrap_let(binds, matched);
+        }
+        self.givens.truncate(givens_len);
+        Ok(binders.into_iter().rev().fold(matched, |acc, s| Core::Lam(s, Box::new(acc))))
     }
 }
 

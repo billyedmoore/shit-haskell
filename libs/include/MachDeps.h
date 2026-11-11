@@ -21,3 +21,194 @@
 #define MAX_Word16 65535
 #define MAX_Word32 4294967295
 #define MAX_Word64 18446744073709551615
+
+/* The sizes and alignments of the C types (as GHC's MachDeps.h and ghcautoconf.h give them). */
+#ifndef ALIGNMENT_CHAR
+#define ALIGNMENT_CHAR 1
+#endif
+#ifndef ALIGNMENT_DOUBLE
+#define ALIGNMENT_DOUBLE 8
+#endif
+#ifndef ALIGNMENT_FLOAT
+#define ALIGNMENT_FLOAT 4
+#endif
+#ifndef ALIGNMENT_HSCHAR
+#define ALIGNMENT_HSCHAR 4
+#endif
+#ifndef ALIGNMENT_HSFUNPTR
+#define ALIGNMENT_HSFUNPTR 8
+#endif
+#ifndef ALIGNMENT_HSSTABLEPTR
+#define ALIGNMENT_HSSTABLEPTR 8
+#endif
+#ifndef ALIGNMENT_INT16
+#define ALIGNMENT_INT16 2
+#endif
+#ifndef ALIGNMENT_INT16_T
+#define ALIGNMENT_INT16_T 2
+#endif
+#ifndef ALIGNMENT_INT32
+#define ALIGNMENT_INT32 4
+#endif
+#ifndef ALIGNMENT_INT32_T
+#define ALIGNMENT_INT32_T 4
+#endif
+#ifndef ALIGNMENT_INT
+#define ALIGNMENT_INT 4
+#endif
+#ifndef ALIGNMENT_INT64
+#define ALIGNMENT_INT64 8
+#endif
+#ifndef ALIGNMENT_INT64_T
+#define ALIGNMENT_INT64_T 8
+#endif
+#ifndef ALIGNMENT_INT8
+#define ALIGNMENT_INT8 1
+#endif
+#ifndef ALIGNMENT_INT8_T
+#define ALIGNMENT_INT8_T 1
+#endif
+#ifndef ALIGNMENT_LONG
+#define ALIGNMENT_LONG 8
+#endif
+#ifndef ALIGNMENT_LONG_LONG
+#define ALIGNMENT_LONG_LONG 8
+#endif
+#ifndef ALIGNMENT_SHORT
+#define ALIGNMENT_SHORT 2
+#endif
+#ifndef ALIGNMENT_UINT16_T
+#define ALIGNMENT_UINT16_T 2
+#endif
+#ifndef ALIGNMENT_UINT32_T
+#define ALIGNMENT_UINT32_T 4
+#endif
+#ifndef ALIGNMENT_UINT64_T
+#define ALIGNMENT_UINT64_T 8
+#endif
+#ifndef ALIGNMENT_UINT8_T
+#define ALIGNMENT_UINT8_T 1
+#endif
+#ifndef ALIGNMENT_UNSIGNED_CHAR
+#define ALIGNMENT_UNSIGNED_CHAR 1
+#endif
+#ifndef ALIGNMENT_UNSIGNED_INT
+#define ALIGNMENT_UNSIGNED_INT 4
+#endif
+#ifndef ALIGNMENT_UNSIGNED_LONG
+#define ALIGNMENT_UNSIGNED_LONG 8
+#endif
+#ifndef ALIGNMENT_UNSIGNED_LONG_LONG
+#define ALIGNMENT_UNSIGNED_LONG_LONG 8
+#endif
+#ifndef ALIGNMENT_UNSIGNED_SHORT
+#define ALIGNMENT_UNSIGNED_SHORT 2
+#endif
+#ifndef ALIGNMENT_VOID_P
+#define ALIGNMENT_VOID_P 8
+#endif
+#ifndef ALIGNMENT_WORD16
+#define ALIGNMENT_WORD16 2
+#endif
+#ifndef ALIGNMENT_WORD32
+#define ALIGNMENT_WORD32 4
+#endif
+#ifndef ALIGNMENT_WORD64
+#define ALIGNMENT_WORD64 8
+#endif
+#ifndef ALIGNMENT_WORD8
+#define ALIGNMENT_WORD8 1
+#endif
+#ifndef SIZEOF_CHAR
+#define SIZEOF_CHAR 1
+#endif
+#ifndef SIZEOF_DOUBLE
+#define SIZEOF_DOUBLE 8
+#endif
+#ifndef SIZEOF_FLOAT
+#define SIZEOF_FLOAT 4
+#endif
+#ifndef SIZEOF_HSFUNPTR
+#define SIZEOF_HSFUNPTR 8
+#endif
+#ifndef SIZEOF_HSSTABLEPTR
+#define SIZEOF_HSSTABLEPTR 8
+#endif
+#ifndef SIZEOF_INT16
+#define SIZEOF_INT16 2
+#endif
+#ifndef SIZEOF_INT16_T
+#define SIZEOF_INT16_T 2
+#endif
+#ifndef SIZEOF_INT32
+#define SIZEOF_INT32 4
+#endif
+#ifndef SIZEOF_INT32_T
+#define SIZEOF_INT32_T 4
+#endif
+#ifndef SIZEOF_INT
+#define SIZEOF_INT 4
+#endif
+#ifndef SIZEOF_INT64
+#define SIZEOF_INT64 8
+#endif
+#ifndef SIZEOF_INT64_T
+#define SIZEOF_INT64_T 8
+#endif
+#ifndef SIZEOF_INT8
+#define SIZEOF_INT8 1
+#endif
+#ifndef SIZEOF_INT8_T
+#define SIZEOF_INT8_T 1
+#endif
+#ifndef SIZEOF_LONG
+#define SIZEOF_LONG 8
+#endif
+#ifndef SIZEOF_LONG_LONG
+#define SIZEOF_LONG_LONG 8
+#endif
+#ifndef SIZEOF_SHORT
+#define SIZEOF_SHORT 2
+#endif
+#ifndef SIZEOF_UINT16_T
+#define SIZEOF_UINT16_T 2
+#endif
+#ifndef SIZEOF_UINT32_T
+#define SIZEOF_UINT32_T 4
+#endif
+#ifndef SIZEOF_UINT64_T
+#define SIZEOF_UINT64_T 8
+#endif
+#ifndef SIZEOF_UINT8_T
+#define SIZEOF_UINT8_T 1
+#endif
+#ifndef SIZEOF_UNSIGNED_CHAR
+#define SIZEOF_UNSIGNED_CHAR 1
+#endif
+#ifndef SIZEOF_UNSIGNED_INT
+#define SIZEOF_UNSIGNED_INT 4
+#endif
+#ifndef SIZEOF_UNSIGNED_LONG
+#define SIZEOF_UNSIGNED_LONG 8
+#endif
+#ifndef SIZEOF_UNSIGNED_LONG_LONG
+#define SIZEOF_UNSIGNED_LONG_LONG 8
+#endif
+#ifndef SIZEOF_UNSIGNED_SHORT
+#define SIZEOF_UNSIGNED_SHORT 2
+#endif
+#ifndef SIZEOF_VOID_P
+#define SIZEOF_VOID_P 8
+#endif
+#ifndef SIZEOF_WORD16
+#define SIZEOF_WORD16 2
+#endif
+#ifndef SIZEOF_WORD32
+#define SIZEOF_WORD32 4
+#endif
+#ifndef SIZEOF_WORD64
+#define SIZEOF_WORD64 8
+#endif
+#ifndef SIZEOF_WORD8
+#define SIZEOF_WORD8 1
+#endif

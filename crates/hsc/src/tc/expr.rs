@@ -96,7 +96,26 @@ impl Checker {
         let mark = self.alt_begin();
         let mut arg_tys: Vec<Ty> = Vec::with_capacity(pats.len());
         let mut rest: Option<Ty> = expected.cloned();
-        for _ in pats {
+        // A polymorphic or constrained type between the parameters (`\a b -> ..` at
+        // `a -> forall b. C b => b -> r`): its variables are rigid in the body and its dictionaries
+        // are parameters of the lambda at that place.
+        let mut binders: Vec<Option<usize>> = Vec::new();
+        let mut dict_names: Vec<String> = Vec::new();
+        let mut given_dicts: Vec<(Pred, String)> = Vec::new();
+        for (k, _) in pats.iter().enumerate() {
+            if k > 0 {
+                if let Some(t) = rest.take() {
+                    let before = dict_names.len();
+                    let mut names = Vec::new();
+                    let t = self.peel_polymorphic(t, &mut names, &mut given_dicts);
+                    dict_names.extend(names);
+                    for _ in before..dict_names.len() {
+                        binders.push(None);
+                    }
+                    rest = Some(t);
+                }
+            }
+            binders.push(Some(k));
             let split = rest.as_ref().and_then(|t| self.metas.prune(t).as_fun().map(|(x, y)| (x.clone(), y.clone())));
             let (a, r) = match split {
                 Some(p) => p,
@@ -112,11 +131,39 @@ impl Checker {
             arg_tys.push(a);
             rest = Some(r);
         }
+        // And one after the last parameter: the body is checked at its rigid instance.
+        if !pats.is_empty() {
+            if let Some(t) = rest.take() {
+                let before = dict_names.len();
+                let mut names = Vec::new();
+                let t = self.peel_polymorphic(t, &mut names, &mut given_dicts);
+                dict_names.extend(names);
+                for _ in before..dict_names.len() {
+                    binders.push(None);
+                }
+                rest = Some(t);
+            }
+        }
         let cpats = self.check_pats(pats, &arg_tys)?;
+        let givens_len = self.givens.len();
+        for (p, d) in &given_dicts {
+            self.add_given(super::Given { pred: p.clone(), ev: Core::Var(d.clone()) });
+        }
+        let outer = if given_dicts.is_empty() { None } else { Some(std::mem::take(&mut self.wanted)) };
         let (cbody, tbody) = match &rest {
             Some(r) => (self.check(body, r)?, r.clone()),
             None => self.infer(body)?,
         };
+        let cbody = match outer {
+            Some(outer) => {
+                let inner = std::mem::replace(&mut self.wanted, outer);
+                let (binds, residual) = self.solve(inner)?;
+                self.wanted.extend(residual);
+                wrap_let(binds, cbody)
+            }
+            None => cbody,
+        };
+        self.givens.truncate(givens_len);
         let cbody = match self.alt_end(mark, CBody::Expr(cbody))? {
             CBody::Expr(c) => c,
             other => {
@@ -133,8 +180,13 @@ impl Checker {
         let mut fresh = |b: &str| self.fresh_name(b);
         let matched = compile_rows(&scruts, &rows, fail, &mut fresh);
         let mut core = matched;
-        for s in scruts.iter().rev() {
-            core = Core::Lam(s.clone(), Box::new(core));
+        let mut dicts = dict_names.iter().rev();
+        for b in binders.iter().rev() {
+            let name = match b {
+                Some(k) => scruts[*k].clone(),
+                None => dicts.next().cloned().unwrap_or_default(),
+            };
+            core = Core::Lam(name, Box::new(core));
         }
         Ok((core, Ty::funs(arg_tys, tbody)))
     }
@@ -696,11 +748,8 @@ impl Checker {
             self.add_given(super::Given { pred: p.clone(), ev: Core::Var(d.clone()) });
         }
         let outer = std::mem::take(&mut self.wanted);
-        let result = (|| -> TR<Core> {
-            let (ca, ta) = self.infer(a)?;
-            self.unify_at(&ta, body)?;
-            Ok(ca)
-        })();
+        // Checked against the parameter type (a lambda takes its argument types from it).
+        let result = self.check(a, body);
         let inner = std::mem::replace(&mut self.wanted, outer);
         let ca = match result {
             Ok(ca) => ca,

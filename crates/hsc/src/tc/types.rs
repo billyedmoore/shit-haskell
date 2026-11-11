@@ -144,11 +144,20 @@ pub fn subst_bound(t: &Ty, ids: &[u32], tys: &[Ty]) -> Ty {
         },
         Ty::App(f, a) => Ty::app(subst_bound(f, ids, tys), subst_bound(a, ids, tys)),
         Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(), Box::new(subst_bound(b, ids, tys))),
-        Ty::Forall(is, ps, b) => Ty::Forall(
-            is.clone(),
-            ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(),
-            Box::new(subst_bound(b, ids, tys)),
-        ),
+        Ty::Forall(is, ps, b) => {
+            // An inner quantifier of the same variable shadows it (a synonym's `forall`, expanded
+            // twice in one type, binds the same variable twice).
+            if ids.iter().any(|i| is.contains(i)) {
+                let (ids2, tys2): (Vec<u32>, Vec<Ty>) =
+                    ids.iter().zip(tys).filter(|(i, _)| !is.contains(i)).map(|(i, t)| (*i, t.clone())).unzip();
+                return Ty::Forall(
+                    is.clone(),
+                    ps.iter().map(|p| subst_bound_pred(p, &ids2, &tys2)).collect(),
+                    Box::new(subst_bound(b, &ids2, &tys2)),
+                );
+            }
+            Ty::Forall(is.clone(), ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(), Box::new(subst_bound(b, ids, tys)))
+        }
         other => other.clone(),
     }
 }

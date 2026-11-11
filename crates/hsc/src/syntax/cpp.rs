@@ -628,6 +628,10 @@ fn min_version(word: &str, chars: &[char], i: &mut usize, version_of: &dyn Fn(&s
     let pkg = word.strip_prefix("MIN_VERSION_")?;
     let version = version_of(pkg)?;
     let mut j = *i;
+    // White space may come between the name and its arguments, as with any function-like macro.
+    while j < chars.len() && (chars[j] == ' ' || chars[j] == '\t') {
+        j += 1;
+    }
     if j >= chars.len() || chars[j] != '(' {
         return None;
     }
