@@ -154,9 +154,154 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
                 int_value(m, oa - ob)
             }
         }
+        "setByteArray#" => {
+            // setByteArray# arr off n c
+            let (Some(_), Some(off), Some(n), Some(c)) = (force_arg(m, 0), int_arg(m, 1), int_arg(m, 2), int_arg(m, 3)) else { return Some(0) };
+            let b = m.args[0];
+            let len = bytes_len(m, b);
+            let (off, n) = clamp(off, n, len);
+            // SAFETY: the range lies inside the array's bytes.
+            unsafe { std::ptr::write_bytes(((b + 8) as *mut u8).add(off), c as u8, n) };
+            unit(m)
+        }
+        "copyByteArray#" | "copyMutableByteArray#" | "copyMutableByteArrayNonOverlapping#" => {
+            // copy src srcOff dst dstOff n
+            let (Some(_), Some(so), Some(_), Some(dof), Some(n)) =
+                (force_arg(m, 0), int_arg(m, 1), force_arg(m, 2), int_arg(m, 3), int_arg(m, 4))
+            else {
+                return Some(0);
+            };
+            let (src, dst) = (m.args[0], m.args[2]);
+            let n = n.max(0) as usize;
+            if (so as usize) + n <= bytes_len(m, src) && (dof as usize) + n <= bytes_len(m, dst) {
+                // SAFETY: both ranges were checked against the arrays' lengths; `copy` allows overlap.
+                unsafe { std::ptr::copy(((src + 8) as *const u8).add(so as usize), ((dst + 8) as *mut u8).add(dof as usize), n) };
+            }
+            unit(m)
+        }
+        "copyByteArrayToAddr#" | "copyMutableByteArrayToAddr#" => {
+            // copy src srcOff addr n
+            let (Some(_), Some(so), Some(n)) = (force_arg(m, 0), int_arg(m, 1), int_arg(m, 3)) else { return Some(0) };
+            let Some(dst) = addr_ptr(m, 2) else { return Some(0) };
+            let src = m.args[0];
+            let n = n.max(0) as usize;
+            // SAFETY: the source range is inside the array; the address names writable memory of the program.
+            unsafe { std::ptr::copy(((src + 8) as *const u8).add(so as usize), dst, n) };
+            unit(m)
+        }
+        "copyAddrToByteArray#" => {
+            // copy addr dst dstOff n
+            let (Some(_), Some(dof), Some(n)) = (force_arg(m, 1), int_arg(m, 2), int_arg(m, 3)) else { return Some(0) };
+            let Some(src) = addr_ptr(m, 0) else { return Some(0) };
+            let dst = m.args[1];
+            let n = n.max(0) as usize;
+            // SAFETY: as above.
+            unsafe { std::ptr::copy(src, ((dst + 8) as *mut u8).add(dof as usize), n) };
+            unit(m)
+        }
+        "compareByteArrays#" => {
+            // compareByteArrays# a aOff b bOff n
+            let (Some(_), Some(ao), Some(_), Some(bo), Some(n)) =
+                (force_arg(m, 0), int_arg(m, 1), force_arg(m, 2), int_arg(m, 3), int_arg(m, 4))
+            else {
+                return Some(0);
+            };
+            let (a, b) = (m.args[0], m.args[2]);
+            let n = n.max(0) as usize;
+            // SAFETY: the ranges lie in the arrays (the library checks them).
+            let (x, y) = unsafe {
+                (
+                    std::slice::from_raw_parts(((a + 8) as *const u8).add(ao as usize), n),
+                    std::slice::from_raw_parts(((b + 8) as *const u8).add(bo as usize), n),
+                )
+            };
+            let ord = match x.cmp(y) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            int_value(m, ord)
+        }
+        "shrinkMutableByteArray#" => {
+            let (Some(_), Some(n)) = (force_arg(m, 0), int_arg(m, 1)) else { return Some(0) };
+            let b = m.args[0];
+            let h = m.heap_get(b, 0);
+            let n = (n.max(0) as usize).min(bytes_len(m, b));
+            m.heap_set(b, heap::header(kind::BYTES, heap::size_of(h), n as u32));
+            unit(m)
+        }
+        "resizeMutableByteArray#" => {
+            let (Some(_), Some(n)) = (force_arg(m, 0), int_arg(m, 1)) else { return Some(0) };
+            let n = n.max(0) as usize;
+            let words = n.div_ceil(8);
+            m.reserve(2 + words);
+            let nb = m.alloc(1 + words);
+            m.heap_set(nb, heap::header(kind::BYTES, words as u32, n as u32));
+            for i in 0..words {
+                m.heap_set(nb + 8 + 8 * i as Word, 0);
+            }
+            let old = m.args[0];
+            let k = n.min(bytes_len(m, old));
+            // SAFETY: both ranges are inside their arrays.
+            unsafe { std::ptr::copy_nonoverlapping((old + 8) as *const u8, (nb + 8) as *mut u8, k) };
+            state_pair(m, nb)
+        }
+        "isByteArrayPinned#" | "isMutableByteArrayPinned#" => int_value(m, 1),
+        "copyArray#" | "copyMutableArray#" => {
+            let (Some(_), Some(so), Some(_), Some(dof), Some(n)) =
+                (force_arg(m, 0), int_arg(m, 1), force_arg(m, 2), int_arg(m, 3), int_arg(m, 4))
+            else {
+                return Some(0);
+            };
+            let (src, dst) = (m.args[0], m.args[2]);
+            let vals: Vec<Word> = (0..n.max(0) as usize).map(|i| m.heap_get(src, 1 + so as usize + i)).collect();
+            for (i, v) in vals.into_iter().enumerate() {
+                m.heap_set(dst + 8 * (1 + dof as usize + i) as Word, v);
+            }
+            unit(m)
+        }
+        "freezeArray#" | "thawArray#" | "cloneArray#" | "cloneMutableArray#" => {
+            let (Some(_), Some(off), Some(n)) = (force_arg(m, 0), int_arg(m, 1), int_arg(m, 2)) else { return Some(0) };
+            let n = n.max(0) as usize;
+            m.reserve(2 + n);
+            let a = m.alloc(1 + n);
+            m.heap_set(a, heap::header(kind::ARRAY, n as u32, 0));
+            let src = m.args[0];
+            for i in 0..n {
+                let v = m.heap_get(src, 1 + off as usize + i);
+                m.heap_set(a + 8 + 8 * i as Word, v);
+            }
+            if name.starts_with("clone") && name != "cloneMutableArray#" { a } else { state_pair(m, a) }
+        }
+        "seq#" => {
+            let Some(v) = force_arg(m, 0) else { return Some(0) };
+            state_pair(m, v)
+        }
         _ => return element_access(m, name),
     };
     Some(r)
+}
+
+/// The length in bytes of a byte array object.
+fn bytes_len(m: &Machine, b: Word) -> usize {
+    (m.heap_get(b, 0) >> 32) as usize
+}
+
+/// An offset and count clamped to a length.
+fn clamp(off: i64, n: i64, len: usize) -> (usize, usize) {
+    let off = (off.max(0) as usize).min(len);
+    (off, (n.max(0) as usize).min(len - off))
+}
+
+/// The machine address an `Addr#` argument names: a byte array's data plus an offset, or a raw
+/// address (an ADDR object without an array).
+fn addr_ptr(m: &mut Machine, k: usize) -> Option<*mut u8> {
+    let a = force_arg(m, k)?;
+    if heap::kind_of(m.heap_get(a, 0)) != kind::ADDR {
+        return Some(std::ptr::null_mut());
+    }
+    let (base, off) = (m.heap_get(a, 1), m.heap_get(a, 2) as i64);
+    Some(if base == 0 { off as *mut u8 } else { (base as i64 + 8 + off) as *mut u8 })
 }
 
 /// The element types of byte arrays and addresses: the name, the width in bytes, the kind.
