@@ -1150,6 +1150,7 @@ impl Parser {
         };
         // The calling convention is kept (`prim` is the runtime's own primitives); safety is not.
         let prim = self.at_varid("prim");
+        let capi = self.at_varid("capi");
         if ["ccall", "capi", "stdcall", "prim", "javascript"]
             .iter()
             .any(|cc| self.at_varid(cc))
@@ -1167,6 +1168,8 @@ impl Parser {
             _ => None,
         };
         let name = self.binder_name()?;
+        // A capi import is called through a C wrapper (it may name a macro): `%capi` marks it.
+        let entity = if capi { Some(format!("%capi {}", entity.unwrap_or_else(|| name.clone()))) } else { entity };
         self.expect_res(ROp::DColon)?;
         let ty = self.sigtype()?;
         Ok(Decl::Foreign {

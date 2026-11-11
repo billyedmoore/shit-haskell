@@ -81,13 +81,37 @@ fn divide_by_zero<T>() -> Result<T, RtError> {
 
 /// Calls a primitive by name with its (unevaluated) arguments.
 pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
+    match call_named(rt, name, args) {
+        // An argument of the wrong kind: the message names the primitive.
+        Err(RtError::Fail(msg)) if msg.starts_with("internal: expected") && !msg.contains(" in ") => {
+            Err(RtError::Fail(format!("{msg} in {name}")))
+        }
+        r => r,
+    }
+}
+
+fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
     // A foreign C call: the runtime's own version of the function, else the C function itself.
     if let Some((sig, ret, sym)) = crate::ccall::parse(name) {
         if let Some(r) = super::ffi::call(rt, sym, args) {
             return r;
         }
-        if let Some(f) = crate::ccall::lookup(sym) {
-            return super::ffi::generic(rt, f, sig, ret, args);
+        if let Some(f) = crate::ccall::resolve(name) {
+            let r = super::ffi::generic(rt, f, sig, ret, args);
+            // HSC_TRACE_CCALL: each C call made by name, with its answer.
+            if std::env::var_os("HSC_TRACE_CCALL").is_some() {
+                let shown = match &r {
+                    Ok(Value::Con(c)) if c.args.len() == 2 => match &*c.args[1].borrow() {
+                        super::Thunk::Done(Value::Int(i)) => format!("{i} ({i:#x})"),
+                        super::Thunk::Done(Value::Addr(_, o)) => format!("addr+{o}"),
+                        _ => "value".into(),
+                    },
+                    Ok(_) => "value".into(),
+                    Err(_) => "error".into(),
+                };
+                eprintln!("hsc: ccall {sym} -> {shown}");
+            }
+            return r;
         }
         return call(rt, sym, args);
     }
@@ -673,15 +697,33 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                     write_element(&mut bytes.borrow_mut(), o + off, size, kind, &v);
                     Ok(unit_value())
                 }
+                // A raw machine address (memory a C function answered): read and written in place.
+                (acc, Value::Int(p)) if p != 0 => {
+                    let at = (p as usize).wrapping_add(off) as *mut u8;
+                    if acc == "write" {
+                        let v = unbox_element(rt, rt.force(&args[2])?)?;
+                        let mut tmp = vec![0u8; size];
+                        write_element(&mut tmp, 0, size, kind, &v);
+                        // SAFETY: the program writes memory it was given by C code.
+                        unsafe { std::ptr::copy_nonoverlapping(tmp.as_ptr(), at, size) };
+                        return Ok(unit_value());
+                    }
+                    // SAFETY: the program reads memory it was given by C code.
+                    let bytes = unsafe { std::slice::from_raw_parts(at, size) };
+                    let v = read_element(bytes, 0, size, kind);
+                    Ok(if acc == "read" { io_result(v) } else { v })
+                }
                 (_, other) => Err(RtError::Fail(format!("internal: {name} on an unsupported value {}", match other { Value::Con(c) => format!("con {}/{}", c.name, c.args.len()), Value::Int(i) => format!("int {i}"), Value::Addr(..) => "addr".into(), Value::Bytes(_) => "bytes".into(), _ => "other".into() }))),
             }
         }
         "plusAddr#" => match rt.force(&args[0])? {
             Value::Addr(b, o) => Ok(Value::Addr(b, (o as i64 + int(rt, &args[1])?) as usize)),
+            Value::Int(p) => int_v(p.wrapping_add(int(rt, &args[1])?)),
             _ => Err(RtError::Fail("internal: plusAddr# of a non-address".into())),
         },
         "minusAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
             (Value::Addr(a, x), Value::Addr(b, y)) if Rc::ptr_eq(&a, &b) => int_v(x as i64 - y as i64),
+            (Value::Int(x), Value::Int(y)) => int_v(x.wrapping_sub(y)),
             _ => Err(RtError::Fail("internal: minusAddr# of non-addresses".into())),
         },
         // Ordering of addresses into the same buffer (by offset); different buffers by their place.
@@ -1081,7 +1123,9 @@ fn read_element(bytes: &[u8], at: usize, size: usize, kind: &str) -> Value {
         }
         "word" => Value::Int(v as i64),
         "double" => Value::Double(f64::from_bits(v)),
-        "addr" => Value::Addr(Rc::new(RefCell::new(Vec::new())), 0),
+        // An address read from memory is a raw machine address (or the null address).
+        "addr" if v == 0 => Value::Addr(Rc::new(RefCell::new(Vec::new())), 0),
+        "addr" => Value::Int(v as i64),
         _ => Value::Double(f32::from_bits(v as u32) as f64),
     }
 }
@@ -1102,6 +1146,16 @@ fn write_element(bytes: &mut [u8], at: usize, size: usize, kind: &str, v: &Value
     let bits: u64 = match (kind, v) {
         ("double", Value::Double(d)) => d.to_bits(),
         ("float", Value::Double(d)) => (*d as f32).to_bits() as u64,
+        // An address stored in memory is the machine address of its bytes (C code may read it).
+        (_, Value::Addr(b, o)) => {
+            // SAFETY: only the address is taken.
+            let vec = unsafe { &mut *b.as_ptr() };
+            if vec.is_empty() && *o == 0 { 0 } else { vec.as_mut_ptr() as u64 + *o as u64 }
+        }
+        (_, Value::Bytes(b)) => {
+            // SAFETY: as above.
+            unsafe { (*b.as_ptr()).as_mut_ptr() as u64 }
+        }
         (_, Value::Char(c)) => *c as u64,
         (_, Value::Int(i)) => *i as u64,
         (_, Value::Double(d)) => *d as i64 as u64,

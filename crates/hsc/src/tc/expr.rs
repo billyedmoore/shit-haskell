@@ -345,7 +345,7 @@ impl Checker {
                 // `$$(e)` in a typed quotation: `e :: Code m t` stands for a `t`.
                 self.loc = *loc;
                 let (_, te) = self.infer(e)?;
-                let m = self.meta();
+                let m = self.quote_monads.last().cloned().unwrap_or_else(|| self.meta());
                 let t = self.meta();
                 self.unify_at(&te, &Ty::apps(Ty::con("GHC.Internal.TH.Syntax.Code"), vec![m, t.clone()]))?;
                 Ok((Core::Fail("hsc: Template Haskell splices cannot be run yet".into()), t))
@@ -376,7 +376,10 @@ impl Checker {
                 });
                 let ty = match (*kind, body) {
                     ('T', Some(b)) => {
-                        let (_, t) = self.infer(b)?;
+                        self.quote_monads.push(m.clone());
+                        let r = self.infer(b);
+                        self.quote_monads.pop();
+                        let (_, t) = r?;
                         Ty::apps(Ty::con(&format!("{TH}.Code")), vec![m, t])
                     }
                     ('e', Some(b)) => {

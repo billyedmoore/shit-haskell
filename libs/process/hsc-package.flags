@@ -1,0 +1,6 @@
+-XHaskell2010
+-Iinclude
+-c-source=cbits/posix/runProcess.c
+-c-source=cbits/posix/fork_exec.c
+-c-source=cbits/posix/posix_spawn.c
+-c-source=cbits/posix/find_executable.c

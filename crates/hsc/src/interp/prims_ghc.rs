@@ -597,6 +597,27 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             copy_buf(&src, so, &dst, dof, n);
             Ok(unit_value())
         })(),
+        "copyAddrToByteArray#" if matches!(rt.force(&args[0]), Ok(Value::Int(_))) => (|| {
+            let src = raw_ptr(rt, &args[0])?;
+            let dst = raw_ptr(rt, &args[1])?;
+            let dof = int_arg(rt, &args[2])?.max(0) as usize;
+            let n = int_arg(rt, &args[3])?.max(0) as usize;
+            // SAFETY: C memory and an array the library sized for the copy.
+            unsafe { std::ptr::copy(src, dst.add(dof), n) };
+            Ok(unit_value())
+        })(),
+        "copyAddrToAddr#" | "copyAddrToAddrNonOverlapping#"
+            if matches!(rt.force(&args[0]), Ok(Value::Int(_))) || matches!(rt.force(&args[1]), Ok(Value::Int(_))) =>
+        {
+            (|| {
+                let src = raw_ptr(rt, &args[0])?;
+                let dst = raw_ptr(rt, &args[1])?;
+                let n = int_arg(rt, &args[2])?.max(0) as usize;
+                // SAFETY: as above.
+                unsafe { std::ptr::copy(src, dst, n) };
+                Ok(unit_value())
+            })()
+        }
         "copyAddrToByteArray#" => (|| {
             let (src, so) = bytes_of(rt, &args[0])?;
             let (dst, dof) = bytes_of(rt, &args[1])?;
@@ -695,6 +716,17 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
 }
 
 /// The bytes of a byte array argument (or an address's buffer) as a shared buffer and an offset.
+/// The machine address of an address-like value: a buffer's bytes (and offset), or a raw address.
+fn raw_ptr(rt: &Runtime, c: &Cell) -> Result<*mut u8, RtError> {
+    match rt.force(c)? {
+        Value::Bytes(b) => Ok(unsafe { (*b.as_ptr()).as_mut_ptr() }),
+        // SAFETY: the offset lies within the buffer, which is not reallocated during the copy.
+        Value::Addr(b, o) => Ok(unsafe { (*b.as_ptr()).as_mut_ptr().add(o) }),
+        Value::Int(p) => Ok(p as usize as *mut u8),
+        _ => Err(RtError::Fail("internal: expected an address".into())),
+    }
+}
+
 /// Copies `n` bytes between buffers (the same buffer included, overlapping or not).
 fn copy_buf(src: &Rc<RefCell<Vec<u8>>>, so: usize, dst: &Rc<RefCell<Vec<u8>>>, dof: usize, n: usize) {
     if Rc::ptr_eq(src, dst) {

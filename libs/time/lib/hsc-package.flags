@@ -1,0 +1,10 @@
+-XHaskell2010
+-XRank2Types
+-XDeriveDataTypeable
+-XDeriveLift
+-XDeriveGeneric
+-XStandaloneDeriving
+-XPatternSynonyms
+-XViewPatterns
+-Iinclude
+-c-source=cbits/HsTime.c

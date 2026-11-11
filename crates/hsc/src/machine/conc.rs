@@ -511,6 +511,27 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             unit(m)
         }
         "killThread#" => throw_to(mp),
+        "waitRead#" | "waitWrite#" => {
+            let t = force_arg(m, 0)?;
+            let fd = int_of(m, t) as i32;
+            let write = name == "waitWrite#";
+            loop {
+                // SAFETY: the machine is re-derived after every switch.
+                let m = unsafe { &mut *mp };
+                if crate::sched::fd_ready(fd, write) {
+                    break;
+                }
+                if m.sched.sleep_cur(1000) {
+                    switch(mp);
+                }
+                // SAFETY: as above.
+                if check(unsafe { &mut *mp }) {
+                    return Some(0);
+                }
+            }
+            // SAFETY: as above.
+            unit(unsafe { &mut *mp })
+        }
         "threadStatus#" => {
             let t = force_arg(m, 0)?;
             let status = m.sched.status(int_of(m, t) as Tid);

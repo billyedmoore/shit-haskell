@@ -87,6 +87,8 @@ pub struct Checker {
     pub overloaded_strings: bool,
     /// Quantified constraints are kept while a signature's context is converted.
     pub allow_quantified: bool,
+    /// The monads of the typed quotations being checked, innermost last (their splices share them).
+    pub quote_monads: Vec<Ty>,
     /// The flexible kind variables of the signature being checked. Each clause of its body
     /// sees them afresh, as it would the rigid kind variables of a signature.
     pub flex_kinds: Vec<u32>,
@@ -149,6 +151,7 @@ impl Checker {
             sig_kind_vars: HashMap::new(),
             overloaded_strings: false,
             allow_quantified: false,
+            quote_monads: Vec::new(),
             flex_kinds: Vec::new(),
             explicit_sigs: std::collections::HashSet::new(),
             deferred_eqs: Vec::new(),

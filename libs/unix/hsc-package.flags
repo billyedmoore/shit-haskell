@@ -1,0 +1,4 @@
+-XHaskell2010
+-Iinclude
+-c-source=cbits/HsUnix.c
+-c-source=cbits/execvpe.c

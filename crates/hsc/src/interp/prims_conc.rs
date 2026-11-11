@@ -282,6 +282,17 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             Ok(unit_value())
         })(),
         "killThread#" => throw_to(rt, args),
+        // waitRead#/waitWrite# fd: the thread sleeps (other threads run) until the descriptor is ready.
+        "waitRead#" | "waitWrite#" => (|| {
+            let fd = int_of(rt, &args[0])? as i32;
+            while !crate::sched::fd_ready(fd, name == "waitWrite#") {
+                if conc::with(|s| s.sleep_cur(1000)) {
+                    conc::switch();
+                }
+                check(rt)?;
+            }
+            Ok(unit_value())
+        })(),
         "threadStatus#" => int_of(rt, &args[0]).map(|t| {
             let status = conc::with(|s| s.status(t as u64));
             tuple(vec![unit_cell(), cell_of(Value::Int(status)), cell_of(Value::Int(0)), cell_of(Value::Int(0))])

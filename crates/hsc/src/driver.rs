@@ -29,6 +29,8 @@ pub struct Driver {
     pub sources: Vec<(String, PathBuf, bool)>,
     /// The C sources of the packages the program uses, with the C compiler's flags for each.
     pub c_sources: Vec<(PathBuf, Vec<String>)>,
+    /// The C include and macro flags of every package module loaded (for the capi wrappers).
+    pub c_flags: Vec<String>,
 }
 
 /// Where a module was found: its source, the flags it is compiled with, and whether it is one of
@@ -137,6 +139,7 @@ impl Driver {
             flags,
             sources: Vec::new(),
             c_sources: Vec::new(),
+            c_flags: Vec::new(),
         }
     }
 
@@ -151,6 +154,13 @@ impl Driver {
                     return Some(Found { path: p, flags: self.flags.clone(), home: true });
                 }
             }
+            // A `.hsc` module is translated by hsc2hs first.
+            let p = d.join(format!("{stem}.hsc"));
+            if p.is_file() {
+                if let Ok(hs) = crate::hsc2hs::translate(&p, &self.flags) {
+                    return Some(Found { path: hs, flags: self.flags.clone(), home: true });
+                }
+            }
         }
         for d in &self.pkg_dirs {
             if let Some((path, flags)) = read_interface(&d.join(format!("{stem}.hi"))) {
@@ -161,6 +171,14 @@ impl Driver {
             let p = d.join(format!("{stem}.hs"));
             if p.is_file() {
                 return Some(Found { path: p, flags: package_flags(d), home: false });
+            }
+            let p = d.join(format!("{stem}.hsc"));
+            if p.is_file() {
+                let flags = package_flags(d);
+                match crate::hsc2hs::translate(&p, &flags) {
+                    Ok(hs) => return Some(Found { path: hs, flags, home: false }),
+                    Err(e) => eprintln!("{e}"),
+                }
             }
         }
         None
@@ -262,6 +280,11 @@ impl Driver {
         let (path, flags, home) = (found.path, found.flags, found.home);
         // A package module brings the package's C sources into the program.
         let c_flags: Vec<String> = flags.iter().filter(|f| f.starts_with("-I") || f.starts_with("-D") || f.starts_with("-cc-option=")).cloned().collect();
+        for f in &c_flags {
+            if !self.c_flags.contains(f) {
+                self.c_flags.push(f.clone());
+            }
+        }
         for f in &flags {
             if let Some(src) = f.strip_prefix("-c-source=") {
                 let p = PathBuf::from(src);
@@ -549,6 +572,62 @@ pub fn c_sources_library(sources: &[(PathBuf, Vec<String>)]) -> Result<Option<Pa
     std::fs::rename(&tmp, &lib).map_err(|e| format!("{}: {e}", lib.display()))?;
     let _ = std::fs::remove_dir_all(&dir);
     Ok(Some(lib))
+}
+
+/// The C wrappers of a program's capi imports, as a C source to compile with the program (written
+/// in the cache, by its contents), with the flags to compile it with.
+pub fn capi_source(binds: &[TopBind], flags: &[String]) -> Result<Option<(PathBuf, Vec<String>)>, String> {
+    fn walk(c: &crate::core::Core, out: &mut Vec<String>) {
+        use crate::core::{Alt, Core};
+        match c {
+            Core::Prim(n, args) => {
+                if n.starts_with("capi:") && !out.contains(n) {
+                    out.push(n.clone());
+                }
+                args.iter().for_each(|a| walk(a, out));
+            }
+            Core::App(f, a) => {
+                walk(f, out);
+                walk(a, out);
+            }
+            Core::Lam(_, b) => walk(b, out),
+            Core::Let(bs, b) => {
+                bs.iter().for_each(|(_, e)| walk(e, out));
+                walk(b, out);
+            }
+            Core::Case(s, _, alts) => {
+                walk(s, out);
+                for a in alts {
+                    match a {
+                        Alt::Con(_, _, e) | Alt::Lit(_, e) | Alt::Default(e) => walk(e, out),
+                    }
+                }
+            }
+            Core::Con(_, args) => args.iter().for_each(|a| walk(a, out)),
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        }
+    }
+    let mut prims = Vec::new();
+    for b in binds {
+        walk(&b.body, &mut prims);
+    }
+    let Some(src) = crate::ccall::capi_stubs(&prims) else { return Ok(None) };
+    let mut ctx = [0u8; 88];
+    crate::interp::md5::init(&mut ctx);
+    crate::interp::md5::update(&mut ctx, src.as_bytes());
+    let digest: String = crate::interp::md5::finish(&mut ctx).iter().map(|b| format!("{b:02x}")).collect();
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("hsc")
+        .join("capi");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(format!("capi-{digest}.c"));
+    if !path.is_file() {
+        std::fs::write(&path, src).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(Some((path, flags.to_vec())))
 }
 
 /// The name of the binding a program's payload carries for its C libraries (their paths).

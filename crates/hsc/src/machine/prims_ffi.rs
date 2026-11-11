@@ -280,13 +280,6 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             let r = unsafe { readlink(raw(pb, poff), raw(bb, boff), n) };
             ret_int(m, if r < 0 { -1 } else { r as i64 })
         }
-        "fcntl" => {
-            let fd = int_arg(m, 0)? as i32;
-            let cmd = int_arg(m, 1)? as i32;
-            let arg = int_arg(m, 2)?;
-            // SAFETY: fcntl takes integers.
-            ret_int(m, unsafe { fcntl(fd, cmd, arg) } as i64)
-        }
         "ftruncate" | "__hscore_ftruncate" => {
             let fd = int_arg(m, 0)? as i32;
             let len = int_arg(m, 1)?;

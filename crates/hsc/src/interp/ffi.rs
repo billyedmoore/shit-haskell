@@ -388,13 +388,6 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             // SAFETY: ftruncate takes plain integers.
             ret_int(unsafe { ftruncate(fd, len) } as i64)
         })(),
-        "fcntl" => (|| {
-            let fd = int_of(rt, &args[0])? as i32;
-            let cmd = int_of(rt, &args[1])? as i32;
-            let arg = int_of(rt, &args[2])?;
-            // SAFETY: fcntl takes plain integers.
-            ret_int(unsafe { fcntl(fd, cmd, arg) } as i64)
-        })(),
         "dup" => int_of(rt, &args[0]).and_then(|fd| {
             // SAFETY: dup takes a descriptor number.
             ret_int(unsafe { dup(fd as i32) } as i64)

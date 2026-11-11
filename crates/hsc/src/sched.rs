@@ -19,6 +19,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+extern "C" {
+    fn poll(fds: *mut PollFd, n: u64, timeout: i32) -> i32;
+}
+
+/// Whether a descriptor is ready for reading (or writing), without waiting.
+pub fn fd_ready(fd: i32, write: bool) -> bool {
+    const POLLIN: i16 = 1;
+    const POLLOUT: i16 = 4;
+    let mut p = PollFd { fd, events: if write { POLLOUT } else { POLLIN }, revents: 0 };
+    // SAFETY: one pollfd, no waiting.
+    let r = unsafe { poll(&mut p, 1, 0) };
+    // An error (a closed descriptor) also ends the wait: the operation that follows reports it.
+    r != 0
+}
+
 /// A thread's number: 1 for the main thread, increasing with every fork.
 pub type Tid = u64;
 

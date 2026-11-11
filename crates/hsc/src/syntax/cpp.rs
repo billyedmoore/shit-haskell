@@ -763,3 +763,20 @@ impl ExprParser {
 pub fn package_version(pkg: &str) -> Option<[u32; 3]> {
     PACKAGE_VERSIONS.iter().find(|(p, _)| *p == pkg).map(|(_, v)| *v)
 }
+
+/// The C definitions of the predefined macros and `MIN_VERSION_<pkg>` macros, for C code that
+/// Haskell tools generate (hsc2hs): as cabal's `cabal_macros.h` and GHC define them.
+pub fn c_macro_definitions() -> String {
+    let mut out = String::new();
+    for (k, v) in PREDEFINED {
+        if *k != "__LINE__" {
+            out.push_str(&format!("#ifndef {k}\n#define {k} {v}\n#endif\n"));
+        }
+    }
+    for (p, [a, b, c]) in PACKAGE_VERSIONS {
+        out.push_str(&format!(
+            "#define MIN_VERSION_{p}(x,y,z) ((x)<{a} || ((x)=={a} && ((y)<{b} || ((y)=={b} && (z)<={c}))))\n"
+        ));
+    }
+    out
+}

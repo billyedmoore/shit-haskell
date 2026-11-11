@@ -69,6 +69,9 @@ pub struct PatSynDef {
     pub params: Vec<String>,
     pub pat: crate::syntax::ast::Pat,
     pub builder: bool,
+    /// The argument types of the synonym's signature that mention no type variable (renamed): the
+    /// arguments of a use get them as pattern signatures, so that the expansion keeps their types.
+    pub arg_types: Vec<Option<crate::syntax::ast::Type>>,
 }
 
 #[derive(Clone, Debug, Default)]

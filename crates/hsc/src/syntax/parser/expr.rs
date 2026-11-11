@@ -520,6 +520,12 @@ impl Parser {
             }
             Tok::Float(s) => {
                 self.bump();
+                // NumDecimals: a literal with an integral value (`1e12`, `1.5e3`) is an integer.
+                if self.exts.is_on("NumDecimals") {
+                    if let Some(digits) = integral_decimal(&s) {
+                        return Ok(Expr::Lit(Lit::Int(digits), loc));
+                    }
+                }
                 Ok(Expr::Lit(Lit::Frac(s), loc))
             }
             Tok::Char(c) => {
@@ -732,7 +738,16 @@ impl Parser {
             if self.at_special(',') || self.at_special(')') {
                 elems.push(None);
             } else {
-                elems.push(Some(self.expr()?));
+                let l = self.loc();
+                let e = self.expr()?;
+                // ViewPatterns in a tuple pattern: `(x, f -> p)`.
+                if self.at_res(ROp::RArrow) {
+                    self.bump();
+                    let pat = self.expr()?;
+                    elems.push(Some(Expr::ViewPat(Box::new(e), Box::new(pat), l)));
+                } else {
+                    elems.push(Some(e));
+                }
             }
         }
         self.expect_special(')')?;
@@ -954,4 +969,23 @@ fn negate_prim(p: crate::syntax::token::PrimLit) -> crate::syntax::token::PrimLi
         PrimLit::Double(s) => PrimLit::Double(neg(s)),
         other => other,
     }
+}
+
+/// The digits of a decimal literal (`1.5e3`) when its value is an integer, exactly.
+fn integral_decimal(s: &str) -> Option<String> {
+    let (mantissa, exp) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], s[i + 1..].parse::<i64>().ok()?),
+        None => (s, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let frac_part = frac_part.trim_end_matches('0');
+    if exp < frac_part.len() as i64 {
+        return None;
+    }
+    let mut digits = format!("{int_part}{frac_part}");
+    for _ in 0..(exp - frac_part.len() as i64) {
+        digits.push('0');
+    }
+    let digits = digits.trim_start_matches('0');
+    Some(if digits.is_empty() { "0".to_string() } else { digits.to_string() })
 }

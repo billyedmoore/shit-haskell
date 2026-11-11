@@ -345,6 +345,7 @@ fn element(name: &str) -> Option<(usize, &'static str)> {
         "Word32" => (4, "word"),
         "Double" => (8, "double"),
         "Float" => (4, "float"),
+        "Addr" | "StablePtr" => (8, "addr"),
         _ => return None,
     })
 }
@@ -381,7 +382,13 @@ fn element_access(m: &mut Machine, name: &str) -> Option<Word> {
     let addr = if base == 0 { base_off + index * scale } else { (base + 8) as i64 + base_off + index * scale };
     if access == "write" {
         let v = m.args[2];
-        let bits = m.heap_get(v, 1);
+        // An address is stored as the machine address it names.
+        let bits = if ekind == "addr" && heap::kind_of(m.heap_get(v, 0)) == kind::ADDR {
+            let (b, o) = (m.heap_get(v, 1), m.heap_get(v, 2) as i64);
+            if b == 0 { o as Word } else { (b as i64 + 8 + o) as Word }
+        } else {
+            m.heap_get(v, 1)
+        };
         let bytes = bits.to_le_bytes();
         // SAFETY: the element lies within the byte array, which does not move during this copy.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, width) };
@@ -393,6 +400,14 @@ fn element_access(m: &mut Machine, name: &str) -> Option<Word> {
     unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), width) };
     let bits = u64::from_le_bytes(buf);
     let v = match ekind {
+        // An address read from memory is a raw machine address.
+        "addr" => {
+            let a = m.alloc(3);
+            m.heap_set(a, heap::header(kind::ADDR, 2, 0));
+            m.heap_set(a + 8, 0);
+            m.heap_set(a + 16, bits);
+            a
+        }
         "char8" => char_object(m, bits as u8 as char),
         "char32" => char_object(m, char::from_u32(bits as u32).unwrap_or('\u{fffd}')),
         "int" => {

@@ -5,7 +5,7 @@ A development tool. `python3 libs/packages.py vendor` copies the sources of the 
 from ref/ (GHC's source tree and Hackage downloads) into libs/<name>; with no argument it writes
 the package database and, in each import directory, `hsc-package.flags`: the flags its modules
 are compiled with (relative paths in it are relative to that directory)."""
-import hashlib, os, shutil, sys
+import hashlib, os, shutil, subprocess, sys
 
 here = os.path.dirname(os.path.abspath(__file__))
 ref = os.path.join(here, "..", "ref")
@@ -51,6 +51,30 @@ PACKAGES = [
      ["base", "bytestring", "deepseq", "exceptions", "os-string", "template-haskell"]),
     ("parsec", "3.1.18.0", "hackage/parsec-3.1.18.0", ["src", "LICENSE"], ["parsec/src"], ["-XHaskell2010"],
      ["base", "bytestring", "mtl", "text"]),
+    ("time", "1.14", "hackage/time-1.14", ["lib", "LICENSE"], ["time/lib"],
+     ["-XHaskell2010", "-XRank2Types", "-XDeriveDataTypeable", "-XDeriveLift", "-XDeriveGeneric", "-XStandaloneDeriving",
+      "-XPatternSynonyms", "-XViewPatterns", "-Iinclude", "-c-source=cbits/HsTime.c"],
+     ["base", "deepseq", "template-haskell"]),
+    ("unix", "2.8.6.0", "hackage/unix-2.8.6.0", ["System", "include", "cbits", "LICENSE"], ["unix"],
+     ["-XHaskell2010", "-Iinclude", "-c-source=cbits/HsUnix.c", "-c-source=cbits/execvpe.c"],
+     ["base", "bytestring", "filepath", "os-string", "time"]),
+    ("file-io", "0.1.5", "hackage/file-io-0.1.5", ["System", "posix", "LICENSE"], ["file-io/posix", "file-io"],
+     ["-XHaskell2010"], ["base", "bytestring", "deepseq", "filepath", "os-string", "unix"]),
+    ("directory", "1.3.9.0", "hackage/directory-1.3.9.0", ["System", "LICENSE"], ["directory"],
+     ["-XHaskell2010", "-I."], ["base", "filepath", "os-string", "time", "unix", "file-io"]),
+    ("process", "1.6.25.0", "hackage/process-1.6.25.0", ["System", "include", "cbits", "LICENSE"], ["process"],
+     ["-XHaskell2010", "-Iinclude", "-c-source=cbits/posix/runProcess.c", "-c-source=cbits/posix/fork_exec.c",
+      "-c-source=cbits/posix/posix_spawn.c", "-c-source=cbits/posix/find_executable.c"],
+     ["base", "deepseq", "directory", "filepath", "unix"]),
+]
+
+# Config headers made by tools/confprobe.py in place of the packages' configure scripts:
+# (package, template under ref/, output under libs/<package>/).
+CONFIGS = [
+    ("time", "hackage/time-1.14/lib/include/HsTimeConfig.h.in", "lib/include/HsTimeConfig.h"),
+    ("unix", "hackage/unix-2.8.6.0/include/HsUnixConfig.h.in", "include/HsUnixConfig.h"),
+    ("directory", "hackage/directory-1.3.9.0/HsDirectoryConfig.h.in", "HsDirectoryConfig.h"),
+    ("process", "hackage/process-1.6.25.0/include/HsProcessConfig.h.in", "include/HsProcessConfig.h"),
 ]
 
 def vendor():
@@ -66,6 +90,13 @@ def vendor():
             s = os.path.join(src, e)
             (shutil.copytree if os.path.isdir(s) else shutil.copy)(s, os.path.join(dst, e))
         print("vendored", name, ver)
+    probe = os.path.join(here, "..", "tools", "confprobe.py")
+    versions = {name: ver for name, ver, *_ in PACKAGES}
+    for name, template, out in CONFIGS:
+        target = os.path.join(here, name, out)
+        if not os.path.exists(target):
+            subprocess.run([sys.executable, probe, os.path.join(ref, template), target, name, versions[name]], check=True)
+            print("configured", name)
 
 def modules(d):
     out = []
@@ -73,9 +104,10 @@ def modules(d):
     for dp, dns, fns in os.walk(root):
         dns[:] = sorted(x for x in dns if x[0].isupper())
         for f in fns:
-            if f.endswith(".hs") and f[0].isupper():
-                out.append(os.path.relpath(os.path.join(dp, f[:-3]), root).replace(os.sep, "."))
-    return sorted(out)
+            for ext in (".hs", ".hsc"):
+                if f.endswith(ext) and f[0].isupper():
+                    out.append(os.path.relpath(os.path.join(dp, f[:-len(ext)]), root).replace(os.sep, "."))
+    return sorted(set(out))
 
 def write_db():
     ids = {name: f"{name}-{ver}" for name, ver, *_ in PACKAGES}

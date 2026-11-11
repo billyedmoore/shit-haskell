@@ -182,7 +182,24 @@ impl<'a> Renamer<'a> {
         let mut builders = Vec::new();
         for d in &m.decls {
             if let Decl::PatSyn { name, args, pat, dir, loc } = d {
+                let sig = m.decls.iter().find_map(|s| match s {
+                    Decl::PatSynSig { names, ty, .. } if names.iter().any(|n| n == name) => Some(ty.clone()),
+                    _ => None,
+                });
                 self.patsyn_definition(name, args, pat, dir, *loc)?;
+                if let Some(sig) = sig {
+                    let tys = closed_arg_types(&sig);
+                    let mut renamed = Vec::with_capacity(tys.len());
+                    for t in tys {
+                        renamed.push(match t {
+                            Some(t) => self.ty(t).ok(),
+                            None => None,
+                        });
+                    }
+                    if let Some(def) = self.patsyns.get_mut(&GName::new(self.module.clone(), name)) {
+                        def.arg_types = renamed;
+                    }
+                }
                 let defs = builder_decls(name, args, pat, dir, *loc)?;
                 // A builder has the synonym's signature, with both of its contexts required.
                 if !defs.is_empty() {
@@ -716,6 +733,7 @@ impl<'a> Renamer<'a> {
             params,
             pat: renamed,
             builder: !matches!(dir, PatSynDir::Unidirectional),
+            arg_types: Vec::new(),
         };
         self.patsyns.insert(GName::new(self.module.clone(), name), def);
         Ok(())
@@ -1377,8 +1395,27 @@ impl<'a> Renamer<'a> {
                 dotdot,
                 loc,
             } => {
-                let entity = self.lookup_entity(&con, loc)?;
+                // A record pattern synonym builds by its builder, its fields in the synonym's order.
                 let con_q = self.value_ref(&con, loc, true)?;
+                if let Some(def) = self.patsyn_of(&con_q).filter(|d| d.builder) {
+                    let mut f = Expr::Var(QName { qual: con_q.qual.clone(), name: builder_name(&con_q.name) }, loc);
+                    for p in &def.params {
+                        let occ = p.split('%').next().unwrap_or(p).to_string();
+                        let value = fields.iter().find(|(q, _)| q.name == occ).map(|(_, v)| v.clone());
+                        let arg = match value {
+                            Some(Some(x)) => self.expr(x)?,
+                            Some(None) => self.expr(Expr::Var(QName::unqual(occ.clone()), loc))?,
+                            None if dotdot => self.expr(Expr::Var(QName::unqual(occ.clone()), loc))?,
+                            None => self.expr(Expr::App(
+                                Box::new(Expr::Var(QName { qual: Some("%Base".into()), name: "error".into() }, loc)),
+                                Box::new(Expr::Lit(Lit::Str(format!("Missing field in record construction {occ}")), loc)),
+                            ))?,
+                        };
+                        f = Expr::App(Box::new(f), Box::new(arg));
+                    }
+                    return Ok(f);
+                }
+                let entity = self.lookup_entity(&con, loc)?;
                 let mut out = Vec::new();
                 let mut given: HashSet<String> = HashSet::new();
                 for (f, v) in fields {
@@ -1541,6 +1578,7 @@ impl<'a> Renamer<'a> {
                             ),
                         });
                     }
+                    let out = typed_args(out, &def.arg_types, loc);
                     return Ok(subst_pat(&def.pat, &def.params, &out));
                 }
                 Pat::Con(cq, out, loc)
@@ -1626,7 +1664,7 @@ impl<'a> Renamer<'a> {
             Pat::Con(q, args, loc) if args.len() == 2 => {
                 let args: Vec<Pat> = args.into_iter().map(|a| self.expand_infix_patsyns(a)).collect();
                 match self.patsyn_of(&q) {
-                    Some(def) if def.params.len() == 2 => subst_pat(&def.pat, &def.params, &args),
+                    Some(def) if def.params.len() == 2 => subst_pat(&def.pat, &def.params, &typed_args(args, &def.arg_types, loc)),
                     _ => Pat::Con(q, args, loc),
                 }
             }
@@ -2118,4 +2156,44 @@ fn package_of_module(module: &str, current: &str) -> String {
     } else {
         "base".into()
     }
+}
+
+/// The argument types of a pattern synonym's signature that mention no type variable.
+fn closed_arg_types(sig: &Type) -> Vec<Option<Type>> {
+    let mut t = sig;
+    loop {
+        match t {
+            Type::Forall(_, b) => t = b,
+            Type::Qual(_, b) => t = b,
+            _ => break,
+        }
+    }
+    fn has_var(t: &Type) -> bool {
+        match t {
+            Type::Var(..) => true,
+            Type::App(f, a) | Type::Fun(f, a) => has_var(f) || has_var(a),
+            Type::List(e, _) => has_var(e),
+            Type::Tuple(ts, _) => ts.iter().any(has_var),
+            Type::Sig(t, _) => has_var(t),
+            Type::OpChain(items, _) => items.iter().any(|i| matches!(i, TypeOpItem::Operand(x) if has_var(x))),
+            _ => false,
+        }
+    }
+    let mut out = Vec::new();
+    while let Type::Fun(a, r) = t {
+        out.push(if has_var(a) { None } else { Some((**a).clone()) });
+        t = r;
+    }
+    out
+}
+
+/// The arguments of a pattern synonym use, with the types its signature gives them.
+fn typed_args(args: Vec<Pat>, tys: &[Option<Type>], loc: Loc) -> Vec<Pat> {
+    args.into_iter()
+        .enumerate()
+        .map(|(i, a)| match tys.get(i).cloned().flatten() {
+            Some(t) => Pat::Sig(Box::new(a), t, loc),
+            None => a,
+        })
+        .collect()
 }

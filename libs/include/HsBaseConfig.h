@@ -189,3 +189,29 @@
 #define SIZEOF_HSINT 8
 #define SIZEOF_HSWORD 8
 #define SIZEOF_HSPTR 8
+/* More C types of System.Posix.Types (x86-64 Linux, probed). */
+#define HTYPE_TCFLAG_T Word32
+#define HTYPE_CLOCKID_T Int32
+#define HTYPE_FSBLKCNT_T Word64
+#define HTYPE_FSFILCNT_T Word64
+#define HTYPE_ID_T Word32
+#define HTYPE_KEY_T Int32
+#define HTYPE_NFDS_T Word64
+#define HTYPE_SOCKLEN_T Word32
+/* POSIX functions and headers base tests for (x86-64 Linux). The event manager's (epoll, poll,
+   kqueue) and file locking's (flock, OFD locks) are left out: hsc's runtime does not use them. */
+#define HAVE_CHMOD 1
+#define HAVE_DUP 1
+#define HAVE_FORK 1
+#define HAVE_GETPID 1
+#define HAVE_GETRUSAGE 1
+#define HAVE_MKFIFO 1
+#define HAVE_PIPE 1
+#define HAVE_SYS_RESOURCE_H 1
+#define HAVE_SYS_TIMES_H 1
+#define HAVE_TERMIOS_H 1
+#define HAVE_TIMES 1
+#define HAVE_UMASK 1
+#define HAVE_UNISTD_H 1
+#define HAVE_UNSETENV 1
+#define HAVE_DECL_CLOCK_PROCESS_CPUTIME_ID 1

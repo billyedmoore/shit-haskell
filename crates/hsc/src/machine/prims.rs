@@ -56,7 +56,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
         if std::mem::take(&mut m.prim_failed) {
             return 0;
         }
-        if let Some(f) = crate::ccall::lookup(&sym) {
+        if let Some(f) = crate::ccall::resolve(name) {
             return super::prims_ffi::generic(m, f, &sig, ret).unwrap_or(0);
         }
         return run(m, &sym, nargs);

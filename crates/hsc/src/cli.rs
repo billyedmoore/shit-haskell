@@ -717,12 +717,19 @@ fn build_program(
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let out = exe.display().to_string();
+    let mut c_sources = d.c_sources.clone();
+    if let Some(stub) = driver::capi_source(&binds, &d.c_flags)? {
+        c_sources.push(stub);
+    }
+    // The RTS functions library C code calls (include/Rts.h) and base's C helpers: their (weak)
+    // definitions, in every program.
+    c_sources.push((driver::default_lib_dir().join("rts").join("hsc-rts-shim.c"), Vec::new()));
     let written = if o.native {
-        driver::write_native_with(&out, &binds, &d.c_sources)
+        driver::write_native_with(&out, &binds, &c_sources)
     } else {
         // The interpreter loads the C sources as a shared library named in the program.
         let mut binds = binds;
-        if let Some(lib) = driver::c_sources_library(&d.c_sources)? {
+        if let Some(lib) = driver::c_sources_library(&c_sources)? {
             binds.push(crate::core::TopBind {
                 name: driver::CBITS_BIND.into(),
                 body: crate::core::Core::Lit(crate::core::Lit::Str(lib.display().to_string())),

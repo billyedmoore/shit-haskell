@@ -317,6 +317,11 @@ impl Checker {
                 binds.push((w.ev.clone(), ev));
                 continue;
             }
+            // KnownNat, KnownSymbol and KnownChar at a literal type: the compiler builds the dictionary.
+            if let Some(ev) = self.known_literal_evidence(&pred) {
+                binds.push((w.ev.clone(), ev));
+                continue;
+            }
             // A quantified given whose head (or a superclass of it) matches: a local instance.
             if let Some((ev, ctx)) = self.find_quantified_given(&pred) {
                 let mut core = ev;
@@ -518,6 +523,32 @@ impl Checker {
         None
     }
 
+    /// The dictionary of `KnownNat 5`, `KnownSymbol "x"` or `KnownChar 'c'`: the class's one method
+    /// is the literal's value (`SNat`, `SSymbol` and `SChar` are newtypes of it).
+    fn known_literal_evidence(&self, pred: &Pred) -> Option<Core> {
+        if pred.args.len() != 1 {
+            return None;
+        }
+        let Ty::Con(lit) = self.metas.zonk(&pred.args[0]) else { return None };
+        let text = lit.strip_prefix('#')?;
+        let value = match pred.class.as_str() {
+            "GHC.Internal.TypeNats.KnownNat" if text.chars().all(|c| c.is_ascii_digit()) => Core::App(
+                Box::new(Core::Var("GHC.Num.Integer.integerToNatural".into())),
+                Box::new(Core::Lit(crate::core::Lit::Integer(text.to_string()))),
+            ),
+            "GHC.Internal.TypeLits.KnownSymbol" if text.starts_with('"') => {
+                let s: String = text.trim_matches('"').replace("\\\"", "\"").replace("\\\\", "\\");
+                Core::Lit(crate::core::Lit::Str(s))
+            }
+            "GHC.Internal.TypeLits.KnownChar" if text.starts_with('\'') => {
+                Core::Lit(crate::core::Lit::Char(text.trim_matches('\'').chars().next()?))
+            }
+            _ => return None,
+        };
+        let dict_con = self.class(&pred.class)?.dict_con.clone();
+        Some(Core::Con(dict_con, vec![value]))
+    }
+
     /// Searches the givens and their superclass closures for an exact match.
     pub fn find_given(&self, want: &Pred) -> Option<Core> {
         for g in self.givens.iter().rev() {
@@ -560,6 +591,11 @@ impl Checker {
     /// Finds an instance for a predicate. Returns the dictionary function name and the
     /// instance context instantiated for this predicate.
     pub fn find_instance(&self, want: &Pred) -> Option<(String, Vec<Pred>)> {
+        // Every matching instance; the most specific is chosen (an instance whose head another one's
+        // head matches is more specific), as GHC chooses among overlapping instances. Kinds are not
+        // tracked, so this also tells apart instances GHC separates by kind (`HasResolution E12` and
+        // `KnownNat n => HasResolution n`).
+        let mut matches: Vec<(&InstInfo, Vec<Option<Ty>>)> = Vec::new();
         for inst in &self.env.instances {
             if inst.class != want.class || inst.head.len() != want.args.len() {
                 continue;
@@ -571,6 +607,19 @@ impl Checker {
                 .zip(&want.args)
                 .all(|(pat, t)| self.match_ty(pat, &self.metas.zonk(t), &mut sub));
             if ok {
+                matches.push((inst, sub));
+            }
+        }
+        let rigid = |t: &Ty| super::types::subst_gen(t, &(0..64).map(|i| Ty::Con(format!("%rigid{i}"))).collect::<Vec<_>>());
+        let more_general = |a: &InstInfo, b: &InstInfo| -> bool {
+            // a's head matches b's (with b's variables rigid): a is at least as general as b.
+            let mut sub: Vec<Option<Ty>> = vec![None; a.nvars as usize];
+            a.head.iter().zip(&b.head).all(|(pa, pb)| self.match_ty(pa, &rigid(pb), &mut sub))
+        };
+        let best = (0..matches.len()).find(|&i| (0..matches.len()).all(|j| j == i || !more_general(matches[i].0, matches[j].0) || more_general(matches[j].0, matches[i].0)));
+        if let Some(i) = best.or(if matches.is_empty() { None } else { Some(0) }) {
+            let (inst, sub) = matches.swap_remove(i);
+            {
                 let args: Vec<Ty> = sub.into_iter().map(|s| s.unwrap_or(Ty::con("Builtin.?"))).collect();
                 let ctx = inst
                     .ctx
