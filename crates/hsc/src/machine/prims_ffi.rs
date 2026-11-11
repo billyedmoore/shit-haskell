@@ -16,6 +16,7 @@ extern "C" {
     fn getpid() -> i32;
     fn getppid() -> i32;
     fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    fn readlink(path: *const u8, buf: *mut u8, n: usize) -> isize;
     fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
     fn dup(fd: i32) -> i32;
@@ -206,6 +207,14 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             // SAFETY: the path is NUL-terminated and outlives the call.
             let fd = unsafe { open(bytes.as_ptr(), flags, mode) };
             ret_int(m, if fd < 0 { -1 } else { fd as i64 })
+        }
+        "readlink" => {
+            let (pb, poff) = addr_arg(m, 0)?;
+            let (bb, boff) = addr_arg(m, 1)?;
+            let n = int_arg(m, 2)?.max(0) as usize;
+            // SAFETY: the path is NUL-terminated within its array; the buffer holds `n` bytes.
+            let r = unsafe { readlink(raw(pb, poff), raw(bb, boff), n) };
+            ret_int(m, if r < 0 { -1 } else { r as i64 })
         }
         "fcntl" => {
             let fd = int_arg(m, 0)? as i32;

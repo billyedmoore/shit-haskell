@@ -11,7 +11,11 @@ use crate::syntax::extensions::Extensions;
 use crate::tc::Checker;
 
 pub struct Driver {
+    /// The directories of the program's own modules (`-i`), searched first.
     pub search: Vec<PathBuf>,
+    /// The import directories of the visible packages: each holds a module's source, or the
+    /// interface file that names its source (see `Iface pointer` in `write_interface`).
+    pub pkg_dirs: Vec<PathBuf>,
     pub ifaces: BTreeMap<String, Iface>,
     pub checker: Checker,
     pub binds: Vec<TopBind>,
@@ -19,28 +23,85 @@ pub struct Driver {
     loading: Vec<String>,
     /// Modules imported through `{-# SOURCE #-}`, known so far by their `.hs-boot` file.
     booted: BTreeSet<String>,
+    /// The flags of the program's own modules.
     flags: Vec<String>,
+    /// Every module loaded: its name, source file, and whether it is one of the program's own.
+    pub sources: Vec<(String, PathBuf, bool)>,
+}
+
+/// Where a module was found: its source, the flags it is compiled with, and whether it is one of
+/// the program's own modules (found in a `-i` directory).
+pub struct Found {
+    pub path: PathBuf,
+    pub flags: Vec<String>,
+    pub home: bool,
+}
+
+/// The import directories of the vendored packages, as the global package database lists them.
+pub fn default_package_dirs() -> Vec<PathBuf> {
+    let libs = default_lib_dir();
+    vec![
+        libs.join("base").join("src"),
+        libs.join("ghc-prim"),
+        libs.join("ghc-internal").join("src"),
+        libs.join("ghc-bignum").join("src"),
+    ]
+}
+
+/// The first line of an interface file written by hsc.
+pub const IFACE_MAGIC: &str = "hsc-interface 1";
+
+/// Reads an interface file written by `write_interface`: the module's source and its flags.
+pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != IFACE_MAGIC {
+        return None;
+    }
+    let mut source = None;
+    let mut flags = Vec::new();
+    for l in lines {
+        if let Some(v) = l.strip_prefix("source: ") {
+            source = Some(PathBuf::from(v));
+        } else if let Some(v) = l.strip_prefix("flag: ") {
+            flags.push(v.to_string());
+        }
+    }
+    Some((source?, flags))
+}
+
+/// Writes the interface file of a module of a package being built: hsc compiles programs from
+/// source, so it records where the source is and the flags it is compiled with. The file is left
+/// alone when it already says the same, so that its time stamp shows when the module last changed.
+pub fn write_interface(path: &Path, module: &str, source: &Path, flags: &[String]) -> Result<(), String> {
+    let mut text = format!("{IFACE_MAGIC}\nmodule: {module}\nsource: {}\n", source.display());
+    for f in flags {
+        text.push_str(&format!("flag: {f}\n"));
+    }
+    if std::fs::read_to_string(path).is_ok_and(|t| t == text) {
+        return Ok(());
+    }
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The default library directory: `libs/` at the project root.
 pub fn default_lib_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HSC_LIBDIR") {
-        return PathBuf::from(dir);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../libs")
+    let dir = match std::env::var("HSC_LIBDIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../libs"),
+    };
+    std::fs::canonicalize(&dir).unwrap_or(dir)
 }
 
 impl Driver {
-    pub fn new(main_dir: &Path, flags: Vec<String>) -> Driver {
-        // The Haskell libraries are the vendored GHC packages: base (Prelude included), ghc-prim,
-        // ghc-internal and ghc-bignum.
-        let libs = default_lib_dir();
-        let mut search = vec![main_dir.to_path_buf(), libs.join("base").join("src")];
-        search.push(libs.join("ghc-prim"));
-        search.push(libs.join("ghc-internal").join("src"));
-        search.push(libs.join("ghc-bignum").join("src"));
+    /// A driver whose own modules are in `search` and whose packages' modules are in `pkg_dirs`.
+    pub fn new(search: Vec<PathBuf>, pkg_dirs: Vec<PathBuf>, flags: Vec<String>) -> Driver {
         Driver {
             search,
+            pkg_dirs,
             ifaces: BTreeMap::new(),
             checker: Checker::new(),
             binds: Vec::new(),
@@ -48,17 +109,50 @@ impl Driver {
             booted: BTreeSet::new(),
             loading: Vec::new(),
             flags,
+            sources: Vec::new(),
         }
     }
 
+    /// Finds a module: among the program's own first, then in the packages (by interface file or
+    /// by source).
+    pub fn find_module(&self, module: &str) -> Option<Found> {
+        let stem = module.replace('.', "/");
+        for d in &self.search {
+            for ext in ["hs", "lhs"] {
+                let p = d.join(format!("{stem}.{ext}"));
+                if p.is_file() {
+                    return Some(Found { path: p, flags: self.flags.clone(), home: true });
+                }
+            }
+        }
+        for d in &self.pkg_dirs {
+            if let Some((path, flags)) = read_interface(&d.join(format!("{stem}.hi"))) {
+                if path.is_file() {
+                    return Some(Found { path, flags, home: false });
+                }
+            }
+            let p = d.join(format!("{stem}.hs"));
+            if p.is_file() {
+                return Some(Found { path: p, flags: Vec::new(), home: false });
+            }
+        }
+        None
+    }
+
     fn find_source(&self, module: &str) -> Option<PathBuf> {
-        let rel = format!("{}.hs", module.replace('.', "/"));
-        self.search.iter().map(|d| d.join(&rel)).find(|p| p.is_file())
+        self.find_module(module).map(|f| f.path)
     }
 
     fn find_boot(&self, module: &str) -> Option<PathBuf> {
         let rel = format!("{}.hs-boot", module.replace('.', "/"));
-        self.search.iter().map(|d| d.join(&rel)).find(|p| p.is_file())
+        // A package module's boot file is beside its source.
+        if let Some(f) = self.find_module(module) {
+            let p = f.path.with_extension("hs-boot");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        self.search.iter().chain(self.pkg_dirs.iter()).map(|d| d.join(&rel)).find(|p| p.is_file())
     }
 
     /// Loads the `.hs-boot` file of a module imported through `{-# SOURCE #-}`: its signatures
@@ -70,9 +164,10 @@ impl Driver {
         let path = self
             .find_boot(module)
             .ok_or_else(|| format!("Could not find module ‘{module}’ (no .hs-boot file for a SOURCE import)"))?;
+        let flags = self.find_module(module).map(|f| f.flags).unwrap_or_default();
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let src = preprocess_if_needed(src, &path, &self.flags)?;
-        let (mut parsed, exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
+        let src = preprocess_if_needed(src, &path, &flags)?;
+        let (mut parsed, exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
         strip_boot_bodies(&mut parsed);
@@ -136,12 +231,11 @@ impl Driver {
         if self.loading.iter().any(|m| m == module) {
             return Err(format!("Module imports form a cycle: {}", self.loading.join(" -> ")));
         }
-        let path = self
-            .find_source(module)
-            .ok_or_else(|| format!("Could not find module ‘{module}’"))?;
+        let found = self.find_module(module).ok_or_else(|| format!("Could not find module ‘{module}’"))?;
+        let (path, flags, home) = (found.path, found.flags, found.home);
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let src = preprocess_if_needed(src, &path, &self.flags)?;
-        let (parsed, mut exts) = crate::syntax::parse_module_source(&src, &self.flags).map_err(|e| {
+        let src = preprocess_if_needed(src, &path, &flags)?;
+        let (parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
         // The GHC packages compile with NoImplicitPrelude as a package default (their cabal files).
@@ -167,6 +261,7 @@ impl Driver {
         self.loading.pop();
         self.compile_module(parsed, exts, &path)?;
         self.loaded.insert(module.to_string());
+        self.sources.push((module.to_string(), path.clone(), home));
         Ok(())
     }
 
@@ -196,13 +291,19 @@ impl Driver {
     }
 }
 
-/// Compiles a program rooted at `main_file`, returning all its Core bindings.
+/// Compiles a program rooted at `main_file` with the vendored packages, returning its Core.
 pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBind>, String> {
     let dir = main_file.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut d = Driver::new(&dir, flags.clone());
+    let mut d = Driver::new(vec![dir], default_package_dirs(), flags.clone());
+    compile_with(&mut d, main_file, &flags)
+}
+
+/// Compiles the program rooted at `main_file` with a driver set up for its search path and
+/// packages, returning all its Core bindings. The main module's flags are `flags`.
+pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Result<Vec<TopBind>, String> {
     let src = read_source(main_file).map_err(|e| format!("{}: {e}", main_file.display()))?;
-    let src = preprocess_if_needed(src, main_file, &flags)?;
-    let (parsed, exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
+    let src = preprocess_if_needed(src, main_file, flags)?;
+    let (parsed, exts) = crate::syntax::parse_module_source(&src, flags).map_err(|e| {
         format!("{}:{}:{}: error:\n    {}", main_file.display(), e.line, e.col, e.msg)
     })?;
     let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
@@ -224,6 +325,7 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
     }
     let name = parsed.name.clone();
     d.compile_module(parsed, exts, main_file)?;
+    d.sources.push((name.clone(), main_file.to_path_buf(), true));
     d.load_booted()?;
     if name == "Main" && !d.checker.env.values.contains_key("Main.main") {
         return Err(format!(
@@ -239,6 +341,15 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
     crate::core::opt::specialise_literals(&mut binds);
     crate::core::opt::resolve_known_methods(&mut binds);
     Ok(binds)
+}
+
+/// The name a source file gives its module (from its `module` line; `Main` when it has none).
+pub fn module_name_of(path: &Path, flags: &[String]) -> Result<String, String> {
+    let src = read_source(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let src = preprocess_if_needed(src, path, flags)?;
+    let (parsed, _) = crate::syntax::parse_module_source(&src, flags)
+        .map_err(|e| format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg))?;
+    Ok(parsed.name)
 }
 
 /// Reads a source file. Bytes that are not valid UTF-8 (found in comments of some sources)
@@ -258,7 +369,25 @@ pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Resul
         return Ok(src);
     }
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut pp = crate::syntax::cpp::Preprocessor::new(vec![default_lib_dir().join("include")]);
+    let mut includes: Vec<PathBuf> = flags.iter().filter_map(|f| f.strip_prefix("-I")).filter(|d| !d.is_empty()).map(PathBuf::from).collect();
+    includes.push(default_lib_dir().join("include"));
+    let mut pp = crate::syntax::cpp::Preprocessor::new(includes);
+    let mut prelude = String::new();
+    for f in flags {
+        if let Some(def) = f.strip_prefix("-D") {
+            let (name, value) = def.split_once('=').unwrap_or((def, "1"));
+            pp.define_macro(name, value);
+        } else if let Some(name) = f.strip_prefix("-U") {
+            pp.undefine(name);
+        } else if let Some(file) = f.strip_prefix("-include=") {
+            prelude.push_str(&format!("#include \"{file}\"\n"));
+        }
+    }
+    if prelude.is_empty() {
+        return pp.run(&src, &dir).map_err(|e| format!("{}: error: {e}", path.display()));
+    }
+    // The files of `-include` come first; their lines are not part of the output.
+    pp.run(&prelude, &dir).map_err(|e| format!("{}: error: {e}", path.display()))?;
     pp.run(&src, &dir).map_err(|e| format!("{}: error: {e}", path.display()))
 }
 

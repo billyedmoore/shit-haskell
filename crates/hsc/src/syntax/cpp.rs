@@ -82,6 +82,16 @@ impl Preprocessor {
         Preprocessor { defs, include_dirs }
     }
 
+    /// Defines an object-like macro (`-D`).
+    pub fn define_macro(&mut self, name: &str, value: &str) {
+        self.defs.insert(name.to_string(), Macro::Object(value.to_string()));
+    }
+
+    /// Removes a macro (`-U`).
+    pub fn undefine(&mut self, name: &str) {
+        self.defs.remove(name);
+    }
+
     /// Runs the preprocessor over a source file's text.
     pub fn run(&mut self, src: &str, dir: &Path) -> Result<String, String> {
         let mut out = String::with_capacity(src.len());

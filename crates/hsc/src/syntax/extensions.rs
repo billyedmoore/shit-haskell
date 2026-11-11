@@ -175,3 +175,9 @@ fn implied_by(name: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
+
+/// The language names `--supported-languages` lists: GHC 9.12's, so that build tools accept the
+/// same package descriptions.
+pub fn supported_languages() -> Vec<String> {
+    include_str!("languages.txt").lines().map(String::from).collect()
+}

@@ -1,0 +1,16 @@
+cabal-version:      2.4
+name:               toy
+version:            0.1.0.0
+build-type:         Simple
+
+library
+    exposed-modules:  Toy.Greet
+    hs-source-dirs:   src
+    build-depends:    base
+    default-language: Haskell2010
+
+executable toy
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    build-depends:    base, toy
+    default-language: Haskell2010

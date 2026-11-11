@@ -1,37 +1,19 @@
 //! hsc: a Haskell compiler compatible with GHC 9.12.
 //!
-//! Command line (a subset of GHC's, plus development modes):
-//!   hsc [flags] file.hs            compile; `-o FILE` writes an executable
+//! The command line is GHC's (see `cli`), plus development modes:
 //!   hsc --run file.hs              compile and run
 //!   hsc --dump-ast file.hs         print the parsed syntax tree
 //!   hsc --dump-core file.hs        print the Core program
+//!   hsc --native ...               native code (x86-64) instead of the interpreter
 //!
-//! Output executables are copies of this binary with the compiled program appended;
-//! at startup a binary that carries a program runs it instead of compiling.
+//! Output executables are copies of this binary with the compiled program appended; at startup a
+//! binary that carries a program runs it instead of compiling (or native code, with `--native`).
 
-use hsc::{core, driver, interp, rename, syntax, tc};
-
-const MAGIC: &[u8; 8] = b"HSCPROG1";
+use hsc::{cli, driver, syntax};
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::ExitCode;
-
-
-/// Options that take the following argument as their value.
-const VALUE_FLAGS: &[&str] = &[
-    "-o",
-    "-outputdir",
-    "-odir",
-    "-hidir",
-    "-stubdir",
-    "-dumpdir",
-    "-tmpdir",
-    "-package",
-    "-package-id",
-    "-package-db",
-    "-x",
-];
 
 extern "C" {
     fn mallopt(param: i32, value: i32) -> i32;
@@ -56,69 +38,81 @@ fn main() -> ExitCode {
     if let Some(payload) = embedded_payload() {
         return ExitCode::from(driver::run_payload_bytes(payload) as u8);
     }
-
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut flags: Vec<String> = Vec::new();
-    let mut files: Vec<String> = Vec::new();
-    let mut output: Option<String> = None;
-    let mut run = false;
-    let mut dump_ast = false;
-    let mut preprocess_only = false;
-    let mut dump_core = false;
-    let mut native = false;
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        match a {
-            "--run" => run = true,
-            "--dump-ast" => dump_ast = true,
-            "-E" => preprocess_only = true,
-            "--dump-core" => dump_core = true,
-            "--native" => native = true,
-            "-o" => {
-                output = args.get(i + 1).cloned();
-                i += 1;
-            }
-            _ if VALUE_FLAGS.contains(&a) => i += 1,
-            _ if a.starts_with("-X") => flags.push(a.to_string()),
-            _ if a.starts_with('-') => {}
-            _ => files.push(a.to_string()),
-        }
-        i += 1;
+    if args.first().is_some_and(|a| a == "--install-ghc-shims") {
+        return install_shims(args.get(1).map(String::as_str).unwrap_or("."));
     }
-    let Some(file) = files.first().cloned() else {
+    let opts = match cli::parse(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("hsc: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(what) = &opts.info {
+        print!("{}", cli::info(what));
+        return ExitCode::SUCCESS;
+    }
+    if opts.preprocess_only || opts.dump_ast || opts.run {
+        return dev_mode(&opts);
+    }
+    if opts.inputs.is_empty() {
+        eprintln!("hsc: no input files\nUsage: For basic information, try the `--help' option.");
+        return ExitCode::from(1);
+    }
+    match cli::compile(&opts) {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Makes `ghc` and `ghc-pkg` links to hsc and hsc-pkg in a directory: build tools find the package
+/// tool from the compiler's name (`cabal build -w DIR/ghc`).
+fn install_shims(dir: &str) -> ExitCode {
+    let result = (|| -> std::io::Result<()> {
+        let me = std::fs::canonicalize(std::env::current_exe()?)?;
+        let pkg = me.with_file_name("hsc-pkg");
+        std::fs::create_dir_all(dir)?;
+        for (name, target) in [("ghc", &me), ("ghc-pkg", &pkg)] {
+            let link = Path::new(dir).join(name);
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(target, &link)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("hsc: {dir}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// The development modes on a single file.
+fn dev_mode(opts: &cli::Opts) -> ExitCode {
+    let Some(file) = opts.inputs.first().cloned() else {
         eprintln!("hsc: no input files");
         return ExitCode::from(1);
     };
-
-    if preprocess_only {
-        let path = std::path::Path::new(&file);
-        return match driver::read_source(path).and_then(|s| {
-            driver::preprocess_if_needed(s, path, &flags).map_err(std::io::Error::other)
-        }) {
-            Ok(s) => {
-                print!("{s}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("hsc: {file}: {e}");
-                ExitCode::from(1)
-            }
-        };
-    }
-
-    if dump_ast {
-        let path = std::path::Path::new(&file);
-        let src = match driver::read_source(path).and_then(|s| {
-            driver::preprocess_if_needed(s, path, &flags).map_err(std::io::Error::other)
-        }) {
+    let path = Path::new(&file);
+    let flags = &opts.flags;
+    if opts.preprocess_only || opts.dump_ast {
+        let src = match driver::read_source(path).and_then(|s| driver::preprocess_if_needed(s, path, flags).map_err(std::io::Error::other)) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("hsc: {file}: {e}");
                 return ExitCode::from(1);
             }
         };
-        return match syntax::parse_module_source(&src, &flags) {
+        if opts.preprocess_only {
+            print!("{src}");
+            return ExitCode::SUCCESS;
+        }
+        return match syntax::parse_module_source(&src, flags) {
             Ok((module, _)) => {
                 println!("{module:#?}");
                 ExitCode::SUCCESS
@@ -129,78 +123,15 @@ fn main() -> ExitCode {
             }
         };
     }
-
-    let binds = match driver::compile_program(Path::new(&file), flags) {
+    let binds = match driver::compile_program(path, flags.clone()) {
         Ok(b) => b,
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::from(1);
         }
     };
-    if dump_core {
-        for b in &binds {
-            println!("{} = {}", b.name, crate::core::pretty::show(&b.body));
-        }
-        return ExitCode::SUCCESS;
-    }
-    let prog_name = Path::new(&file)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "main".into());
-    if run {
-        return run_binds(binds, prog_name);
-    }
-    if let Some(out) = output {
-        let written = if native {
-            driver::write_native(&out, &binds)
-        } else {
-            write_executable(&out, &binds).map_err(|e| e.to_string())
-        };
-        return match written {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("hsc: cannot write {out}: {e}");
-                ExitCode::from(1)
-            }
-        };
-    }
-    ExitCode::SUCCESS
-}
-
-/// Runs a program on a thread with a large stack: evaluation is recursive.
-fn run_binds(binds: Vec<core::TopBind>, prog_name: String) -> ExitCode {
+    let prog_name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "main".into());
     ExitCode::from(driver::run_binds_code(binds, prog_name) as u8)
-}
-
-/// Writes an executable: this binary, then the serialised program, its length, and a
-/// magic trailer.
-fn write_executable(path: &str, binds: &[core::TopBind]) -> std::io::Result<()> {
-    let me = std::env::current_exe()?;
-    let mut bytes = std::fs::read(me)?;
-    if let Some(start) = payload_offset(&bytes) {
-        bytes.truncate(start);
-    }
-    let payload = core::serial::encode(binds);
-    bytes.extend_from_slice(&payload);
-    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(MAGIC);
-    std::fs::write(path, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
-}
-
-/// Where an embedded payload starts, if this file has one.
-fn payload_offset(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 16 || &bytes[bytes.len() - 8..] != MAGIC {
-        return None;
-    }
-    let len_bytes: [u8; 8] = bytes[bytes.len() - 16..bytes.len() - 8].try_into().ok()?;
-    let len = u64::from_le_bytes(len_bytes) as usize;
-    (bytes.len() - 16).checked_sub(len)
 }
 
 /// The payload of this executable, if it carries one. Reads only the trailer first.
@@ -214,7 +145,7 @@ fn embedded_payload() -> Option<Vec<u8>> {
     f.seek(SeekFrom::End(-16)).ok()?;
     let mut trailer = [0u8; 16];
     f.read_exact(&mut trailer).ok()?;
-    if &trailer[8..] != MAGIC {
+    if &trailer[8..] != cli::MAGIC {
         return None;
     }
     let len = u64::from_le_bytes(trailer[..8].try_into().ok()?);

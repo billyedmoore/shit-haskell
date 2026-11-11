@@ -20,6 +20,7 @@ extern "C" {
     fn __errno_location() -> *mut i32;
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
     fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    fn readlink(path: *const u8, buf: *mut u8, n: usize) -> isize;
     fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
     fn dup(fd: i32) -> i32;
@@ -243,6 +244,18 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "__hscore_sizeof_stat" => ret_int(STAT_SIZE),
         "__hscore_setmode" => ret_int(0),
         "lockFile" | "unlockFile" => ret_int(0),
+        "readlink" => (|| {
+            let (path, poff) = addr_of(rt, &args[0])?;
+            let mut bytes: Vec<u8> = path.borrow()[poff..].iter().take_while(|&&b| b != 0).copied().collect();
+            bytes.push(0);
+            let (buf, off) = addr_of(rt, &args[1])?;
+            let n = int_of(rt, &args[2])?.max(0) as usize;
+            let mut data = buf.borrow_mut();
+            let n = n.min(data.len().saturating_sub(off));
+            // SAFETY: the path is NUL-terminated; the buffer slice holds `n` bytes.
+            let r = unsafe { readlink(bytes.as_ptr(), data[off..].as_mut_ptr(), n) };
+            ret_int(if r < 0 { -1 } else { r as i64 })
+        })(),
         "__hscore_open" => (|| {
             let (path, poff) = addr_of(rt, &args[0])?;
             let mut bytes: Vec<u8> = path.borrow()[poff..].iter().take_while(|&&b| b != 0).copied().collect();
