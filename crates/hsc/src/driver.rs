@@ -344,19 +344,21 @@ pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), Str
         let st = std::process::Command::new("gcc").args(args).status().map_err(|e| format!("gcc: {e}"))?;
         if st.success() { Ok(()) } else { Err(format!("gcc {} failed", args.join(" "))) }
     };
+    // HSC_DEBUG keeps the symbols and the generated assembly (its directory is printed).
+    let debug = std::env::var_os("HSC_DEBUG").is_some();
     let result = run(&["-c", &asm.display().to_string(), "-o", &obj.display().to_string()]).and_then(|()| {
-        run(&[
-            &obj.display().to_string(),
-            &runtime.display().to_string(),
-            "-o",
-            out,
-            "-s",
-            "-lpthread",
-            "-ldl",
-            "-lm",
-            "-lgcc_s",
-        ])
+        let (o, r) = (obj.display().to_string(), runtime.display().to_string());
+        let mut args = vec![o.as_str(), r.as_str(), "-o", out];
+        if !debug {
+            args.push("-s");
+        }
+        args.extend_from_slice(&["-lpthread", "-ldl", "-lm", "-lgcc_s"]);
+        run(&args)
     });
-    let _ = std::fs::remove_dir_all(&dir);
+    if debug {
+        eprintln!("hsc: assembly kept in {}", dir.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     result
 }

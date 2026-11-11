@@ -121,18 +121,6 @@ pub extern "C" fn hsc_native_main(table: *const NativeTable) -> i32 {
 }
 
 impl Machine {
-    /// Runs the first queued thread to the end (or to its exception, which ends only that thread).
-    /// Answers false when no thread is queued.
-    pub fn run_one_thread(&mut self) -> bool {
-        let Some(f) = self.runq.pop_front() else { return false };
-        if self.apply_nested(f, &[0]).is_none() {
-            // An exception in a forked thread ends that thread; it does not reach the program.
-            self.exc = 0;
-            self.prim_failed = false;
-        }
-        true
-    }
-
     /// The value of an object, evaluated: a runtime call for a thunk runs it to weak head normal form
     /// on this stack, above the current frame. Returns None when the evaluation raised (the exception
     /// is in `exc`).
@@ -187,9 +175,14 @@ pub extern "C" fn hsc_gc(m: *mut Machine, words: u64) {
 /// A primitive operation: `id` names it in the program's table; its arguments are in the record.
 /// Returns the result, or 0 with the exception raised in `exc`.
 #[no_mangle]
-pub extern "C" fn hsc_prim(m: *mut Machine, id: u64, nargs: u64) -> Word {
+pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
+    // At the end of a time slice another thread runs first; an exception thrown to this one
+    // meanwhile is raised in place of the primitive.
+    if super::conc::safe_point(mp) {
+        return 0;
+    }
     // SAFETY: generated code passes the machine record.
-    let m = unsafe { &mut *m };
+    let m = unsafe { &mut *mp };
     let name = m.prog.prim_names[id as usize].clone();
     // A primitive builds its result from several allocations, holding the earlier objects in Rust
     // locals; a collection between them would move those objects. So the collection happens before
@@ -300,12 +293,18 @@ pub extern "C" fn hsc_unwind(m: *mut Machine) -> i32 {
                 m.heap_set(t, h & 0xffff_ffff);
                 p += 8;
             }
+            frame::MASK => {
+                let saved = m.stack_load(p);
+                super::conc::unwind_mask(m, saved);
+                p += 8;
+            }
             frame::CATCH => {
                 // The catch frame [return][handler] is popped; the handler gets the exception and the
-                // state token, as its two arguments, in its place.
+                // state token, as its two arguments, in its place. It runs masked: when the thread was
+                // not, a mask frame takes the catch frame's place, below the arguments.
                 let handler = m.stack_load(p);
                 let exc = m.exc;
-                let new_sp = p - 8;
+                let new_sp = if super::conc::mask_for_handler(m, p - 8) { p - 24 } else { p - 8 };
                 m.stack_store(new_sp, exc);
                 m.stack_store(new_sp + 8, 0);
                 m.sp = new_sp;

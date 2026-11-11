@@ -51,6 +51,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
         .or_else(|| super::prims_mem::run(m, name))
         .or_else(|| super::prims_ffi::run(m, name, nargs))
         .or_else(|| super::prims_misc::run(m, name, nargs))
+        .or_else(|| super::conc::run(m, name))
         .or_else(|| super::prims_integer::run(m, name));
     match result {
         Some(r) => r,

@@ -39,6 +39,8 @@ pub mod frame {
     pub const APPLY: u64 = 4;
     /// The bottom of a stack segment: returns to the runtime.
     pub const STOP: u64 = 5;
+    /// A mask frame: the masking state to put back (one word, not a pointer).
+    pub const MASK: u64 = 6;
 }
 
 /// Machine record offsets (`machine::Machine` is `#[repr(C)]` with these fields).
@@ -52,6 +54,7 @@ pub mod mach {
     pub const NARGS: i64 = 48;
     pub const CODE: i64 = 56;
     pub const ARGS: i64 = 64;
+    pub const TID: i64 = 192;
 }
 
 /// Where an expression's result goes.
@@ -685,6 +688,7 @@ const RUNTIME_ASM: &str = r#"
     .globl hsc_eval
     .globl hsc_apply
     .globl hsc_raise_pending
+    .globl hsc_mask_ret
 hsc_enter_eval:
     pushq %rbx
     pushq %rbp
@@ -744,7 +748,7 @@ hsc_eval:
     shrq $32, %rdx
     testq %rdx, %rdx
     jnz .Leval_loop
-    movq $1, %rdx
+    movq 192(%rbx), %rdx
     shlq $32, %rdx
     orq %rdx, %rax
     movq %rax, (%r14)
@@ -762,11 +766,14 @@ hsc_eval:
     movq %rbx, %rdi
     movq %rsp, %r15
     andq $-16, %rsp
-    call hsc_nontermination
+    call hsc_blackhole
     movq %r15, %rsp
     movq 0(%rbx), %r12
     movq 8(%rbx), %r13
     movq 16(%rbx), %rbp
+    movq 40(%rbx), %r14
+    testl %eax, %eax
+    jz hsc_eval
     jmp hsc_raise_pending
 
     .p2align 4
@@ -848,6 +855,26 @@ hsc_apply_ret:
     .quad 3, 1
 hsc_catch_ret:
     addq $16, %rbp
+    jmp *(%rbp)
+
+    .p2align 4
+    .quad 6, 1
+hsc_mask_ret:
+    movq %r14, 40(%rbx)
+    movq %r12, 0(%rbx)
+    movq %rbp, 16(%rbx)
+    movq $0, 24(%rbx)
+    movq %rbx, %rdi
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call hsc_mask_restore
+    movq %r15, %rsp
+    movq 0(%rbx), %r12
+    movq 8(%rbx), %r13
+    movq 16(%rbx), %rbp
+    movq 40(%rbx), %r14
+    testl %eax, %eax
+    jnz hsc_raise_pending
     jmp *(%rbp)
 
     .p2align 4

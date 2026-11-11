@@ -17,6 +17,8 @@ use crate::core::{Alt, Core, TopBind};
 pub const RTS_GLOBALS: &[&str] = &[
     "GHC.Internal.Control.Exception.Base.nonTerminationException",
     "GHC.Internal.Exception.errorCallException",
+    "GHC.Internal.IO.Exception.blockedIndefinitelyOnMVar",
+    "GHC.Internal.IO.Exception.blockedIndefinitelyOnSTM",
 ];
 
 /// The constructors the runtime builds: each has an id in every program.

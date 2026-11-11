@@ -4,6 +4,7 @@
 //! The record's first words are read and written by generated code; their offsets are fixed by
 //! `native::codegen::mach` (see NATIVE.md).
 
+pub mod conc;
 pub mod entry;
 pub mod gc;
 pub mod heap;
@@ -46,6 +47,8 @@ pub struct Machine {
     pub code: Word,
     /// The arguments of a primitive operation (roots).
     pub args: [Word; ARG_SLOTS],
+    /// The number of the running Haskell thread (generated code marks the thunks it evaluates).
+    pub tid: Word,
     // Runtime-only state from here on.
     pub heap: Heap,
     /// The Haskell stack: `stack_base..stack_top` words, growing down from the top.
@@ -58,9 +61,16 @@ pub struct Machine {
     pub con_ids: std::collections::HashMap<String, u32>,
     /// Extra roots the runtime keeps (stable pointers and similar), by index.
     pub stable: Vec<Word>,
-    /// Forked threads not yet run: their actions (state-token functions). A thread runs when another
-    /// blocks on an MVar, or when the program delays or yields; the actions are roots.
-    pub runq: std::collections::VecDeque<Word>,
+    /// The scheduler of the Haskell threads; the values it holds are roots.
+    pub sched: crate::sched::Sched<Word>,
+    /// The registers of the threads waiting for their turn (their roots), by thread.
+    pub suspended: std::collections::HashMap<crate::sched::Tid, conc::Ctx>,
+    /// The writes of the running transaction: each variable with its contents before.
+    pub stm_log: Vec<(Word, Word)>,
+    /// The transactions the running thread is in.
+    pub stm_depth: u32,
+    /// Set when a nested run failed because of `retry#` rather than an exception.
+    pub stm_retry: bool,
     /// The per-name pointer slots of the RTS (`getOrSet…`), by name.
     pub named: std::collections::HashMap<String, Word>,
     /// The global closures (the GC roots `globals` points to).
@@ -112,7 +122,12 @@ impl Machine {
             prog,
             con_ids: std::collections::HashMap::new(),
             stable: vec![0],
-            runq: std::collections::VecDeque::new(),
+            tid: 1,
+            sched: crate::sched::Sched::new(conc::SLICE_MS),
+            suspended: std::collections::HashMap::new(),
+            stm_log: Vec::new(),
+            stm_depth: 0,
+            stm_retry: false,
             named: std::collections::HashMap::new(),
             global_vec: Vec::new(),
             rts_globals: std::collections::HashMap::new(),
@@ -126,7 +141,7 @@ impl Machine {
         for (i, n) in m.prog.con_names.iter().enumerate() {
             m.con_ids.insert(n.clone(), i as u32);
         }
-        CURRENT.with(|c| c.set(&*m as *const Machine as usize));
+        set_current(&mut *m);
         m
     }
 
@@ -238,7 +253,7 @@ impl Machine {
         // Roots: the stack (walked from sp), the globals, the record's arguments and registers,
         // the exception, and the stable pointers.
         let mut locs: Vec<*mut Word> = Vec::new();
-        self.stack_roots(&mut locs);
+        stack_roots(self.sp, self.top, &mut locs);
         for i in 0..self.prog.globals.len() {
             // SAFETY: the globals table has one slot per global, allocated with the machine.
             locs.push(unsafe { self.globals.add(i) });
@@ -256,9 +271,14 @@ impl Machine {
         for s in self.stable.iter_mut() {
             locs.push(s as *mut Word);
         }
-        for t in self.runq.iter_mut() {
+        for (t, v) in self.stm_log.iter_mut() {
             locs.push(t as *mut Word);
+            locs.push(v as *mut Word);
         }
+        for ctx in self.suspended.values_mut() {
+            ctx.roots(&mut locs);
+        }
+        self.sched.roots(&mut |v: &mut Word| locs.push(v as *mut Word));
         for v in self.named.values_mut() {
             locs.push(v as *mut Word);
         }
@@ -291,7 +311,7 @@ impl Machine {
             match fkind {
                 crate::native::codegen::frame::BODY => p += 8 * size,
                 crate::native::codegen::frame::UPDATE => p += 8,
-                crate::native::codegen::frame::CATCH => p += 8,
+                crate::native::codegen::frame::CATCH | crate::native::codegen::frame::MASK => p += 8,
                 crate::native::codegen::frame::APPLY => {
                     let n = unsafe { *(p as *const Word) };
                     p += 8 * (1 + n);
@@ -301,63 +321,72 @@ impl Machine {
         }
         out
     }
+}
 
-    /// The pointer slots of the Haskell stack: the innermost `top` words, then every frame above
-    /// the return addresses (see `native::codegen::frame`). A stop frame links to the outer stack.
-    fn stack_roots(&mut self, out: &mut Vec<*mut Word>) {
-        use crate::native::codegen::frame;
-        let mut p = self.sp;
-        let mut top = self.top;
-        loop {
-            for _ in 0..top {
+/// The pointer slots of the Haskell stack: the innermost `top` words, then every frame above
+/// the return addresses (see `native::codegen::frame`). A stop frame links to the outer stack.
+pub fn stack_roots(sp: Word, top: Word, out: &mut Vec<*mut Word>) {
+    use crate::native::codegen::frame;
+    let mut p = sp;
+    let mut top = top;
+    loop {
+        for _ in 0..top {
+            out.push(p as *mut Word);
+            p += 8;
+        }
+        let ret = unsafe { *(p as *const Word) };
+        if ret == 0 {
+            break;
+        }
+        let fkind = unsafe { *((ret - 16) as *const Word) };
+        let size = unsafe { *((ret - 8) as *const Word) };
+        p += 8;
+        top = 0;
+        match fkind {
+            frame::STOP => {
+                let outer_sp = unsafe { *(p as *const Word) };
+                let outer_top = unsafe { *((p + 8) as *const Word) };
+                if outer_sp == 0 {
+                    break;
+                }
+                p = outer_sp;
+                top = outer_top;
+            }
+            frame::BODY => {
+                for i in 0..size {
+                    out.push((p + 8 * i) as *mut Word);
+                }
+                p += 8 * size;
+            }
+            frame::UPDATE => {
                 out.push(p as *mut Word);
                 p += 8;
             }
-            let ret = unsafe { *(p as *const Word) };
-            if ret == 0 {
-                break;
+            frame::MASK => {
+                // The saved masking state: not a pointer.
+                p += 8;
             }
-            let fkind = unsafe { *((ret - 16) as *const Word) };
-            let size = unsafe { *((ret - 8) as *const Word) };
-            p += 8;
-            top = 0;
-            match fkind {
-                frame::STOP => {
-                    let outer_sp = unsafe { *(p as *const Word) };
-                    let outer_top = unsafe { *((p + 8) as *const Word) };
-                    if outer_sp == 0 {
-                        break;
-                    }
-                    p = outer_sp;
-                    top = outer_top;
-                }
-                frame::BODY => {
-                    for i in 0..size {
-                        out.push((p + 8 * i) as *mut Word);
-                    }
-                    p += 8 * size;
-                }
-                frame::UPDATE => {
-                    out.push(p as *mut Word);
-                    p += 8;
-                }
-                frame::CATCH => {
-                    // The handler; the frame above the return address is that one word.
-                    out.push(p as *mut Word);
-                    p += 8;
-                }
-                frame::APPLY => {
-                    let n = unsafe { *(p as *const Word) };
-                    out.push(p as *mut Word);
-                    for i in 0..n {
-                        out.push((p + 8 + 8 * i) as *mut Word);
-                    }
-                    p += 8 * (1 + n);
-                }
-                other => panic!("internal: unknown frame kind {other} on the stack"),
+            frame::CATCH => {
+                // The handler; the frame above the return address is that one word.
+                out.push(p as *mut Word);
+                p += 8;
             }
+            frame::APPLY => {
+                let n = unsafe { *(p as *const Word) };
+                out.push(p as *mut Word);
+                for i in 0..n {
+                    out.push((p + 8 + 8 * i) as *mut Word);
+                }
+                p += 8 * (1 + n);
+            }
+            other => panic!("internal: unknown frame kind {other} on the stack"),
         }
     }
+}
+
+/// Makes a machine the one of the running OS thread.
+pub fn set_current(m: *mut Machine) {
+    CURRENT.with(|c| c.set(m as usize));
 }
 
 /// The machine of the running thread.
