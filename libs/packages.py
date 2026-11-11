@@ -36,6 +36,13 @@ PACKAGES = [
     # The pure-haskell flag: the C code of bytestring is replaced by its Haskell version.
     ("bytestring", "0.12.2.0", "hackage/bytestring-0.12.2.0", ["Data", "include", "LICENSE"], ["bytestring"],
      ['-XHaskell2010', '-XBangPatterns', '-XDeriveDataTypeable', '-XDeriveGeneric', '-XDeriveLift', '-XFlexibleContexts', '-XFlexibleInstances', '-XLambdaCase', '-XMagicHash', '-XMultiWayIf', '-XNamedFieldPuns', '-XPatternSynonyms', '-XRankNTypes', '-XScopedTypeVariables', '-XStandaloneDeriving', '-XTupleSections', '-XTypeApplications', '-XTypeOperators', '-XUnboxedTuples', '-DPURE_HASKELL=1', '-Iinclude'], ["base", "deepseq", "ghc-prim", "template-haskell"]),
+    ("binary", "0.8.9.3", "hackage/binary-0.8.9.3", ["src", "LICENSE"], ["binary/src"], ["-XHaskell2010"],
+     ["base", "bytestring", "containers", "array"]),
+    # Without simdutf (C++): the C routines of cbits/.
+    ("text", "2.1.2", "hackage/text-2.1.2", ["src", "cbits", "LICENSE"], ["text/src"],
+     ["-XHaskell2010", "-XNondecreasingIndentation", "-c-source=../cbits/is_ascii.c", "-c-source=../cbits/reverse.c",
+      "-c-source=../cbits/utils.c", "-c-source=../cbits/measure_off.c"],
+     ["array", "base", "binary", "bytestring", "deepseq", "ghc-prim", "template-haskell"]),
 ]
 
 def vendor():

@@ -106,6 +106,83 @@ fn stat_field(rt: &Runtime, c: &Cell, at: usize, width: usize) -> RR {
     ret_int(i64::from_le_bytes(bytes))
 }
 
+/// A C function called by its address with the arguments of a foreign import (see `crate::ccall`).
+/// A pointer argument is the address of its buffer's bytes; a pointer the function answers is an
+/// address into one of the argument buffers when it points into one, the null address when null,
+/// and otherwise the raw address as a number.
+pub fn generic(rt: &Runtime, f: *mut std::ffi::c_void, sig: &str, ret: char, args: &[Cell]) -> RR {
+    let mut ints: Vec<u64> = Vec::new();
+    let mut floats: Vec<f64> = Vec::new();
+    // The buffers passed (kept alive through the call), with their start addresses and lengths.
+    let mut bufs: Vec<(Rc<RefCell<Vec<u8>>>, usize, usize)> = Vec::new();
+    for (k, class) in sig.chars().enumerate() {
+        let Some(c) = args.get(k) else { break };
+        let mut v = rt.force(c)?;
+        // One-field boxes (CInt, Ptr, FunPtr) hold the machine value.
+        while let Value::Con(con) = &v {
+            if con.args.len() != 1 {
+                break;
+            }
+            let inner = con.args[0].clone();
+            v = rt.force(&inner)?;
+        }
+        match class {
+            'd' | 'f' => {
+                let x = match v {
+                    Value::Double(d) => d,
+                    Value::Int(i) => i as f64,
+                    _ => 0.0,
+                };
+                floats.push(if class == 'f' { crate::ccall::float_arg(x) } else { x });
+            }
+            _ => ints.push(match v {
+                Value::Int(i) => i as u64,
+                Value::Char(ch) => ch as u64,
+                Value::Addr(b, off) => {
+                    let (start, len) = {
+                        // SAFETY: the buffer is not reallocated while the call runs.
+                        let vec = unsafe { &mut *b.as_ptr() };
+                        (vec.as_mut_ptr() as usize, vec.len())
+                    };
+                    let p = if len == 0 && off == 0 { 0 } else { start + off };
+                    bufs.push((b, start, len));
+                    p as u64
+                }
+                Value::Bytes(b) => {
+                    let (start, len) = {
+                        // SAFETY: as above.
+                        let vec = unsafe { &mut *b.as_ptr() };
+                        (vec.as_mut_ptr() as usize, vec.len())
+                    };
+                    bufs.push((b, start, len));
+                    start as u64
+                }
+                Value::Con(con) => match con.name {
+                    "GHC.Types.True" => 1,
+                    _ => 0,
+                },
+                _ => 0,
+            }),
+        }
+    }
+    // SAFETY: the foreign import declares the function's type; the buffers outlive the call.
+    let answer = unsafe { crate::ccall::call(f, &ints, &floats, ret) };
+    let value = match (answer, ret) {
+        (_, 'v') => unit_value(),
+        (crate::ccall::Answer::Double(d), _) => Value::Double(d),
+        (crate::ccall::Answer::Int(p), 'p') => {
+            let p = p as usize;
+            match bufs.iter().find(|(_, start, len)| p >= *start && p <= start + len) {
+                Some((b, start, _)) => Value::Addr(b.clone(), p - start),
+                None if p == 0 => Value::Addr(Rc::new(RefCell::new(Vec::new())), 0),
+                None => Value::Int(p as i64),
+            }
+        }
+        (crate::ccall::Answer::Int(i), _) => Value::Int(i),
+    };
+    Ok(io_result_of(value))
+}
+
 /// Runs a C entry point by its symbol, or answers None when it is not one of them.
 pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
     let r: RR = match name {
@@ -411,11 +488,6 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
                 // The null pointer.
                 None => Value::Addr(Rc::new(RefCell::new(Vec::new())), 0),
             }))
-        })(),
-        "strlen" => (|| {
-            let (a, ao) = addr_of(rt, &args[0])?;
-            let x = a.borrow();
-            ret_int(x[ao.min(x.len())..].iter().take_while(|&&b| b != 0).count() as i64)
         })(),
         "base_strerror_r" => (|| {
             let e = int_of(rt, &args[0])? as i32;

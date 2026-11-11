@@ -1,0 +1,6 @@
+-XHaskell2010
+-XNondecreasingIndentation
+-c-source=../cbits/is_ascii.c
+-c-source=../cbits/reverse.c
+-c-source=../cbits/utils.c
+-c-source=../cbits/measure_off.c

@@ -717,7 +717,19 @@ fn build_program(
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let out = exe.display().to_string();
-    let written = if o.native { driver::write_native(&out, &binds) } else { write_executable(&out, &binds).map_err(|e| e.to_string()) };
+    let written = if o.native {
+        driver::write_native_with(&out, &binds, &d.c_sources)
+    } else {
+        // The interpreter loads the C sources as a shared library named in the program.
+        let mut binds = binds;
+        if let Some(lib) = driver::c_sources_library(&d.c_sources)? {
+            binds.push(crate::core::TopBind {
+                name: driver::CBITS_BIND.into(),
+                body: crate::core::Core::Lit(crate::core::Lit::Str(lib.display().to_string())),
+            });
+        }
+        write_executable(&out, &binds).map_err(|e| e.to_string())
+    };
     written.map_err(|e| format!("hsc: cannot write {out}: {e}"))?;
     let mut record = key;
     for (_, p, _) in &d.sources {

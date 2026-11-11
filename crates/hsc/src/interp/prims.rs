@@ -81,6 +81,16 @@ fn divide_by_zero<T>() -> Result<T, RtError> {
 
 /// Calls a primitive by name with its (unevaluated) arguments.
 pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
+    // A foreign C call: the runtime's own version of the function, else the C function itself.
+    if let Some((sig, ret, sym)) = crate::ccall::parse(name) {
+        if let Some(r) = super::ffi::call(rt, sym, args) {
+            return r;
+        }
+        if let Some(f) = crate::ccall::lookup(sym) {
+            return super::ffi::generic(rt, f, sig, ret, args);
+        }
+        return call(rt, sym, args);
+    }
     match name {
         // ----- Int -----
         "intAdd" => int_v(int(rt, &args[0])?.wrapping_add(int(rt, &args[1])?)),

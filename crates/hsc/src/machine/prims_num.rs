@@ -129,7 +129,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let flag = (r > i64::MAX as i128 || r < i64::MIN as i128) as i64;
             int(m, flag)
         }
-        "negateInt#" | "notI#" | "not#" | "int2Word#" | "word2Int#" | "chr#" | "ord#" => {
+        "negateInt#" | "notI#" | "not#" | "int2Word#" | "word2Int#" | "ord#" => {
             let Some(a) = i(m, 0) else { return Some(0) };
             match name {
                 "negateInt#" => int(m, a.wrapping_neg()),

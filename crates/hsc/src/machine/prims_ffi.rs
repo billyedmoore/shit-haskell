@@ -109,6 +109,46 @@ fn ret_int(m: &mut Machine, n: i64) -> Word {
     state_pair(m, v)
 }
 
+/// A C function called by its address with the arguments of a foreign import (see `crate::ccall`).
+/// None when forcing an argument raised.
+pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char) -> Option<Word> {
+    let mut ints: Vec<u64> = Vec::new();
+    let mut floats: Vec<f64> = Vec::new();
+    let classes: Vec<char> = sig.chars().collect();
+    for (k, class) in classes.iter().enumerate() {
+        let v = force_arg(m, k)?;
+        let v = unbox(m, v)?;
+        let h = m.heap_get(v, 0);
+        match class {
+            'd' | 'f' => {
+                let x = if heap::kind_of(h) == kind::DOUBLE { f64::from_bits(m.heap_get(v, 1)) } else { m.heap_get(v, 1) as i64 as f64 };
+                floats.push(if *class == 'f' { crate::ccall::float_arg(x) } else { x });
+            }
+            _ => ints.push(match heap::kind_of(h) {
+                kind::ADDR => raw(m.heap_get(v, 1), m.heap_get(v, 2) as i64) as u64,
+                kind::BYTES => v + 8,
+                kind::CON => {
+                    // Bool: True is the second constructor.
+                    (m.con_name(v) == "GHC.Types.True") as u64
+                }
+                _ => m.heap_get(v, 1),
+            }),
+        }
+    }
+    // The arrays passed, for pointers the function answers into them (they move with the collector).
+    let pointer_args: Vec<usize> = (0..classes.len()).collect();
+    // SAFETY: the foreign import declares the function's type; no collection happens during the call.
+    let answer = unsafe { crate::ccall::call(f, &ints, &floats, ret) };
+    m.reserve(16);
+    let value = match (answer, ret) {
+        (_, 'v') => unit(m),
+        (crate::ccall::Answer::Double(d), _) => super::prims_num::double_value(m, d),
+        (crate::ccall::Answer::Int(p), 'p') => addr_result(m, p as *mut u8, &pointer_args),
+        (crate::ccall::Answer::Int(i), _) => int_value(m, i),
+    };
+    Some(state_pair(m, value))
+}
+
 /// The C names base imports, as the machine answers them. None when `name` is not one of them.
 pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
     let _ = nargs;
@@ -339,19 +379,6 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
                 None => addr_result(m, std::ptr::null_mut(), &[]),
             };
             state_pair(m, r)
-        }
-        "strlen" => {
-            let (ab, ao) = addr_arg(m, 0)?;
-            let mut p = raw(ab, ao);
-            let mut n = 0i64;
-            // SAFETY: the string is NUL-terminated.
-            unsafe {
-                while !p.is_null() && *p != 0 {
-                    n += 1;
-                    p = p.add(1);
-                }
-            }
-            ret_int(m, n)
         }
         "base_strerror_r" => {
             let e = int_arg(m, 0)? as i32;

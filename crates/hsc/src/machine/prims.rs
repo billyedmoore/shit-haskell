@@ -47,6 +47,20 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
     // The flag records a failed evaluation inside this primitive only: an earlier primitive that
     // failed (and answered 0 itself) must not make this one look failed.
     m.prim_failed = false;
+    // A foreign C call: the runtime's own version of the function, else the C function itself.
+    if let Some((sig, ret, sym)) = crate::ccall::parse(name) {
+        let (sig, sym) = (sig.to_string(), sym.to_string());
+        if let Some(r) = super::prims_ffi::run(m, &sym, nargs) {
+            return r;
+        }
+        if std::mem::take(&mut m.prim_failed) {
+            return 0;
+        }
+        if let Some(f) = crate::ccall::lookup(&sym) {
+            return super::prims_ffi::generic(m, f, &sig, ret).unwrap_or(0);
+        }
+        return run(m, &sym, nargs);
+    }
     let result = super::prims_num::run(m, name)
         .or_else(|| super::prims_mem::run(m, name))
         .or_else(|| super::prims_ffi::run(m, name, nargs))

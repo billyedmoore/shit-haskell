@@ -27,6 +27,8 @@ pub struct Driver {
     flags: Vec<String>,
     /// Every module loaded: its name, source file, and whether it is one of the program's own.
     pub sources: Vec<(String, PathBuf, bool)>,
+    /// The C sources of the packages the program uses, with the C compiler's flags for each.
+    pub c_sources: Vec<(PathBuf, Vec<String>)>,
 }
 
 /// Where a module was found: its source, the flags it is compiled with, and whether it is one of
@@ -60,9 +62,14 @@ pub fn package_flags(dir: &Path) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(|l| match l.strip_prefix("-I") {
-            Some(rel) if !Path::new(rel).is_absolute() => format!("-I{}", dir.join(rel).display()),
-            _ => l.to_string(),
+        .map(|l| {
+            if let Some(rel) = l.strip_prefix("-I").filter(|r| !Path::new(r).is_absolute()) {
+                return format!("-I{}", dir.join(rel).display());
+            }
+            if let Some(rel) = l.strip_prefix("-c-source=").filter(|r| !Path::new(r).is_absolute()) {
+                return format!("-c-source={}", dir.join(rel).display());
+            }
+            l.to_string()
         })
         .collect()
 }
@@ -129,6 +136,7 @@ impl Driver {
             loading: Vec::new(),
             flags,
             sources: Vec::new(),
+            c_sources: Vec::new(),
         }
     }
 
@@ -252,6 +260,16 @@ impl Driver {
         }
         let found = self.find_module(module).ok_or_else(|| format!("Could not find module ‘{module}’"))?;
         let (path, flags, home) = (found.path, found.flags, found.home);
+        // A package module brings the package's C sources into the program.
+        let c_flags: Vec<String> = flags.iter().filter(|f| f.starts_with("-I") || f.starts_with("-D") || f.starts_with("-cc-option=")).cloned().collect();
+        for f in &flags {
+            if let Some(src) = f.strip_prefix("-c-source=") {
+                let p = PathBuf::from(src);
+                if !self.c_sources.iter().any(|(q, _)| *q == p) {
+                    self.c_sources.push((p, c_flags.clone()));
+                }
+            }
+        }
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
         let (parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
@@ -452,6 +470,7 @@ pub fn run_payload_bytes(payload: Vec<u8>) -> i32 {
             return 1;
         }
     };
+    load_cbits(&binds);
     let prog_name = std::env::args()
         .next()
         .and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned()))
@@ -459,9 +478,103 @@ pub fn run_payload_bytes(payload: Vec<u8>) -> i32 {
     run_binds_code(binds, prog_name)
 }
 
+/// Compiles the C sources of a program's packages into objects in `dir` (`-fPIC`, for a shared
+/// library too). Answers the object files.
+pub fn compile_c_sources(sources: &[(PathBuf, Vec<String>)], dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    for (i, (src, flags)) in sources.iter().enumerate() {
+        let obj = dir.join(format!("c{i}-{}.o", src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
+        let mut cmd = std::process::Command::new("gcc");
+        cmd.args(["-c", "-O2", "-fPIC", "-w"]).arg(src).arg("-o").arg(&obj);
+        cmd.arg(format!("-I{}", default_lib_dir().join("include").display()));
+        for f in flags {
+            match f.strip_prefix("-cc-option=") {
+                Some(o) => {
+                    cmd.arg(o);
+                }
+                None => {
+                    cmd.arg(f);
+                }
+            }
+        }
+        let st = cmd.status().map_err(|e| format!("gcc: {e}"))?;
+        if !st.success() {
+            return Err(format!("gcc failed on {}", src.display()));
+        }
+        out.push(obj);
+    }
+    Ok(out)
+}
+
+/// The shared library of a program's C sources, for the interpreter (cached by their contents and
+/// flags under `~/.cache/hsc/cbits`). Answers its path.
+pub fn c_sources_library(sources: &[(PathBuf, Vec<String>)]) -> Result<Option<PathBuf>, String> {
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let mut key = String::new();
+    for (src, flags) in sources {
+        let text = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        key.push_str(&format!("{}\n{}\n{}\n", src.display(), flags.join(" "), text.len()));
+        key.push_str(&String::from_utf8_lossy(&text));
+    }
+    let mut ctx = [0u8; 88];
+    crate::interp::md5::init(&mut ctx);
+    crate::interp::md5::update(&mut ctx, key.as_bytes());
+    let digest: String = crate::interp::md5::finish(&mut ctx).iter().map(|b| format!("{b:02x}")).collect();
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("hsc")
+        .join("cbits");
+    let lib = base.join(format!("{digest}.so"));
+    if lib.is_file() {
+        return Ok(Some(lib));
+    }
+    let dir = base.join(format!("build-{digest}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let objs = compile_c_sources(sources, &dir)?;
+    let tmp = dir.join("lib.so");
+    let st = std::process::Command::new("gcc")
+        .arg("-shared")
+        .args(&objs)
+        .arg("-o")
+        .arg(&tmp)
+        .status()
+        .map_err(|e| format!("gcc: {e}"))?;
+    if !st.success() {
+        return Err("gcc failed to link the C sources".into());
+    }
+    std::fs::rename(&tmp, &lib).map_err(|e| format!("{}: {e}", lib.display()))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(Some(lib))
+}
+
+/// The name of the binding a program's payload carries for its C libraries (their paths).
+pub const CBITS_BIND: &str = "hsc$cbits";
+
+/// Loads the C libraries a program's payload names.
+pub fn load_cbits(binds: &[TopBind]) {
+    for b in binds.iter().filter(|b| b.name == CBITS_BIND) {
+        if let crate::core::Core::Lit(crate::core::Lit::Str(paths)) = &b.body {
+            for p in paths.lines() {
+                if let Err(e) = crate::ccall::load(p) {
+                    eprintln!("hsc: cannot load {p}: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// Writes a native executable for a program: its code is generated as assembly, assembled, and
 /// linked with the hsc runtime library next to this binary.
 pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), String> {
+    write_native_with(out, binds, &[])
+}
+
+/// As `write_native`, with the C sources of the program's packages compiled and linked in.
+pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &[(PathBuf, Vec<String>)]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let runtime = exe.parent().map(|d| d.join("libhsc.a")).unwrap_or_default();
     if !runtime.is_file() {
@@ -501,9 +614,14 @@ pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), Str
     };
     // HSC_DEBUG keeps the symbols and the generated assembly (its directory is printed).
     let debug = std::env::var_os("HSC_DEBUG").is_some();
+    let c_objs = compile_c_sources(c_sources, &dir)?;
+    let c_objs: Vec<String> = c_objs.iter().map(|p| p.display().to_string()).collect();
     let result = run(&["-c", &asm.display().to_string(), "-o", &obj.display().to_string()]).and_then(|()| {
         let (o, r) = (obj.display().to_string(), runtime.display().to_string());
-        let mut args = vec![o.as_str(), r.as_str(), "-o", out];
+        let mut args = vec![o.as_str()];
+        args.extend(c_objs.iter().map(String::as_str));
+        // The program's C symbols are found by name at run time (`crate::ccall`).
+        args.extend_from_slice(&[r.as_str(), "-rdynamic", "-o", out]);
         if !debug {
             args.push("-s");
         }

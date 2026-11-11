@@ -1232,8 +1232,14 @@ impl Checker {
     fn irrefutable(&self, p: &Pat) -> bool {
         match p {
             Pat::Var(..) | Pat::Wild(_) | Pat::Lazy(..) => true,
-            Pat::Bang(sub, _) | Pat::Sig(sub, _, _) => self.irrefutable(sub),
+            Pat::Bang(sub, _) | Pat::Sig(sub, _, _) | Pat::As(_, sub, _) => self.irrefutable(sub),
             Pat::Tuple(ps, _) => ps.iter().all(|p| self.irrefutable(p)),
+            Pat::Rec { con, .. } => self
+                .env
+                .datacons
+                .get(&qkey(con))
+                .and_then(|d| self.env.tycons.get(&d.tycon))
+                .is_some_and(|t| t.cons.len() == 1),
             Pat::Con(q, args, _) => {
                 let single = self
                     .env

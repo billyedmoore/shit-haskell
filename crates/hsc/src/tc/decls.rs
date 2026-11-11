@@ -543,6 +543,45 @@ impl Checker {
         }
     }
 
+    /// The C class of a foreign argument or result type (see `crate::ccall`): newtypes and one-field
+    /// boxes are followed to the primitive type, whose width and signedness give the letter.
+    fn ffi_class(&self, ty: &Ty) -> char {
+        let mut t = ty.clone();
+        for _ in 0..12 {
+            let Ty::Con(name) = t.split_apps().0.clone() else { return 'i' };
+            let prim = match name.as_str() {
+                "GHC.Prim.Int8#" => Some('b'),
+                "GHC.Prim.Word8#" => Some('B'),
+                "GHC.Prim.Int16#" => Some('h'),
+                "GHC.Prim.Word16#" => Some('H'),
+                "GHC.Prim.Int32#" => Some('w'),
+                "GHC.Prim.Word32#" | "GHC.Prim.Char#" => Some('W'),
+                "GHC.Prim.Addr#" => Some('p'),
+                "GHC.Prim.Double#" => Some('d'),
+                "GHC.Prim.Float#" => Some('f'),
+                "Builtin.()" => Some('v'),
+                "GHC.Types.Bool" => Some('w'),
+                _ => None,
+            };
+            if let Some(c) = prim {
+                return c;
+            }
+            let Some(info) = self.env.tycons.get(&name) else { return 'i' };
+            if info.cons.len() != 1 {
+                return 'i';
+            }
+            let Some(dc) = self.env.datacons.get(&info.cons[0]) else { return 'i' };
+            if dc.arity != 1 {
+                return 'i';
+            }
+            match dc.scheme.ty.as_fun() {
+                Some((field, _)) => t = field.clone(),
+                None => return 'i',
+            }
+        }
+        'i'
+    }
+
     fn foreign_import(&mut self, name: &str, entity: Option<&str>, ty: &Type, is_prim: bool) -> TR<()> {
         let mut tvs = Vec::new();
         let (preds, body) = self.sig_parts(ty, &mut tvs)?;
@@ -585,6 +624,28 @@ impl Checker {
         // A C result is raw: a Bool, or a box around one, is made here. A runtime primitive
         // already answers with Haskell values.
         let boxed = if is_prim { None } else { value_ty.clone().and_then(|t| self.ffi_result_kind(&t)) };
+        // A C call carries its signature, for the runtimes' generic call (`crate::ccall`).
+        let prim = if is_prim {
+            prim
+        } else {
+            let mut arg_tys = Vec::new();
+            let mut t = body.clone();
+            for _ in 0..arity {
+                if let Some((a, r)) = t.as_fun() {
+                    arg_tys.push(a.clone());
+                    t = r.clone();
+                }
+            }
+            let args: String = arg_tys
+                .iter()
+                .map(|a| match self.ffi_class(a) {
+                    c @ ('d' | 'f') => c,
+                    _ => 'i',
+                })
+                .collect();
+            let ret = value_ty.as_ref().map(|v| self.ffi_class(v)).unwrap_or('v');
+            format!("ccall:{args}>{ret}:{prim}")
+        };
         // The runtime answers a C call with the (# state, value #) pair; a pure call takes the value.
         let call = Core::Prim(prim, args);
         let call = if !io && !is_prim {
