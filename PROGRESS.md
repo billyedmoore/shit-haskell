@@ -14,11 +14,11 @@ Parse-only dev mode: `target/release/hsc [-X<ext>] [--dump-ast] file.hs`.
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| 1 | Differential harness and seed corpus | done (`difftest`, `tests/`: 59 of 59); GHC testsuite sweep is a scratch script |
+| 1 | Differential harness and seed corpus | done (`difftest`, `tests/`: 69 of 69); GHC testsuite sweep is a scratch script; `--bench <n>` times programs against the oracle (`bench/`) |
 | 2 | Front end: lexer, layout, parser, fixity, renamer, modules | done for the Haskell 2010 and GHC2021 surface, plus CPP, DataKinds promotion, view patterns, pattern synonyms, RecursiveDo, MagicHash literals, TypeApplications |
 | 3 | Types and Core | done: HM with classes, defaulting, deriving (incl. standalone), GADTs, existentials, fundeps, kinds, type families; Core lint (`-dcore-lint`) passes on the corpus and the testsuite's compiling programs |
 | 4 | Real `base` from GHC sources | done. The libraries are the vendored GHC packages (`libs/base`, `libs/ghc-prim`, `libs/ghc-internal`, `libs/ghc-bignum`); the mini library is removed. Corpus: 59 of 59 (19 of 19 rejections, 40 of 40 runs). Programs run through `GHC.Internal.TopHandler` (uncaught exceptions as GHC reports them, `<<loop>>` as NonTermination, stdout flushed at exit), pattern-match failures carry GHC's source spans, and `HasCallStack` frames are recorded at every call site. Stand-ins for hsc2hs or RTS-only modules are documented in each file (`Stack/CCS`, `ExecutionStack/Internal`, `InfoProv/Types`, `Event/EPoll`, `Event/Poll`, `GHC.Debug`, `RTS/Flags/Test`, hand-preprocessed `Clock`, `rts/Signals.h`). Runtime: the primops the corpus needs (numbers, arrays, mutable variables, masking, exceptions, threads, stable pointers, byte arrays, `Addr#`), with the libc and RTS entry points base imports on Linux. Not yet: most of the remaining primops (about 500 of 656 are unimplemented: they answer "unknown primitive"), and the GHC testsuite and nofib beyond the seed corpus. A hello program takes about 1.3 s, mostly compiling base |
-| 5 | Native back end and RTS | in progress. `--native` emits x86-64 assembly and links it with the Rust runtime (`libhsc.a`) via gcc. Interpreter corpus: 59 of 59. Native corpus: 59 of 59. Only the bindings reachable from `main` (and the few the runtime uses) are compiled: a hello program compiles natively in about 5 s and its binary is 38 MB (was 20 s and 131 MB). Arguments of unlifted type are evaluated before the call (as GHC's calling convention does), so `GHC.Internal.Arr` is the unmodified GHC source again. Errors the runtime raises (`<<loop>>`, failed pattern matches, primitive failures) are the library's own `SomeException` values. Native threads are still cooperative: a forked thread runs when another thread blocks on an MVar, or when the program delays or yields (no preemption, no asynchronous exceptions, no masking state, no STM). Native programs run on a 4 GB thread stack, as the interpreter does. |
+| 5 | Native back end and RTS | done. `--native` emits x86-64 assembly and links it with the Rust runtime (`libhsc.a`) via gcc. Interpreter corpus: 69 of 69; native corpus: 69 of 69. Only the bindings reachable from `main` (and those the runtime uses) are compiled. Copying GC; synchronous and asynchronous exceptions; both back ends share one scheduler (`sched.rs`) that reproduces GHC's single-capability order of events: one OS thread per Haskell thread holding a baton, preemption (20 ms native at primitive calls, 50 ms interpreter at evaluation steps), FIFO `MVar` queues with direct handoff, `throwTo` with masking states (blocked throwers, interruptible operations), catch handlers run masked (a MASK frame natively), `threadStatus#`, `BlockedIndefinitelyOnMVar`/`OnSTM` on deadlock (forked threads in creation order, main last), and STM with an undo log (`atomically#`, `retry#`, `catchRetry#`, `catchSTM#`). Thunks under evaluation record their thread: re-entry by the same thread is `<<loop>>`, another thread waits. Bignum through the library's `Integer` primitives; libc and RTS FFI entry points for base on Linux. Performance is tracked with `difftest --bench` (table below). `HSC_DEBUG=1` keeps symbols and the generated assembly. |
 | 6 | Driver and packages | partial: `-o`, `--run`, `-i` search path, output executables carry the program |
 | 7 | Boot libraries | partial: Map, Set, Array, mutable arrays (ST/IO/MArray), State, Printf, Semigroup, Bifunctor, Monad.Fix |
 | 8 | Speed parity with GHC | not started. Measured: deep recursion costs seconds of system time (evaluator stack frames); `length` and list walks now run in constant stack |
@@ -55,9 +55,27 @@ Parse-only dev mode: `target/release/hsc [-X<ext>] [--dump-ast] file.hs`.
 
 ## Differential results (`tests/`)
 
-- Clone: 57 of 59 (run passing, 2 known stderr gaps). Oracle: GHC 9.12.2.
-- The two failures compare stderr for uncaught `head []` and pattern-match failures: GHC prints
-  ghc-internal call-stack frames that need the real base sources.
+- Interpreter and native: 69 of 69 (19 of 19 rejections, 50 of 50 runs). Oracle: GHC 9.12.2.
+
+## Performance (`bench/`, native, best of 3, against `ghc -O0`)
+
+    ./target/debug/difftest --hsc /path/to/hsc-native-wrapper --timeout 300 --work target/bench --bench 3 bench/
+
+| program | ghc -O0 ms | hsc ms | ratio |
+|---------|-----------:|-------:|------:|
+| fib (27) | 16.5 | 592 | 36x |
+| integer (3000!) | 6.3 | 129 | 20x |
+| ioref (10^6 modifyIORef') | 61 | 3031 | 50x |
+| mapops (search tree, 5·10^4) | 145 | 1635 | 11x |
+| mvar (2·10^4 round trips) | 12 | 1004 | 84x |
+| nqueens (9) | 38 | 583 | 15x |
+| strings (words, map) | 188 | 10077 | 54x |
+| sumloop (5·10^6 strict Int loop) | 212 | 111100 | 524x |
+
+Profile of `sumloop`: integer literals at type `Int` go through `fromInteger` with the literal
+parsed at run time (`BigInt::parse`), primitives are dispatched by name (string clone and match
+chains), and the copying collector re-copies the program's large live set. These are milestone 8
+items.
 
 ## GHC testsuite sweep (scratch, not in the repo)
 
@@ -82,14 +100,14 @@ Parse-only dev mode: `target/release/hsc [-X<ext>] [--dump-ast] file.hs`.
    LambdaCase `\case` coverage, PatternSynonyms, TemplateHaskell.
 4. Missing modules: Data.Typeable, GHC.Generics, GHC.Records, Data.Tree, Data.Dynamic, Foreign.*
    (needs the native back end), GHC.Conc (throwTo currently lives in Control.Concurrent).
-5. Performance (milestone 8). Measured on this machine:
-   - N-queens and tight loops run about 30x slower than GHC -O0.
+5. Performance (milestone 8). Measured on this machine (see the table above):
+   - Native programs run 11x to 500x slower than GHC -O0 (geometric mean about 40x).
    - Deep non-tail recursion (`foldr (+) 0 [1..300000]`) costs several seconds, mostly system
      time from touching the large Rust stack frames of `eval`; reducing frame size and the
      `force`/`eval` pair is the first item.
    - Dictionary-parameterised local functions are not specialised.
 6. Typeable, data families, default signatures, rewrite rules.
-7. Native code generation and the ELF writer (milestones 5 and 13).
+7. The ELF writer and x86-64 encoder (milestone 13).
 
 ## Corpus
 

@@ -32,7 +32,9 @@ const USAGE: &str = "usage: difftest [options] <corpus-dir>...
   --diag             also require identical compiler diagnostics
   --no-cache         ignore cached oracle results
   -v, --verbose      show full output for failures
-  --work <dir>       scratch directory (default: target/difftest)";
+  --work <dir>       scratch directory (default: target/difftest)
+  --bench <n>        time the programs instead: best of <n> runs of each binary,
+                     the oracle's and hsc's (outputs must agree), one test at a time";
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
@@ -48,6 +50,8 @@ struct Opts {
     verbose: bool,
     work: PathBuf,
     roots: Vec<PathBuf>,
+    /// Benchmark mode: the number of timed runs of each binary.
+    bench: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -135,6 +139,13 @@ fn main() {
         std::process::exit(2);
     }
 
+    if let Some(n) = opts.bench {
+        let report = bench(&opts, &tests, n, &version);
+        print!("{report}");
+        let _ = fs::write(opts.work.join("bench.txt"), &report);
+        return;
+    }
+
     let total = tests.len();
     let jobs = opts.jobs.clamp(1, total);
     let opts = Arc::new(opts);
@@ -181,6 +192,7 @@ fn parse_args(args: Vec<String>) -> Result<Opts, String> {
         verbose: false,
         work: PathBuf::from("target/difftest"),
         roots: Vec::new(),
+        bench: None,
     };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -196,6 +208,10 @@ fn parse_args(args: Vec<String>) -> Result<Opts, String> {
                 o.timeout = Duration::from_secs(secs);
             }
             "--work" => o.work = PathBuf::from(next_val(&mut it, &a)?),
+            "--bench" => {
+                let n: usize = next_val(&mut it, &a)?.parse().map_err(|_| format!("bad value for {a}"))?;
+                o.bench = Some(n.max(1));
+            }
             "--diag" => o.diag = true,
             "--no-cache" => o.no_cache = true,
             "-v" | "--verbose" => o.verbose = true,
@@ -606,4 +622,61 @@ fn clip(s: &str) -> String {
         let head: String = s.chars().take(MAX).collect();
         format!("{head}...")
     }
+}
+
+/// Benchmark mode: each test is compiled by both compilers and each binary is run `n` times; the
+/// best wall-clock time of each is reported with their ratio (hsc / oracle), and the geometric mean
+/// of the ratios at the end. Tests whose outputs differ are reported and left out of the mean.
+fn bench(opts: &Opts, tests: &[Test], n: usize, version: &str) -> String {
+    let mut out = format!("oracle: {version}\n{:<32} {:>10} {:>10} {:>8}\n", "test", "oracle ms", "hsc ms", "ratio");
+    let mut logs: Vec<f64> = Vec::new();
+    for t in tests {
+        if is_reject_category(&t.category) {
+            continue;
+        }
+        let built = |compiler: &str, side: &str| -> Result<PathBuf, String> {
+            let o = execute(compiler, t, &opts.work.join(format!("bench-{side}")), opts.timeout, false)?;
+            if !o.compile_ok {
+                return Err(format!("{side} did not compile it: {}", first_line(&o.compile_err)));
+            }
+            Ok(opts.work.join(format!("bench-{side}")).join(&t.category).join(&t.stem).join("prog"))
+        };
+        let timed = |bin: &Path| -> Result<(Duration, Proc), String> {
+            let mut best: Option<(Duration, Proc)> = None;
+            for _ in 0..n {
+                let mut cmd = Command::new(bin);
+                cmd.current_dir(bin.parent().unwrap_or(Path::new(".")));
+                let start = Instant::now();
+                let p = run_proc(cmd, &t.stdin, opts.timeout).map_err(|e| e.to_string())?;
+                let d = start.elapsed();
+                if p.timed_out {
+                    return Err("timed out".into());
+                }
+                if best.as_ref().is_none_or(|(b, _)| d < *b) {
+                    best = Some((d, p));
+                }
+            }
+            best.ok_or_else(|| "not run".into())
+        };
+        let line = (|| -> Result<String, String> {
+            let (ob, hb) = (built(&opts.oracle, "oracle")?, built(&opts.hsc, "hsc")?);
+            let (od, op) = timed(&ob)?;
+            let (hd, hp) = timed(&hb)?;
+            if op.stdout != hp.stdout || op.code != hp.code {
+                return Err(format!("outputs differ: {}", first_diff(&op.stdout, &hp.stdout)));
+            }
+            let (oms, hms) = (od.as_secs_f64() * 1000.0, hd.as_secs_f64() * 1000.0);
+            let ratio = hms / oms.max(0.001);
+            logs.push(ratio.ln());
+            Ok(format!("{:<32} {:>10.1} {:>10.1} {:>7.1}x", t.id, oms, hms, ratio))
+        })()
+        .unwrap_or_else(|e| format!("{:<32} {}", t.id, clip(&e)));
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if !logs.is_empty() {
+        let mean = (logs.iter().sum::<f64>() / logs.len() as f64).exp();
+        out.push_str(&format!("geometric mean of the ratios: {mean:.1}x over {} programs\n", logs.len()));
+    }
+    out
 }
