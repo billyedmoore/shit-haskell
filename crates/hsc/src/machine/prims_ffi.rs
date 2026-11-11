@@ -429,42 +429,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             }
             ret_int(m, n)
         }
-        "__hscore_fstat" | "__hscore_stat" | "__hscore_lstat" => {
-            let meta = if name == "__hscore_fstat" {
-                let fd = int_arg(m, 0)? as i32;
-                // SAFETY: the file is borrowed from the descriptor, and not closed here.
-                let f = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-                f.metadata()
-            } else {
-                let (b, off) = addr_arg(m, 0)?;
-                let mut bytes: Vec<u8> = Vec::new();
-                let mut p = raw(b, off);
-                if !p.is_null() {
-                    // SAFETY: a C string is NUL-terminated.
-                    unsafe {
-                        while *p != 0 {
-                            bytes.push(*p);
-                            p = p.add(1);
-                        }
-                    }
-                }
-                let path = std::path::PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
-                if name == "__hscore_stat" { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) }
-            };
-            let Ok(meta) = meta else { return Some(ret_int(m, -2)) };
-            use std::os::unix::fs::MetadataExt;
-            let (b, off) = addr_arg(m, if name == "__hscore_fstat" { 1 } else { 1 })?;
-            let dst = raw(b, off);
-            // SAFETY: the stat buffer is a live byte array of the size base reserves (144 bytes).
-            unsafe {
-                std::ptr::write_unaligned(dst as *mut u64, meta.dev());
-                std::ptr::write_unaligned(dst.add(8) as *mut u64, meta.ino());
-                std::ptr::write_unaligned(dst.add(24) as *mut u32, meta.mode());
-                std::ptr::write_unaligned(dst.add(48) as *mut u64, meta.size());
-                std::ptr::write_unaligned(dst.add(88) as *mut u64, meta.mtime() as u64);
-            }
-            ret_int(m, 0)
-        }
+        // stat, fstat and lstat are the real C functions (the RTS shim's), which set errno.
         "__hscore_st_dev" | "__hscore_st_ino" | "__hscore_st_mode" | "__hscore_st_size" | "__hscore_st_mtime" => {
             let (b, off) = addr_arg(m, 0)?;
             let (at, width) = match name {

@@ -22,6 +22,9 @@ fn int_arg(m: &mut Machine, k: usize) -> Option<i64> {
     Some(m.heap_get(v, 1) as i64)
 }
 
+/// The size from which GHC allocates byte arrays pinned (a large object: 3276 bytes on 64 bits).
+const LARGE_BYTES: i64 = 3277;
+
 /// The address of the bytes of a byte array object, plus an offset: where element reads go.
 fn data_ptr(m: &Machine, bytes: Word) -> Word {
     bytes + 8
@@ -62,6 +65,18 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             m.heap_set(r + 8, new_contents);
             con_value(m, "Builtin.(,,)", 3, &[0, old, res])
         }
+        "atomicModifyMutVar_#" => {
+            // The contents become `f old`; the answer is (# s, old, new #).
+            let Some(_) = force_arg(m, 0) else { return Some(0) };
+            let r = m.args[0];
+            let old = m.heap_get(r, 1);
+            m.args[2] = old;
+            let f = m.args[1];
+            let Some(new) = m.apply_nested(f, &[old]) else { return Some(0) };
+            let (r, old) = (m.args[0], m.args[2]);
+            m.heap_set(r + 8, new);
+            con_value(m, "Builtin.(,,)", 3, &[0, old, new])
+        }
         "newArray#" => {
             let Some(n) = int_arg(m, 0) else { return Some(0) };
             let n = n.max(0) as usize;
@@ -100,7 +115,16 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let Some(a) = force_arg(m, 0) else { return Some(0) };
             state_pair(m, a)
         }
-        "newByteArray#" | "newPinnedByteArray#" | "newAlignedPinnedByteArray#" => {
+        // Pinned arrays (and large ones, as GHC pins them) are allocated where they never move.
+        "newPinnedByteArray#" | "newAlignedPinnedByteArray#" | "newByteArray#"
+            if name != "newByteArray#" || matches!(int_arg(m, 0), Some(n) if n >= LARGE_BYTES) =>
+        {
+            let Some(n) = int_arg(m, 0) else { return Some(0) };
+            let align = if name == "newAlignedPinnedByteArray#" { int_arg(m, 1)?.max(1) as usize } else { 16 };
+            let b = m.alloc_pinned_bytes(n.max(0) as usize, align);
+            state_pair(m, b)
+        }
+        "newByteArray#" => {
             let Some(n) = int_arg(m, 0) else { return Some(0) };
             let n = n.max(0) as usize;
             let words = n.div_ceil(8);
@@ -144,15 +168,25 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             m.heap_set(p + 16, off as Word);
             p
         }
+        // Addresses compare (and subtract) as machine addresses, however they were made.
         "eqAddr#" | "minusAddr#" => {
-            let (Some(a), Some(b)) = (force_arg(m, 0), force_arg(m, 1)) else { return Some(0) };
-            let (ba, oa) = (m.heap_get(a, 1), m.heap_get(a, 2) as i64);
-            let (bb, ob) = (m.heap_get(b, 1), m.heap_get(b, 2) as i64);
-            if name == "eqAddr#" {
-                int_value(m, (ba == bb && oa == ob) as i64)
-            } else {
-                int_value(m, oa - ob)
-            }
+            let (Some(x), Some(y)) = (addr_ptr(m, 0), addr_ptr(m, 1)) else { return Some(0) };
+            let (x, y) = (x as i64, y as i64);
+            int_value(m, if name == "eqAddr#" { (x == y) as i64 } else { x - y })
+        }
+        // An address as an integer is its machine address (stable for pinned arrays, as in GHC),
+        // and an integer as an address is a raw machine address.
+        "addr2Int#" => {
+            let Some(x) = addr_ptr(m, 0) else { return Some(0) };
+            int_value(m, x as i64)
+        }
+        "int2Addr#" => {
+            let Some(n) = int_arg(m, 0) else { return Some(0) };
+            let p = m.alloc(3);
+            m.heap_set(p, heap::header(kind::ADDR, 2, 0));
+            m.heap_set(p + 8, 0);
+            m.heap_set(p + 16, n as Word);
+            p
         }
         "setByteArray#" => {
             // setByteArray# arr off n c
@@ -272,7 +306,11 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             unsafe { std::ptr::copy_nonoverlapping((old + 8) as *const u8, (nb + 8) as *mut u8, k) };
             state_pair(m, nb)
         }
-        "isByteArrayPinned#" | "isMutableByteArrayPinned#" => int_value(m, 1),
+        "isByteArrayPinned#" | "isMutableByteArrayPinned#" => {
+            let Some(b) = force_arg(m, 0) else { return Some(0) };
+            let pinned = m.heap.is_pinned(b);
+            int_value(m, pinned as i64)
+        }
         "copyArray#" | "copyMutableArray#" => {
             let (Some(_), Some(so), Some(_), Some(dof), Some(n)) =
                 (force_arg(m, 0), int_arg(m, 1), force_arg(m, 2), int_arg(m, 3), int_arg(m, 4))

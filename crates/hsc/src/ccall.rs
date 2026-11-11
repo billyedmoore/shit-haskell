@@ -132,6 +132,12 @@ pub fn capi_stubs(prims: &[String]) -> Option<String> {
 
 /// The address of a C symbol in the running program, if it has one.
 pub fn lookup(sym: &str) -> Option<*mut c_void> {
+    // The RTS's own C functions, defined here.
+    match sym {
+        "getProgArgv" => return Some(get_prog_argv as *mut c_void),
+        "setProgArgv" => return Some(set_prog_argv as *mut c_void),
+        _ => {}
+    }
     let find = |s: &str| -> Option<*mut c_void> {
         let c = CString::new(s).ok()?;
         // SAFETY: dlsym reads the NUL-terminated name.
@@ -209,4 +215,60 @@ pub unsafe fn call(f: *mut c_void, ints: &[u64], floats: &[f64], ret: char) -> A
 /// A float argument as the bits of an f32 in the low half of a vector register.
 pub fn float_arg(x: f64) -> f64 {
     f64::from_bits((x as f32).to_bits() as u64)
+}
+
+/// The program's `argv` as C strings (with a terminating null pointer), as the RTS keeps it.
+struct ProgArgv {
+    _strings: Vec<CString>,
+    ptrs: Vec<*mut std::ffi::c_char>,
+}
+
+// SAFETY: the pointers point into the CStrings the same value owns.
+unsafe impl Send for ProgArgv {}
+
+static PROG_ARGV: std::sync::Mutex<Option<ProgArgv>> = std::sync::Mutex::new(None);
+
+fn make_argv(args: Vec<Vec<u8>>) -> ProgArgv {
+    let strings: Vec<CString> = args
+        .into_iter()
+        .map(|a| CString::new(a.into_iter().filter(|&b| b != 0).collect::<Vec<u8>>()).unwrap_or_default())
+        .collect();
+    let mut ptrs: Vec<*mut std::ffi::c_char> = strings.iter().map(|c| c.as_ptr() as *mut _).collect();
+    ptrs.push(std::ptr::null_mut());
+    ProgArgv { _strings: strings, ptrs }
+}
+
+/// Sets the program's arguments (its name first), for a program the interpreter runs.
+pub fn set_program_args(args: Vec<String>) {
+    *PROG_ARGV.lock().unwrap() = Some(make_argv(args.into_iter().map(String::into_bytes).collect()));
+}
+
+/// `getProgArgv(int *argc, char ***argv)`: the process's arguments unless they were set.
+extern "C" fn get_prog_argv(argc: *mut i32, argv: *mut *mut *mut std::ffi::c_char) {
+    use std::os::unix::ffi::OsStringExt;
+    let mut g = PROG_ARGV.lock().unwrap();
+    let a = g.get_or_insert_with(|| make_argv(std::env::args_os().map(|a| a.into_vec()).collect()));
+    // SAFETY: the caller passes writable locations (or null).
+    unsafe {
+        if !argc.is_null() {
+            *argc = (a.ptrs.len() - 1) as i32;
+        }
+        if !argv.is_null() {
+            *argv = a.ptrs.as_mut_ptr();
+        }
+    }
+}
+
+/// `setProgArgv(int argc, char *argv[])`: copies the arguments.
+extern "C" fn set_prog_argv(argc: i32, argv: *const *const std::ffi::c_char) {
+    let mut args = Vec::new();
+    for i in 0..argc.max(0) as usize {
+        // SAFETY: the caller passes `argc` NUL-terminated strings.
+        let p = unsafe { *argv.add(i) };
+        if p.is_null() {
+            break;
+        }
+        args.push(unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec());
+    }
+    *PROG_ARGV.lock().unwrap() = Some(make_argv(args));
 }

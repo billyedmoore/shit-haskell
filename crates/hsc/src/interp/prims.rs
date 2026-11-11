@@ -726,31 +726,28 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             (Value::Int(x), Value::Int(y)) => int_v(x.wrapping_sub(y)),
             _ => Err(RtError::Fail("internal: minusAddr# of non-addresses".into())),
         },
-        // Ordering of addresses into the same buffer (by offset); different buffers by their place.
-        "ltAddr#" | "leAddr#" | "gtAddr#" | "geAddr#" | "neAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
-            (Value::Addr(a, x), Value::Addr(b, y)) => {
-                let (x, y) = if Rc::ptr_eq(&a, &b) {
-                    (x as i64, y as i64)
-                } else {
-                    (Rc::as_ptr(&a) as i64, Rc::as_ptr(&b) as i64)
-                };
-                let r = match name {
-                    "ltAddr#" => x < y,
-                    "leAddr#" => x <= y,
-                    "gtAddr#" => x > y,
-                    "geAddr#" => x >= y,
-                    _ => x != y || !Rc::ptr_eq(&a, &b),
-                };
-                int_v(r as i64)
-            }
-            _ => int_v(0),
-        },
-        "eqAddr#" => match (rt.force(&args[0])?, rt.force(&args[1])?) {
-            (Value::Addr(a, x), Value::Addr(b, y)) => int_v((Rc::ptr_eq(&a, &b) && x == y) as i64),
-            // Integer addresses (stable pointer indices, the null address) compare by value.
-            (Value::Int(x), Value::Int(y)) => int_v((x == y) as i64),
-            _ => int_v(0),
-        },
+        // Addresses compare within a buffer by offset, different buffers by their place, and raw
+        // machine addresses (and the null address, however it was made) by value.
+        "ltAddr#" | "leAddr#" | "gtAddr#" | "geAddr#" | "neAddr#" | "eqAddr#" => {
+            let key = |v: Value| -> (usize, i64) {
+                match v {
+                    Value::Addr(b, o) if b.borrow().is_empty() => (0, o as i64),
+                    Value::Addr(b, o) => (Rc::as_ptr(&b) as *const u8 as usize, o as i64),
+                    Value::Int(x) => (0, x),
+                    _ => (usize::MAX, 0),
+                }
+            };
+            let (a, b) = (key(rt.force(&args[0])?), key(rt.force(&args[1])?));
+            let r = match name {
+                "eqAddr#" => a == b,
+                "neAddr#" => a != b,
+                "ltAddr#" => a < b,
+                "leAddr#" => a <= b,
+                "gtAddr#" => a > b,
+                _ => a >= b,
+            };
+            int_v(r as i64)
+        }
         _ if sized_conversion(name).is_some() => {
             let f = sized_conversion(name).unwrap_or(|x| x);
             int_v(f(int(rt, &args[0])?))

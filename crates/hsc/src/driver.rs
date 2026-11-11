@@ -450,6 +450,7 @@ pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Resul
             prelude.push_str(&format!("#include \"{file}\"\n"));
         }
     }
+    pp.set_file(&path.display().to_string());
     if prelude.is_empty() {
         return pp.run(&src, &dir).map_err(|e| format!("{}: error: {e}", path.display()));
     }

@@ -1,0 +1,4 @@
+-c-source=../cbits/SetEnv.c
+-c-source=../cbits/md5.c
+-c-source=../cbits/sysconf.c
+-c-source=../cbits/iconv.c

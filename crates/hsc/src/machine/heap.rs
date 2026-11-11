@@ -83,11 +83,48 @@ pub struct Heap {
     pub hp: usize,
     /// Collections so far.
     pub collections: u64,
+    /// Pinned objects (byte arrays the collector never moves, so that C code and raw addresses
+    /// may refer to their bytes): each object's address and the block it was allocated in. They
+    /// live outside the semispaces; a collection frees the ones it did not reach.
+    pub pinned: std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
+    /// Bytes of pinned objects allocated since the last collection (which triggers one when large).
+    pub pinned_since_gc: usize,
 }
 
 impl Heap {
     pub fn new(words: usize) -> Heap {
-        Heap { from: vec![0; words], to: Vec::new(), hp: 0, collections: 0 }
+        Heap {
+            from: vec![0; words],
+            to: Vec::new(),
+            hp: 0,
+            collections: 0,
+            pinned: std::collections::HashMap::new(),
+            pinned_since_gc: 0,
+        }
+    }
+
+    /// Allocates a pinned object of `total` words (header included) whose second word (the data)
+    /// is aligned to `align` bytes; it is zeroed and given header `h`.
+    pub fn alloc_pinned(&mut self, total: usize, align: usize, h: Word) -> Word {
+        let align = align.max(16).next_power_of_two();
+        let size = (total.max(2) * 8 + align).max(16);
+        let layout = std::alloc::Layout::from_size_align(size, align).expect("pinned layout");
+        // SAFETY: the layout has a non-zero size.
+        let block = unsafe { std::alloc::alloc_zeroed(layout) };
+        if block.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        // The header sits just before an aligned data address.
+        let p = block as usize + align - 8;
+        self.pinned.insert(p as Word, (block as usize, layout));
+        self.pinned_since_gc += size;
+        self.set_word(p as Word, 0, h);
+        p as Word
+    }
+
+    /// Whether `p` is a pinned object.
+    pub fn is_pinned(&self, p: Word) -> bool {
+        self.pinned.contains_key(&p)
     }
 
     /// The address of word `i` of the current space, as a pointer value.

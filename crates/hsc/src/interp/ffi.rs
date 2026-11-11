@@ -346,37 +346,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             }
             ret_int(fd as i64)
         })(),
-        "__hscore_fstat" | "__hscore_stat" | "__hscore_lstat" => (|| {
-            let meta = match name {
-                "__hscore_fstat" => {
-                    let fd = int_of(rt, &args[0])? as i32;
-                    // SAFETY: the file is borrowed from the descriptor and not closed here.
-                    let f = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-                    f.metadata()
-                }
-                _ => {
-                    let (path, poff) = addr_of(rt, &args[0])?;
-                    let text: Vec<u8> = path.borrow()[poff..].iter().take_while(|&&b| b != 0).copied().collect();
-                    let p = std::path::PathBuf::from(String::from_utf8_lossy(&text).into_owned());
-                    if name == "__hscore_stat" { std::fs::metadata(p) } else { std::fs::symlink_metadata(p) }
-                }
-            };
-            let Ok(meta) = meta else {
-                let e = errno_or(libc_enoent());
-                // SAFETY: __errno_location returns this thread's errno cell.
-                unsafe { *__errno_location() = e as i32 };
-                return ret_int(-1);
-            };
-            use std::os::unix::fs::MetadataExt;
-            let (buf, off) = addr_of(rt, &args[1])?;
-            let mut data = buf.borrow_mut();
-            write_u64(&mut data, off, meta.dev());
-            write_u64(&mut data, off + 8, meta.ino());
-            write_u32(&mut data, off + 24, meta.mode());
-            write_u64(&mut data, off + 48, meta.size());
-            write_u64(&mut data, off + 88, meta.mtime() as u64);
-            ret_int(0)
-        })(),
+        // stat, fstat and lstat are the real C functions (the RTS shim's), which set errno.
         "__hscore_st_dev" => stat_field(rt, &args[0], 0, 8),
         "__hscore_st_ino" => stat_field(rt, &args[0], 8, 8),
         "__hscore_st_mode" => stat_field(rt, &args[0], 24, 4),

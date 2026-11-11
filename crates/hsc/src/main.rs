@@ -131,6 +131,8 @@ fn dev_mode(opts: &cli::Opts) -> ExitCode {
         }
     };
     let prog_name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "main".into());
+    // The program's arguments: the inputs after the source file.
+    hsc::ccall::set_program_args(std::iter::once(prog_name.clone()).chain(opts.inputs[1..].iter().cloned()).collect());
     ExitCode::from(driver::run_binds_code(binds, prog_name) as u8)
 }
 

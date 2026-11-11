@@ -10,14 +10,28 @@ use super::heap::{self, kind, Heap, Word};
 pub fn collect(heap: &mut Heap, roots: &mut [Word], need: usize) {
     let mut space = std::mem::take(&mut heap.from);
     let mut capacity = space.len();
-    let (mut to, mut live) = copy(&mut space, roots, capacity);
+    let pinned = std::mem::take(&mut heap.pinned);
+    let mut reached: std::collections::HashSet<Word> = std::collections::HashSet::new();
+    let (mut to, mut live) = copy(&mut space, roots, capacity, &pinned, &mut reached);
     while capacity - live < need + capacity / 4 {
         // Too little room: copy again into a larger space (the live data is all in `to`).
         capacity = (capacity * 2).max(live + need + capacity / 4);
-        let (bigger, l) = copy(&mut to, roots, capacity);
+        let (bigger, l) = copy(&mut to, roots, capacity, &pinned, &mut reached);
         to = bigger;
         live = l;
     }
+    // The pinned objects nothing reached are freed.
+    let mut kept = std::collections::HashMap::with_capacity(reached.len());
+    for (p, (block, layout)) in pinned {
+        if reached.contains(&p) {
+            kept.insert(p, (block, layout));
+        } else {
+            // SAFETY: the block was allocated with this layout and nothing refers to it.
+            unsafe { std::alloc::dealloc(block as *mut u8, layout) };
+        }
+    }
+    heap.pinned = kept;
+    heap.pinned_since_gc = 0;
     heap.from = to;
     heap.hp = live;
     heap.collections += 1;
@@ -26,13 +40,19 @@ pub fn collect(heap: &mut Heap, roots: &mut [Word], need: usize) {
 /// Copies everything reachable from `roots` out of `src` into a new space of `capacity` words.
 /// Returns the new space and the number of live words. The roots are updated in place; `src` is
 /// left with forwarding pointers.
-fn copy(src: &mut [Word], roots: &mut [Word], capacity: usize) -> (Vec<Word>, usize) {
+fn copy(
+    src: &mut [Word],
+    roots: &mut [Word],
+    capacity: usize,
+    pinned: &std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
+    reached: &mut std::collections::HashSet<Word>,
+) -> (Vec<Word>, usize) {
     let mut dst: Vec<Word> = vec![0; capacity];
     let mut free = 0usize;
     let base = src.as_ptr() as Word;
     let limit = base + (src.len() as Word) * 8;
     for r in roots.iter_mut() {
-        *r = evacuate(src, &mut dst, &mut free, *r, base, limit);
+        *r = evacuate(src, &mut dst, &mut free, *r, base, limit, pinned, reached);
     }
     // Cheney scan: the copied objects, in the order they were copied, give up their pointers.
     let dst_base = dst.as_ptr() as Word;
@@ -44,7 +64,7 @@ fn copy(src: &mut [Word], roots: &mut [Word], capacity: usize) -> (Vec<Word>, us
         for i in first..first + count {
             let v = dst[scan + i];
             // Pointers in `dst` are into `src` (the from-space), never into `dst`, until copied.
-            dst[scan + i] = evacuate(src, &mut dst, &mut free, v, base, limit);
+            dst[scan + i] = evacuate(src, &mut dst, &mut free, v, base, limit, pinned, reached);
         }
         scan += total;
     }
@@ -54,8 +74,22 @@ fn copy(src: &mut [Word], roots: &mut [Word], capacity: usize) -> (Vec<Word>, us
 
 /// Copies the object `v` (if it is a pointer into the source space) into `dst`, leaving a
 /// forwarding pointer in the source, and returns its new address. Anything else is unchanged.
-fn evacuate(src: &mut [Word], dst: &mut Vec<Word>, free: &mut usize, v: Word, base: Word, limit: Word) -> Word {
+#[allow(clippy::too_many_arguments)]
+fn evacuate(
+    src: &mut [Word],
+    dst: &mut Vec<Word>,
+    free: &mut usize,
+    v: Word,
+    base: Word,
+    limit: Word,
+    pinned: &std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
+    reached: &mut std::collections::HashSet<Word>,
+) -> Word {
     if v < base || v >= limit {
+        // A pinned object stays where it is (it holds no pointers); it is only marked as reached.
+        if pinned.contains_key(&v) {
+            reached.insert(v);
+        }
         return v;
     }
     let from_index = ((v - base) / 8) as usize;

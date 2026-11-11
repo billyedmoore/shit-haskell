@@ -248,6 +248,17 @@ impl Machine {
         p
     }
 
+    /// Allocates a pinned byte array of `n` bytes, its data aligned to `align` (zeroed). Pinned
+    /// arrays are never moved; a collection is due when many bytes were pinned since the last.
+    pub fn alloc_pinned_bytes(&mut self, n: usize, align: usize) -> Word {
+        let budget = (self.heap.from.len() * 8).max(64 << 20);
+        if self.heap.pinned_since_gc > budget {
+            self.collect(0);
+        }
+        let words = n.div_ceil(8);
+        self.heap.alloc_pinned(1 + words, align, heap::header(kind::BYTES, words as u32, n as u32))
+    }
+
     /// Collects the heap, with every root the machine holds.
     pub fn collect(&mut self, need: usize) {
         // Roots: the stack (walked from sp), the globals, the record's arguments and registers,

@@ -34,3 +34,50 @@ __attribute__((weak)) unsigned char *__hscore_ptr_c_cc(struct termios *ts) { ret
 static void *saved_termios[3];
 __attribute__((weak)) void *__hscore_get_saved_termios(int fd) { return (fd >= 0 && fd < 3) ? saved_termios[fd] : 0; }
 __attribute__((weak)) void __hscore_set_saved_termios(int fd, void *ts) { if (fd >= 0 && fd < 3) saved_termios[fd] = ts; }
+
+/* The rest of HsBase.h's helpers (System.Posix.Internals, System.Environment). */
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+extern char **environ;
+__attribute__((weak)) char **__hscore_environ(void) { return environ; }
+__attribute__((weak)) int __hscore_get_errno(void) { return errno; }
+__attribute__((weak)) void __hscore_set_errno(int e) { errno = e; }
+__attribute__((weak)) HsInt __hscore_bufsiz(void) { return BUFSIZ; }
+__attribute__((weak)) int __hscore_o_binary(void) { return 0; }
+__attribute__((weak)) int __hscore_o_rdonly(void) { return O_RDONLY; }
+__attribute__((weak)) int __hscore_o_wronly(void) { return O_WRONLY; }
+__attribute__((weak)) int __hscore_o_rdwr(void) { return O_RDWR; }
+__attribute__((weak)) int __hscore_o_append(void) { return O_APPEND; }
+__attribute__((weak)) int __hscore_o_creat(void) { return O_CREAT; }
+__attribute__((weak)) int __hscore_o_excl(void) { return O_EXCL; }
+__attribute__((weak)) int __hscore_o_trunc(void) { return O_TRUNC; }
+__attribute__((weak)) int __hscore_o_noctty(void) { return O_NOCTTY; }
+__attribute__((weak)) int __hscore_o_nonblock(void) { return O_NONBLOCK; }
+__attribute__((weak)) int __hscore_f_getfl(void) { return F_GETFL; }
+__attribute__((weak)) int __hscore_f_setfl(void) { return F_SETFL; }
+__attribute__((weak)) int __hscore_f_setfd(void) { return F_SETFD; }
+__attribute__((weak)) long __hscore_fd_cloexec(void) { return FD_CLOEXEC; }
+__attribute__((weak)) int __hscore_ftruncate(int fd, off_t where) { return ftruncate(fd, where); }
+__attribute__((weak)) int __hscore_setmode(int fd, HsBool toBin) { (void)fd; (void)toBin; return 0; }
+__attribute__((weak)) HsInt __hscore_sizeof_stat(void) { return sizeof(struct stat); }
+__attribute__((weak)) time_t __hscore_st_mtime(struct stat *st) { return st->st_mtime; }
+__attribute__((weak)) off_t __hscore_st_size(struct stat *st) { return st->st_size; }
+__attribute__((weak)) mode_t __hscore_st_mode(struct stat *st) { return st->st_mode; }
+__attribute__((weak)) dev_t __hscore_st_dev(struct stat *st) { return st->st_dev; }
+__attribute__((weak)) ino_t __hscore_st_ino(struct stat *st) { return st->st_ino; }
+__attribute__((weak)) int __hscore_stat(char *file, struct stat *buf) { return stat(file, buf); }
+__attribute__((weak)) int __hscore_fstat(int fd, struct stat *buf) { return fstat(fd, buf); }
+__attribute__((weak)) int __hscore_lstat(const char *fname, struct stat *buf) { return lstat(fname, buf); }
+__attribute__((weak)) size_t __hscore_sizeof_siginfo_t(void) { return sizeof(siginfo_t); }
+__attribute__((weak)) int __hscore_open(char *file, int how, mode_t mode) { return open(file, how, mode); }
+__attribute__((weak)) void *__hscore_from_uintptr(uintptr_t n) { return (void *)n; }
+__attribute__((weak)) void *__hscore_from_intptr(intptr_t n) { return (void *)n; }
+__attribute__((weak)) uintptr_t __hscore_to_uintptr(void *p) { return (uintptr_t)p; }
+__attribute__((weak)) intptr_t __hscore_to_intptr(void *p) { return (intptr_t)p; }
+__attribute__((weak)) void errorBelch2(const char *s, char *t) { fprintf(stderr, s, t); fputc('\n', stderr); }
+__attribute__((weak)) void debugBelch2(const char *s, char *t) { fprintf(stderr, s, t); }

@@ -66,6 +66,8 @@ const DIRECTIVES: &[&str] = &[
 pub struct Preprocessor {
     defs: HashMap<String, Macro>,
     include_dirs: Vec<PathBuf>,
+    /// The file being read, for `__FILE__`.
+    file: String,
 }
 
 /// Whether a source needs the preprocessor: the `CPP` extension is on by flag or pragma.
@@ -95,12 +97,17 @@ impl Preprocessor {
             .iter()
             .map(|(k, v)| (k.to_string(), Macro::Object(v.to_string())))
             .collect();
-        Preprocessor { defs, include_dirs }
+        Preprocessor { defs, include_dirs, file: String::new() }
     }
 
     /// Defines an object-like macro (`-D`).
     pub fn define_macro(&mut self, name: &str, value: &str) {
         self.defs.insert(name.to_string(), Macro::Object(value.to_string()));
+    }
+
+    /// Names the file whose text `run` reads next (the expansion of `__FILE__`).
+    pub fn set_file(&mut self, file: &str) {
+        self.file = file.to_string();
     }
 
     /// Removes a macro (`-U`).
@@ -191,7 +198,10 @@ impl Preprocessor {
                             // A header that only defines macros adds no lines, so the lines of the
                             // source keep their numbers (as GHC's line markers keep them).
                             let mut inner = String::new();
-                            self.process(&text.1, &inner_dir, &mut inner, depth + 1)?;
+                            let outer_file = std::mem::replace(&mut self.file, text.0.display().to_string());
+                            let r = self.process(&text.1, &inner_dir, &mut inner, depth + 1);
+                            self.file = outer_file;
+                            r?;
                             if inner.lines().any(|l| !l.trim().is_empty()) {
                                 out.push_str(&inner);
                             }
@@ -208,6 +218,11 @@ impl Preprocessor {
             }
             if active {
                 let stripped = strip_c_comments(&line, &mut in_c_comment);
+                // `__LINE__` and `__FILE__` may come from a macro's body, so they are always current.
+                self.defs.insert("__LINE__".into(), Macro::Object((i + 1).to_string()));
+                if !matches!(self.defs.get("__FILE__"), Some(Macro::Object(f)) if f.len() == self.file.len() + 2) {
+                    self.defs.insert("__FILE__".into(), Macro::Object(format!("{:?}", self.file)));
+                }
                 let expanded = self.expand_line(&stripped, 0)?;
                 out.push_str(&expanded);
             }

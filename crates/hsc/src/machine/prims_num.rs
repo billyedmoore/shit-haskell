@@ -373,21 +373,22 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
 
 /// Sized integer conversions: `intToInt8#` and friends, which truncate and sign- or zero-extend.
 fn narrow(m: &mut Machine, name: &str) -> Option<Word> {
-    let (bits, signed, from_word) = match name {
-        "intToInt8#" | "int8ToInt#" | "int8ToWord8#" | "word8ToInt8#" => (8, true, false),
-        "intToInt16#" | "int16ToInt#" => (16, true, false),
-        "intToInt32#" | "int32ToInt#" => (32, true, false),
-        "intToInt64#" | "int64ToInt#" => (64, true, false),
-        "narrow8Word#" | "wordToWord8#" | "word8ToWord#" => (8, false, true),
-        "narrow16Word#" => (16, false, true),
-        "narrow32Word#" => (32, false, true),
-        "wordToWord16#" | "word16ToWord#" => (16, false, true),
-        "wordToWord32#" | "word32ToWord#" => (32, false, true),
-        "wordToWord64#" | "word64ToWord#" => (64, false, true),
+    // By the target type: a sized word zero-extends, a sized int sign-extends, and the
+    // conversions to a full-width type keep the (already extended) value.
+    let (bits, signed) = match name {
+        "intToInt8#" | "word8ToInt8#" | "int8ToInt8#" | "narrow8Int#" => (8, true),
+        "intToInt16#" | "word16ToInt16#" | "int16ToInt16#" | "narrow16Int#" => (16, true),
+        "intToInt32#" | "word32ToInt32#" | "int32ToInt32#" | "narrow32Int#" => (32, true),
+        "wordToWord8#" | "int8ToWord8#" | "word8ToWord8#" | "narrow8Word#" => (8, false),
+        "wordToWord16#" | "int16ToWord16#" | "word16ToWord16#" | "narrow16Word#" => (16, false),
+        "wordToWord32#" | "int32ToWord32#" | "word32ToWord32#" | "narrow32Word#" => (32, false),
+        "wordToWord64#" | "word64ToWord#" | "int64ToWord64#" | "word64ToInt64#" | "intToInt64#"
+        | "int64ToInt#" | "word8ToWord#" | "word16ToWord#" | "word32ToWord#" | "int8ToInt#"
+        | "int16ToInt#" | "int32ToInt#" | "word8ToInt#" | "word16ToInt#" | "word32ToInt#"
+        | "word64ToInt#" | "int64ToWord#" | "word64ToWord64#" | "int64ToInt64#" => (64, true),
         _ => return None,
     };
     let v = i(m, 0)?;
-    let _ = from_word;
     let r = match (bits, signed) {
         (64, _) => v,
         (b, true) => (v << (64 - b)) >> (64 - b),

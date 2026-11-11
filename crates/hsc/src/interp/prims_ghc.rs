@@ -531,6 +531,18 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             Ok(_) => Err(RtError::Fail("internal: atomicModifyMutVar2# of a non-variable".into())),
             Err(e) => Err(e),
         },
+        // atomicModifyMutVar_# mv f: the contents become `f old`; the answer is (# s, old, new #).
+        "atomicModifyMutVar_#" => match rt.force(&args[0]) {
+            Ok(Value::Ref(r)) => (|| {
+                let old: Cell = r.borrow().clone();
+                let f = rt.force(&args[1])?;
+                let new = new_cell(Thunk::Done(rt.apply(f, old.clone())?));
+                *r.borrow_mut() = new.clone();
+                Ok(Value::Con(Rc::new(ConVal { name: "Builtin.(,,)", args: vec![unit_cell(), old, new] })))
+            })(),
+            Ok(_) => Err(RtError::Fail("internal: atomicModifyMutVar_# of a non-variable".into())),
+            Err(e) => Err(e),
+        },
         "readMutVar#" => match rt.force(&args[0]) {
             Ok(Value::Ref(r)) => {
                 let contents = r.borrow().clone();
