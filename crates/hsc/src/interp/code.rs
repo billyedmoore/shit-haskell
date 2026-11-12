@@ -83,6 +83,9 @@ struct Scope {
 struct Compiler<'g> {
     globals: &'g HashMap<String, u32>,
     scopes: Vec<Scope>,
+    /// Every name the top-level binding being compiled mentions (locals are unique, so this
+    /// tells whether a case binder is used without searching its alternatives each time).
+    mentioned: std::collections::HashSet<String>,
 }
 
 impl Compiler<'_> {
@@ -184,9 +187,7 @@ impl Compiler<'_> {
                 let scrut_code = self.expr(scrut);
                 let mark = self.scopes.last().expect("scope").locals.len();
                 // An unused binder needs no slot; its cell is then never read.
-                let used = alts.iter().any(|a| match a {
-                    Alt::Con(_, _, body) | Alt::Lit(_, body) | Alt::Default(body) => mentions(body, b),
-                });
+                let used = self.mentioned.contains(b.as_str());
                 let bslot = if used { self.bind(b) } else { u32::MAX };
                 let mut out = Vec::with_capacity(alts.len());
                 for alt in alts {
@@ -212,7 +213,38 @@ impl Compiler<'_> {
     }
 }
 
+/// The variable names an expression mentions.
+fn names_in(c: &Core, out: &mut std::collections::HashSet<String>) {
+    match c {
+        Core::Var(v) => {
+            if !out.contains(v.as_str()) {
+                out.insert(v.clone());
+            }
+        }
+        Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            names_in(f, out);
+            names_in(a, out);
+        }
+        Core::Lam(_, b) => names_in(b, out),
+        Core::Let(binds, body) => {
+            binds.iter().for_each(|(_, b)| names_in(b, out));
+            names_in(body, out);
+        }
+        Core::Case(s, _, alts) => {
+            names_in(s, out);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => names_in(b, out),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| names_in(a, out)),
+    }
+}
+
 /// Whether a name occurs free-or-bound in a Core expression (a conservative test).
+#[allow(dead_code)]
 fn mentions(c: &Core, name: &str) -> bool {
     match c {
         Core::Var(v) => v == name,
@@ -244,16 +276,31 @@ pub fn compile_program(binds: Vec<TopBind>) -> Program {
         names.push(b.name.clone());
     }
     let mut bodies = Vec::with_capacity(binds.len());
+    let timing = std::env::var_os("HSC_TIME_CODE").is_some();
+    let mut slow: Vec<(std::time::Duration, String)> = Vec::new();
     for b in &binds {
+        let t0 = std::time::Instant::now();
+        let mut mentioned = std::collections::HashSet::new();
+        names_in(&b.body, &mut mentioned);
         let mut comp = Compiler {
             globals: &index,
             scopes: Vec::new(),
+            mentioned,
         };
         comp.new_scope();
         let code = comp.expr(&b.body);
         let scope = comp.scopes.pop().expect("scope");
         debug_assert!(scope.captures.is_empty(), "top-level code captures nothing");
         bodies.push((code, scope.nslots));
+        if timing {
+            slow.push((t0.elapsed(), b.name.clone()));
+        }
+    }
+    if timing {
+        slow.sort();
+        for (t, n) in slow.iter().rev().take(8) {
+            eprintln!("  {t:?} {n}");
+        }
     }
     Program { names, index, bodies }
 }

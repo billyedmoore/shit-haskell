@@ -71,6 +71,17 @@ pub(crate) fn mentions<'a>(e: &'a Core, out: &mut Vec<&'a str>) {
 
 /// The bindings a program needs: those reachable from its roots. The order is kept.
 pub fn reachable(binds: Vec<TopBind>, roots: &[&str]) -> Vec<TopBind> {
+    let keep = reachable_set(&binds, roots);
+    binds.into_iter().enumerate().filter(|(i, _)| keep.contains(i)).map(|(_, b)| b).collect()
+}
+
+/// The bindings reachable from `roots`, copied (the rest of the program is left alone).
+pub fn reachable_cloned(binds: &[TopBind], roots: &[&str]) -> Vec<TopBind> {
+    let keep = reachable_set(binds, roots);
+    binds.iter().enumerate().filter(|(i, _)| keep.contains(i)).map(|(_, b)| b.clone()).collect()
+}
+
+fn reachable_set(binds: &[TopBind], roots: &[&str]) -> HashSet<usize> {
     let index: HashMap<&str, usize> = binds.iter().enumerate().map(|(i, b)| (b.name.as_str(), i)).collect();
     let mut keep: HashSet<usize> = HashSet::new();
     let mut work: Vec<usize> = roots.iter().filter_map(|r| index.get(r).copied()).collect();
@@ -89,8 +100,7 @@ pub fn reachable(binds: Vec<TopBind>, roots: &[&str]) -> Vec<TopBind> {
             }
         }
     }
-    drop(index);
-    binds.into_iter().enumerate().filter(|(i, _)| keep.contains(i)).map(|(_, b)| b).collect()
+    keep
 }
 
 /// The assembly of a program's `main`, which passes the program's table to the runtime.

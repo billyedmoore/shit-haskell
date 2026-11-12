@@ -463,6 +463,40 @@ impl Driver {
     /// Runs the Template Haskell splices and quasi-quotations of a module, whose imports are
     /// loaded, and puts what they produce in their place (see `crate::th`).
     fn expand_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<(), String> {
+        self.expand_decl_splices(m, exts, path)?;
+        self.expand_expr_splices(m, exts, path)
+    }
+
+    /// The declaration splices of a module, in order: each runs with the declarations before it
+    /// compiled (under the module's own name, so that `''T` names them as they will be named),
+    /// and the declarations it produces take its place.
+    fn expand_decl_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<(), String> {
+        while let Some(i) = m.decls.iter().position(|d| matches!(d, Decl::Splice(..))) {
+            let Decl::Splice(body, loc) = m.decls[i].clone() else { unreachable!() };
+            for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.IO.Unsafe"] {
+                self.load(lib)?;
+            }
+            self.load_booted()?;
+            // The declarations before it may have expression splices of their own.
+            let mut before = Module { decls: m.decls[..i].to_vec(), ..m.clone() };
+            self.expand_expr_splices(&mut before, exts, path)?;
+            m.decls.splice(..i, before.decls.iter().cloned());
+            let smod = crate::th::decl_splice_module(m, before.decls, body, loc);
+            let mark = self.binds.len();
+            let user_module = self.checker.user_module;
+            self.compile_module(smod, exts.clone(), path)?;
+            self.checker.user_module = user_module;
+            let generated = crate::th::run_decl_splice(&self.binds, &m.name, loc)
+                .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), loc.line, loc.col))?;
+            // The module is compiled for real afterwards.
+            self.binds.truncate(mark);
+            self.ifaces.remove(&m.name);
+            m.decls.splice(i..=i, generated);
+        }
+        Ok(())
+    }
+
+    fn expand_expr_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<(), String> {
         if !(exts.is_on("TemplateHaskell") || exts.is_on("QuasiQuotes")) || !crate::th::has_splices(m) {
             return Ok(());
         }
@@ -491,7 +525,7 @@ impl Driver {
         if timing {
             eprintln!("splices compiled: {:?}", t0.elapsed());
         }
-        let results = crate::th::run_splices(self.binds.clone(), &name, splices.len(), locs)
+        let results = crate::th::run_splices(&self.binds, &name, splices.len(), locs)
             .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))?;
         crate::th::fill_splices(m, &results);
         // The splice bindings are not part of the program.

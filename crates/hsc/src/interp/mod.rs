@@ -123,7 +123,11 @@ impl Runtime {
     /// code is a constant: each binding is evaluated at most once, on first use.
     pub fn new(binds: Vec<TopBind>, prog_name: String) -> Runtime {
         let prog_has_real_base = binds.iter().any(|b| b.name.starts_with("GHC.Internal.Real."));
+        let t0 = std::time::Instant::now();
         let prog = code::compile_program(binds);
+        if std::env::var_os("HSC_TIME_SPLICES").is_some() {
+            eprintln!("interpreter code compiled in {:?}", t0.elapsed());
+        }
         let empty: Rc<Vec<Cell>> = Rc::new(Vec::new());
         let mut cells = Vec::with_capacity(prog.bodies.len());
         for (body, nslots) in prog.bodies {

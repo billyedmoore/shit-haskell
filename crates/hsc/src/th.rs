@@ -94,18 +94,27 @@ pub fn fill_splices(m: &mut Module, results: &[Expr]) {
 /// The module the splices of `m` are compiled in: `m`'s imports, and one binding per splice
 /// that runs it (`unsafePerformIO (runQ splice)`, an `Exp`).
 pub fn splice_module(m: &Module, splices: &[Splice], name: &str) -> Module {
-    let mut decls = Vec::new();
+    let exp = Type::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Exp".into() }, m.loc);
+    splice_module_at(m.imports.clone(), Vec::new(), splices, name, exp)
+}
+
+/// The module a declaration splice runs in: the module's name and imports, the declarations
+/// before the splice, and the splice (a `[Dec]`).
+pub fn decl_splice_module(m: &Module, before: Vec<Decl>, body: Expr, loc: Loc) -> Module {
+    let decs = Type::List(Box::new(Type::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Dec".into() }, loc)), loc);
+    splice_module_at(m.imports.clone(), before, &[Splice { body, loc }], &m.name, decs)
+}
+
+fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice], name: &str, result: Type) -> Module {
+    let module_loc = splices.first().map_or(Loc::default(), |s| s.loc);
+    let mut decls = before;
     for (i, s) in splices.iter().enumerate() {
         let loc = s.loc;
         let run = app(
             th_var("GHC.Internal.IO.Unsafe", "unsafePerformIO", loc),
             app(th_var("GHC.Internal.TH.Syntax", "runQ", loc), s.body.clone()),
         );
-        let typed = Expr::Sig(
-            Box::new(run),
-            Type::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Exp".into() }, loc),
-            loc,
-        );
+        let typed = Expr::Sig(Box::new(run), result.clone(), loc);
         decls.push(Decl::Fun {
             name: placeholder(i),
             clauses: vec![Clause {
@@ -117,7 +126,7 @@ pub fn splice_module(m: &Module, splices: &[Splice], name: &str) -> Module {
             loc,
         });
     }
-    Module { name: name.to_string(), exports: None, imports: m.imports.clone(), decls, loc: m.loc }
+    Module { name: name.to_string(), exports: None, imports, decls, loc: module_loc }
 }
 
 // ----- walking the expressions of a module -----------------------------------------------
@@ -278,38 +287,62 @@ pub fn has_splices(m: &Module) -> bool {
 // ----- running the splices ---------------------------------------------------------------
 
 /// Runs the splice bindings of a compiled program and converts what each produced (a Template
-/// Haskell `Exp`) to source syntax. Runs on a thread of its own with a large stack, as the
-/// interpreter needs.
-pub fn run_splices(binds: Vec<crate::core::TopBind>, module: &str, count: usize, locs: Vec<Loc>) -> Result<Vec<Expr>, String> {
-    let module = module.to_string();
+/// Haskell `Exp`) to source syntax.
+pub fn run_splices(binds: &[crate::core::TopBind], module: &str, count: usize, locs: Vec<Loc>) -> Result<Vec<Expr>, String> {
+    let names: Vec<String> = (0..count).map(|i| format!("{module}.{}", placeholder(i))).collect();
+    with_runtime(binds, names.clone(), move |rt| {
+        let mut out = Vec::with_capacity(count);
+        for (name, loc) in names.iter().zip(locs) {
+            let cell = rt.global(name).ok_or_else(|| format!("internal: splice {name} was not compiled"))?;
+            out.push(Conv { rt, loc }.exp(&cell)?);
+        }
+        Ok(out)
+    })
+}
+
+/// Runs a declaration splice (the first splice binding of `module`, a `[Dec]`) and converts the
+/// declarations it produced.
+pub fn run_decl_splice(binds: &[crate::core::TopBind], module: &str, loc: Loc) -> Result<Vec<Decl>, String> {
+    let name = format!("{module}.{}", placeholder(0));
+    with_runtime(binds, vec![name.clone()], move |rt| {
+        let cell = rt.global(&name).ok_or_else(|| format!("internal: splice {name} was not compiled"))?;
+        Conv { rt, loc }.top_decs(&cell)
+    })
+}
+
+/// Runs `f` with an interpreter of the bindings that `roots` reach, on a thread of its own with a
+/// large stack, as the interpreter needs.
+fn with_runtime<T: Send + 'static>(
+    binds: &[crate::core::TopBind],
+    roots: Vec<String>,
+    f: impl FnOnce(&Runtime) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
     // Only what the splices reach is compiled for the interpreter, with the bindings the runtime
     // itself looks up.
-    let names: Vec<String> = (0..count).map(|i| format!("{module}.{}", placeholder(i))).collect();
-    let mut roots: Vec<&str> = names.iter().map(String::as_str).collect();
-    roots.extend_from_slice(crate::native::RTS_GLOBALS);
-    roots.extend_from_slice(&["GHC.Internal.Exception.Type.displayException", "GHC.Internal.TopHandler.runMainIO"]);
-    let binds = crate::native::reachable(binds, &roots);
+    let mut all: Vec<&str> = roots.iter().map(String::as_str).collect();
+    all.extend_from_slice(crate::native::RTS_GLOBALS);
+    all.extend_from_slice(&["GHC.Internal.Exception.Type.displayException", "GHC.Internal.TopHandler.runMainIO"]);
+    let mut binds = crate::native::reachable_cloned(binds, &all);
+    // The program's own optimisations (literal patterns compare directly, known methods are
+    // called directly): without them the interpreter's code for the large tables is very slow
+    // to build.
+    crate::core::opt::inline_prim_wrappers(&mut binds);
+    crate::core::opt::specialise_literals(&mut binds);
+    crate::core::opt::resolve_known_methods(&mut binds);
     let handle = std::thread::Builder::new()
         .stack_size(4 << 30)
-        .spawn(move || -> Result<Vec<Expr>, String> {
+        .spawn(move || -> Result<T, String> {
             crate::interp::conc::set_stack_base();
             let t0 = std::time::Instant::now();
+            let n = binds.len();
             let rt = Runtime::new(binds, "hsc-splice".into());
-            if std::env::var_os("HSC_TIME_SPLICES").is_some() {
-                eprintln!("splice runtime: {:?}", t0.elapsed());
-            }
+            let t1 = t0.elapsed();
             crate::interp::conc::set_runtime(&rt);
-            let mut out = Vec::with_capacity(count);
-            for (i, loc) in locs.into_iter().enumerate().take(count) {
-                let name = format!("{module}.{}", placeholder(i));
-                let cell = rt.global(&name).ok_or_else(|| format!("internal: splice {name} was not compiled"))?;
-                let conv = Conv { rt: &rt, loc };
-                out.push(conv.exp(&cell)?);
-                if std::env::var_os("HSC_TIME_SPLICES").is_some() {
-                    eprintln!("splice {i}: {:?}", t0.elapsed());
-                }
+            let r = f(&rt);
+            if std::env::var_os("HSC_TIME_SPLICES").is_some() {
+                eprintln!("splice runtime of {n} bindings built in {t1:?}, splices ran in {:?}", t0.elapsed() - t1);
             }
-            Ok(out)
+            r
         })
         .map_err(|e| format!("cannot start the splice thread: {e}"))?;
     handle.join().map_err(|_| "a Template Haskell splice crashed".to_string())?
@@ -688,9 +721,15 @@ impl Conv<'_> {
     // ----- declarations (of `let` and `where`) -----
 
     fn decs(&self, c: &crate::interp::Cell) -> CR<Vec<Decl>> {
+        let ds = self.list(c)?;
+        self.decs_of(&ds)
+    }
+
+    /// Value declarations (`FunD`, `ValD`, `SigD`).
+    fn decs_of(&self, ds: &[crate::interp::Cell]) -> CR<Vec<Decl>> {
         let loc = self.loc;
         let mut out = Vec::new();
-        for d in self.list(c)? {
+        for d in ds {
             let (k, a) = self.con(&d)?;
             match k.as_str() {
                 "FunD" => {
@@ -714,6 +753,122 @@ impl Conv<'_> {
                 "SigD" => out.push(Decl::Sig { names: vec![self.binder(&a[0])?], ty: self.ty(&a[1])?, loc }),
                 other => return Err(format!("Template Haskell declaration {other} is not supported here yet")),
             }
+        }
+        Ok(out)
+    }
+
+    // ----- top-level declarations -----
+
+    /// The declarations a declaration splice produced (a `[Dec]`).
+    fn top_decs(&self, c: &crate::interp::Cell) -> CR<Vec<Decl>> {
+        let loc = self.loc;
+        let mut out = Vec::new();
+        for d in self.list(c)? {
+            let (k, a) = self.con(&d)?;
+            match k.as_str() {
+                "FunD" | "ValD" | "SigD" => out.extend(self.decs_of(&[d.clone()])?),
+                "DataD" | "NewtypeD" => {
+                    let newtype = k == "NewtypeD";
+                    let context = self.cxt(&a[0])?;
+                    let name = self.binder(&a[1])?;
+                    let tyvars = self.tyvar_binds(&a[2])?;
+                    let cons = if newtype { vec![self.con_decl(&a[4])?] } else { self.list(&a[4])?.iter().map(|x| self.con_decl(x)).collect::<CR<_>>()? };
+                    let deriving = self.deriv_clauses(&a[5])?;
+                    out.push(Decl::Data(DataDecl { newtype, context, name, tyvars, cons, deriving, loc }));
+                }
+                "TySynD" => out.push(Decl::TypeSyn { name: self.binder(&a[0])?, tyvars: self.tyvar_binds(&a[1])?, rhs: self.ty(&a[2])?, loc }),
+                "InstanceD" => {
+                    let overlap = match self.maybe(&a[0])? {
+                        Some(o) => Some(self.con(&o)?.0.to_uppercase()),
+                        None => None,
+                    };
+                    let decls = self.decs(&a[3])?;
+                    out.push(Decl::Instance(InstDecl { overlap, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, decls, loc }));
+                }
+                "StandaloneDerivD" => {
+                    let strategy = match self.maybe(&a[0])? {
+                        Some(s) => self.strategy(&s)?,
+                        None => None,
+                    };
+                    out.push(Decl::Deriving(StandaloneDeriving { strategy, via: None, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, loc }));
+                }
+                // Pragmas and kind signatures change nothing here.
+                "PragmaD" | "KiSigD" => {}
+                other => return Err(format!("Template Haskell declaration {other} is not supported yet")),
+            }
+        }
+        Ok(out)
+    }
+
+    fn cxt(&self, c: &crate::interp::Cell) -> CR<Vec<Type>> {
+        self.list(c)?.iter().map(|t| self.ty(t)).collect()
+    }
+
+    fn tyvar_binds(&self, c: &crate::interp::Cell) -> CR<Vec<TyVarBind>> {
+        let mut out = Vec::new();
+        for b in self.list(c)? {
+            let (bk, ba) = self.con(&b)?;
+            let name = self.binder(&ba[0])?;
+            let kind = if bk == "KindedTV" { Some(self.ty(&ba[2])?) } else { None };
+            out.push(TyVarBind { name, kind });
+        }
+        Ok(out)
+    }
+
+    fn field(&self, c: &crate::interp::Cell) -> CR<Field> {
+        // A `BangType`: `(Bang unpackedness strictness, type)`.
+        let (_, pa) = self.con(c)?;
+        let (_, bang) = self.con(&pa[0])?;
+        let strict = self.con(&bang[1])?.0 == "SourceStrict";
+        Ok(Field { ty: self.ty(&pa[1])?, strict })
+    }
+
+    fn con_decl(&self, c: &crate::interp::Cell) -> CR<ConDecl> {
+        let loc = self.loc;
+        let (k, a) = self.con(c)?;
+        let plain = |name: String, fields: ConFields, infix: bool| ConDecl { name, exist: Vec::new(), context: Vec::new(), fields, gadt_result: None, infix, loc };
+        Ok(match k.as_str() {
+            "NormalC" => plain(self.binder(&a[0])?, ConFields::Positional(self.list(&a[1])?.iter().map(|f| self.field(f)).collect::<CR<_>>()?), false),
+            "RecC" => {
+                let mut groups = Vec::new();
+                for f in self.list(&a[1])? {
+                    // `(name, bang, type)`.
+                    let (_, fa) = self.con(&f)?;
+                    let (_, bang) = self.con(&fa[1])?;
+                    let strict = self.con(&bang[1])?.0 == "SourceStrict";
+                    groups.push((vec![self.binder(&fa[0])?], Field { ty: self.ty(&fa[2])?, strict }));
+                }
+                plain(self.binder(&a[0])?, ConFields::Record(groups), false)
+            }
+            "InfixC" => plain(self.binder(&a[1])?, ConFields::Positional(vec![self.field(&a[0])?, self.field(&a[2])?]), true),
+            "ForallC" => {
+                let mut inner = self.con_decl(&a[2])?;
+                inner.exist = self.tyvar_binds(&a[0])?;
+                inner.context = self.cxt(&a[1])?;
+                inner
+            }
+            other => return Err(format!("Template Haskell constructor {other} is not supported yet")),
+        })
+    }
+
+    fn strategy(&self, c: &crate::interp::Cell) -> CR<Option<Strategy>> {
+        Ok(match self.con(c)?.0.as_str() {
+            "StockStrategy" => Some(Strategy::Stock),
+            "NewtypeStrategy" => Some(Strategy::Newtype),
+            "AnyclassStrategy" => Some(Strategy::Anyclass),
+            _ => None,
+        })
+    }
+
+    fn deriv_clauses(&self, c: &crate::interp::Cell) -> CR<Vec<Deriving>> {
+        let mut out = Vec::new();
+        for d in self.list(c)? {
+            let (_, da) = self.con(&d)?;
+            let strategy = match self.maybe(&da[0])? {
+                Some(s) => self.strategy(&s)?,
+                None => None,
+            };
+            out.push(Deriving { strategy, classes: self.cxt(&da[1])?, via: None });
         }
         Ok(out)
     }

@@ -854,6 +854,10 @@ impl<'a> Renamer<'a> {
             Decl::DefaultSig { loc, .. } => {
                 return Err(RnError { loc, msg: "A default signature outside a class".into() })
             }
+            // (The driver runs declaration splices before the module is renamed.)
+            Decl::Splice(_, loc) => {
+                return Err(RnError { loc, msg: "A declaration splice needs TemplateHaskell".into() })
+            }
             // Pattern synonyms are resolved away before declarations are renamed.
             Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } => {
                 return Err(RnError { loc, msg: "internal: pattern synonym reached the declaration pass".into() })
@@ -2199,6 +2203,7 @@ fn collect_pat_vars(p: &Pat, out: &mut Vec<(String, Loc)>) {
 fn decl_loc(d: &Decl) -> Loc {
     match d {
         Decl::PatSyn { loc, .. } | Decl::PatSynSig { loc, .. } | Decl::IPBind { loc, .. } | Decl::DefaultSig { loc, .. } => *loc,
+        Decl::Splice(_, loc) => *loc,
         Decl::Many(ds) => ds.first().map(decl_loc).unwrap_or_default(),
         Decl::Sig { loc, .. }
         | Decl::Fixity { loc, .. }

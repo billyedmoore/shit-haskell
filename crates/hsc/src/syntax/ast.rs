@@ -93,6 +93,9 @@ pub enum PatSynDir {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decl {
+    /// A Template Haskell declaration splice: `$(e)`, `$x` or a bare expression at top level,
+    /// which generates declarations.
+    Splice(Expr, Loc),
     /// A default signature in a class: `default m :: ctx => t` (DefaultSignatures).
     DefaultSig {
         names: Vec<String>,

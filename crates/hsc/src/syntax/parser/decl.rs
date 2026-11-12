@@ -54,8 +54,27 @@ impl Parser {
                 Ok(Decl::Default { types, loc })
             }
             Tok::Kw(Kw::Foreign) if self.real() => self.foreign_decl(loc),
+            _ if self.exts.is_on("TemplateHaskell") => self.splice_or_value_decl(loc),
             _ => self.value_decl(),
         }
+    }
+
+    /// A top-level item that is an expression and nothing else (`$(deriveJSON ''T)`, or
+    /// `makeLenses ''T` without the `$`) is a declaration splice; anything else a binding.
+    fn splice_or_value_decl(&mut self, loc: Loc) -> PResult<Decl> {
+        let saved = self.pos_state();
+        if let Ok(e) = self.infix_expr() {
+            let ends = self.at_semi() || self.at_vrbrace() || self.at_special('}') || *self.tok() == Tok::Eof;
+            if ends {
+                let e = match e {
+                    Expr::Splice(false, inner, _) => *inner,
+                    other => other,
+                };
+                return Ok(Decl::Splice(e, loc));
+            }
+        }
+        self.restore_pos_state(saved);
+        self.value_decl()
     }
 
     /// A declaration in a `let`, `where`, class or instance body.
