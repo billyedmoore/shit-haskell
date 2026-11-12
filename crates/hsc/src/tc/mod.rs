@@ -87,6 +87,8 @@ pub struct Checker {
     pub overloaded_strings: bool,
     /// OverloadedLists: list literals, sequences and list patterns go through `IsList`.
     pub overloaded_lists: bool,
+    /// GeneralizedNewtypeDeriving: a newtype derives most classes through its representation.
+    pub newtype_deriving: bool,
     /// Quantified constraints are kept while a signature's context is converted.
     pub allow_quantified: bool,
     /// The monads of the typed quotations being checked, innermost last (their splices share them).
@@ -153,6 +155,7 @@ impl Checker {
             sig_kind_vars: HashMap::new(),
             overloaded_strings: false,
             overloaded_lists: false,
+            newtype_deriving: false,
             allow_quantified: false,
             quote_monads: Vec::new(),
             flex_kinds: Vec::new(),
@@ -643,25 +646,40 @@ impl Checker {
     /// Ends an alternative. Constraints raised in it are solved while its givens are still
     /// in scope; the rest float outwards.
     pub fn alt_end(&mut self, mark: AltMark, body: crate::core::matcher::CBody) -> TR<crate::core::matcher::CBody> {
+        let binds = self.alt_end_binds(mark)?;
+        Ok(if binds.is_empty() { body } else { crate::core::matcher::CBody::Where(binds, Box::new(body)) })
+    }
+
+    /// Ends a scope that introduced nothing: its constraints rejoin the enclosing ones, and type
+    /// variables its pattern signatures bound stay in scope (a pattern guard's, for the body).
+    pub fn alt_merge(&mut self, mark: AltMark) {
+        let inner = std::mem::replace(&mut self.wanted, mark.outer);
+        self.wanted.extend(inner);
+    }
+
+    /// Whether the scope begun at `mark` has introduced givens or refinements so far.
+    pub fn alt_introduced(&self, mark: &AltMark) -> bool {
+        self.givens.len() > mark.givens || self.metas.skol_binds.len() != mark.skol.len()
+    }
+
+    /// Ends an alternative, answering the evidence bindings of the constraints solved in it (to
+    /// be placed where its givens are bound).
+    pub fn alt_end_binds(&mut self, mark: AltMark) -> TR<Vec<(String, Core)>> {
         let inner = std::mem::replace(&mut self.wanted, mark.outer);
         let introduced = self.givens.len() > mark.givens || self.metas.skol_binds.len() != mark.skol.len();
-        let body = if introduced {
+        let binds = if introduced {
             let (binds, residual) = self.solve(inner)?;
             self.wanted.extend(residual);
-            if binds.is_empty() {
-                body
-            } else {
-                crate::core::matcher::CBody::Where(binds, Box::new(body))
-            }
+            binds
         } else {
             self.wanted.extend(inner);
-            body
+            Vec::new()
         };
         self.givens.truncate(mark.givens);
         self.metas.skol_binds = mark.skol;
         // Type variables that a pattern signature bound are in scope in its alternative only.
         self.scoped.truncate(mark.scoped);
-        Ok(body)
+        Ok(binds)
     }
 }
 

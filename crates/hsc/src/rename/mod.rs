@@ -95,11 +95,12 @@ pub struct Renamer<'a> {
 
 /// Renames a module against the interfaces of its imports.
 pub fn rename_module(
-    m: Module,
+    mut m: Module,
     ifaces: &BTreeMap<String, Iface>,
     implicit_prelude: bool,
     boot: bool,
 ) -> RR<(Module, Iface)> {
+    name_duplicate_fields(&mut m.decls);
     // Global names are unique, so the fixities of every loaded module can be merged. This
     // matters for re-exports: `Prelude` exports operators whose fixities `Base` declares.
     let mut fixities = HashMap::new();
@@ -545,6 +546,27 @@ impl<'a> Renamer<'a> {
         }
     }
 
+    /// A field of a record construction or pattern: an unqualified name the constructor has is
+    /// its field, in scope or not (DisambiguateRecordFields; `M.C { f = x }` with `M` qualified).
+    fn con_field_ref(&mut self, con: &Entity, f: &QName, loc: Loc) -> RR<QName> {
+        // A qualified name (`M.f`, a duplicate field of the module `M` names) is the
+        // constructor's field when that is in scope under the qualifier.
+        if let Some(x) = con.fields.iter().find(|x| iface::field_label(x) == f.name) {
+            let global = QName { qual: Some(con.global.module.clone()), name: x.clone() };
+            let visible = match &f.qual {
+                None => true,
+                Some(m) => self
+                    .qvals
+                    .get(&(m.clone(), f.name.clone()))
+                    .is_some_and(|es| es.iter().any(|e| e.global.module == con.global.module && e.global.name == *x)),
+            };
+            if visible {
+                return Ok(global);
+            }
+        }
+        self.field_ref(f, loc)
+    }
+
     fn lookup_global(&self, q: &QName, ns: Ns) -> Result<Entity, Vec<Entity>> {
         let list = match (&q.qual, ns) {
             (None, Ns::Value) => self.vals.get(&q.name),
@@ -702,6 +724,40 @@ impl<'a> Renamer<'a> {
     }
 
     /// The definition of the pattern synonym a resolved constructor name refers to, if any.
+    /// A record update whose fields all belong to one bidirectional record pattern synonym, as
+    /// `case e of P x1 .. xn -> P x1' .. xn'` (the updated fields replaced).
+    fn patsyn_update(&mut self, e: &Expr, fields: &[(QName, Option<Expr>)], loc: Loc) -> RR<Option<Expr>> {
+        let mut globals = Vec::with_capacity(fields.len());
+        for (f, _) in fields {
+            match self.field_ref(f, loc) {
+                Ok(q) => globals.push(q),
+                Err(_) => return Ok(None),
+            }
+        }
+        let owner = self.patsyns.iter().find(|(g, def)| {
+            def.builder
+                && globals.iter().all(|q| q.qual.as_deref() == Some(g.module.as_str()) && def.names.iter().any(|n| *n == q.name))
+        });
+        let Some((g, def)) = owner.map(|(g, d)| (g.clone(), d.clone())) else { return Ok(None) };
+        let vars: Vec<String> = def.names.iter().map(|n| self.fresh(n)).collect();
+        let pats: Vec<Pat> = vars.iter().map(|v| Pat::Var(v.clone(), loc)).collect();
+        let pat = subst_pat(&def.pat, &def.params, &pats);
+        let mut body = Expr::Var(QName { qual: Some(g.module.clone()), name: builder_name(&g.name) }, loc);
+        for (i, name) in def.names.iter().enumerate() {
+            let arg = match fields.iter().zip(&globals).find(|(_, q)| q.name == *name) {
+                Some(((f, Some(v)), _)) => {
+                    let _ = f;
+                    self.expr(v.clone())?
+                }
+                Some(((f, None), _)) => self.expr(Expr::Var(QName::unqual(f.name.clone()), loc))?,
+                None => Expr::Var(QName::unqual(vars[i].clone()), loc),
+            };
+            body = Expr::App(Box::new(body), Box::new(arg));
+        }
+        let alt = Alt { pat, rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() }, loc };
+        Ok(Some(Expr::Case(Box::new(e.clone()), vec![alt], loc)))
+    }
+
     fn patsyn_of(&self, q: &QName) -> Option<PatSynDef> {
         let module = q.qual.clone()?;
         self.patsyns.get(&GName::new(module, q.name.clone())).cloned()
@@ -735,6 +791,7 @@ impl<'a> Renamer<'a> {
         self.locals.truncate(depth);
         let def = PatSynDef {
             params,
+            names: args.to_vec(),
             pat: renamed,
             builder: !matches!(dir, PatSynDir::Unidirectional),
             arg_types: Vec::new(),
@@ -1012,16 +1069,27 @@ impl<'a> Renamer<'a> {
 
     fn class_methods(&self, g: &QName) -> Option<Vec<String>> {
         let module = g.qual.as_deref()?;
-        let class = if module == self.module {
-            self.own.iter().find(|e| e.kind == EntKind::Class && e.occ() == g.name)
-        } else {
-            self.ifaces.values().find_map(|i| {
-                i.exports
-                    .iter()
-                    .find(|e| e.kind == EntKind::Class && e.global.module == module && e.occ() == g.name)
-            })
-        }?;
-        Some(class.subs.iter().filter(|s| s.kind.is_value()).map(|s| s.occ().to_string()).collect())
+        if module == self.module {
+            let class = self.own.iter().find(|e| e.kind == EntKind::Class && e.occ() == g.name)?;
+            return Some(class.subs.iter().filter(|s| s.kind.is_value()).map(|s| s.occ().to_string()).collect());
+        }
+        // The methods any module exports the class with: a re-export of the bare class
+        // (`module P (C)`) does not hide the methods another import brings.
+        let mut found = false;
+        let mut out: Vec<String> = Vec::new();
+        for i in self.ifaces.values() {
+            for e in &i.exports {
+                if e.kind == EntKind::Class && e.global.module == module && e.occ() == g.name {
+                    found = true;
+                    for s in e.subs.iter().filter(|s| s.kind.is_value()) {
+                        if !out.iter().any(|o| o == s.occ()) {
+                            out.push(s.occ().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        found.then_some(out)
     }
 
     fn tyvar_binds(&mut self, binds: Vec<TyVarBind>) -> RR<Vec<TyVarBind>> {
@@ -1429,7 +1497,7 @@ impl<'a> Renamer<'a> {
                 let mut given: HashSet<String> = HashSet::new();
                 for (f, v) in fields {
                     given.insert(f.name.clone());
-                    let fq = self.field_ref(&f, loc)?;
+                    let fq = self.con_field_ref(&entity, &f, loc)?;
                     let v = match v {
                         Some(x) => Some(self.expr(x)?),
                         None => Some(self.expr(Expr::Var(QName::unqual(f.name.clone()), loc))?),
@@ -1438,9 +1506,10 @@ impl<'a> Renamer<'a> {
                 }
                 if dotdot {
                     for f in &entity.fields {
-                        if !given.contains(f) {
-                            let fq = self.field_ref(&QName::unqual(f.clone()), loc)?;
-                            let v = self.expr(Expr::Var(QName::unqual(f.clone()), loc))?;
+                        let label = iface::field_label(f).to_string();
+                        if !given.contains(&label) {
+                            let fq = QName { qual: Some(entity.global.module.clone()), name: f.clone() };
+                            let v = self.expr(Expr::Var(QName::unqual(label), loc))?;
                             out.push((fq, Some(v)));
                         }
                     }
@@ -1454,6 +1523,11 @@ impl<'a> Renamer<'a> {
             }
             Expr::RecUpd(e, fields, loc) => {
                 let e = self.expr(*e)?;
+                // An update of a record pattern synonym's fields (`lbi { installedPkgs = i }`
+                // with `pattern LocalBuildInfo {..}`): a match on the synonym and its builder.
+                if let Some(upd) = self.patsyn_update(&e, &fields, loc)? {
+                    return Ok(upd);
+                }
                 let mut out = Vec::with_capacity(fields.len());
                 for (f, v) in fields {
                     // A field name in an update is the field itself, even where a local variable of
@@ -1598,13 +1672,36 @@ impl<'a> Renamer<'a> {
                 dotdot,
                 loc,
             } => {
-                let entity = self.lookup_entity(&con, loc)?;
+                // `P{}` or `P{f = p}` on a pattern synonym: its prefix form, the named parameters
+                // given and the others wildcards.
                 let cq = self.value_ref(&con, loc, true)?;
+                if let Some(def) = self.patsyn_of(&cq) {
+                    let mut args: Vec<Pat> = def.params.iter().map(|_| Pat::Wild(loc)).collect();
+                    for (f, p) in fields {
+                        let i = def.names.iter().position(|x| *x == f.name).ok_or_else(|| RnError {
+                            loc,
+                            msg: format!("Pattern synonym ‘{}’ does not have field ‘{}’", cq.name, f.name),
+                        })?;
+                        args[i] = match p {
+                            Some(p) => p,
+                            None => Pat::Var(f.name.clone(), loc),
+                        };
+                    }
+                    if dotdot {
+                        for (i, x) in def.names.iter().enumerate() {
+                            if matches!(args[i], Pat::Wild(_)) {
+                                args[i] = Pat::Var(x.clone(), loc);
+                            }
+                        }
+                    }
+                    return self.pat(Pat::Con(con, args, loc), mode);
+                }
+                let entity = self.lookup_entity(&con, loc)?;
                 let mut out = Vec::new();
                 let mut given: HashSet<String> = HashSet::new();
                 for (f, p) in fields {
                     given.insert(f.name.clone());
-                    let fq = self.field_ref(&f, loc)?;
+                    let fq = self.con_field_ref(&entity, &f, loc)?;
                     let p = match p {
                         Some(p) => Some(self.pat(p, mode)?),
                         None => Some(Pat::Var(self.bind(&f.name, loc, mode)?, loc)),
@@ -1613,9 +1710,10 @@ impl<'a> Renamer<'a> {
                 }
                 if dotdot {
                     for f in &entity.fields {
-                        if !given.contains(f) {
-                            let fq = self.field_ref(&QName::unqual(f.clone()), loc)?;
-                            let v = Pat::Var(self.bind(f, loc, mode)?, loc);
+                        let label = iface::field_label(f).to_string();
+                        if !given.contains(&label) {
+                            let fq = QName { qual: Some(entity.global.module.clone()), name: f.clone() };
+                            let v = Pat::Var(self.bind(&label, loc, mode)?, loc);
                             out.push((fq, Some(v)));
                         }
                     }
@@ -1881,6 +1979,62 @@ fn check_arities(name: &str, clauses: &[Clause], loc: Loc) -> RR<()> {
     }
     let _ = loc;
     Ok(())
+}
+
+/// DuplicateRecordFields: a field name that several data types of the module declare is
+/// given an internal name per type (`f%T`), which programs still refer to as `f` (see
+/// `field_label`): through its constructor in record syntax, or as a selector where only one
+/// is in scope.
+fn name_duplicate_fields(decls: &mut [Decl]) {
+    fn record_fields(dd: &DataDecl) -> HashSet<String> {
+        dd.cons
+            .iter()
+            .flat_map(|c| match &c.fields {
+                ConFields::Record(groups) => groups.iter().flat_map(|(ns, _)| ns.iter().cloned()).collect::<Vec<_>>(),
+                ConFields::Positional(_) => Vec::new(),
+            })
+            .collect()
+    }
+    fn count(decls: &[Decl], out: &mut HashMap<String, usize>) {
+        for d in decls {
+            match d {
+                Decl::Data(dd) => {
+                    for f in record_fields(dd) {
+                        *out.entry(f).or_default() += 1;
+                    }
+                }
+                Decl::Many(ds) => count(ds, out),
+                _ => {}
+            }
+        }
+    }
+    fn rename(decls: &mut [Decl], dup: &HashMap<String, usize>) {
+        for d in decls {
+            match d {
+                Decl::Data(dd) => {
+                    let ty = dd.name.clone();
+                    for c in &mut dd.cons {
+                        if let ConFields::Record(groups) = &mut c.fields {
+                            for (ns, _) in groups.iter_mut() {
+                                for n in ns.iter_mut() {
+                                    if dup.get(n.as_str()).is_some_and(|&k| k > 1) {
+                                        *n = format!("{n}%{ty}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Decl::Many(ds) => rename(ds, dup),
+                _ => {}
+            }
+        }
+    }
+    let mut counts = HashMap::new();
+    count(decls, &mut counts);
+    if counts.values().any(|&n| n > 1) {
+        rename(decls, &counts);
+    }
 }
 
 /// Builds a top-level entity.
@@ -2163,7 +2317,20 @@ fn pat_to_expr(p: &Pat) -> Option<Expr> {
                 .collect::<Option<_>>()?,
             *loc,
         ),
-        Pat::Wild(_) | Pat::Rec { .. } | Pat::As(..) | Pat::View(..) => return None,
+        // A record pattern is a record construction (a pun stays a pun).
+        Pat::Rec { con, fields, dotdot, loc } => Expr::RecCon {
+            con: con.clone(),
+            fields: fields
+                .iter()
+                .map(|(f, p)| match p {
+                    Some(p) => pat_to_expr(p).map(|e| (f.clone(), Some(e))),
+                    None => Some((f.clone(), None)),
+                })
+                .collect::<Option<_>>()?,
+            dotdot: *dotdot,
+            loc: *loc,
+        },
+        Pat::Wild(_) | Pat::As(..) | Pat::View(..) => return None,
     })
 }
 

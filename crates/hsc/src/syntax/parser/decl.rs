@@ -93,6 +93,13 @@ impl Parser {
             }
             self.expect_res(ROp::DColon)?;
             let ty = self.sigtype()?;
+            // `x :: t = e`: a pattern binding of a variable with a signature pattern.
+            if names.len() == 1 && self.at_res(ROp::Eq) {
+                let name = names.pop().expect("one name");
+                let rhs = self.rhs(ROp::Eq)?;
+                let pat = Pat::Sig(Box::new(Pat::Var(name, loc)), ty, loc);
+                return Ok(Decl::PatBind { pat, rhs, loc });
+            }
             return Ok(Decl::Sig { names, ty, loc });
         }
         let lhs = self.infix_expr()?;
@@ -857,18 +864,34 @@ impl Parser {
             }
         }
         self.expect_res(ROp::DColon)?;
-        // GADT record syntax: `C :: [forall vs.] { f :: t, .. } -> result`.
+        // GADT record syntax: `C :: [forall vs.] [ctx =>] { f :: t, .. } -> result`.
         let mut record_exist = Vec::new();
-        if self.at_varid("forall") {
+        let mut record_context = Vec::new();
+        if self.at_varid("forall") || !self.at_special('{') {
             let saved = self.pos_state();
-            self.bump();
             let mut vars = Vec::new();
-            while !self.at_varsym(".") && self.real() {
-                vars.push(self.tyvar_binder()?);
-            }
-            if self.at_varsym(".") && self.peek_raw(1) == &Tok::Special('{') {
+            let mut ok = true;
+            if self.at_varid("forall") {
                 self.bump();
+                while !self.at_varsym(".") && self.real() {
+                    match self.tyvar_binder() {
+                        Ok(v) => vars.push(v),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && self.at_varsym(".") {
+                    self.bump();
+                } else {
+                    ok = false;
+                }
+            }
+            let ctx = if ok && !self.at_special('{') { self.try_context() } else { Vec::new() };
+            if ok && self.at_special('{') {
                 record_exist = vars;
+                record_context = ctx;
             } else {
                 self.restore_pos_state(saved);
             }
@@ -911,7 +934,7 @@ impl Parser {
                 .map(|name| ConDecl {
                     name,
                     exist: record_exist.clone(),
-                    context: Vec::new(),
+                    context: record_context.clone(),
                     fields: ConFields::Record(groups.clone()),
                     gadt_result: Some(result.clone()),
                     infix: false,

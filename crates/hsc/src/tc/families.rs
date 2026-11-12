@@ -23,6 +23,10 @@ pub(super) fn match_pat(pat: &Ty, t: &Ty, sub: &mut Vec<Option<Ty>>) -> Match {
                 Some(prev) => {
                     if prev == t {
                         Match::Yes
+                    } else if is_rigid_ground(prev) && is_rigid_ground(t) {
+                        // A repeated variable bound to two different types without variables
+                        // (`a == a` at 'User and 'System): the equation does not match.
+                        Match::No
                     } else {
                         Match::Stuck
                     }
@@ -54,6 +58,31 @@ pub(super) fn match_pat(pat: &Ty, t: &Ty, sub: &mut Vec<Option<Ty>>) -> Match {
             }
         }
         _ => Match::No,
+    }
+}
+
+/// A family equation's pattern with each wildcard `_` replaced by a variable of its own.
+fn name_wildcards(t: &Type, n: &mut usize) -> Type {
+    match t {
+        Type::Wild(l) => {
+            *n += 1;
+            Type::Var(format!("_wild{n}"), *l)
+        }
+        Type::App(f, a) => Type::App(Box::new(name_wildcards(f, n)), Box::new(name_wildcards(a, n))),
+        Type::Fun(f, a) => Type::Fun(Box::new(name_wildcards(f, n)), Box::new(name_wildcards(a, n))),
+        Type::List(e, l) => Type::List(Box::new(name_wildcards(e, n)), *l),
+        Type::Tuple(ts, l) => Type::Tuple(ts.iter().map(|x| name_wildcards(x, n)).collect(), *l),
+        Type::Sig(x, k) => Type::Sig(Box::new(name_wildcards(x, n)), k.clone()),
+        other => other.clone(),
+    }
+}
+
+/// A type with no unification or rigid variables: two different ones never become equal.
+fn is_rigid_ground(t: &Ty) -> bool {
+    match t {
+        Ty::Con(_) => true,
+        Ty::App(f, a) => is_rigid_ground(f) && is_rigid_ground(a),
+        _ => false,
     }
 }
 
@@ -283,6 +312,9 @@ impl Checker {
                     Match::Stuck => result = Match::Stuck,
                 }
             }
+            if std::env::var_os("HSC_DEBUG_FAM").is_some() {
+                eprintln!("family {name}: {pats:?} against {args:?}: {result:?}");
+            }
             match result {
                 Match::Yes => {
                     if std::env::var_os("HSC_DEBUG_FAM").is_some() && sub.iter().any(|x| x.is_none()) {
@@ -408,7 +440,10 @@ impl Checker {
         let mut tvs = Vec::new();
         let mut pats = Vec::with_capacity(args.len());
         let mut kinds = Vec::with_capacity(args.len());
-        for a in args {
+        // A wildcard in a pattern (`_ == _ = 'False`) is a variable of its own.
+        let mut wild = 0usize;
+        let args: Vec<Type> = args.iter().map(|a| name_wildcards(a, &mut wild)).collect();
+        for a in &args {
             pats.push(self.convert_type(a, &mut tvs)?);
             kinds.push(match a {
                 Type::Sig(_, k) => match k.as_ref() {
@@ -418,7 +453,22 @@ impl Checker {
                 _ => None,
             });
         }
-        let rhs_ty = self.convert_type(rhs, &mut tvs)?;
+        let mut rhs_ty = self.convert_type(rhs, &mut tvs)?;
+        // An instance with more arguments than the family's parameters (`data family F a :: Type
+        // -> Type` with `data instance F X b = ..`): the extra variables are eta-reduced away, as
+        // GHC does, so that `F X` reduces on its own (`F X b = R b` becomes `F X = R`).
+        let arity = self.env.families.get(name).map_or(pats.len(), |f| f.arity);
+        while pats.len() > arity {
+            let Some(Ty::Gen(i)) = pats.last().cloned() else { break };
+            let Ty::App(f, a) = rhs_ty.clone() else { break };
+            let mentions = |t: &Ty| mentions_gen(t, i);
+            if *a != Ty::Gen(i) || mentions(&f) || pats[..pats.len() - 1].iter().any(|p| mentions(p)) {
+                break;
+            }
+            pats.pop();
+            kinds.pop();
+            rhs_ty = *f;
+        }
         let eqn = FamEqn {
             nvars: tvs.len() as u32,
             args: pats,
@@ -429,6 +479,18 @@ impl Checker {
             info.equations.push(eqn);
         }
         Ok(())
+    }
+}
+
+/// Whether a type mentions the quantified variable `Gen(i)`.
+fn mentions_gen(t: &Ty, i: u32) -> bool {
+    match t {
+        Ty::Gen(j) => *j == i,
+        Ty::App(f, a) => mentions_gen(f, i) || mentions_gen(a, i),
+        Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => {
+            ps.iter().any(|p| p.args.iter().any(|a| mentions_gen(a, i))) || mentions_gen(b, i)
+        }
+        _ => false,
     }
 }
 

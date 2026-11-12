@@ -210,8 +210,12 @@ impl Checker {
         }
 
         let wanteds = std::mem::replace(&mut self.wanted, outer_wanted);
+        // Solved at the group's own level: types the solver makes (a functional dependency's
+        // improvement) belong to the group and can be generalised (Cabal's `tmpDir = targetDir
+        // </> makeRelativePathEx ..`).
+        let solved = self.solve(wanteds);
         self.level = outer_level;
-        let (ev_binds, residual) = self.solve(wanteds)?;
+        let (ev_binds, residual) = solved?;
 
         let restricted = items.iter().any(|it| match &it.kind {
             Kind::Pat { .. } => true,
@@ -239,6 +243,9 @@ impl Checker {
                 self.metas.free_metas(a, &mut ms);
             }
             if restricted {
+                if std::env::var_os("HSC_DEBUG_MR").is_some() {
+                    eprintln!("monomorphism restriction keeps {} for {:?}", self.show_pred(&p), items.iter().map(|i| i.keys.clone()).collect::<Vec<_>>());
+                }
                 // The monomorphism restriction: constrained variables are not generalised.
                 for m in &ms {
                     self.metas.levels[*m as usize] = outer_level;

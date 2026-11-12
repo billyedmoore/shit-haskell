@@ -478,6 +478,7 @@ impl Driver {
         let boot = self.checker.boot;
         self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
         self.checker.overloaded_lists = exts.is_on("OverloadedLists");
+        self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot)
             .map_err(|e| located(e.loc, &e.msg))?;
         let binds = self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;

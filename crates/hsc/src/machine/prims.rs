@@ -170,7 +170,7 @@ pub fn string_list(m: &mut Machine, text: &str) -> Word {
     let nil = con_value(m, "Builtin.[]", 0, &[]);
     let mut list = nil;
     for c in chars.iter().rev() {
-        let ch = char_value(m, *c);
+        let ch = char_code_value(m, crate::syntax::lexer::char_code(*c));
         list = con_value(m, "Builtin.:", 2, &[ch, list]);
     }
     list

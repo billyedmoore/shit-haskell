@@ -113,9 +113,13 @@ fn fun(name: &str, clauses: Vec<Clause>, loc: Loc) -> Decl {
 }
 
 /// Field names of a constructor (empty for positional constructors).
+/// The field labels of a record constructor, as the source names them.
 fn field_names(c: &ConDecl) -> Vec<String> {
     match &c.fields {
-        ConFields::Record(groups) => groups.iter().flat_map(|(ns, _)| ns.iter().cloned()).collect(),
+        ConFields::Record(groups) => groups
+            .iter()
+            .flat_map(|(ns, _)| ns.iter().map(|n| crate::rename::iface::field_label(n).to_string()))
+            .collect(),
         ConFields::Positional(_) => Vec::new(),
     }
 }
@@ -152,7 +156,7 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
             let name = class_qname.name.clone();
             // Newtype deriving is handled by the dictionary alias in the checker.
             // Generic, Data and Lift are derived the stock way for newtypes too.
-            let stock_for_newtype = is_stock(&name) || matches!(name.as_str(), "Generic" | "Generic1" | "Data" | "Lift");
+            let stock_for_newtype = stock_for_newtype(checker.newtype_deriving, &name, dd);
             // Newtype and via deriving: the instance is another type's dictionary (registered by
             // the checker), with no code.
             if d.via.is_some() || d.strategy == Some(Strategy::Newtype) || (dd.newtype && !stock_for_newtype && d.strategy.is_none()) {
@@ -190,6 +194,37 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
 
 /// Marks generated instances, so that a missing class is not an error for them.
 pub const DERIVED_MARK: &str = "derived";
+
+/// Whether a newtype derives a class the stock way when no strategy is given. With
+/// GeneralizedNewtypeDeriving, GHC derives every class through the representation except those
+/// whose stock instance differs (Read, Show) or cannot be coerced (Traversable), and the
+/// generic-programming classes.
+pub fn stock_for_newtype(newtype_deriving: bool, name: &str, dd: &DataDecl) -> bool {
+    if matches!(name, "Generic" | "Generic1" | "Data" | "Lift") {
+        return true;
+    }
+    if newtype_deriving {
+        // A constructor class needs the representation to end in the last parameter (`g p`); a
+        // newtype of the parameter itself (`Par1 p = Par1 p`) is derived the stock way.
+        matches!(name, "Read" | "Show" | "Traversable") || (is_stock(name) && !eta_reducible(dd, name))
+    } else {
+        is_stock(name)
+    }
+}
+
+/// Whether a newtype's representation can stand for it at a constructor class: its field is
+/// `g p` with `p` the last parameter, which `g` does not mention. Other classes always can.
+fn eta_reducible(dd: &DataDecl, name: &str) -> bool {
+    if !matches!(name, "Functor" | "Foldable" | "Traversable") {
+        return true;
+    }
+    let Some(last) = dd.tyvars.last() else { return false };
+    let field = dd.cons.first().and_then(|c| field_types(c).into_iter().next());
+    match field {
+        Some(Type::App(g, a)) => matches!(a.as_ref(), Type::Var(v, _) if *v == last.name) && !mentions(&g, &last.name),
+        _ => false,
+    }
+}
 
 /// Classes with a stock derivation.
 pub fn is_stock(name: &str) -> bool {

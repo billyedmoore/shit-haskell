@@ -674,8 +674,13 @@ impl Parser {
             // ViewPatterns: `(f -> p)`, converted to a pattern by `expr_to_pat`.
             self.bump();
             let pat = self.expr()?;
+            let view = Expr::ViewPat(Box::new(first), Box::new(pat), loc);
+            // The first element of a tuple pattern: `(f -> p, g -> q)`.
+            if self.at_special(',') {
+                return self.tuple_rest(vec![Some(view)], loc);
+            }
             self.expect_special(')')?;
-            return Ok(Expr::ViewPat(Box::new(first), Box::new(pat), loc));
+            return Ok(view);
         }
         self.expect_special(')')?;
         Ok(first)

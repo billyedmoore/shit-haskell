@@ -56,9 +56,20 @@ pub struct Entity {
 }
 
 impl Entity {
+    /// The name a program refers to the entity by (a duplicate record field's internal name
+    /// `f%T` is referred to as `f`).
     pub fn occ(&self) -> &str {
+        if self.kind == EntKind::Field {
+            return field_label(&self.global.name);
+        }
         &self.global.name
     }
+}
+
+/// The source name of a record field: a field several types of a module declare
+/// (DuplicateRecordFields) is named `f%T` internally.
+pub fn field_label(name: &str) -> &str {
+    name.split('%').next().unwrap_or(name)
 }
 
 /// A pattern synonym after renaming: its argument variables (as bound in `pat`) and its
@@ -67,6 +78,8 @@ impl Entity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PatSynDef {
     pub params: Vec<String>,
+    /// The parameters as the source names them (a record synonym's field names).
+    pub names: Vec<String>,
     pub pat: crate::syntax::ast::Pat,
     pub builder: bool,
     /// The argument types of the synonym's signature that mention no type variable (renamed): the

@@ -508,7 +508,7 @@ impl Gen {
         };
         let lbl = match l {
             SLit::Int(i) => stat(self, INT, *i as u64),
-            SLit::Char(c) => stat(self, CHAR, *c as u64),
+            SLit::Char(c) => stat(self, CHAR, crate::syntax::lexer::char_code(*c) as u64),
             SLit::Double(d) => stat(self, DOUBLE, d.to_bits()),
             other => {
                 // Strings, big integers, fractions and addresses: the runtime builds the object (the
@@ -644,7 +644,7 @@ impl Gen {
 fn lit_text(l: &Lit) -> (u64, String) {
     match l {
         Lit::Int(i) => (0, i.to_string()),
-        Lit::Char(c) => (1, (*c as u32).to_string()),
+        Lit::Char(c) => (1, crate::syntax::lexer::char_code(*c).to_string()),
         Lit::Integer(s) => (2, s.clone()),
         Lit::Double(d) => (3, d.to_bits().to_string()),
         Lit::Frac(s) => (4, s.clone()),

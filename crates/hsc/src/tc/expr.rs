@@ -55,6 +55,23 @@ impl Checker {
                 );
                 Ok(self.bind_scrutinee(&ts, s, cs, matched))
             }
+            // `\case` against a function type: its argument and result types reach the
+            // alternatives (a GADT or data-family pattern needs them).
+            Expr::LamCase(alts, loc) if self.metas.zonk(ty).as_fun().is_some() => {
+                self.loc = *loc;
+                let zt = self.metas.zonk(ty);
+                let (a, r) = zt.as_fun().map(|(a, r)| (a.clone(), r.clone())).expect("a function type");
+                let x = self.fresh_name("lc");
+                let rows = self.alt_rows(alts, &a, &r)?;
+                let mut fresh = |b: &str| self.fresh_name(b);
+                let matched = compile_rows(
+                    std::slice::from_ref(&x),
+                    &rows,
+                    Core::Fail("Non-exhaustive patterns in \\case".into()),
+                    &mut fresh,
+                );
+                Ok(Core::Lam(x, Box::new(matched)))
+            }
             Expr::Let(decls, body, loc) if !decls.iter().any(|d| matches!(d, Decl::IPBind { .. })) => {
                 self.loc = *loc;
                 let binds = self.infer_local(decls)?;
@@ -1090,7 +1107,13 @@ impl Checker {
         // are reduced first, so that a reducible family application refines like its value.
         let cur_n = self.normalize(&cur);
         let ty_n = self.normalize(ty);
-        match self.metas.unify_refine(&cur_n, &ty_n) {
+        let refinements = self.metas.skol_binds.len();
+        let refined = self.metas.unify_refine(&cur_n, &ty_n);
+        // A refinement can make a family given reduce to more equalities.
+        if self.metas.skol_binds.len() != refinements {
+            self.refine_family_givens();
+        }
+        match refined {
             Ok(()) => {}
             Err(_) => {
                 let (r, t) = (self.show(&cur), self.show(ty));
@@ -1244,10 +1267,32 @@ impl Checker {
         let mut out = Vec::with_capacity(alts.len());
         for (conds, e) in alts {
             let mut gs = Vec::with_capacity(conds.len());
+            // A pattern guard whose pattern gives constraints (`| Dict <- d`) scopes them over
+            // the guards after it and the body: their evidence is bound right after it.
+            let mut scopes: Vec<(super::AltMark, usize)> = Vec::new();
             for s in conds {
+                if let Stmt::Bind { pat, expr, loc } = s {
+                    self.loc = *loc;
+                    let (ce, te) = self.infer(expr)?;
+                    let mark = self.alt_begin();
+                    let cp = self.check_pat(pat, &te)?;
+                    gs.push(CGuard::Pat(cp, ce));
+                    if self.alt_introduced(&mark) {
+                        scopes.push((mark, gs.len()));
+                    } else {
+                        self.alt_merge(mark);
+                    }
+                    continue;
+                }
                 gs.push(self.guard(s)?);
             }
             let c = self.check(e, ty)?;
+            while let Some((mark, pos)) = scopes.pop() {
+                let binds = self.alt_end_binds(mark)?;
+                if !binds.is_empty() {
+                    gs.insert(pos, CGuard::Let(binds));
+                }
+            }
             out.push((gs, c));
         }
         Ok(out)

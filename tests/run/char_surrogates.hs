@@ -21,3 +21,8 @@ main = do
   print decoded
   back <- GHC.withCStringLen enc decoded $ \(p, n) -> peekArray n (castPtr p) :: IO [Word8]
   print (back, back == bytes)
+  -- Surrogates written as literals (Cabal-syntax's `c <= '\xDFFF'`).
+  let lits = ['\xD800', '\xDFFF', '\55296', '\o154000']
+  print (lits, map ord lits, "a\xDC80z", length "a\xDC80z")
+  print (map (\c -> c <= '\xDFFF' && c >= '\xD800') ['\xD7FF', '\xD800', '\xDBFF', '\xE000'])
+  print (case chr 0xDC00 of { '\xDC00' -> "matched"; _ -> "no" })

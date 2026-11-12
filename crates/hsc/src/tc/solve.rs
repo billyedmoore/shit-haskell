@@ -134,15 +134,16 @@ impl Checker {
             Ty::Con(c) if c.starts_with('#') && args.is_empty() => {
                 let text = &c[1..];
                 let sort = if text.starts_with('"') { 1 } else if text.starts_with('\'') { 2 } else { 0 };
-                let (s, _) = self.infer(&crate::syntax::ast::Expr::Lit(crate::syntax::ast::Lit::Str(text.to_string()), loc))?;
+                let s = Core::Lit(crate::core::Lit::Str(text.to_string()));
                 let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTypeableLit#".into());
                 Core::App(Box::new(Core::App(Box::new(mk), Box::new(Core::Lit(crate::core::Lit::Int(sort))))), Box::new(s))
             }
             // A constructor applied to arguments: its representation applied to theirs.
             Ty::Con(c) => {
                 let (modl, name, arity) = self.typeable_tycon(c);
-                let (m, _) = self.infer(&crate::syntax::ast::Expr::Lit(crate::syntax::ast::Lit::Str(modl), loc))?;
-                let (n, _) = self.infer(&crate::syntax::ast::Expr::Lit(crate::syntax::ast::Lit::Str(name), loc))?;
+                // Plain String literals: the module may have OverloadedStrings on.
+                let m = Core::Lit(crate::core::Lit::Str(modl));
+                let n = Core::Lit(crate::core::Lit::Str(name));
                 let k = Core::Lit(crate::core::Lit::Int(arity.max(args.len()) as i64));
                 let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTypeableCon#".into());
                 let mut rep = Core::App(Box::new(Core::App(Box::new(Core::App(Box::new(mk), Box::new(m))), Box::new(n))), Box::new(k));
@@ -255,12 +256,54 @@ impl Checker {
 
     /// Adds a given constraint. An equality given `a ~ b` refines the rigid variables it
     /// mentions, for the rest of the enclosing scope.
-    pub fn add_given(&mut self, g: Given) {
+    pub fn add_given(&mut self, mut g: Given) {
+        // A constraint variable known to be a class (`c b` in an instance for `c := ParsecPretty`)
+        // is given as that class, so that its superclasses are given too.
+        if g.pred.class == super::convert::CONSTRAINT_VAR {
+            g.pred = self.metas_zonk_pred(&g.pred);
+            // A tuple of constraints (`Dict (Show a, Eq a)` matched) gives each of them: its
+            // evidence is the tuple of their dictionaries.
+            if let Some(parts) = constraint_tuple_parts(&g.pred) {
+                let n = parts.len();
+                for (i, part) in parts.into_iter().enumerate() {
+                    let ev = super::select_field(g.ev.clone(), &Ty::tuple_con(n), n, i, &mut || self.fresh_name("ct"));
+                    self.add_given(Given { pred: part, ev });
+                }
+                return;
+            }
+        }
         if is_eq_class(&g.pred.class) && g.pred.args.len() == 2 {
             let (a, b) = (g.pred.args[0].clone(), g.pred.args[1].clone());
             let _ = self.metas.unify_refine(&a, &b);
         }
+        let family = self.env.families.contains_key(&g.pred.class);
         self.givens.push(g);
+        if family {
+            self.refine_family_givens();
+        }
+    }
+
+    /// Constraint-family givens that now reduce (`If (s == System) (a ~ B, ..) ()` once a GADT
+    /// match has refined `s`): the equalities they reduce to refine the types in scope.
+    pub fn refine_family_givens(&mut self) {
+        let fam_givens: Vec<Pred> = self
+            .givens
+            .iter()
+            .filter(|g| self.env.families.contains_key(&g.pred.class))
+            .map(|g| g.pred.clone())
+            .collect();
+        for p in fam_givens {
+            let applied = Ty::apps(Ty::con(&p.class), p.args.iter().map(|t| self.metas.zonk(t)).collect());
+            let reduced = self.normalize(&applied);
+            if reduced == applied {
+                continue;
+            }
+            for part in super::convert::ty_to_preds(&reduced) {
+                if is_eq_class(&part.class) && part.args.len() == 2 {
+                    let _ = self.metas.unify_refine(&part.args[0], &part.args[1]);
+                }
+            }
+        }
     }
 
     /// Solves what can be solved. Returns evidence bindings and the residual wanteds
@@ -293,6 +336,18 @@ impl Checker {
         while let Some(w) = work.pop() {
             self.improve(&w.pred)?;
             let pred = self.metas_zonk_pred(&w.pred);
+            // A wanted tuple of constraints: each is wanted, the evidence is their tuple.
+            if let Some(parts) = constraint_tuple_parts(&pred) {
+                let n = parts.len();
+                let mut evs = Vec::with_capacity(n);
+                for part in parts {
+                    let ev = self.fresh_name("ctw");
+                    evs.push(Core::Var(ev.clone()));
+                    work.push(Wanted { pred: part, ev, loc: w.loc });
+                }
+                binds.push((w.ev.clone(), Core::Con(Ty::tuple_con(n), evs)));
+                continue;
+            }
             if is_eq_class(&pred.class) && pred.args.len() == 2 {
                 self.unify_at(&pred.args[0], &pred.args[1])?;
                 binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
@@ -375,6 +430,14 @@ impl Checker {
             // A wanted quantified constraint: its head is solved under rigid variables, with its
             // context as givens.
             if pred.class == QUANTIFIED_CLASS {
+                // A head applying a constraint variable not yet known (`forall a. c (T a)` with `c`
+                // decided later by a functional dependency) waits.
+                if let Ty::Forall(_, _, head) = self.metas.zonk(&pred.args[0]) {
+                    if matches!(head.split_apps().0, Ty::Meta(_)) {
+                        residual.push(Wanted { pred, ..w });
+                        continue;
+                    }
+                }
                 let ev = self.solve_quantified(&pred, w.loc)?;
                 binds.push((w.ev.clone(), ev));
                 continue;
@@ -492,7 +555,7 @@ impl Checker {
         out.push(p.clone());
         if let Some(info) = self.class(&p.class) {
             for sup in info.supers.clone() {
-                let q = Pred { class: sup.class.clone(), args: sup.args.iter().map(|t| subst_gen(t, &p.args)).collect() };
+                let q = super::types::subst_gen_pred(&sup, &p.args);
                 self.superclass_closure(&q, out, depth + 1);
             }
         }
@@ -500,13 +563,22 @@ impl Checker {
 
     /// A predicate with solved variables substituted and type families reduced.
     pub fn metas_zonk_pred(&self, p: &Pred) -> Pred {
-        if self.env.families.is_empty() {
-            return self.metas.zonk_pred(p);
+        let out = if self.env.families.is_empty() {
+            self.metas.zonk_pred(p)
+        } else {
+            Pred { class: p.class.clone(), args: p.args.iter().map(|t| self.normalize(t)).collect() }
+        };
+        // A constraint variable solved to a class (`c a` with `c := Pretty`) is that class's
+        // predicate.
+        if out.class == super::convert::CONSTRAINT_VAR && out.args.len() == 1 {
+            let (head, cargs) = out.args[0].split_apps();
+            if let Ty::Con(c) = head {
+                if self.env.classes.contains_key(c) {
+                    return Pred { class: c.clone(), args: cargs.into_iter().cloned().collect() };
+                }
+            }
         }
-        Pred {
-            class: p.class.clone(),
-            args: p.args.iter().map(|t| self.normalize(t)).collect(),
-        }
+        out
     }
 
     pub fn pred_has_metas(&self, p: &Pred) -> bool {
@@ -527,8 +599,11 @@ impl Checker {
         let ctx: Vec<Pred> = ctx.iter().map(|p| super::types::subst_bound_pred(p, &ids, &sk)).collect();
         let head = super::types::subst_bound(&head, &ids, &sk);
         let (h, hargs) = head.split_apps();
-        let Ty::Con(class) = h else { return self.err("internal: malformed quantified constraint head") };
-        let head_pred = Pred { class: class.clone(), args: hargs.into_iter().cloned().collect() };
+        let head_pred = match h {
+            Ty::Con(class) => Pred { class: class.clone(), args: hargs.into_iter().cloned().collect() },
+            // `forall a. c (T a)` with `c` a constraint variable.
+            _ => self.metas_zonk_pred(&Pred { class: super::convert::CONSTRAINT_VAR.into(), args: vec![head.clone()] }),
+        };
         let params: Vec<String> = ctx.iter().map(|_| self.fresh_name("qg")).collect();
         let mark = self.givens.len();
         for (p, d) in ctx.iter().zip(&params) {
@@ -558,8 +633,11 @@ impl Checker {
             let gens: Vec<Ty> = (0..ids.len()).map(|k| Ty::Gen(k as u32)).collect();
             let head = super::types::subst_bound(&head, &ids, &gens);
             let (h, hargs) = head.split_apps();
-            let Ty::Con(class) = h else { continue };
-            let have = Pred { class: class.clone(), args: hargs.into_iter().cloned().collect() };
+            // A head applying a constraint variable (`forall a. c (T a)`) is a `%constraint` one.
+            let have = match h {
+                Ty::Con(class) => Pred { class: class.clone(), args: hargs.into_iter().cloned().collect() },
+                _ => Pred { class: super::convert::CONSTRAINT_VAR.into(), args: vec![head.clone()] },
+            };
             let mut path: Vec<(String, usize, usize)> = Vec::new();
             if let Some(sub) = self.quantified_match(&have, want, ids.len(), &mut path, 0) {
                 let inst: Vec<Ty> = sub.into_iter().map(|s| s.unwrap_or(Ty::con("Builtin.()"))).collect();
@@ -599,7 +677,7 @@ impl Checker {
         let info = self.class(&have.class)?;
         let n = info.nsupers() + info.methods.len();
         for (i, sup) in info.supers.iter().enumerate() {
-            let sup_pred = Pred { class: sup.class.clone(), args: sup.args.iter().map(|t| subst_gen(t, &have.args)).collect() };
+            let sup_pred = super::types::subst_gen_pred(sup, &have.args);
             path.push((info.dict_con.clone(), n, i));
             if let Some(sub) = self.quantified_match(&sup_pred, want, nvars, path, depth + 1) {
                 return Some(sub);
@@ -656,10 +734,7 @@ impl Checker {
         let info = self.class(&have.class)?;
         let nsupers = info.nsupers();
         for (i, sup) in info.supers.iter().enumerate() {
-            let sup_pred = Pred {
-                class: sup.class.clone(),
-                args: sup.args.iter().map(|t| subst_gen(t, &have.args)).collect(),
-            };
+            let sup_pred = super::types::subst_gen_pred(sup, &have.args);
             let dict_con = info.dict_con.clone();
             let mut counter = 0usize;
             let mut fresh = || {
@@ -820,7 +895,11 @@ impl Checker {
                 }
                 for cand in DEFAULT_CANDIDATES {
                     let cand_ty = Ty::con(cand);
+                    // Typeable holds at every candidate (its evidence is built, not declared).
                     let ok = preds_on_m.iter().all(|p| {
+                        if p.class == TYPEABLE_CLASS {
+                            return true;
+                        }
                         let args: Vec<Ty> = p
                             .args
                             .iter()
@@ -893,4 +972,28 @@ fn core_apply_base(core: Core, ctx_evs: &[String]) -> Core {
         }
         other => other,
     }
+}
+
+/// The parts of a constraint that is a tuple of constraints (`%constraint ((Show a, Eq a))`, or
+/// `()`), each as a predicate.
+fn constraint_tuple_parts(p: &Pred) -> Option<Vec<Pred>> {
+    if p.class != super::convert::CONSTRAINT_VAR || p.args.len() != 1 {
+        return None;
+    }
+    let (head, args) = p.args[0].split_apps();
+    let Ty::Con(c) = head else { return None };
+    let n = if c == "Builtin.()" { 0 } else { super::types::tuple_arity(c)? };
+    if n != args.len() {
+        return None;
+    }
+    Some(
+        args.into_iter()
+            .map(|a| match a.split_apps() {
+                (Ty::Con(cls), cargs) if super::types::tuple_arity(cls).is_none() && cls != "Builtin.()" => {
+                    Pred { class: cls.clone(), args: cargs.into_iter().cloned().collect() }
+                }
+                _ => Pred { class: super::convert::CONSTRAINT_VAR.into(), args: vec![a.clone()] },
+            })
+            .collect(),
+    )
 }

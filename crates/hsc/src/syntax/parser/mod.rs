@@ -347,6 +347,13 @@ impl Parser {
             };
             return !standalone;
         }
+        // An operator cannot begin an item (`(do ..\n  <|> e)` with `<|>` at the items' column),
+        // except a negation, a bang or lazy pattern, a splice, an implicit parameter and a label.
+        match self.tok() {
+            Tok::VarSym(s) if !matches!(s.as_str(), "-" | "!" | "~" | "$" | "$$" | "?" | "#") && !s.starts_with('?') => return true,
+            Tok::ConSym(_) | Tok::QVarSym(..) | Tok::QConSym(..) | Tok::Special('`') => return true,
+            _ => {}
+        }
         matches!(
             self.tok(),
             Tok::Kw(Kw::Where | Kw::In | Kw::Then | Kw::Else | Kw::Of)
@@ -640,11 +647,16 @@ impl Parser {
             return Ok(Subs::All);
         }
         let mut names = Vec::new();
+        // `T (C, f, .., P)`: a `..` among the names (GHC allows it anywhere in the list).
+        let mut all = false;
         loop {
             if self.at_special(')') {
                 break;
             }
-            if self.at_special('(') {
+            if self.at_res(ROp::DotDot) {
+                self.bump();
+                all = true;
+            } else if self.at_special('(') {
                 names.push(self.paren_op()?.name);
             } else if self.real() {
                 match self.tok().clone() {
@@ -664,6 +676,9 @@ impl Parser {
             }
         }
         self.expect_special(')')?;
+        if all {
+            return Ok(Subs::AllPlus(names));
+        }
         Ok(Subs::Some(names))
     }
 }

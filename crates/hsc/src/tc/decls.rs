@@ -1004,10 +1004,7 @@ impl Checker {
         let mut super_vars: Vec<Core> = Vec::new();
         let outer_wanted = std::mem::take(&mut self.wanted);
         for sup in &info.supers {
-            let p = Pred {
-                class: sup.class.clone(),
-                args: sup.args.iter().map(|t| subst_gen(t, &head)).collect(),
-            };
+            let p = super::types::subst_gen_pred(sup, &head);
             let ev = self.fresh_name("sd");
             self.wanted.push(Wanted {
                 pred: p,
@@ -1211,9 +1208,8 @@ impl Checker {
                 };
                 // Generic, Generic1, Data and Lift are derived stock for a newtype too, as GHC does
                 // without a strategy.
-                let stock_too = matches!(short.as_str(), "Generic" | "Generic1" | "Data" | "Lift");
                 let via_newtype = d.strategy == Some(Strategy::Newtype)
-                    || (d.strategy.is_none() && !super::derive::is_stock(&short) && !stock_too);
+                    || (d.strategy.is_none() && !super::derive::stock_for_newtype(self.newtype_deriving, &short, dd));
                 if !via_newtype || d.strategy == Some(Strategy::Anyclass) {
                     continue;
                 }

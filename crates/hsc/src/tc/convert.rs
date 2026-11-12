@@ -235,7 +235,7 @@ pub fn tvar_index(tvs: &mut Vec<String>, name: &str) -> u32 {
 pub fn ty_to_preds(t: &Ty) -> Vec<Pred> {
     let (head, args) = t.split_apps();
     match head {
-        Ty::Con(c) if c == "()" => Vec::new(),
+        Ty::Con(c) if c == "()" || c == "Builtin.()" => Vec::new(),
         Ty::Con(c) if super::types::tuple_arity(c) == Some(args.len()) && args.len() >= 2 => {
             args.iter().flat_map(|a| ty_to_preds(a)).collect()
         }

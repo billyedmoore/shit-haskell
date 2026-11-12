@@ -695,7 +695,30 @@ impl Lexer {
 fn code_char(digits: &str, radix: u32, lx: &Lexer) -> Result<char, LexError> {
     let decimal = to_decimal(digits, radix);
     let value: u32 = decimal.parse().unwrap_or(u32::MAX);
-    char::from_u32(value).ok_or_else(|| lx.error("numeric escape sequence out of range"))
+    char_of_code(value).ok_or_else(|| lx.error("numeric escape sequence out of range"))
+}
+
+/// Where a surrogate code point (U+D800..U+DFFF) is kept in a literal's text: a Rust `char`
+/// cannot hold one, so the first 2048 code points of plane 15 (private use, U+F0000..U+F07FF)
+/// stand for them, and the back ends map them back (`char_code`) when they build a `Char`.
+const SURROGATE_HOME: u32 = 0xF0000;
+
+/// The character standing for a code point in a literal (see `SURROGATE_HOME`).
+pub fn char_of_code(v: u32) -> Option<char> {
+    if (0xD800..=0xDFFF).contains(&v) {
+        return char::from_u32(v - 0xD800 + SURROGATE_HOME);
+    }
+    char::from_u32(v)
+}
+
+/// The code point a literal's character stands for (surrogates included).
+pub fn char_code(c: char) -> u32 {
+    let v = c as u32;
+    if (SURROGATE_HOME..SURROGATE_HOME + 0x800).contains(&v) {
+        v - SURROGATE_HOME + 0xD800
+    } else {
+        v
+    }
 }
 
 /// Converts digits in `radix` to a decimal string without any width limit.
