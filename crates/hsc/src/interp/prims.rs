@@ -62,7 +62,7 @@ fn double(rt: &Runtime, c: &Cell) -> Result<f64, RtError> {
 
 fn chr(rt: &Runtime, c: &Cell) -> Result<char, RtError> {
     match rt.force(c)? {
-        Value::Char(ch) => Ok(ch),
+        Value::Char(ch) => Ok(char::from_u32(ch).unwrap_or('\u{fffd}')),
         _ => Err(RtError::Fail("internal: expected Char".into())),
     }
 }
@@ -405,11 +405,14 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         "doubleIsInfinite" => Ok(bool_value(double(rt, &args[0])?.is_infinite())),
 
         // ----- Char -----
-        "charOrd" => int_v(chr(rt, &args[0])? as i64),
+        "charOrd" => match rt.force(&args[0])? {
+            Value::Char(ch) => int_v(ch as i64),
+            _ => Err(RtError::Fail("internal: expected Char".into())),
+        },
         "charChr" => {
             let n = int(rt, &args[0])?;
-            match char::from_u32(n as u32) {
-                Some(c) if (0..=0x10FFFF).contains(&n) => Ok(Value::Char(c)),
+            match n {
+                0..=0x10FFFF => Ok(Value::Char(n as u32)),
                 _ => Err(RtError::Error(format!("Base.chr: bad argument: {n}"))),
             }
         }
@@ -624,7 +627,7 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
         "int2Word#" | "word2Int#" => int_v(int(rt, &args[0])?),
         "int2Double#" => Ok(Value::Double(int(rt, &args[0])? as f64)),
         "double2Int#" => int_v(double(rt, &args[0])? as i64),
-        "chr#" => Ok(Value::Char(char::from_u32(int(rt, &args[0])? as u32).unwrap_or('\u{fffd}'))),
+        "chr#" => Ok(Value::Char(int(rt, &args[0])? as u32)),
         "ord#" => int_v(match rt.force(&args[0])? {
             Value::Char(c) => c as i64,
             _ => return Err(RtError::Fail("internal: ord# of a non-character".into())),
@@ -659,7 +662,7 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let at = |k: usize| bytes.get(k).copied().unwrap_or(0) as i64;
             let base = off as i64 + i;
             match name {
-                "indexCharOffAddr#" | "indexWideCharOffAddr#" => Ok(Value::Char(char::from_u32(at(base as usize) as u32).unwrap_or('\0'))),
+                "indexCharOffAddr#" | "indexWideCharOffAddr#" => Ok(Value::Char(at(base as usize) as u32)),
                 "indexWord8OffAddr#" => int_v(at(base as usize)),
                 "indexInt8OffAddr#" => int_v(at(base as usize) as u8 as i8 as i64),
                 _ => {
@@ -1121,8 +1124,8 @@ fn read_element(bytes: &[u8], at: usize, size: usize, kind: &str) -> Value {
         v = (v << 8) | bytes.get(at + k).copied().unwrap_or(0) as u64;
     }
     match kind {
-        "char8" => Value::Char(v as u8 as char),
-        "char32" => Value::Char(char::from_u32(v as u32).unwrap_or('\u{fffd}')),
+        "char8" => Value::Char(v as u8 as u32),
+        "char32" => Value::Char(v as u32),
         "int" => {
             let shift = 64 - 8 * size as u32;
             Value::Int(((v << shift) as i64) >> shift)

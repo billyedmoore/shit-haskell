@@ -595,25 +595,32 @@ fn derive_show(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         let pat = con_pat(&module, &c.name, a.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc);
         let show_arg = |v: &String, prec: i64| app(base_var("showsPrec", loc), vec![int(prec, loc), local(v, loc)]);
         // An unboxed field is shown as its boxed value and a `#`, as GHC does.
-        let ftys = field_types(c);
+        // (Through synonyms: happy's `type Happy_Int = Int#`.) Word# and Double# take `##`.
+        let ftys: Vec<Option<(&str, &str)>> = field_types(c)
+            .iter()
+            .map(|t| {
+                let mut tvs: Vec<String> = dd.tyvars.iter().map(|tv| tv.name.clone()).collect();
+                match checker.convert_type(t, &mut tvs).ok()? {
+                    super::types::Ty::Con(name) => match name.as_str() {
+                        "GHC.Prim.Int#" => Some(("I#", "#")),
+                        "GHC.Prim.Word#" => Some(("W#", "##")),
+                        "GHC.Prim.Char#" => Some(("C#", "#")),
+                        "GHC.Prim.Double#" => Some(("D#", "##")),
+                        "GHC.Prim.Float#" => Some(("F#", "#")),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect();
         let shown_field = |i: usize, prec: i64| -> Expr {
             let v = &a[i];
-            let boxed = ftys.get(i).and_then(|t| match t {
-                Type::Con(q, _) => match q.name.as_str() {
-                    "Int#" => Some("I#"),
-                    "Word#" => Some("W#"),
-                    "Char#" => Some("C#"),
-                    "Double#" => Some("D#"),
-                    "Float#" => Some("F#"),
-                    _ => None,
-                },
-                _ => None,
-            });
-            match boxed {
-                Some(con) => compose(
+            match ftys.get(i).copied().flatten() {
+                Some((con, hashes)) => compose(
                     vec![
-                        app(base_var("showsPrec", loc), vec![int(prec, loc), app(base_con(con, loc), vec![local(v, loc)])]),
-                        app(base_var("showChar", loc), vec![ch('#', loc)]),
+                        // At precedence 0, as GHC shows them (`Reduce -2#`).
+                        app(base_var("showsPrec", loc), vec![int(0, loc), app(base_con(con, loc), vec![local(v, loc)])]),
+                        app(base_var("showString", loc), vec![text(hashes, loc)]),
                     ],
                     loc,
                 ),
@@ -1350,7 +1357,7 @@ fn prim_ops(t: &Type) -> Option<(&'static str, &'static str)> {
 }
 
 /// The field types of a constructor, in order.
-fn field_types(c: &ConDecl) -> Vec<Type> {
+pub(super) fn field_types(c: &ConDecl) -> Vec<Type> {
     match &c.fields {
         ConFields::Positional(fs) => fs.iter().map(|f| f.ty.clone()).collect(),
         ConFields::Record(groups) => groups

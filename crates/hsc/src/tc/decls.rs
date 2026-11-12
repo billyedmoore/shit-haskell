@@ -105,6 +105,8 @@ impl Checker {
 
         // 2. Data constructors and field selectors.
         let mut derived: Vec<Decl> = Vec::new();
+        // The declaration each instance derived in a `deriving` clause is for.
+        let mut derived_from: Vec<DataDecl> = Vec::new();
         for d in decls {
             if let Decl::Data(dd) = d {
                 self.data_decl(dd)?;
@@ -112,7 +114,9 @@ impl Checker {
                     format!("{}.{}", self.module, dd.name),
                     (self.module.clone(), dd.clone()),
                 );
-                derived.extend(self.derive_instances(dd)?);
+                let insts = self.derive_instances(dd)?;
+                derived_from.extend(insts.iter().map(|_| dd.clone()));
+                derived.extend(insts);
             }
         }
 
@@ -157,15 +161,24 @@ impl Checker {
 
         // 5. Instance headers, visible before any body is checked.
         let mut all_insts: Vec<InstDecl> = Vec::new();
-        for d in decls.iter().chain(derived.iter()) {
-            match d {
-                Decl::Instance(id) => {
-                    self.instance_header(id)?;
-                    all_insts.push(id.clone());
-                }
-                _ => {}
+        let mut derived_insts: Vec<(usize, DataDecl)> = Vec::new();
+        for d in decls {
+            if let Decl::Instance(id) = d {
+                self.instance_header(id)?;
+                all_insts.push(id.clone());
             }
         }
+        for (i, d) in derived.iter().enumerate() {
+            if let Decl::Instance(id) = d {
+                let before = self.env.instances.len();
+                self.instance_header(id)?;
+                all_insts.push(id.clone());
+                if let Some(dd) = derived_from.get(i).filter(|_| self.env.instances.len() > before) {
+                    derived_insts.push((self.env.instances.len() - 1, dd.clone()));
+                }
+            }
+        }
+        self.reduce_derived_contexts(&derived_insts);
         // 6. Top-level values.
         let value_decls: Vec<Decl> = decls
             .iter()
@@ -197,6 +210,20 @@ impl Checker {
             }
             for id in &all_insts {
                 self.instance_body(id)?;
+            }
+        }
+
+        // `main` is an IO action: a type the monomorphism restriction left open (`main = return
+        // ()`) is fixed to `IO t` before the remaining constraints are solved, as GHC checks it.
+        if self.module == "Main" {
+            if let Some(scheme) = self.vars.get("Main.main").cloned() {
+                let ty = self.metas.zonk(&scheme.ty);
+                let mut ms = Vec::new();
+                self.metas.free_metas(&ty, &mut ms);
+                if !ms.is_empty() {
+                    let t = self.meta();
+                    let _ = self.unify_at(&ty, &Ty::app(Ty::con("GHC.Types.IO"), t));
+                }
             }
         }
 
@@ -791,6 +818,106 @@ impl Checker {
             dict,
         });
         Ok(())
+    }
+
+    /// The contexts of the instances derived in `deriving` clauses, as GHC infers them: the class
+    /// at each field's type, reduced through the instances to constraints on type variables
+    /// (`deriving Eq` of a newtype of `[Range v]` needs what `Eq (Range v)` needs). The derived
+    /// instances of a module may need each other's, so this repeats until nothing changes. An
+    /// instance whose fields do not reduce keeps the context the deriving pass guessed.
+    fn reduce_derived_contexts(&mut self, insts: &[(usize, DataDecl)]) {
+        for _round in 0..8 {
+            let mut changed = false;
+            for (idx, dd) in insts {
+                let inst = self.env.instances[*idx].clone();
+                let short = super::types::unqualify(&inst.class);
+                if !matches!(short, "Eq" | "Ord" | "Show" | "Read" | "Data") || inst.head.len() != 1 {
+                    continue;
+                }
+                let Some(ctx) = self.derived_context(&inst, dd) else { continue };
+                if ctx != inst.ctx {
+                    self.env.instances[*idx].ctx = ctx;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
+    fn derived_context(&mut self, inst: &InstInfo, dd: &DataDecl) -> Option<Vec<Pred>> {
+        if dd.tyvars.len() != inst.nvars as usize || dd.cons.iter().any(|c| !c.exist.is_empty() || c.gadt_result.is_some() || !c.context.is_empty()) {
+            return None;
+        }
+        let mut wanted = Vec::new();
+        for c in &dd.cons {
+            for t in super::derive::field_types(c) {
+                let mut tvs: Vec<String> = dd.tyvars.iter().map(|tv| tv.name.clone()).collect();
+                let ty = self.convert_type(&t, &mut tvs).ok()?;
+                if tvs.len() != dd.tyvars.len() {
+                    return None;
+                }
+                wanted.push(Pred { class: inst.class.clone(), args: vec![self.normalize(&ty)] });
+            }
+        }
+        // `Data` has `Typeable` as a superclass: every parameter must be Typeable (a phantom one
+        // included), unless its `Data` constraint implies it.
+        if super::types::unqualify(&inst.class) == "Data" {
+            for i in 0..inst.nvars {
+                wanted.push(Pred { class: "GHC.Internal.Data.Typeable.Internal.Typeable".into(), args: vec![Ty::Gen(i)] });
+            }
+        }
+        let this = Pred { class: inst.class.clone(), args: inst.head.clone() };
+        let mut out: Vec<Pred> = Vec::new();
+        let mut stack = vec![this];
+        for w in wanted {
+            self.reduce_derived_pred(w, &mut stack, &mut out, 0)?;
+        }
+        // A constraint another one implies through its superclasses is left out.
+        let mut implied = Vec::new();
+        for (i, p) in out.iter().enumerate() {
+            let mut closure = Vec::new();
+            self.superclass_closure(p, &mut closure, 0);
+            for q in closure.into_iter().skip(1) {
+                if q != *p && out.iter().enumerate().any(|(j, o)| j != i && *o == q) {
+                    implied.push(q);
+                }
+            }
+        }
+        out.retain(|p| !implied.contains(p));
+        Some(out)
+    }
+
+    fn reduce_derived_pred(&mut self, p: Pred, stack: &mut Vec<Pred>, out: &mut Vec<Pred>, depth: usize) -> Option<()> {
+        if depth > 40 {
+            return None;
+        }
+        let head_is_var = |t: &Ty| {
+            let mut h = t;
+            while let Ty::App(f, _) = h {
+                h = f;
+            }
+            matches!(h, Ty::Gen(_))
+        };
+        if p.args.iter().all(head_is_var) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+            return Some(());
+        }
+        // An instance being derived needs nothing more of itself (a recursive type).
+        if stack.contains(&p) {
+            return Some(());
+        }
+        let (_, subs) = self.find_instance(&p)?;
+        stack.push(p);
+        for s in subs {
+            let s = Pred { class: s.class.clone(), args: s.args.iter().map(|t| self.normalize(&self.metas.zonk(t))).collect() };
+            self.reduce_derived_pred(s, stack, out, depth + 1)?;
+        }
+        stack.pop();
+        Some(())
     }
 
     /// Builds the dictionary for an instance and checks its methods.

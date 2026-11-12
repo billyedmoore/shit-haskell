@@ -358,7 +358,11 @@ pub extern "C" fn hsc_nontermination(m: *mut Machine) {
 pub extern "C" fn hsc_mk_literal(m: *mut Machine, ptr: *const u8, len: u64, kind_: u64) -> Word {
     // SAFETY: generated code passes the machine record and the literal's text.
     let m = unsafe { &mut *m };
-    let text = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len as usize) }).into_owned();
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    if kind_ == 3 {
+        return super::prims::addr_literal(m, bytes);
+    }
+    let text = String::from_utf8_lossy(bytes).into_owned();
     super::prims::literal(m, &text, kind_)
 }
 

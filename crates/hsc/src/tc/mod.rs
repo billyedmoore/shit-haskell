@@ -85,6 +85,8 @@ pub struct Checker {
     pub sig_kind_vars: HashMap<String, Vec<String>>,
     /// OverloadedStrings is on in the module being checked: string literals are `fromString`.
     pub overloaded_strings: bool,
+    /// OverloadedLists: list literals, sequences and list patterns go through `IsList`.
+    pub overloaded_lists: bool,
     /// Quantified constraints are kept while a signature's context is converted.
     pub allow_quantified: bool,
     /// The monads of the typed quotations being checked, innermost last (their splices share them).
@@ -150,6 +152,7 @@ impl Checker {
             scoped: Vec::new(),
             sig_kind_vars: HashMap::new(),
             overloaded_strings: false,
+            overloaded_lists: false,
             allow_quantified: false,
             quote_monads: Vec::new(),
             flex_kinds: Vec::new(),

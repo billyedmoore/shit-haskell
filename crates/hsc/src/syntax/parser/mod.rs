@@ -508,8 +508,11 @@ impl Parser {
             self.bump();
             qualified = true;
         }
+        let mut package = None;
         if self.real() && matches!(self.tok(), Tok::Str(_)) {
-            // PackageImports: the package name is accepted and ignored.
+            if let Tok::Str(s) = self.tok() {
+                package = Some(s.to_string());
+            }
             self.bump();
         }
         let module = self.modid()?;
@@ -539,6 +542,7 @@ impl Parser {
         };
         Ok(Import {
             module,
+            package,
             qualified,
             alias,
             hiding,

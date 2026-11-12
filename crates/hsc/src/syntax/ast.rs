@@ -46,6 +46,8 @@ pub struct Module {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Import {
     pub module: String,
+    /// The package of a package-qualified import (`import "pkg" M`).
+    pub package: Option<String>,
     pub qualified: bool,
     pub alias: Option<String>,
     pub hiding: bool,

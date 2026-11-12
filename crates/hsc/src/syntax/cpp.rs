@@ -494,6 +494,22 @@ fn collect_args(chars: &[char], open: usize) -> Result<(Vec<String>, usize), Str
                 args.push(cur.trim().to_string());
                 cur.clear();
             }
+            // A string literal's commas and parentheses are its own.
+            '"' => {
+                cur.push(c);
+                i += 1;
+                while i < chars.len() && chars[i] != '"' && chars[i] != '\n' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        cur.push(chars[i]);
+                        i += 1;
+                    }
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    cur.push(chars[i]);
+                }
+            }
             _ => cur.push(c),
         }
         i += 1;

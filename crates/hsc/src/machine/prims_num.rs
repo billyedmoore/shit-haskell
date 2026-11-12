@@ -3,7 +3,7 @@
 //! object; a comparison answers an `Int#` 0 or 1.
 
 use super::heap::{self, kind, Word};
-use super::prims::{char_value, force_arg, int_value};
+use super::prims::{force_arg, int_value};
 use super::Machine;
 use crate::native::codegen::DOUBLE;
 
@@ -140,7 +140,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
         }
         "chr#" => {
             let Some(a) = i(m, 0) else { return Some(0) };
-            char_value(m, char::from_u32(a as u32).unwrap_or('\u{fffd}'))
+            super::prims::char_code_value(m, a as u32)
         }
         // ----- Word# -----
         "plusWord#" | "minusWord#" | "timesWord#" | "quotWord#" | "remWord#" | "and#" | "or#" | "xor#"

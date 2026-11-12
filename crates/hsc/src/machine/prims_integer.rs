@@ -5,7 +5,7 @@
 use super::heap::Word;
 use super::prims::{force_arg, int_value, integer_of, integer_value};
 use super::Machine;
-use crate::interp::bigint::{bit_length, bitwise, popcount, shift_left, shift_right, test_bit, BigInt};
+use crate::interp::bigint::{bit_length, bitwise, limb64, limb64_count, popcount, shift_left, shift_right, test_bit, BigInt};
 
 /// An `Integer` argument, forced and decoded.
 fn big(m: &mut Machine, k: usize) -> Option<BigInt> {
@@ -102,6 +102,25 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
         "integerToDouble" => {
             let a = big(m, 0)?;
             super::prims_num::double_value(m, a.to_f64())
+        }
+        // A BigNat# is the limbs object of an `IP`: an Integer's magnitude, least significant first.
+        "integerBigNat" => {
+            let a = big(m, 0)?.abs();
+            let limbs: Vec<u64> = (0..limb64_count(&a)).map(|i| limb64(&a, i)).collect();
+            let words = limbs.len();
+            m.reserve(words + 2);
+            let bp = m.alloc(1 + words);
+            m.heap_set(bp, super::heap::header(super::heap::kind::BYTES, words as u32, 0));
+            for (i, l) in limbs.iter().enumerate() {
+                m.heap_set(bp + 8 + 8 * i as Word, *l);
+            }
+            bp
+        }
+        "integerFromBigNat" => {
+            let bp = force_arg(m, 0)?;
+            let words = super::heap::size_of(m.heap_get(bp, 0)) as usize;
+            let limbs: Vec<u64> = (0..words).map(|i| m.heap_get(bp, 1 + i)).collect();
+            integer_value(m, BigInt::from_u64_limbs(false, &limbs))
         }
         "bigNatSize" => {
             // The limbs of a BigNat (the byte array an `IP`/`IN` holds): their count.

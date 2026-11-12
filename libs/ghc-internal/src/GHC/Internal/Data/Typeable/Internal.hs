@@ -1015,8 +1015,16 @@ tyCon'BoxedRep = mkTyCon ghcPrimPackage "GHC.Types" "'BoxedRep" 0
 ghcPrimPackage :: String
 ghcPrimPackage = tyConPackage (typeRepTyCon (typeRep @Bool))
 
+-- hsc: GHC's FUN, made directly (the representation of @(->)@ is built from it, see 'trArrow#').
 funTyCon :: TyCon
-funTyCon = typeRepTyCon (typeRep @(->))
+funTyCon = mkTyCon ghcPrimPackage "GHC.Prim" "FUN" 0 (KindRepFun star (KindRepFun star star))
+  where star = KindRepTYPE (BoxedRep Lifted)
+
+-- | Compiler support: the representation of an unsaturated arrow, @(->)@ or @(->) a@ before its
+-- arguments are applied: @FUN 'Many@ with its runtime representations, as 'bareArrow' builds it
+-- from a function type's representation (so that both have the same fingerprint).
+trArrow# :: TypeRep a
+trArrow# = mkTrCon funTyCon [SomeTypeRep trMany, SomeTypeRep trLiftedRep, SomeTypeRep trLiftedRep]
 
 isListTyCon :: TyCon -> Bool
 isListTyCon tc = tc == typeRepTyCon (typeRep :: TypeRep [])

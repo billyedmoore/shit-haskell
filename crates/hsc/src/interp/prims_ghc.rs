@@ -331,7 +331,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "word2Double#" => word(rt, &args[0]).map(|a| Value::Double(a as f64)),
         "word2Float#" => word(rt, &args[0]).map(|a| f32v(a as f32)),
         "double2Int#" | "float2Int#" => dbl(rt, &args[0]).map(|d| Value::Int(d as i64)),
-        "chr#" => int(rt, &args[0]).map(|a| Value::Char(char::from_u32(a as u32).unwrap_or('\u{fffd}'))),
+        "chr#" => int(rt, &args[0]).map(|a| Value::Char(a as u32)),
         "ord#" => chr_of(rt, &args[0]).map(|c| Value::Int(c as i64)),
 
         // ----- Word# -----

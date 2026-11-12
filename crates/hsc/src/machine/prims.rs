@@ -127,15 +127,22 @@ pub fn literal(m: &mut Machine, text: &str, kind: u64) -> Word {
             con_value(m, "GHC.Internal.Real.:%", 2, &[nv, dv])
         }
         _ => {
-            let bytes = text.as_bytes();
-            let bp = bytes_object(m, bytes);
-            let p = m.alloc(3);
-            m.heap_set(p, heap::header(kind::ADDR, 2, 0));
-            m.heap_set(p + 8, bp);
-            m.heap_set(p + 16, 0);
-            p
+            let bytes: Vec<u8> = text.chars().map(|c| c as u32 as u8).collect();
+            addr_literal(m, &bytes)
         }
     }
+}
+
+/// An `Addr#` literal: its bytes, NUL-terminated.
+pub fn addr_literal(m: &mut Machine, bytes: &[u8]) -> Word {
+    let bp = bytes_object(m, bytes);
+    m.stable.push(bp);
+    let p = m.alloc(3);
+    let bp = m.stable.pop().unwrap_or(bp);
+    m.heap_set(p, heap::header(kind::ADDR, 2, 0));
+    m.heap_set(p + 8, bp);
+    m.heap_set(p + 16, 0);
+    p
 }
 
 /// A byte array object holding `bytes`, followed by a NUL.
@@ -171,6 +178,12 @@ pub fn string_list(m: &mut Machine, text: &str) -> Word {
 
 /// A `Char#` (or `Char`) object.
 pub fn char_value(m: &mut Machine, c: char) -> Word {
+    char_code_value(m, c as u32)
+}
+
+/// A boxed character by its code point: any value up to 0x10FFFF, surrogates included (GHC's
+/// `Char` holds them, as the roundtrip encodings do).
+pub fn char_code_value(m: &mut Machine, c: u32) -> Word {
     let p = m.alloc(2);
     m.heap_set(p, heap::header(CHAR, 1, 0));
     m.heap_set(p + 8, c as Word);

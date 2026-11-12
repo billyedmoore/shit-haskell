@@ -38,8 +38,44 @@ fn split(src: &str) -> Vec<Part> {
     let mut parts = Vec::new();
     let mut text = String::new();
     let mut i = 0;
+    let symbol = |c: char| "!#$%&*+./<=>?@\\^|-~:".contains(c);
     while i < chars.len() {
         let c = chars[i];
+        // Haskell comments are copied as they are: a directive in one is not processed.
+        if c == '-' && chars.get(i + 1) == Some(&'-') && (i == 0 || !symbol(chars[i - 1])) {
+            let mut k = i;
+            while k < chars.len() && chars[k] == '-' {
+                k += 1;
+            }
+            if k >= chars.len() || !symbol(chars[k]) {
+                while i < chars.len() && chars[i] != '\n' {
+                    text.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        if c == '{' && chars.get(i + 1) == Some(&'-') && chars.get(i + 2) != Some(&'#') {
+            let mut depth = 0;
+            while i < chars.len() {
+                if chars[i] == '{' && chars.get(i + 1) == Some(&'-') {
+                    depth += 1;
+                    text.push_str("{-");
+                    i += 2;
+                } else if chars[i] == '-' && chars.get(i + 1) == Some(&'}') {
+                    depth -= 1;
+                    text.push_str("-}");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    text.push(chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
         if c != '#' {
             text.push(c);
             i += 1;

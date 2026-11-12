@@ -447,7 +447,7 @@ fn element_access(m: &mut Machine, name: &str) -> Option<Word> {
             a
         }
         "char8" => char_object(m, bits as u8 as char),
-        "char32" => char_object(m, char::from_u32(bits as u32).unwrap_or('\u{fffd}')),
+        "char32" => super::prims::char_code_value(m, bits as u32),
         "int" => {
             let v = match width {
                 1 => bits as u8 as i8 as i64,

@@ -342,6 +342,30 @@ impl Lexer {
             }
             _ => {}
         }
+        // A negative unboxed literal (`-1#`) is one token unless the minus follows a closing
+        // token (`x-1#` is a subtraction), as GHC lexes it.
+        if c == '-' && self.peek(1).is_some_and(|d| d.is_ascii_digit()) {
+            let prev = if self.pos == 0 { '\n' } else { self.chars[self.pos - 1] };
+            let closing = matches!(prev, ')' | ']' | '"' | '\'' | '_') || prev.is_alphanumeric()
+                || (prev == '}' && !(self.pos >= 2 && self.chars[self.pos - 2] == '-'));
+            if !closing {
+                let saved = (self.pos, self.line, self.col);
+                self.bump();
+                match self.lex_number()? {
+                    Tok::Prim(p @ (PrimLit::Int(_) | PrimLit::Word(_) | PrimLit::Float(_) | PrimLit::Double(_))) => {
+                        let neg = |v: String| format!("-{v}");
+                        return Ok(Tok::Prim(match p {
+                            PrimLit::Int(v) => PrimLit::Int(neg(v)),
+                            PrimLit::Word(v) => PrimLit::Word(neg(v)),
+                            PrimLit::Float(v) => PrimLit::Float(neg(v)),
+                            PrimLit::Double(v) => PrimLit::Double(neg(v)),
+                            other => other,
+                        }));
+                    }
+                    _ => (self.pos, self.line, self.col) = saved,
+                }
+            }
+        }
         if is_symbol(c) {
             return self.lex_symbol(None);
         }
@@ -456,13 +480,10 @@ impl Lexer {
 
     /// Counts and consumes the MagicHash suffix of a literal (`3#` is 1, `3##` is 2).
     fn take_hashes(&mut self) -> usize {
-        // The run of `#` characters (at most two) ends at a non-symbol character.
+        // At most two `#`, by maximal munch as GHC lexes them (`1#::Int#` is `1#` and `::`).
         let mut run = 0;
-        while self.peek(run) == Some('#') {
+        while run < 2 && self.peek(run) == Some('#') {
             run += 1;
-        }
-        if run == 0 || run > 2 || self.peek(run).is_some_and(|c| is_symbol(c) && c != '#') {
-            return 0;
         }
         for _ in 0..run {
             self.bump();

@@ -520,9 +520,12 @@ impl Gen {
                     SLit::Addr(s) => (3, s.clone()),
                     _ => unreachable!("numbers and characters are static"),
                 };
-                let t = self.string_label(text.as_bytes());
+                // An `Addr#` literal's characters are its bytes (as the interpreter takes them).
+                let latin1 = kind == 3 && text.chars().all(|c| (c as u32) < 256);
+                let bytes: Vec<u8> = if latin1 { text.chars().map(|c| c as u32 as u8).collect() } else { text.into_bytes() };
+                let t = self.string_label(&bytes);
                 self.emit(&format!("leaq {t}(%rip), %rsi"));
-                self.emit(&format!("movq ${}, %rdx", text.len()));
+                self.emit(&format!("movq ${}, %rdx", bytes.len()));
                 self.emit(&format!("movq ${kind}, %rcx"));
                 self.rt_call("hsc_mk_literal", p, 3);
                 if reg != "%rax" {

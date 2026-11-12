@@ -120,6 +120,16 @@ impl Checker {
                 let rb = wanted_rep(self, args[1].clone(), work);
                 Core::App(Box::new(Core::App(Box::new(Core::App(Box::new(mk), Box::new(many))), Box::new(ra))), Box::new(rb))
             }
+            // An arrow applied to fewer than two arguments: FUN's representation applied to them.
+            Ty::Con(c) if c == super::types::ARROW => {
+                let mut rep = Core::Var("GHC.Internal.Data.Typeable.Internal.trArrow#".into());
+                for a in args {
+                    let ra = wanted_rep(self, a, work);
+                    let app = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrApp".into());
+                    rep = Core::App(Box::new(Core::App(Box::new(app), Box::new(rep))), Box::new(ra));
+                }
+                rep
+            }
             // A type-level literal (`3`, `"s"`, `'c'`).
             Ty::Con(c) if c.starts_with('#') && args.is_empty() => {
                 let text = &c[1..];
@@ -433,12 +443,17 @@ impl Checker {
         for (from, to) in fundeps {
             // A given whose determining arguments are the wanted's fixes the others (`MonadReader r m`
             // given and `MonadReader ?r m` wanted: `?r := r`).
+            // The givens' superclasses count too (`RegexOptions r c e` of a given `RegexMaker r c e s`).
             let zonked: Vec<Ty> = p.args.iter().map(|t| self.metas.zonk(t)).collect();
-            let given_match: Option<Vec<Ty>> = self.givens.iter().rev().find_map(|g| {
-                if g.pred.class != p.class || g.pred.args.len() != zonked.len() {
+            let mut available: Vec<Pred> = Vec::new();
+            for g in self.givens.iter().rev() {
+                self.superclass_closure(&g.pred, &mut available, 0);
+            }
+            let given_match: Option<Vec<Ty>> = available.iter().find_map(|g| {
+                if g.class != p.class || g.args.len() != zonked.len() {
                     return None;
                 }
-                let gz: Vec<Ty> = g.pred.args.iter().map(|t| self.metas.zonk(t)).collect();
+                let gz: Vec<Ty> = g.args.iter().map(|t| self.metas.zonk(t)).collect();
                 from.iter().all(|&i| gz[i] == zonked[i]).then_some(gz)
             });
             if let Some(gz) = given_match {
@@ -467,6 +482,20 @@ impl Checker {
             }
         }
         Ok(())
+    }
+
+    /// A predicate and its superclasses, transitively (instantiated at its arguments).
+    pub(super) fn superclass_closure(&self, p: &Pred, out: &mut Vec<Pred>, depth: usize) {
+        if depth > 20 || out.contains(p) {
+            return;
+        }
+        out.push(p.clone());
+        if let Some(info) = self.class(&p.class) {
+            for sup in info.supers.clone() {
+                let q = Pred { class: sup.class.clone(), args: sup.args.iter().map(|t| subst_gen(t, &p.args)).collect() };
+                self.superclass_closure(&q, out, depth + 1);
+            }
+        }
     }
 
     /// A predicate with solved variables substituted and type families reduced.

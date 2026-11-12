@@ -623,9 +623,20 @@ impl Checker {
                 for e in elems {
                     cores.push(self.check(e, &elem)?);
                 }
+                let n = cores.len();
                 let mut core = Core::Con("Builtin.[]".into(), vec![]);
                 for c in cores.into_iter().rev() {
                     core = Core::Con("Builtin.:".into(), vec![c, core]);
+                }
+                if self.overloaded_lists {
+                    // `fromListN n [..]` at any IsList type.
+                    let (f, fty) = self.lookup_inst("GHC.Internal.IsList.fromListN")?;
+                    let (len_ty, rest) = split_fun_ty(&fty);
+                    let (list_ty, res) = split_fun_ty(&rest);
+                    self.unify_at(&len_ty, &Ty::con("GHC.Types.Int"))?;
+                    self.unify_at(&list_ty, &Ty::list(elem))?;
+                    let len = Core::Con("GHC.Types.I#".into(), vec![Core::Lit(CLit::Int(n as i64))]);
+                    return Ok((Core::App(Box::new(Core::App(Box::new(f), Box::new(len))), Box::new(core)), res));
                 }
                 Ok((core, Ty::list(elem)))
             }
@@ -641,6 +652,13 @@ impl Checker {
                     ),
                 };
                 let call = args.into_iter().fold(prelude(name, *loc), app);
+                if self.overloaded_lists {
+                    let (seq, seq_ty) = self.infer(&call)?;
+                    let (f, fty) = self.lookup_inst("GHC.Internal.IsList.fromList")?;
+                    let (list_ty, res) = split_fun_ty(&fty);
+                    self.unify_at(&list_ty, &seq_ty)?;
+                    return Ok((Core::App(Box::new(f), Box::new(seq)), res));
+                }
                 self.infer(&call)
             }
             Expr::ListComp(body, branches, loc) => {
@@ -978,6 +996,22 @@ impl Checker {
             Pat::List(ps, loc) => {
                 self.loc = *loc;
                 let elem = self.meta();
+                if self.overloaded_lists {
+                    // `toList -> [..]` at any IsList type.
+                    let (f, fty) = self.lookup_inst("GHC.Internal.IsList.toList")?;
+                    let (arg, res) = split_fun_ty(&fty);
+                    self.unify_at(&arg, ty)?;
+                    self.unify_at(&res, &Ty::list(elem.clone()))?;
+                    let mut subs = Vec::with_capacity(ps.len());
+                    for p in ps {
+                        subs.push(self.check_pat(p, &elem)?);
+                    }
+                    let mut core = CPat::Con("Builtin.[]".into(), vec![]);
+                    for s in subs.into_iter().rev() {
+                        core = CPat::Con("Builtin.:".into(), vec![s, core]);
+                    }
+                    return Ok(CPat::View(f, Box::new(core)));
+                }
                 self.unify_at(&Ty::list(elem.clone()), ty)?;
                 let mut subs = Vec::with_capacity(ps.len());
                 for p in ps {
@@ -1545,7 +1579,7 @@ pub fn prim_lit(p: &crate::syntax::token::PrimLit, negative: bool) -> (Core, &'s
     let sign = if negative { "-" } else { "" };
     match p {
         PrimLit::Int(s) => (Core::Lit(CLit::Int(format!("{sign}{s}").parse().unwrap_or(0))), "GHC.Prim.Int#"),
-        PrimLit::Word(s) => (Core::Lit(CLit::Int(s.parse::<u64>().unwrap_or(0) as i64)), "GHC.Prim.Word#"),
+        PrimLit::Word(s) => (Core::Lit(CLit::Int(s.parse::<i128>().unwrap_or(0) as u64 as i64)), "GHC.Prim.Word#"),
         PrimLit::Float(s) => (Core::Lit(CLit::Double(format!("{sign}{s}").parse().unwrap_or(0.0))), "GHC.Prim.Float#"),
         PrimLit::Double(s) => (Core::Lit(CLit::Double(format!("{sign}{s}").parse().unwrap_or(0.0))), "GHC.Prim.Double#"),
         PrimLit::Char(c) => (Core::Lit(CLit::Char(*c)), "GHC.Prim.Char#"),

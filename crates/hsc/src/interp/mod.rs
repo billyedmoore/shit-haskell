@@ -46,7 +46,8 @@ pub enum Value {
     Int(i64),
     Integer(Rc<BigInt>),
     Double(f64),
-    Char(char),
+    /// A character by its code point (surrogates included, as GHC's Char allows).
+    Char(u32),
     Con(Rc<ConVal>),
     Fun(Rc<FunVal>),
     /// A mutable reference (`IORef`): the cell it currently holds.
@@ -211,7 +212,7 @@ impl Runtime {
     fn delay(&self, code: &'static Code, frame: &FrameRef) -> Cell {
         match code {
             Code::Var(acc) => self.access(*acc, frame),
-            Code::Char(c) => new_cell(Thunk::Done(Value::Char(*c))),
+            Code::Char(c) => new_cell(Thunk::Done(Value::Char(*c as u32))),
             Code::Integer(b) => new_cell(Thunk::Done(prims::integer_con((**b).clone()))),
             Code::Int(i) => new_cell(Thunk::Done(Value::Int(*i))),
             _ => new_cell(Thunk::Pending(code, frame.clone())),
@@ -240,7 +241,7 @@ impl Runtime {
                 Code::Int(i) => return Ok(Value::Int(*i)),
                 Code::Double(d) => return Ok(Value::Double(*d)),
                 Code::Frac(s) => return Ok(Value::Double(s.parse().unwrap_or(0.0))),
-                Code::Char(c) => return Ok(Value::Char(*c)),
+                Code::Char(c) => return Ok(Value::Char(*c as u32)),
                 Code::Str(s) => return Ok(string_value(s)),
                 Code::Addr(bytes) => return Ok(Value::Addr(Rc::new(RefCell::new((**bytes).clone())), 0)),
                 Code::App(f, a) => {
@@ -359,7 +360,7 @@ impl Runtime {
             match cur {
                 Value::Con(c) if c.name == "Builtin.:" => {
                     match self.force(&c.args[0])? {
-                        Value::Char(ch) => out.push(ch),
+                        Value::Char(ch) => out.push(char::from_u32(ch).unwrap_or('\u{fffd}')),
                         _ => return Err(RtError::Fail("internal: string of non-characters".into())),
                     }
                     cur = self.force(&c.args[1])?;
@@ -376,7 +377,7 @@ pub fn lit_value(l: &Lit) -> RR {
         Lit::Frac(s) => Value::Double(s.parse().unwrap_or(0.0)),
         Lit::Int(i) => Value::Int(*i),
         Lit::Double(d) => Value::Double(*d),
-        Lit::Char(c) => Value::Char(*c),
+        Lit::Char(c) => Value::Char(*c as u32),
         Lit::Str(s) => string_value(s),
         Lit::Addr(s) => Value::Addr(
             Rc::new(RefCell::new(s.chars().map(|c| c as u32 as u8).chain(std::iter::once(0)).collect())),
@@ -394,7 +395,7 @@ pub fn string_value(s: &str) -> Value {
     for ch in s.chars().rev() {
         v = Value::Con(Rc::new(ConVal {
             name: "Builtin.:",
-            args: vec![new_cell(Thunk::Done(Value::Char(ch))), new_cell(Thunk::Done(v))],
+            args: vec![new_cell(Thunk::Done(Value::Char(ch as u32))), new_cell(Thunk::Done(v))],
         }));
     }
     v
@@ -402,7 +403,7 @@ pub fn string_value(s: &str) -> Value {
 
 fn lit_matches(rt: &Runtime, v: &Value, l: &Lit) -> Result<bool, RtError> {
     Ok(match (v, l) {
-        (Value::Char(a), Lit::Char(b)) => a == b,
+        (Value::Char(a), Lit::Char(b)) => *a == *b as u32,
         (Value::Int(a), Lit::Int(b)) => a == b,
         (Value::Int(a), Lit::Integer(s)) => s.parse::<i64>().ok() == Some(*a),
         (v, Lit::Integer(s)) => match prims::integer_from_value(rt, v)? {

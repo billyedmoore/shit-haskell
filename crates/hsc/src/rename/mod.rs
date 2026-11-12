@@ -140,6 +140,7 @@ impl<'a> Renamer<'a> {
                 0,
                 Import {
                     module: PRELUDE.to_string(),
+                    package: None,
                     qualified: false,
                     alias: None,
                     hiding: false,

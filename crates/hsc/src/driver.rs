@@ -31,6 +31,10 @@ pub struct Driver {
     pub c_sources: Vec<(PathBuf, Vec<String>)>,
     /// The C include and macro flags of every package module loaded (for the capi wrappers).
     pub c_flags: Vec<String>,
+    /// Modules a package-qualified import names that the plain name would not find (such as a
+    /// module importing its namesake from another package): the internal name each is loaded
+    /// under, with its real name and the package directory it is in.
+    renamed: BTreeMap<String, (String, PathBuf)>,
 }
 
 /// Where a module was found: its source, the flags it is compiled with, and whether it is one of
@@ -213,12 +217,16 @@ impl Driver {
             sources: Vec::new(),
             c_sources: Vec::new(),
             c_flags: Vec::new(),
+            renamed: BTreeMap::new(),
         }
     }
 
     /// Finds a module: among the program's own first, then in the packages (by interface file or
     /// by source).
     pub fn find_module(&self, module: &str) -> Option<Found> {
+        if let Some((real, dir)) = self.renamed.get(module) {
+            return Self::find_in_package_dir(dir, &real.replace('.', "/"));
+        }
         let stem = module.replace('.', "/");
         for d in &self.search {
             for ext in ["hs", "lhs"] {
@@ -235,26 +243,69 @@ impl Driver {
                 }
             }
         }
-        for d in &self.pkg_dirs {
-            if let Some((path, flags)) = read_interface(&d.join(format!("{stem}.hi"))) {
-                if path.is_file() {
-                    return Some(Found { path, flags, home: false });
-                }
+        self.pkg_dirs.iter().find_map(|d| Self::find_in_package_dir(d, &stem))
+    }
+
+    /// A module (by its path stem) in one package import directory.
+    fn find_in_package_dir(d: &Path, stem: &str) -> Option<Found> {
+        if let Some((path, flags)) = read_interface(&d.join(format!("{stem}.hi"))) {
+            if path.is_file() {
+                return Some(Found { path, flags, home: false });
             }
-            let p = d.join(format!("{stem}.hs"));
-            if p.is_file() {
-                return Some(Found { path: p, flags: package_flags(d), home: false });
-            }
-            let p = d.join(format!("{stem}.hsc"));
-            if p.is_file() {
-                let flags = package_flags(d);
-                match crate::hsc2hs::translate(&p, &flags) {
-                    Ok(hs) => return Some(Found { path: hs, flags, home: false }),
-                    Err(e) => eprintln!("{e}"),
-                }
+        }
+        let p = d.join(format!("{stem}.hs"));
+        if p.is_file() {
+            return Some(Found { path: p, flags: package_flags(d), home: false });
+        }
+        let p = d.join(format!("{stem}.hsc"));
+        if p.is_file() {
+            let flags = package_flags(d);
+            match crate::hsc2hs::translate(&p, &flags) {
+                Ok(hs) => return Some(Found { path: hs, flags, home: false }),
+                Err(e) => eprintln!("{e}"),
             }
         }
         None
+    }
+
+    /// Whether a package import directory belongs to package `pkg` (a store directory is named
+    /// `<pkg>-<version>-<hash>`, a vendored package's `libs/<pkg>`).
+    fn dir_of_package(d: &Path, pkg: &str) -> bool {
+        d.components().any(|c| {
+            let c = c.as_os_str().to_string_lossy();
+            c == pkg || c.strip_prefix(pkg).and_then(|r| r.strip_prefix('-')).is_some_and(|r| r.starts_with(|ch: char| ch.is_ascii_digit()))
+        })
+    }
+
+    /// Points the package-qualified imports of a module at the package they name. An import the
+    /// plain module name would resolve elsewhere is loaded under an internal name of its own
+    /// (still referred to by its real name in the importing module).
+    fn resolve_package_imports(&mut self, m: &mut Module) {
+        for imp in &mut m.imports {
+            let Some(pkg) = imp.package.clone() else { continue };
+            if pkg == "this" {
+                continue;
+            }
+            let stem = imp.module.replace('.', "/");
+            let Some((dir, found)) = self
+                .pkg_dirs
+                .iter()
+                .filter(|d| Self::dir_of_package(d, &pkg))
+                .find_map(|d| Self::find_in_package_dir(d, &stem).map(|f| (d.clone(), f)))
+            else {
+                continue;
+            };
+            let plain = self.find_module(&imp.module).map(|f| f.path);
+            if plain.as_ref() == Some(&found.path) && imp.module != m.name {
+                continue;
+            }
+            let key = format!("{}_pkg_{}", imp.module, pkg.replace('-', "_"));
+            self.renamed.insert(key.clone(), (imp.module.clone(), dir));
+            if imp.alias.is_none() {
+                imp.alias = Some(imp.module.clone());
+            }
+            imp.module = key;
+        }
     }
 
     fn find_source(&self, module: &str) -> Option<PathBuf> {
@@ -368,9 +419,13 @@ impl Driver {
         }
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
-        let (parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
+        let (mut parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
+        if self.renamed.contains_key(module) {
+            parsed.name = module.to_string();
+        }
+        self.resolve_package_imports(&mut parsed);
         // The GHC packages compile with NoImplicitPrelude as a package default (their cabal files).
         let path_text = path.to_string_lossy();
         if ["/libs/ghc-internal/", "/libs/ghc-prim/", "/libs/ghc-bignum/", "/libs/base/"].iter().any(|p| path_text.contains(p)) {
@@ -380,6 +435,9 @@ impl Driver {
         let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
         if exts.is_on("OverloadedStrings") && module != "GHC.Internal.Data.String" && !path_text.contains("/libs/ghc-prim/") {
             deps.push("GHC.Internal.Data.String".into());
+        }
+        if exts.is_on("OverloadedLists") && module != "GHC.Internal.IsList" && !path_text.contains("/libs/ghc-prim/") {
+            deps.push("GHC.Internal.IsList".into());
         }
         if exts.is_on("ImplicitPrelude") && module != "Prelude" && !deps.iter().any(|d| d == "Prelude") {
             deps.insert(0, "Prelude".into());
@@ -419,6 +477,7 @@ impl Driver {
         };
         let boot = self.checker.boot;
         self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
+        self.checker.overloaded_lists = exts.is_on("OverloadedLists");
         let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot)
             .map_err(|e| located(e.loc, &e.msg))?;
         let binds = self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;
@@ -440,15 +499,19 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
 pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Result<Vec<TopBind>, String> {
     let src = read_source(main_file).map_err(|e| format!("{}: {e}", main_file.display()))?;
     let src = preprocess_if_needed(src, main_file, flags)?;
-    let (parsed, exts) = crate::syntax::parse_module_source(&src, flags).map_err(|e| {
+    let (mut parsed, exts) = crate::syntax::parse_module_source(&src, flags).map_err(|e| {
         format!("{}:{}:{}: error:\n    {}", main_file.display(), e.line, e.col, e.msg)
     })?;
+    d.resolve_package_imports(&mut parsed);
     let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
     if exts.is_on("ImplicitPrelude") && !deps.iter().any(|x| x == "Prelude") {
         deps.insert(0, "Prelude".into());
     }
     if exts.is_on("OverloadedStrings") {
         deps.push("GHC.Internal.Data.String".into());
+    }
+    if exts.is_on("OverloadedLists") {
+        deps.push("GHC.Internal.IsList".into());
     }
     let source = Driver::source_imports(&src);
     for dep in &deps {
