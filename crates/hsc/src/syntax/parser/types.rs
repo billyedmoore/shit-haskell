@@ -96,6 +96,7 @@ impl Parser {
             | Tok::Special('(' | '[')
             | Tok::Kw(Kw::Underscore)
             | Tok::Int(_)
+            | Tok::Char(_)
             | Tok::Str(_) => true,
             // A tick before a constructor operator is an infix promoted operator, not an argument.
             Tok::Special('\'') => !matches!(self.peek_raw(1), Tok::ConSym(_)),
@@ -219,6 +220,11 @@ impl Parser {
             Tok::Str(s) => {
                 self.bump();
                 Ok(Type::Lit(Lit::Str(s), loc))
+            }
+            // A type-level character (DataKinds): `'x'`.
+            Tok::Char(c) => {
+                self.bump();
+                Ok(Type::Lit(Lit::Char(c), loc))
             }
             Tok::Special('(') => {
                 self.bump();

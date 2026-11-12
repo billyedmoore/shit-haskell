@@ -144,6 +144,77 @@ impl Checker {
         None
     }
 
+    /// The type-level arithmetic and comparisons GHC computes itself (GHC.TypeNats, GHC.TypeLits),
+    /// on literal arguments.
+    fn builtin_family(&self, name: &str, args: &[Ty]) -> Option<Ty> {
+        let occ = name.rsplit_once('.').map(|(m, o)| (m, o))?;
+        let (module, op) = occ;
+        if !module.starts_with("GHC.Internal.TypeNats") && !module.starts_with("GHC.Internal.TypeLits") {
+            return None;
+        }
+        let args: Vec<Ty> = args.iter().map(|a| self.normalize(a)).collect();
+        let lit = |t: &Ty| -> Option<String> {
+            match t {
+                Ty::Con(c) => c.strip_prefix('#').map(str::to_string),
+                _ => None,
+            }
+        };
+        let nat = |t: &Ty| -> Option<u128> { lit(t)?.parse().ok() };
+        let sym = |t: &Ty| -> Option<String> {
+            let l = lit(t)?;
+            let inner = l.strip_prefix('"')?.strip_suffix('"')?;
+            if inner.contains('\\') {
+                return None;
+            }
+            Some(inner.to_string())
+        };
+        let chr = |t: &Ty| -> Option<char> {
+            let l = lit(t)?;
+            let inner = l.strip_prefix('\'')?.strip_suffix('\'')?;
+            let mut cs = inner.chars();
+            let c = cs.next()?;
+            if cs.next().is_some() {
+                return None;
+            }
+            Some(c)
+        };
+        let nat_ty = |n: u128| Ty::Con(format!("#{n}"));
+        let ordering = |o: std::cmp::Ordering| {
+            Ty::Con(
+                match o {
+                    std::cmp::Ordering::Less => "GHC.Types.'LT",
+                    std::cmp::Ordering::Equal => "GHC.Types.'EQ",
+                    std::cmp::Ordering::Greater => "GHC.Types.'GT",
+                }
+                .to_string(),
+            )
+        };
+        let two = || -> Option<(u128, u128)> { Some((nat(args.first()?)?, nat(args.get(1)?)?)) };
+        Some(match op {
+            "+" => nat_ty(two().and_then(|(a, b)| a.checked_add(b))?),
+            "*" => nat_ty(two().and_then(|(a, b)| a.checked_mul(b))?),
+            "^" => nat_ty(two().and_then(|(a, b)| a.checked_pow(u32::try_from(b).ok()?))?),
+            "-" => nat_ty(two().and_then(|(a, b)| a.checked_sub(b))?),
+            "Div" => nat_ty(two().and_then(|(a, b)| a.checked_div(b))?),
+            "Mod" => nat_ty(two().and_then(|(a, b)| a.checked_rem(b))?),
+            "Log2" => {
+                let a = nat(args.first()?)?;
+                if a == 0 {
+                    return None;
+                }
+                nat_ty(u128::from(127 - a.leading_zeros()))
+            }
+            "CmpNat" => ordering(two().map(|(a, b)| a.cmp(&b))?),
+            "CmpSymbol" => ordering(sym(args.first()?)?.cmp(&sym(args.get(1)?)?)),
+            "CmpChar" => ordering(chr(args.first()?)?.cmp(&chr(args.get(1)?)?)),
+            "AppendSymbol" => Ty::Con(format!("#{:?}", sym(args.first()?)? + &sym(args.get(1)?)?)),
+            "ConsSymbol" => Ty::Con(format!("#{:?}", format!("{}{}", chr(args.first()?)?, sym(args.get(1)?)?))),
+            "CharToNat" => nat_ty(u128::from(chr(args.first()?)? as u32)),
+            "NatToChar" => Ty::Con(format!("#{:?}", char::from_u32(u32::try_from(nat(args.first()?)?).ok()?)?)),
+            _ => return None,
+        })
+    }
+
     /// The kind of a type, as the name of a type, when it is plain from the type: a promoted
     /// constructor's is its data type, a literal's Natural or Symbol, and a saturated type
     /// constructor's Type ("->" when it is not saturated).
@@ -181,6 +252,9 @@ impl Checker {
         let Some((name, args)) = self.family_app(t) else {
             return self.partial_family_reduce(t);
         };
+        if let Some(r) = self.builtin_family(&name, &args) {
+            return Some(r);
+        }
         let info: &FamilyInfo = self.env.families.get(&name)?;
         let arity = info.arity;
         let args: Vec<Ty> = args.iter().map(|a| self.metas.zonk(a)).collect();
