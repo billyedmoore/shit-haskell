@@ -194,13 +194,45 @@ impl Checker {
         if let Some(r) = self.reduce_head(t) {
             return self.normalize_zonked(&self.metas.zonk(&r), depth + 1);
         }
-        match t {
+        let n = match t {
             Ty::App(f, a) => Ty::app(
                 self.normalize_zonked(f, depth + 1),
                 self.normalize_zonked(a, depth + 1),
             ),
             other => other.clone(),
+        };
+        // With its arguments reduced, the application itself may reduce now
+        // (`IfM (Nothing ||? Nothing) c d`).
+        if n != *t {
+            if let Some(r) = self.reduce_head(&n) {
+                return self.normalize_zonked(&self.metas.zonk(&r), depth + 1);
+            }
         }
+        // A stuck family application that a given equality names (`Weights_ (Rep a) ~ L c` in a
+        // context) stands for the other side.
+        if self.family_app(&n).is_some() {
+            if let Some(r) = self.given_family_equality(&n) {
+                return self.normalize_zonked(&r, depth + 1);
+            }
+        }
+        n
+    }
+
+    /// The other side of a given equality one of whose sides is the family application `t`.
+    fn given_family_equality(&self, t: &Ty) -> Option<Ty> {
+        for g in self.givens.iter().rev() {
+            if !super::solve::is_eq_class(&g.pred.class) || g.pred.args.len() != 2 {
+                continue;
+            }
+            let (a, b) = (self.metas.zonk(&g.pred.args[0]), self.metas.zonk(&g.pred.args[1]));
+            if a == *t && b != *t {
+                return Some(b);
+            }
+            if b == *t && a != *t {
+                return Some(a);
+            }
+        }
+        None
     }
 
     /// Whether a (normalised) type still contains a family application.

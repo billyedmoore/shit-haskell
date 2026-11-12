@@ -434,6 +434,8 @@ impl Parser {
                         let q = match self.tok().clone() {
                             Tok::VarSym(s) | Tok::ConSym(s) => QName::unqual(s),
                             Tok::QVarSym(m, s) | Tok::QConSym(m, s) => QName { qual: Some(m), name: s },
+                            // The reserved operators that name types: `''(~)`, `''(->)`.
+                            Tok::Res(op @ (ROp::Tilde | ROp::RArrow)) => QName::unqual(op.text().to_string()),
                             _ => return self.unexpected(),
                         };
                         self.bump();

@@ -1232,7 +1232,10 @@ impl<'a> Renamer<'a> {
             Expr::NameQuote(is_type, q, loc) => {
                 // `'f`, `'C`, `''T`: the TH `Name` of the global the name refers to, built by
                 // `mkNameG_v`, `mkNameG_d` or `mkNameG_tc` from its package, module and name.
-                let (fun, resolved) = if is_type {
+                let (fun, resolved) = if is_type && q.qual.is_none() && matches!(q.name.as_str(), "~" | "->") {
+                    // The built-in type operators: GHC names them in GHC.Types.
+                    ("mkNameG_tc", Some(("GHC.Types".to_string(), q.name.clone())))
+                } else if is_type {
                     let e = self.lookup_global(&q, Ns::Type).map_err(|c| {
                         if c.is_empty() {
                             RnError { loc, msg: format!("Not in scope: type constructor or class ‘{}’", q.name) }
@@ -1925,9 +1928,12 @@ fn select_item(exports: &[Entity], item: &IEItem) -> Option<Vec<Entity>> {
             }
         }
         IEItem::Thing { name, subs } => {
-            let Some(t) = exports
-                .iter()
-                .find(|e| !e.kind.is_value() && e.occ() == name.name)
+            // A type is exported on its own, or as the associated type of an exported class
+            // (`Item` of `IsList(..)`), and can be imported by its name either way.
+            let t = exports.iter().find(|e| !e.kind.is_value() && e.occ() == name.name).or_else(|| {
+                exports.iter().flat_map(|e| e.subs.iter()).find(|e| !e.kind.is_value() && e.occ() == name.name)
+            });
+            let Some(t) = t
             else {
                 // No type of this name: a constructor (possibly inside an exported type).
                 return select_item(exports, &IEItem::Var(name.clone()));

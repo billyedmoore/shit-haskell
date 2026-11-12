@@ -846,12 +846,28 @@ fn sum_path(n: usize, i: usize) -> Vec<bool> {
 #[derive(Clone)]
 enum FieldRep {
     Par,
+    /// A field of an unlifted type (`Int#`): `UInt` and friends, with their constructor and field.
+    Unlifted(&'static str, &'static str),
     Rec0(Type),
     Rec1(Type),
     Comp(Type, Box<FieldRep>),
 }
 
 fn field_rep(t: &Type, last: Option<&str>) -> FieldRep {
+    if let Type::Con(q, _) = t {
+        let unlifted = match q.name.as_str() {
+            "Addr#" => Some(("UAddr", "uAddr#")),
+            "Char#" => Some(("UChar", "uChar#")),
+            "Double#" => Some(("UDouble", "uDouble#")),
+            "Float#" => Some(("UFloat", "uFloat#")),
+            "Int#" => Some(("UInt", "uInt#")),
+            "Word#" => Some(("UWord", "uWord#")),
+            _ => None,
+        };
+        if let Some((con, sel)) = unlifted {
+            return FieldRep::Unlifted(con, sel);
+        }
+    }
     let Some(v) = last else { return FieldRep::Rec0(t.clone()) };
     if matches!(t, Type::Var(x, _) if x == v) {
         return FieldRep::Par;
@@ -907,6 +923,7 @@ fn derive_generic(checker: &mut Checker, dd: &DataDecl, one: bool) -> Vec<Decl> 
     fn rep_ty(r: &FieldRep, gty: &dyn Fn(&str) -> Type, tapp: &dyn Fn(Type, Vec<Type>) -> Type) -> Type {
         match r {
             FieldRep::Par => gty("Par1"),
+            FieldRep::Unlifted(con, _) => gty(con),
             FieldRep::Rec0(t) => tapp(gty("Rec0"), vec![t.clone()]),
             FieldRep::Rec1(f) => tapp(gty("Rec1"), vec![f.clone()]),
             FieldRep::Comp(f, inner) => tapp(gty(":.:"), vec![f.clone(), rep_ty(inner, gty, tapp)]),
@@ -943,8 +960,11 @@ fn derive_generic(checker: &mut Checker, dd: &DataDecl, one: bool) -> Vec<Decl> 
         };
         let node = |a: Type, b: Type| tapp(gty(":*:"), vec![a, b]);
         let prod = balanced(&sels, &leaf, &node, gty("U1"));
-        let fixity = if c.infix || is_operator(&c.name) {
-            tapp(prom(G, "InfixI"), vec![prom(G, "LeftAssociative"), Type::Lit(Lit::Int("9".into()), loc)])
+        let symbolic = is_operator(&c.name) && !c.name.starts_with('[') && !c.name.starts_with('(');
+        let fixity = if c.infix || symbolic {
+            // `:` is infixr 5; other operator constructors are taken as infixl 9.
+            let (assoc, prec) = if c.name == ":" { ("RightAssociative", "5") } else { ("LeftAssociative", "9") };
+            tapp(prom(G, "InfixI"), vec![prom(G, assoc), Type::Lit(Lit::Int(prec.into()), loc)])
         } else {
             prom(G, "PrefixI")
         };
@@ -953,7 +973,21 @@ fn derive_generic(checker: &mut Checker, dd: &DataDecl, one: bool) -> Vec<Decl> 
         tapp(gty("C1"), vec![meta, prod])
     };
     let sum = balanced(&dd.cons, &con_rep, &|a, b| tapp(gty(":+:"), vec![a, b]), gty("V1"));
-    let meta = tapp(prom(G, "MetaData"), vec![sym(&dd.name), sym(&module), sym(pkg), bool_ty(dd.newtype)]);
+    // The built-in types are named as GHC names them (GHC.Types.List, GHC.Tuple.Tuple2).
+    let (dname, dmodule, dpkg) = if module == "Builtin" {
+        let n = if dd.name == "[]" {
+            "List".to_string()
+        } else if dd.name == "()" {
+            "Unit".to_string()
+        } else {
+            format!("Tuple{}", dd.name.matches(',').count() + 1)
+        };
+        let m = if dd.name == "[]" { "GHC.Types" } else { "GHC.Tuple" };
+        (n, m.to_string(), "ghc-prim")
+    } else {
+        (dd.name.clone(), module.clone(), pkg)
+    };
+    let meta = tapp(prom(G, "MetaData"), vec![sym(&dname), sym(&dmodule), sym(dpkg), bool_ty(dd.newtype)]);
     let rep = tapp(gty("D1"), vec![meta, sum]);
     let kept = if one { &dd.tyvars[..dd.tyvars.len().saturating_sub(1)] } else { &dd.tyvars[..] };
     let head = kept.iter().fold(
@@ -973,6 +1007,7 @@ fn derive_generic(checker: &mut Checker, dd: &DataDecl, one: bool) -> Vec<Decl> 
     fn wrap(r: &FieldRep, e: Expr, checker: &mut Checker, loc: Loc, gcon: &dyn Fn(&str) -> QName, fmap: &dyn Fn() -> Expr) -> Expr {
         match r {
             FieldRep::Par => app(Expr::Con(gcon("Par1"), loc), vec![e]),
+            FieldRep::Unlifted(con, _) => app(Expr::Con(gcon(con), loc), vec![e]),
             FieldRep::Rec0(_) => app(Expr::Con(gcon("K1"), loc), vec![e]),
             FieldRep::Rec1(_) => app(Expr::Con(gcon("Rec1"), loc), vec![e]),
             FieldRep::Comp(_, inner) => {
@@ -986,6 +1021,7 @@ fn derive_generic(checker: &mut Checker, dd: &DataDecl, one: bool) -> Vec<Decl> 
     fn unwrap(r: &FieldRep, e: Expr, checker: &mut Checker, loc: Loc, gvar: &dyn Fn(&str) -> Expr, fmap: &dyn Fn() -> Expr) -> Expr {
         match r {
             FieldRep::Par => app(gvar("unPar1"), vec![e]),
+            FieldRep::Unlifted(_, sel) => app(gvar(sel), vec![e]),
             FieldRep::Rec0(_) => app(gvar("unK1"), vec![e]),
             FieldRep::Rec1(_) => app(gvar("unRec1"), vec![e]),
             FieldRep::Comp(_, inner) => {

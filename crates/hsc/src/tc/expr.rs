@@ -1349,9 +1349,10 @@ impl Checker {
                 );
                 // foldr (\x acc -> case .. ++ acc) [] xs: built from foldr and (++), which every
                 // base module defines (concatMap lives in a later module).
-                let acc = "lc%acc";
+                // A fresh name for each (a comprehension in another's qualifiers has its own).
+                let acc = self.fresh_name("lcacc");
                 let step = Expr::Lam(
-                    vec![Pat::Var(x, *l), Pat::Var(acc.into(), *l)],
+                    vec![Pat::Var(x, *l), Pat::Var(acc.clone(), *l)],
                     Box::new(app(
                         app(prelude("++", *l), case),
                         Expr::Var(QName::unqual(acc), *l),

@@ -752,9 +752,17 @@ impl Checker {
             head.push(self.normalize(&converted));
         }
         let mut ctx = Vec::new();
-        for c in &id.context {
-            ctx.extend(self.convert_context_item(c, &mut tvs)?);
-        }
+        // An instance's context may hold quantified constraints (`(forall a. Show a => Show (m a))
+        // => Show (T m)`): they are wanted where the instance is used and given in its methods.
+        let outer = std::mem::replace(&mut self.allow_quantified, true);
+        let converted: TR<()> = (|| {
+            for c in &id.context {
+                ctx.extend(self.convert_context_item(c, &mut tvs)?);
+            }
+            Ok(())
+        })();
+        self.allow_quantified = outer;
+        converted?;
         // A module can be registered twice (first as a boot file, then for real): the same instance
         // keeps its dictionary name, so that what was compiled against the first still refers to it.
         let earlier = self
@@ -826,9 +834,19 @@ impl Checker {
             .cloned()
             .expect("instance registered");
         let info = self.class(&class).cloned().expect("class registered");
+        // The variables only the context mentions (`gs` of `(gs ~ F opts) => C opts`) come after
+        // the head's, as the header numbered them: they scope over the methods too.
+        {
+            let outer = std::mem::replace(&mut self.allow_quantified, true);
+            for c in &id.context {
+                let _ = self.convert_context_item(c, &mut tvs);
+            }
+            self.allow_quantified = outer;
+        }
 
-        // Skolemise the instance variables; the context is given.
-        let names: Vec<String> = (0..inst.nvars).map(|i| format!("i{i}")).collect();
+        // Skolemise the instance variables (named as in the source); the context is given.
+        let names: Vec<String> =
+            (0..inst.nvars as usize).map(|i| tvs.get(i).cloned().unwrap_or_else(|| format!("i{i}"))).collect();
         let skolems: Vec<Ty> = names.iter().map(|n| self.metas.fresh_skolem(n)).collect();
         let head: Vec<Ty> = inst.head.iter().map(|t| subst_gen(t, &skolems)).collect();
         let ctx: Vec<Pred> = inst
@@ -1029,8 +1047,11 @@ impl Checker {
                     },
                     _ => continue,
                 };
+                // Generic, Generic1, Data and Lift are derived stock for a newtype too, as GHC does
+                // without a strategy.
+                let stock_too = matches!(short.as_str(), "Generic" | "Generic1" | "Data" | "Lift");
                 let via_newtype = d.strategy == Some(Strategy::Newtype)
-                    || (d.strategy.is_none() && !super::derive::is_stock(&short));
+                    || (d.strategy.is_none() && !super::derive::is_stock(&short) && !stock_too);
                 if !via_newtype || d.strategy == Some(Strategy::Anyclass) {
                     continue;
                 }
@@ -1121,8 +1142,14 @@ impl Checker {
                 None => format!("{}.{}", self.module, q.name),
             },
             Type::Tuple(elems, _) => format!("Builtin.({})", ",".repeat(elems.len().saturating_sub(1))),
-            // Lists are built in, with their instances in Base.
-            Type::List(..) => return Ok(Vec::new()),
+            // Lists are built in: their Generic instances are derived from a declaration written
+            // here; their other instances are written in the libraries.
+            Type::List(..) => {
+                if !matches!(&cls, Type::Con(q, _) if q.name == "Generic" || q.name == "Generic1") {
+                    return Ok(Vec::new());
+                }
+                "Builtin.[]".to_string()
+            }
             // Unboxed tuples and sums: only Template Haskell's `Lift` derives instances for them,
             // which need Template Haskell to be used.
             _ if !matches!(&cls, Type::Con(q, _) if super::derive::is_stock(&q.name)) => return Ok(Vec::new()),
@@ -1131,10 +1158,46 @@ impl Checker {
         // Unit and tuples are built in: their declaration is written here, so the stock
         // instance is generated for them as for any type. Lists keep their instances in Base.
         if let Some(occ) = tycon.strip_prefix("Builtin.") {
+            use crate::syntax::ast::{ConDecl, ConFields, Field, Loc, TyVarBind};
+            if occ == "[]" {
+                let at = Loc { line: 0, col: 0 };
+                let a = crate::syntax::ast::Type::Var("a".into(), at);
+                let con = |name: &str, fields: Vec<Field>, infix: bool| ConDecl {
+                    name: name.to_string(),
+                    exist: Vec::new(),
+                    context: Vec::new(),
+                    fields: ConFields::Positional(fields),
+                    gadt_result: None,
+                    infix,
+                    loc: at,
+                };
+                let synthetic = DataDecl {
+                    newtype: false,
+                    context: Vec::new(),
+                    name: "[]".to_string(),
+                    tyvars: vec![TyVarBind { name: "a".into(), kind: None }],
+                    cons: vec![
+                        con("[]", Vec::new(), false),
+                        con(
+                            ":",
+                            vec![
+                                Field { ty: a.clone(), strict: false },
+                                Field { ty: crate::syntax::ast::Type::List(Box::new(a), at), strict: false },
+                            ],
+                            true,
+                        ),
+                    ],
+                    deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
+                    loc: sd.loc,
+                };
+                let here = std::mem::replace(&mut self.module, "Builtin".to_string());
+                let derived = self.derive_instances(&synthetic);
+                self.module = here;
+                return derived;
+            }
             if !(occ == "()" || occ.starts_with("(,")) {
                 return Ok(Vec::new());
             }
-            use crate::syntax::ast::{ConDecl, ConFields, Field, Loc, TyVarBind};
             let arity = if occ == "()" { 0 } else { occ.matches(',').count() + 1 };
             let tyvars: Vec<TyVarBind> = (0..arity)
                 .map(|i| TyVarBind { name: format!("t{i}"), kind: None })

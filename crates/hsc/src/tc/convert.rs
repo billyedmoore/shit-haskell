@@ -126,8 +126,8 @@ impl Checker {
     /// parameter, or a constraint synonym, which may stand for several.
     pub fn convert_context_item(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Vec<Pred>> {
         // QuantifiedConstraints: `forall x. ctx => C t` in a signature's context is a predicate
-        // holding that polymorphic type (see `solve::QUANTIFIED_CLASS`). Elsewhere (superclasses,
-        // instance and constructor contexts) it is dropped.
+        // or an instance's context is a predicate holding that polymorphic type (see
+        // `solve::QUANTIFIED_CLASS`). Elsewhere (superclasses, constructor contexts) it is dropped.
         if let Type::Forall(..) = t {
             if !self.allow_quantified {
                 return Ok(Vec::new());
