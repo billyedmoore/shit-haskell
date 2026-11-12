@@ -52,8 +52,19 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
             })?;
         }
     }
+    let th_quotes = exts.is_on("TemplateHaskell") || exts.is_on("TemplateHaskellQuotes");
+    // QuasiQuotes: `[q|text|]` is rewritten to an application the splice pass recognises, and
+    // the source lexed again.
+    let lexed = if exts.is_on("QuasiQuotes") {
+        match rewrite_quasiquotes(src, th_quotes) {
+            Some(rewritten) => lexer::lex(&rewritten).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
+            None => lexed,
+        }
+    } else {
+        lexed
+    };
     let mut tokens = lexed.tokens;
-    if exts.is_on("TemplateHaskell") || exts.is_on("TemplateHaskellQuotes") {
+    if th_quotes {
         tokens = quote_brackets(tokens);
     }
     let module = parser::parse_module(tokens, exts.clone()).map_err(|e| SyntaxError {
@@ -118,4 +129,135 @@ fn quote_brackets(toks: Vec<token::Token>) -> Vec<token::Token> {
         i += 1;
     }
     out
+}
+
+/// Rewrites each quasi-quotation `[quoter|text|]` of a source to `(hsc'quasiquote quoter
+/// "text")`, keeping the lines after it where they were. None when there is none. Strings,
+/// character literals and comments are skipped; `[e|`, `[d|`, `[t|` and `[p|` are Template Haskell
+/// quotes when those are on.
+fn rewrite_quasiquotes(src: &str, th_quotes: bool) -> Option<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut changed = false;
+    let mut i = 0;
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
+    let symbol = |c: char| "!#$%&*+./<=>?@\\^|-~:".contains(c);
+    while i < chars.len() {
+        let c = chars[i];
+        // String literals.
+        if c == '"' {
+            out.push(c);
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // Character literals (a quote after an identifier character is a prime).
+        if c == '\'' && !(i > 0 && ident(chars[i - 1])) {
+            let end = if chars.get(i + 1) == Some(&'\\') { chars[i + 2..].iter().position(|&x| x == '\'').map(|p| i + 2 + p) } else if chars.get(i + 2) == Some(&'\'') { Some(i + 2) } else { None };
+            if let Some(e) = end.filter(|&e| e - i < 12) {
+                out.extend(&chars[i..=e]);
+                i = e + 1;
+                continue;
+            }
+        }
+        // Line comments.
+        if c == '-' && chars.get(i + 1) == Some(&'-') && !(i > 0 && symbol(chars[i - 1])) {
+            let mut k = i;
+            while k < chars.len() && chars[k] == '-' {
+                k += 1;
+            }
+            if k >= chars.len() || !symbol(chars[k]) {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // Block comments and pragmas.
+        if c == '{' && chars.get(i + 1) == Some(&'-') {
+            let mut depth = 0;
+            while i < chars.len() {
+                if chars[i] == '{' && chars.get(i + 1) == Some(&'-') {
+                    depth += 1;
+                    out.push_str("{-");
+                    i += 2;
+                } else if chars[i] == '-' && chars.get(i + 1) == Some(&'}') {
+                    depth -= 1;
+                    out.push_str("-}");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // A quasi-quotation: `[`, a (qualified) variable name, `|`, all without spaces.
+        if c == '[' && !(i > 0 && ident(chars[i - 1])) {
+            let mut k = i + 1;
+            loop {
+                let start = k;
+                while k < chars.len() && ident(chars[k]) {
+                    k += 1;
+                }
+                if k > start && chars.get(k) == Some(&'.') && chars[start].is_uppercase() {
+                    k += 1;
+                    continue;
+                }
+                break;
+            }
+            let quoter: String = chars[i + 1..k].iter().collect();
+            let last = quoter.rsplit('.').next().unwrap_or("");
+            let is_var = last.chars().next().is_some_and(|ch| ch.is_lowercase() || ch == '_');
+            let th_quote = th_quotes && matches!(quoter.as_str(), "e" | "d" | "t" | "p");
+            if is_var && !th_quote && chars.get(k) == Some(&'|') && chars.get(k + 1) != Some(&']') && chars.get(k + 1) != Some(&'|') {
+                let body_start = k + 1;
+                let mut e = body_start;
+                while e + 1 < chars.len() && !(chars[e] == '|' && chars[e + 1] == ']') {
+                    e += 1;
+                }
+                if e + 1 < chars.len() {
+                    let body: String = chars[body_start..e].iter().collect();
+                    let mut lit = String::from("\"");
+                    for ch in body.chars() {
+                        match ch {
+                            '\\' => lit.push_str("\\\\"),
+                            '"' => lit.push_str("\\\""),
+                            '\n' => lit.push_str("\\n"),
+                            '\t' => lit.push_str("\\t"),
+                            '\r' => lit.push_str("\\r"),
+                            ch => lit.push(ch),
+                        }
+                    }
+                    lit.push('"');
+                    out.push_str(&format!("(hsc'quasiquote {quoter} {lit})"));
+                    // The lines the quotation spanned, so that what follows keeps its line.
+                    for _ in body.chars().filter(|&ch| ch == '\n') {
+                        out.push('\n');
+                    }
+                    i = e + 2;
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    changed.then_some(out)
 }

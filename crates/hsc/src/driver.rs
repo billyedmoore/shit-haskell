@@ -453,9 +453,50 @@ impl Driver {
             }
         }
         self.loading.pop();
+        self.expand_splices(&mut parsed, &exts, &path)?;
         self.compile_module(parsed, exts, &path)?;
         self.loaded.insert(module.to_string());
         self.sources.push((module.to_string(), path.clone(), home));
+        Ok(())
+    }
+
+    /// Runs the Template Haskell splices and quasi-quotations of a module, whose imports are
+    /// loaded, and puts what they produce in their place (see `crate::th`).
+    fn expand_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<(), String> {
+        if !(exts.is_on("TemplateHaskell") || exts.is_on("QuasiQuotes")) || !crate::th::has_splices(m) {
+            return Ok(());
+        }
+        for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.TH.Quote", "GHC.Internal.IO.Unsafe"] {
+            self.load(lib)?;
+        }
+        // The splices run with everything loaded so far, so the modules known only by their
+        // boot files are compiled first.
+        let tb = std::time::Instant::now();
+        self.load_booted()?;
+        if std::env::var_os("HSC_TIME_SPLICES").is_some() {
+            eprintln!("booted modules: {:?}", tb.elapsed());
+        }
+        let t0 = std::time::Instant::now();
+        let timing = std::env::var_os("HSC_TIME_SPLICES").is_some();
+        let splices = crate::th::take_splices(m);
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("HscSplice{n}");
+        let locs: Vec<crate::syntax::ast::Loc> = splices.iter().map(|s| s.loc).collect();
+        let first = locs.first().copied().unwrap_or(m.loc);
+        let smod = crate::th::splice_module(m, &splices, &name);
+        let user_module = self.checker.user_module;
+        self.compile_module(smod, exts.clone(), path)?;
+        self.checker.user_module = user_module;
+        if timing {
+            eprintln!("splices compiled: {:?}", t0.elapsed());
+        }
+        let results = crate::th::run_splices(self.binds.clone(), &name, splices.len(), locs)
+            .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))?;
+        crate::th::fill_splices(m, &results);
+        // The splice bindings are not part of the program.
+        let prefix = format!("{name}.");
+        self.binds.retain(|b| !b.name.starts_with(&prefix));
         Ok(())
     }
 
@@ -528,6 +569,8 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
         d.load("GHC.Internal.TopHandler")?;
     }
     let name = parsed.name.clone();
+    let mut parsed = parsed;
+    d.expand_splices(&mut parsed, &exts, main_file)?;
     d.compile_module(parsed, exts, main_file)?;
     d.sources.push((name.clone(), main_file.to_path_buf(), true));
     d.load_booted()?;

@@ -10,6 +10,7 @@
 
 pub mod fixity;
 pub mod iface;
+mod quote;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -610,6 +611,10 @@ impl<'a> Renamer<'a> {
 
     /// Resolves a variable or constructor in the value namespace.
     fn value_ref(&mut self, q: &QName, loc: Loc, con: bool) -> RR<QName> {
+        // `%G:M.x` names the global `x` of module `M` directly (a Template Haskell `NameG`).
+        if let Some(m) = q.qual.as_deref().and_then(|x| x.strip_prefix("%G:")) {
+            return Ok(QName { qual: Some(m.to_string()), name: q.name.clone() });
+        }
         // `%Base.x` names a Base global directly, whatever the module imports (used by
         // desugarings the parser introduces).
         if q.qual.as_deref() == Some("%Base") {
@@ -645,6 +650,15 @@ impl<'a> Renamer<'a> {
     }
 
     fn lookup_entity(&self, q: &QName, loc: Loc) -> RR<Entity> {
+        // A Template Haskell global name: the entity its module exports (or a part of one).
+        if let Some(m) = q.qual.as_deref().and_then(|x| x.strip_prefix("%G:")) {
+            let found = self.ifaces.get(m).and_then(|i| {
+                i.exports.iter().flat_map(|e| std::iter::once(e).chain(e.subs.iter())).find(|e| e.global.name == q.name && e.global.module == m).cloned()
+            });
+            if let Some(e) = found {
+                return Ok(e);
+            }
+        }
         match self.lookup_global(q, Ns::Value) {
             Ok(e) => Ok(e),
             Err(c) if c.is_empty() => Err(RnError {
@@ -656,6 +670,9 @@ impl<'a> Renamer<'a> {
     }
 
     fn tycon_ref(&mut self, q: &QName, loc: Loc) -> RR<QName> {
+        if let Some(m) = q.qual.as_deref().and_then(|x| x.strip_prefix("%G:")) {
+            return Ok(QName { qual: Some(m.to_string()), name: q.name.clone() });
+        }
         if q.qual.is_none() && is_builtin_tycon(&q.name) {
             return Ok(builtin(&q.name, loc));
         }
@@ -1340,12 +1357,27 @@ impl<'a> Renamer<'a> {
             }
             Expr::Splice(typed, e, loc) => Expr::Splice(typed, Box::new(self.expr(*e)?), loc),
             Expr::Quote(kind, body, loc) => {
-                // The names in a quoted expression are resolved as in any expression.
-                let body = match body {
-                    Some(b) => Some(Box::new(self.expr(*b)?)),
-                    None => None,
-                };
-                Expr::Quote(kind, body, loc)
+                // The names in a quoted expression are resolved as in any expression; the
+                // quotation is then the code that builds its syntax (`quote.rs`).
+                match (kind, body) {
+                    ('e' | 'T', Some(b)) => {
+                        let renamed = self.expr(*b)?;
+                        let built = self.quote_exp(&renamed, loc)?;
+                        if kind == 'T' {
+                            let coerce = Expr::Var(QName { qual: Some("GHC.Internal.TH.Syntax".into()), name: "unsafeCodeCoerce".into() }, loc);
+                            Expr::App(Box::new(coerce), Box::new(built))
+                        } else {
+                            built
+                        }
+                    }
+                    (kind, body) => {
+                        let body = match body {
+                            Some(b) => Some(Box::new(self.expr(*b)?)),
+                            None => None,
+                        };
+                        Expr::Quote(kind, body, loc)
+                    }
+                }
             }
             Expr::Var(q, loc) => Expr::Var(self.value_ref(&q, loc, false)?, loc),
             Expr::Con(q, loc) => {

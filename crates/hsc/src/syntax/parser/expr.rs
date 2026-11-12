@@ -149,7 +149,11 @@ impl Parser {
 
     fn is_prefix_occurrence(&self) -> bool {
         let t = self.raw();
-        t.space_before && !t.space_after
+        // Preceded by white space or an opening token (`($x)`, `[$x]`, `, $x`), as GHC lexes it.
+        let opening = self.pos > 0
+            && matches!(self.toks[self.pos - 1].tok, Tok::Special('(' | '[' | ',' | '{' | ';'))
+            && self.toks[self.pos - 1].end_line == t.line;
+        (t.space_before || opening) && !t.space_after
     }
 
     pub(super) fn lexp(&mut self) -> PResult<Expr> {
@@ -631,7 +635,8 @@ impl Parser {
             return self.tuple_rest(vec![None], loc);
         }
         // `(op)` names an operator; `(op e)` is a right section.
-        let bang_pattern = self.at_varsym("!") && self.is_prefix_occurrence();
+        // `(!x)` is a bang pattern and `($x)`, `($(e))` a splice, not sections.
+        let bang_pattern = (self.at_varsym("!") && self.is_prefix_occurrence()) || self.at_splice();
         if let Some((op, oloc)) = self.peek_operator_token().filter(|_| !bang_pattern) {
             let is_minus = op.name == "-" && op.qual.is_none();
             if self.peek_raw(self.operator_width()) == &Tok::Special(')') {
