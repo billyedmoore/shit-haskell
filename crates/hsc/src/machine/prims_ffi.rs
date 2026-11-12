@@ -372,7 +372,16 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
         "__hscore_f_setfd" => ret_int(m, 2),
         "__hscore_fd_cloexec" => ret_int(m, 1),
         "__hscore_sizeof_stat" => ret_int(m, 144),
-        "__hscore_setmode" | "lockFile" | "unlockFile" => ret_int(m, 0),
+        "__hscore_setmode" => ret_int(m, 0),
+        "lockFile" => {
+            let (fd, dev, ino, w) = (int_arg(m, 0)?, int_arg(m, 1)?, int_arg(m, 2)?, int_arg(m, 3)?);
+            let r = crate::filelock::lock_file(fd, dev as u64, ino as u64, w != 0);
+            ret_int(m, r)
+        }
+        "unlockFile" => {
+            let fd = int_arg(m, 0)?;
+            ret_int(m, crate::filelock::unlock_file(fd))
+        }
         "rtsSupportsBoundThreads" | "rts_isThreaded" => ret_int(m, 0),
         "memcpy" | "memmove" => {
             let (db, doff) = addr_arg(m, 0)?;

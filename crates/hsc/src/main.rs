@@ -60,7 +60,11 @@ fn main() -> ExitCode {
         eprintln!("hsc: no input files\nUsage: For basic information, try the `--help' option.");
         return ExitCode::from(1);
     }
-    match cli::compile(&opts) {
+    let t = std::time::Instant::now();
+    let result = cli::compile(&opts);
+    driver::timing::add("total", t);
+    driver::timing::report();
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(msg) => {
             eprintln!("{msg}");

@@ -80,6 +80,42 @@ pub fn package_flags(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Compile-time accounting for `HSC_TIME=1`: the time spent in each phase, printed at exit.
+pub mod timing {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static TOTALS: Mutex<Vec<(&'static str, Duration)>> = Mutex::new(Vec::new());
+
+    pub fn enabled() -> bool {
+        std::env::var_os("HSC_TIME").is_some()
+    }
+
+    /// Adds the time since `start` to `phase`.
+    pub fn add(phase: &'static str, start: Instant) {
+        if !enabled() {
+            return;
+        }
+        let d = start.elapsed();
+        let mut t = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+        match t.iter_mut().find(|(p, _)| *p == phase) {
+            Some((_, total)) => *total += d,
+            None => t.push((phase, d)),
+        }
+    }
+
+    /// Prints the totals (to stderr).
+    pub fn report() {
+        if !enabled() {
+            return;
+        }
+        let t = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+        for (p, d) in t.iter() {
+            eprintln!("hsc time: {p:<12} {:>8.3}s", d.as_secs_f64());
+        }
+    }
+}
+
 /// The first line of an interface file written by hsc.
 pub const IFACE_MAGIC: &str = "hsc-interface 2";
 
@@ -417,11 +453,13 @@ impl Driver {
                 }
             }
         }
+        let t_parse = std::time::Instant::now();
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
         let (mut parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
+        timing::add("parse", t_parse);
         if self.renamed.contains_key(module) {
             parsed.name = module.to_string();
         }
@@ -463,14 +501,17 @@ impl Driver {
     /// Runs the Template Haskell splices and quasi-quotations of a module, whose imports are
     /// loaded, and puts what they produce in their place (see `crate::th`).
     fn expand_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<(), String> {
-        self.expand_decl_splices(m, exts, path)?;
-        self.expand_expr_splices(m, exts, path)
+        let groups_end = self.expand_decl_splices(m, exts, path)?;
+        self.expand_expr_splices(m, exts, path, groups_end)
     }
 
     /// The declaration splices of a module, in order: each runs with the declarations before it
     /// compiled (under the module's own name, so that `''T` names them as they will be named),
     /// and the declarations it produces take its place.
-    fn expand_decl_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<(), String> {
+    /// Answers where the last declaration group ends (what a declaration splice produced last),
+    /// which the expression splices after it may refer to.
+    fn expand_decl_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<usize, String> {
+        let mut groups_end = 0;
         while let Some(i) = m.decls.iter().position(|d| matches!(d, Decl::Splice(..))) {
             let Decl::Splice(body, loc) = m.decls[i].clone() else { unreachable!() };
             for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.IO.Unsafe"] {
@@ -479,9 +520,11 @@ impl Driver {
             self.load_booted()?;
             // The declarations before it may have expression splices of their own.
             let mut before = Module { decls: m.decls[..i].to_vec(), ..m.clone() };
-            self.expand_expr_splices(&mut before, exts, path)?;
+            self.expand_expr_splices(&mut before, exts, path, groups_end)?;
             m.decls.splice(..i, before.decls.iter().cloned());
-            let smod = crate::th::decl_splice_module(m, before.decls, body, loc);
+            let imported = self.quoted_data(&[&body], &m.name);
+            let table = crate::th::reify_table(&before.decls, &m.name, &imported, loc);
+            let smod = crate::th::decl_splice_module(m, before.decls, body, loc, table);
             let mark = self.binds.len();
             let user_module = self.checker.user_module;
             self.compile_module(smod, exts.clone(), path)?;
@@ -491,15 +534,34 @@ impl Driver {
             // The module is compiled for real afterwards.
             self.binds.truncate(mark);
             self.ifaces.remove(&m.name);
+            groups_end = i + generated.len();
             m.decls.splice(i..=i, generated);
         }
-        Ok(())
+        Ok(groups_end)
     }
 
-    fn expand_expr_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<(), String> {
+    /// The data types of other modules that splices quote by name (`''T`), which `reify` may be
+    /// asked about: their declarations, with their modules.
+    fn quoted_data(&self, bodies: &[&crate::syntax::ast::Expr], current: &str) -> Vec<(String, crate::syntax::ast::DataDecl)> {
+        let mut out: Vec<(String, crate::syntax::ast::DataDecl)> = Vec::new();
+        for q in crate::th::quoted_types(bodies) {
+            for (module, dd) in self.checker.env.data_decls.values() {
+                if dd.name == q.name && module != current && !out.iter().any(|(m, d)| m == module && d.name == dd.name) {
+                    out.push((module.clone(), dd.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The expression splices of a module. Those after a declaration splice may refer to the
+    /// declarations of the groups before it (the first `groups_end`): they are compiled with
+    /// those, under the module's own name.
+    fn expand_expr_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path, groups_end: usize) -> Result<(), String> {
         if !(exts.is_on("TemplateHaskell") || exts.is_on("QuasiQuotes")) || !crate::th::has_splices(m) {
             return Ok(());
         }
+        let groups_end = groups_end.min(m.decls.len());
         for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.TH.Quote", "GHC.Internal.IO.Unsafe"] {
             self.load(lib)?;
         }
@@ -512,14 +574,24 @@ impl Driver {
         }
         let t0 = std::time::Instant::now();
         let timing = std::env::var_os("HSC_TIME_SPLICES").is_some();
-        let splices = crate::th::take_splices(m);
+        // The splices of the declarations after the last group; those before it have run.
+        let mut later = Module { decls: m.decls.split_off(groups_end), ..m.clone() };
+        let splices = crate::th::take_splices(&mut later);
+        let earlier = m.decls.clone();
+        m.decls.extend(later.decls);
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let name = format!("HscSplice{n}");
+        let own = !earlier.is_empty();
+        let name = if own { m.name.clone() } else { format!("HscSplice{n}") };
         let locs: Vec<crate::syntax::ast::Loc> = splices.iter().map(|s| s.loc).collect();
         let first = locs.first().copied().unwrap_or(m.loc);
-        let smod = crate::th::splice_module(m, &splices, &name);
+        let bodies: Vec<&crate::syntax::ast::Expr> = splices.iter().map(|s| &s.body).collect();
+        let imported = self.quoted_data(&bodies, &m.name);
+        let table = crate::th::reify_table(&earlier, &m.name, &imported, first);
+        let mut smod = crate::th::splice_module(m, &splices, &name, table);
+        smod.decls.splice(0..0, earlier);
         let user_module = self.checker.user_module;
+        let mark = self.binds.len();
         self.compile_module(smod, exts.clone(), path)?;
         self.checker.user_module = user_module;
         if timing {
@@ -528,9 +600,13 @@ impl Driver {
         let results = crate::th::run_splices(&self.binds, &name, splices.len(), locs)
             .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))?;
         crate::th::fill_splices(m, &results);
-        // The splice bindings are not part of the program.
-        let prefix = format!("{name}.");
-        self.binds.retain(|b| !b.name.starts_with(&prefix));
+        // The splice module is not part of the program (the module itself is compiled next).
+        self.binds.truncate(mark);
+        if !own {
+            self.ifaces.remove(&name);
+        } else {
+            self.ifaces.remove(&m.name);
+        }
         Ok(())
     }
 
@@ -554,9 +630,13 @@ impl Driver {
         self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
         self.checker.overloaded_lists = exts.is_on("OverloadedLists");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
+        let t = std::time::Instant::now();
         let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot)
             .map_err(|e| located(e.loc, &e.msg))?;
+        timing::add("rename", t);
+        let t = std::time::Instant::now();
         let binds = self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;
+        timing::add("typecheck", t);
         self.binds.extend(binds);
         self.ifaces.insert(name, iface);
         Ok(())
@@ -928,11 +1008,14 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let entry = if binds.iter().any(|b| b.name == "hsc$main") { "hsc$main" } else { "Main.main" };
     let mut roots: Vec<&str> = vec![entry];
     roots.extend_from_slice(crate::native::RTS_GLOBALS);
+    let t = std::time::Instant::now();
     let binds = crate::native::reachable(binds, &roots);
     let prog = crate::native::stg::Lowering::program(&binds);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
     std::fs::write(&asm, text).map_err(|e| e.to_string())?;
+    timing::add("codegen", t);
+    let t_link = std::time::Instant::now();
     let run = |args: &[&str]| -> Result<(), String> {
         let st = std::process::Command::new("gcc").args(args).status().map_err(|e| format!("gcc: {e}"))?;
         if st.success() { Ok(()) } else { Err(format!("gcc {} failed", args.join(" "))) }
@@ -942,6 +1025,9 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let c_objs = compile_c_sources(c_sources, &dir)?;
     let c_objs: Vec<String> = c_objs.iter().map(|p| p.display().to_string()).collect();
     let result = run(&["-c", &asm.display().to_string(), "-o", &obj.display().to_string()]).and_then(|()| {
+        timing::add("assemble", t_link);
+        let t_link = std::time::Instant::now();
+        let r = (|| {
         let (o, r) = (obj.display().to_string(), runtime.display().to_string());
         let mut args = vec![o.as_str()];
         args.extend(c_objs.iter().map(String::as_str));
@@ -952,6 +1038,9 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
         }
         args.extend_from_slice(&["-lpthread", "-ldl", "-lm", "-lgcc_s"]);
         run(&args)
+        })();
+        timing::add("link", t_link);
+        r
     });
     if debug {
         eprintln!("hsc: assembly kept in {}", dir.display());

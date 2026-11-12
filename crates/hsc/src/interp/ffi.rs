@@ -341,7 +341,11 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "__hscore_fd_cloexec" => ret_int(1),
         "__hscore_sizeof_stat" => ret_int(STAT_SIZE),
         "__hscore_setmode" => ret_int(0),
-        "lockFile" | "unlockFile" => ret_int(0),
+        "lockFile" => (|| {
+            let (fd, dev, ino, w) = (int_of(rt, &args[0])?, int_of(rt, &args[1])?, int_of(rt, &args[2])?, int_of(rt, &args[3])?);
+            ret_int(crate::filelock::lock_file(fd, dev as u64, ino as u64, w != 0))
+        })(),
+        "unlockFile" => (|| ret_int(crate::filelock::unlock_file(int_of(rt, &args[0])?)))(),
         "readlink" => (|| {
             let (path, poff) = addr_of(rt, &args[0])?;
             let mut bytes: Vec<u8> = path.borrow()[poff..].iter().take_while(|&&b| b != 0).copied().collect();

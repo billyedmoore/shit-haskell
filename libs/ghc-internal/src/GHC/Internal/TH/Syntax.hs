@@ -181,7 +181,7 @@ instance Quasi IO where
   qReport False msg = hPutStrLn stderr ("Template Haskell error: " ++ msg)
 
   qLookupName _ _       = badIO "lookupName"
-  qReify _              = badIO "reify"
+  qReify                = hscReify
   qReifyFixity _        = badIO "reifyFixity"
   qReifyType _          = badIO "reifyFixity"
   qReifyInstances _ _   = badIO "reifyInstances"
@@ -215,6 +215,22 @@ newNameIO s = do { n <- atomicModifyIORef' counter (\x -> (x + 1, x))
 badIO :: String -> IO a
 badIO op = do   { qReport True ("Can't do `" ++ op ++ "' in the IO monad")
                 ; fail "Template Haskell failure" }
+
+-- | hsc: what the names a splice may reify are, set by the compiler before it runs the splice:
+-- each entry is the module and name of a declaration and its 'Info'.
+{-# NOINLINE hscReifyTable #-}
+hscReifyTable :: IORef [(String, String, Info)]
+hscReifyTable = unsafePerformIO (newIORef [])
+
+hscReify :: Name -> IO Info
+hscReify n@(Name (OccName occ) flavour) = do
+  table <- readIORef hscReifyTable
+  let matches (m, o, _) = o == occ && case flavour of
+        NameG _ _ (ModName m') -> m == m'
+        _ -> True
+  case [i | e@(_, _, i) <- table, matches e] of
+    (i : _) -> pure i
+    [] -> badIO ("reify " ++ show n)
 
 -- Global variable to generate unique symbols
 counter :: IORef Uniq

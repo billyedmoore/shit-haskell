@@ -1325,7 +1325,11 @@ impl<'a> Renamer<'a> {
             Expr::NameQuote(is_type, q, loc) => {
                 // `'f`, `'C`, `''T`: the TH `Name` of the global the name refers to, built by
                 // `mkNameG_v`, `mkNameG_d` or `mkNameG_tc` from its package, module and name.
-                let (fun, resolved) = if is_type && q.qual.is_none() && matches!(q.name.as_str(), "~" | "->") {
+                let global = q.qual.as_deref().and_then(|x| x.strip_prefix("%G:")).map(str::to_string);
+                let (fun, resolved) = if let (true, Some(m)) = (is_type, global) {
+                    // A global name the compiler wrote (the reify table of a splice).
+                    ("mkNameG_tc", Some((m, q.name.clone())))
+                } else if is_type && q.qual.is_none() && matches!(q.name.as_str(), "~" | "->") {
                     // The built-in type operators: GHC names them in GHC.Types.
                     ("mkNameG_tc", Some(("GHC.Types".to_string(), q.name.clone())))
                 } else if is_type {
