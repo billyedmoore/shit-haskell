@@ -778,6 +778,12 @@ fn build_program(
     if let Some(stub) = driver::capi_source(&binds, &capi_flags)? {
         c_sources.push(stub);
     }
+    // Objects and archives named on the command line (a build tool's compiled C sources).
+    for inp in &o.inputs {
+        if inp.ends_with(".o") || inp.ends_with(".a") {
+            c_sources.push((PathBuf::from(inp), Vec::new()));
+        }
+    }
     // The C code of the packages' library archives, and the C libraries they need.
     for f in &o.flags {
         if let Some(a) = f.strip_prefix("-hsc-archive=") {

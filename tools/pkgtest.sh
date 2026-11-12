@@ -34,6 +34,8 @@ fi
     for line in "$@"; do echo "$line"; done
 } > "$work/$pkg/cabal.project"
 cd "$work/$pkg"
+# PKGTEST_TEST_OPTIONS passes options to the test programs (tasty's --timeout=120s, say); not
+# every test driver accepts tasty's options.
 HSC_NATIVE=1 timeout "${PKGTEST_TIMEOUT:-2700}" cabal test -v1 -w "$work/shims/ghc" \
-    --test-options="--timeout=${PKGTEST_CASE_TIMEOUT:-120s}" > "$work/$pkg.log" 2>&1 || true
+    ${PKGTEST_TEST_OPTIONS:+--test-options="$PKGTEST_TEST_OPTIONS"} > "$work/$pkg.log" 2>&1 || true
 grep -E "Test suite .*: (PASS|FAIL)|Failed to build|^Error" "$work/$pkg.log" || tail -20 "$work/$pkg.log"

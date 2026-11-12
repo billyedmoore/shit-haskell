@@ -584,8 +584,8 @@ pub fn run_payload_bytes(payload: Vec<u8>) -> i32 {
 pub fn compile_c_sources(sources: &[(PathBuf, Vec<String>)], dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for (i, (src, flags)) in sources.iter().enumerate() {
-        // A C library to link (`-lm`) is passed on as it is.
-        if src.to_string_lossy().starts_with("-l") {
+        // A C library to link (`-lm`) or a compiled object is passed on as it is.
+        if src.to_string_lossy().starts_with("-l") || src.extension().is_some_and(|e| e == "o") {
             out.push(src.clone());
             continue;
         }

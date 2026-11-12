@@ -563,8 +563,11 @@ impl<'a> Renamer<'a> {
     }
 
     fn fresh(&mut self, occ: &str) -> String {
+        // Unique across modules: a pattern synonym's definition, renamed in its module, is
+        // substituted into others, whose own local names must not capture its names.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
         self.counter += 1;
-        format!("{occ}%{}", self.counter)
+        format!("{occ}%{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
     fn ambiguous(&self, q: &QName, cands: &[Entity], loc: Loc) -> RnError {
