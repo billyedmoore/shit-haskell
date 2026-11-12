@@ -736,12 +736,15 @@ hsc_leave:
     ret
 
 hsc_eval:
+    testq %r14, %r14
+    je .Leval_void
     movq (%r14), %rax
     movzbl %al, %ecx
     cmpb $9, %cl
     je .Leval_ind
     cmpb $8, %cl
     je .Leval_thunk
+.Leval_void:
     jmp *(%rbp)
 .Leval_ind:
     movq 8(%r14), %r14

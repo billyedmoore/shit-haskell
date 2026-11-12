@@ -172,7 +172,7 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
                 "Functor" => derive_functor(checker, dd),
                 "Foldable" => derive_foldable(checker, dd),
                 "Traversable" => derive_traversable(checker, dd),
-                "Lift" => derive_lift(dd),
+                "Lift" => derive_lift(checker, dd),
                 "Data" => derive_data(checker, dd),
                 "Generic" => derive_generic(checker, dd, false),
                 "Generic1" => derive_generic(checker, dd, true),
@@ -1223,14 +1223,41 @@ fn derive_data(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
 }
 
 /// `Lift` (DeriveLift): Template Haskell cannot run yet, so the methods are errors.
-fn derive_lift(dd: &DataDecl) -> Vec<Decl> {
+/// `lift (C x1 .. xn) = conE 'C `appE` lift x1 .. `appE` lift xn`, and `liftTyped` its
+/// coercion, as GHC derives them.
+fn derive_lift(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
     let loc = dd.loc;
-    let err = |m: &str| {
-        let f = Expr::Var(QName { qual: Some("GHC.Internal.Err".into()), name: "errorWithoutStackTrace".into() }, loc);
-        let body = app(f, vec![text(&format!("hsc: Template Haskell's {m} cannot be run yet"), loc)]);
-        fun(m, vec![clause(vec![crate::syntax::ast::Pat::Wild(loc)], body, loc)], loc)
-    };
-    vec![err("lift"), err("liftTyped")]
+    let module = checker.module.clone();
+    let q = |m: &str, n: &str| Expr::Var(QName { qual: Some(m.into()), name: n.into() }, loc);
+    let mut clauses = Vec::new();
+    for c in &dd.cons {
+        let xs = fresh_vars(checker, "x", arity(c));
+        let pat = con_pat(&module, &c.name, xs.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc);
+        let name = app(
+            q("GHC.Internal.TH.Syntax", "mkNameG_d"),
+            vec![text("main", loc), text(&module, loc), text(&c.name, loc)],
+        );
+        let mut body = app(q("GHC.Internal.TH.Lib", "conE"), vec![name]);
+        for x in &xs {
+            let lifted = app(q("GHC.Internal.TH.Lift", "lift"), vec![local(x, loc)]);
+            body = app(q("GHC.Internal.TH.Lib", "appE"), vec![body, lifted]);
+        }
+        clauses.push(clause(vec![pat], body, loc));
+    }
+    // A type without constructors has no values to lift.
+    if clauses.is_empty() {
+        let body = app(q("GHC.Internal.Err", "errorWithoutStackTrace"), vec![text("Void lift", loc)]);
+        clauses.push(clause(vec![Pat::Wild(loc)], body, loc));
+    }
+    let y = checker.fresh_name("y");
+    let typed = app(
+        q("GHC.Internal.TH.Syntax", "unsafeCodeCoerce"),
+        vec![app(q("GHC.Internal.TH.Lift", "lift"), vec![local(&y, loc)])],
+    );
+    vec![
+        fun("lift", clauses, loc),
+        fun("liftTyped", vec![clause(vec![Pat::Var(y, loc)], typed, loc)], loc),
+    ]
 }
 
 /// `readsPrec`: each constructor is read by a list comprehension over `lex` tokens and

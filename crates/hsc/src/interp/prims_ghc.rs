@@ -224,6 +224,16 @@ pub(crate) fn sized_alias(name: &str) -> Option<(&'static str, Option<&'static s
         _ => None,
     };
     let stem = name.strip_suffix('#')?;
+    // `quotRem` on a sized type: its operands are already extended to the full width, so the
+    // full-width operation's results are in range.
+    for w in ["8", "16", "32", "64"] {
+        if stem == format!("quotRemInt{w}") {
+            return Some(("quotRemInt#", None));
+        }
+        if stem == format!("quotRemWord{w}") {
+            return Some(("quotRemWord#", None));
+        }
+    }
     for (op, base) in [("plus", "+#"), ("sub", "-#"), ("times", "*#"), ("quot", "quotInt#"), ("rem", "remInt#")] {
         for (ty, w_base) in [("Int", base), ("Word", match base { "+#" => "plusWord#", "-#" => "minusWord#", "*#" => "timesWord#", "quotInt#" => "quotWord#", _ => "remWord#" })] {
             for w in ["8", "16", "32"] {

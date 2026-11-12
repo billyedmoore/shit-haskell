@@ -481,7 +481,7 @@ pub fn run_main(rt: &Runtime) -> i32 {
 
 /// The text of an uncaught exception: the library's `displayException` of the wrapped exception,
 /// applied through the wrapper's dictionary (a `SomeException` is `dict, context, exception`).
-fn uncaught_text(rt: &Runtime, exc: &Value) -> Option<String> {
+pub fn uncaught_text(rt: &Runtime, exc: &Value) -> Option<String> {
     let Value::Con(c) = exc else { return None };
     if c.args.len() != 3 {
         return None;

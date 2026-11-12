@@ -76,7 +76,7 @@ impl Checker {
                 self.loc = *loc;
                 let binds = self.infer_local(decls)?;
                 let cb = self.check(body, ty)?;
-                Ok(wrap_let(binds, cb))
+                Ok(self.wrap_let_forcing(binds, cb))
             }
             Expr::App(..) => Ok(self.infer_spine(e, Some(ty))?.0),
             // A comprehension is checked at its expected type, so that the refinement of a generator's
@@ -93,6 +93,95 @@ impl Checker {
                 Ok(c)
             }
         }
+    }
+
+    /// A `let`: the bindings of an unlifted type (`s2 = poke p w s1 :: State# s`) are evaluated
+    /// before the body, in order, as GHC evaluates them; the others stay lazy.
+    fn wrap_let_forcing(&mut self, binds: Vec<(String, Core)>, body: Core) -> Core {
+        let unlifted: Vec<String> = binds
+            .iter()
+            .filter(|(n, _)| !n.starts_with(STRICT_BIND))
+            .filter(|(n, _)| {
+                // Only a state token carries an effect; other unlifted values are pure.
+                self.vars.get(n).cloned().is_some_and(|s| {
+                    s.nvars == 0
+                        && s.preds.is_empty()
+                        && matches!(self.metas.zonk(&s.ty).split_apps().0, Ty::Con(c) if c == "GHC.Prim.State#")
+                })
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if unlifted.is_empty() {
+            return wrap_let(binds, body);
+        }
+        // Scheduled by their dependencies: the lazy bindings that need no unlifted one not yet
+        // bound form a `let`, then each unlifted one whose dependencies are bound is `case rhs of
+        // n -> ..`, and so on.
+        let names: std::collections::HashSet<String> = binds.iter().map(|(n, _)| n.clone()).collect();
+        let deps: std::collections::HashMap<String, Vec<String>> = binds
+            .iter()
+            .map(|(n, rhs)| {
+                let mut out = Vec::new();
+                crate::native::mentions(rhs, &mut out);
+                let ds: Vec<String> = out.into_iter().filter(|m| names.contains(*m) && *m != n.as_str()).map(str::to_string).collect();
+                (n.clone(), ds)
+            })
+            .collect();
+        enum Step {
+            Lazy(Vec<(String, Core)>),
+            Strict(String, Core),
+        }
+        let mut remaining = binds;
+        let mut steps: Vec<Step> = Vec::new();
+        let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while !remaining.is_empty() {
+            // The lazy bindings that do not need an unbound unlifted one, directly or through others.
+            let mut blocked: std::collections::HashSet<String> =
+                remaining.iter().filter(|(n, _)| unlifted.contains(n)).map(|(n, _)| n.clone()).collect();
+            loop {
+                let more: Vec<String> = remaining
+                    .iter()
+                    .filter(|(n, _)| !blocked.contains(n) && deps[n].iter().any(|d| blocked.contains(d)))
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                if more.is_empty() {
+                    break;
+                }
+                blocked.extend(more);
+            }
+            let (ready, rest): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|(n, _)| !blocked.contains(n));
+            remaining = rest;
+            if !ready.is_empty() {
+                bound.extend(ready.iter().map(|(n, _)| n.clone()));
+                steps.push(Step::Lazy(ready));
+            }
+            // The unlifted bindings whose dependencies are all bound now.
+            let mut progressed = false;
+            let mut i = 0;
+            while i < remaining.len() {
+                let n = remaining[i].0.clone();
+                if unlifted.contains(&n) && deps[&n].iter().all(|d| bound.contains(d)) {
+                    let (n, rhs) = remaining.remove(i);
+                    bound.insert(n.clone());
+                    steps.push(Step::Strict(n, rhs));
+                    progressed = true;
+                } else {
+                    i += 1;
+                }
+            }
+            if !progressed && !remaining.is_empty() {
+                // A cycle through an unlifted binding: left lazy.
+                steps.push(Step::Lazy(std::mem::take(&mut remaining)));
+            }
+        }
+        let mut body = body;
+        for st in steps.into_iter().rev() {
+            body = match st {
+                Step::Strict(n, rhs) => Core::Case(Box::new(rhs), n, vec![Alt::Default(body)]),
+                Step::Lazy(bs) => wrap_let(bs, body),
+            };
+        }
+        body
     }
 
     /// Binds a case scrutinee to its variable. A scrutinee of an unlifted type (`State#`, `Int#`, ...)
@@ -524,7 +613,7 @@ impl Checker {
                 self.loc = *loc;
                 let binds = self.infer_local(decls)?;
                 let (cb, tb) = self.infer(body)?;
-                Ok((wrap_let(binds, cb), tb))
+                Ok((self.wrap_let_forcing(binds, cb), tb))
             }
             Expr::If(c, t, f, loc) => {
                 self.loc = *loc;

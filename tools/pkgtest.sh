@@ -11,7 +11,8 @@
 # enables its tests and lets it build against hsc's base; extra arguments are appended to the
 # project file (for example 'constraints: tasty -unix'). The compiler is target/alt/release/hsc
 # unless HSC_BIN names another; ghc, ghc-pkg and hsc2hs shims for it go in target/pkgtest/shims.
-# Programs are built natively. The log is target/pkgtest/<name>.log; the summary is printed.
+# Programs are built natively. The log is target/pkgtest/<name>.log; the summary is printed. The
+# copy is deleted afterwards unless PKGTEST_KEEP is set.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 installed=no
@@ -38,4 +39,10 @@ cd "$work/$pkg"
 # every test driver accepts tasty's options.
 HSC_NATIVE=1 timeout "${PKGTEST_TIMEOUT:-2700}" cabal test -v1 -w "$work/shims/ghc" \
     ${PKGTEST_TEST_OPTIONS:+--test-options="$PKGTEST_TEST_OPTIONS"} > "$work/$pkg.log" 2>&1 || true
-grep -E "Test suite .*: (PASS|FAIL)|Failed to build|^Error" "$work/$pkg.log" || tail -20 "$work/$pkg.log"
+grep -a -E "Test suite .*: (PASS|FAIL)|Failed to build|^Error" "$work/$pkg.log" || tail -20 "$work/$pkg.log"
+# The copy (with its build products) is removed to save space; PKGTEST_KEEP=1 keeps it, to
+# rebuild in it with `cabal build` while fixing a failure.
+if [ -z "${PKGTEST_KEEP:-}" ]; then
+    cd "$root"
+    rm -rf "$work/$pkg"
+fi

@@ -325,7 +325,13 @@ type CR<T> = Result<T, String>;
 
 impl Conv<'_> {
     fn force(&self, c: &crate::interp::Cell) -> CR<Value> {
-        self.rt.force(c).map_err(|e| format!("Exception when trying to run compile-time code:\n  {}", rt_error_text(&e)))
+        self.rt.force(c).map_err(|e| {
+            let text = match &e {
+                crate::interp::RtError::Thrown(v) => crate::interp::uncaught_text(self.rt, v).unwrap_or_else(|| rt_error_text(&e)),
+                _ => rt_error_text(&e),
+            };
+            format!("Exception when trying to run compile-time code:\n  {text}")
+        })
     }
 
     /// A constructor value: its constructor's name (unqualified) and its fields.
@@ -609,6 +615,27 @@ impl Conv<'_> {
                     s.push(char::from_u32(n & 0xff).unwrap_or('\0'));
                 }
                 Lit::Prim(PrimLit::Str(s))
+            }
+            // `Bytes ptr offset size`: the bytes, as a primitive string (an `Addr#` literal).
+            "BytesPrimL" => {
+                let (_, ba) = self.con(&a[0])?;
+                let off: usize = self.integer(&ba[1])?.parse().unwrap_or(0);
+                let size: usize = self.integer(&ba[2])?.parse().unwrap_or(0);
+                let (_, fa) = self.con(&ba[0])?;
+                let bytes: Vec<u8> = match self.force(&fa[0])? {
+                    Value::Addr(buf, base) => {
+                        let buf = buf.borrow();
+                        let start = (base + off).min(buf.len());
+                        buf[start..(start + size).min(buf.len())].to_vec()
+                    }
+                    Value::Bytes(buf) => {
+                        let buf = buf.borrow();
+                        let start = off.min(buf.len());
+                        buf[start..(start + size).min(buf.len())].to_vec()
+                    }
+                    _ => return Err("internal: the bytes of a BytesPrimL are not an address".into()),
+                };
+                Lit::Prim(PrimLit::Str(bytes.iter().map(|&b| char::from(b)).collect()))
             }
             other => return Err(format!("Template Haskell literal {other} is not supported yet")),
         })

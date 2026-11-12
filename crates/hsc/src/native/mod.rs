@@ -42,7 +42,7 @@ pub const RTS_CONS: &[&str] = &[
 ];
 
 /// The global names an expression mentions.
-fn mentions<'a>(e: &'a Core, out: &mut Vec<&'a str>) {
+pub(crate) fn mentions<'a>(e: &'a Core, out: &mut Vec<&'a str>) {
     match e {
         Core::Var(v) => out.push(v),
         Core::Lit(_) | Core::Fail(_) => {}

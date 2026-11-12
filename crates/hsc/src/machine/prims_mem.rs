@@ -424,6 +424,9 @@ fn element_access(m: &mut Machine, name: &str) -> Option<Word> {
         let bits = if ekind == "addr" && heap::kind_of(m.heap_get(v, 0)) == kind::ADDR {
             let (b, o) = (m.heap_get(v, 1), m.heap_get(v, 2) as i64);
             if b == 0 { o as Word } else { (b as i64 + 8 + o) as Word }
+        } else if ekind == "float" {
+            // A Float is held as a double: its four bytes are the single-precision encoding.
+            (f64::from_bits(m.heap_get(v, 1)) as f32).to_bits() as Word
         } else {
             m.heap_get(v, 1)
         };
