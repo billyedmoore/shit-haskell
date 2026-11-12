@@ -1150,14 +1150,21 @@ impl Parser {
 
     fn standalone_deriving(&mut self, loc: Loc) -> PResult<Decl> {
         self.expect_kw(Kw::Deriving)?;
-        let strategy = self.deriving_strategy();
+        // DerivingVia: `deriving via (V) instance C T`.
+        let via = if self.at_varid("via") {
+            self.bump();
+            Some(self.atype()?)
+        } else {
+            None
+        };
+        let strategy = if via.is_some() { None } else { self.deriving_strategy() };
         self.expect_kw(Kw::Instance)?;
         self.skip_instance_forall();
         let context = self.try_context();
         let head = self.btype()?;
         Ok(Decl::Deriving(StandaloneDeriving {
             strategy,
-            via: None,
+            via,
             context,
             head,
             loc,

@@ -1026,18 +1026,53 @@ impl Checker {
     fn register_newtype_deriving(&mut self, dd: &DataDecl) -> TR<()> {
         use crate::syntax::ast::Strategy;
         self.loc = dd.loc;
-        let (field_ty, rep_last) = match (dd.newtype, dd.cons.first()) {
+        // The representation of a newtype (its one field), for newtype deriving.
+        let newtype_field: Option<Type> = match (dd.newtype, dd.cons.first()) {
             (true, Some(c)) => match &c.fields {
-                ConFields::Positional(fs) if fs.len() == 1 => (fs[0].ty.clone(), true),
-                ConFields::Record(groups) if groups.len() == 1 && groups[0].0.len() == 1 => {
-                    (groups[0].1.ty.clone(), true)
-                }
-                _ => return Ok(()),
+                ConFields::Positional(fs) if fs.len() == 1 => Some(fs[0].ty.clone()),
+                ConFields::Record(groups) if groups.len() == 1 && groups[0].0.len() == 1 => Some(groups[0].1.ty.clone()),
+                _ => None,
             },
-            _ => return Ok(()),
+            _ => None,
         };
-        let _ = rep_last;
         for d in &dd.deriving {
+            // DerivingVia: the instance is the class's dictionary at the via type (a type of the
+            // same representation), for a data type as for a newtype.
+            if let Some(via) = &d.via {
+                for cls in &d.classes {
+                    let cls_name = match cls {
+                        Type::Con(q, _) => global_tycon_name(q),
+                        _ => continue,
+                    };
+                    if !self.env.classes.contains_key(&cls_name) {
+                        continue;
+                    }
+                    let eta = is_constructor_class(&cls_name);
+                    let kept: Vec<String> = dd
+                        .tyvars
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .take(dd.tyvars.len().saturating_sub(if eta { 1 } else { 0 }))
+                        .collect();
+                    let mut tvs = kept.clone();
+                    let rep = self.convert_type(via, &mut tvs)?;
+                    let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
+                    let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
+                    let dict = format!("{}.$fVia{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.counter);
+                    self.counter += 1;
+                    self.env.instances.push(InstInfo {
+                        class: cls_name.clone(),
+                        nvars: tvs.len() as u32,
+                        ctx: vec![Pred { class: cls_name.clone(), args: vec![rep] }],
+                        head: vec![head],
+                        dict: dict.clone(),
+                    });
+                    let d_name = self.fresh_name("gd");
+                    self.out.push(TopBind { name: dict, body: Core::Lam(d_name.clone(), Box::new(Core::Var(d_name))) });
+                }
+                continue;
+            }
+            let Some(field_ty) = newtype_field.clone() else { continue };
             for cls in &d.classes {
                 let short = match cls {
                     Type::Con(q, _) => q.name.clone(),
@@ -1240,7 +1275,7 @@ impl Checker {
             return self.err(format!("Cannot derive an instance for ‘{}’: its declaration is not known", super::types::unqualify(&tycon)));
         };
         let synthetic = DataDecl {
-            deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
+            deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: sd.via.clone() }],
             ..dd
         };
         // The constructors and the instance head are named in the declaring module.

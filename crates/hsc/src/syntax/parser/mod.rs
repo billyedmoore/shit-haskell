@@ -340,6 +340,8 @@ impl Parser {
             let standalone = match self.peek_raw(1) {
                 Tok::Kw(Kw::Instance) => true,
                 Tok::VarId(s) if s == "stock" || s == "anyclass" => *self.peek_raw(2) == Tok::Kw(Kw::Instance),
+                // `deriving via (V) instance ..` (a deriving clause names its classes first).
+                Tok::VarId(s) if s == "via" => true,
                 Tok::Kw(Kw::Newtype) => *self.peek_raw(2) == Tok::Kw(Kw::Instance),
                 _ => false,
             };

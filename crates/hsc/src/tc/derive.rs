@@ -153,7 +153,9 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
             // Newtype deriving is handled by the dictionary alias in the checker.
             // Generic, Data and Lift are derived the stock way for newtypes too.
             let stock_for_newtype = is_stock(&name) || matches!(name.as_str(), "Generic" | "Generic1" | "Data" | "Lift");
-            if d.strategy == Some(Strategy::Newtype) || (dd.newtype && !stock_for_newtype && d.strategy.is_none()) {
+            // Newtype and via deriving: the instance is another type's dictionary (registered by
+            // the checker), with no code.
+            if d.via.is_some() || d.strategy == Some(Strategy::Newtype) || (dd.newtype && !stock_for_newtype && d.strategy.is_none()) {
                 continue;
             }
             let derived = match name.as_str() {
