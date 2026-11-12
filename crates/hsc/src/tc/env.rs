@@ -80,6 +80,9 @@ pub struct FamEqn {
     pub nvars: u32,
     pub args: Vec<Ty>,
     pub rhs: Ty,
+    /// The kind each pattern is annotated with (`(s :: Sizing)`), as the name of a type: the
+    /// equations of a poly-kinded family can differ only in the kinds of their arguments.
+    pub kinds: Vec<Option<String>>,
 }
 
 #[derive(Clone, Debug)]

@@ -53,6 +53,9 @@ pub const WITH_DICT_CLASS: &str = "GHC.Magic.Dict.WithDict";
 /// `ctx` to the dictionary of `C t`.
 pub const QUANTIFIED_CLASS: &str = "%quantified";
 
+/// The name of the placeholder for an instance variable only its context mentions.
+const UNBOUND_PREFIX: &str = "%unbound";
+
 /// The class `Typeable`, whose instances the compiler builds.
 pub const TYPEABLE_CLASS: &str = "GHC.Internal.Data.Typeable.Internal.Typeable";
 
@@ -391,6 +394,7 @@ impl Checker {
             }
             match self.find_instance(&pred) {
                 Some((inst_dict, ctx)) => {
+                    let ctx = self.instantiate_unbound(ctx);
                     let mut args = Vec::with_capacity(ctx.len());
                     for cp in ctx {
                         let ev = self.fresh_name("d");
@@ -641,6 +645,35 @@ impl Checker {
         None
     }
 
+    /// The placeholders `find_instance` leaves for an instance's context-only variables, replaced by
+    /// fresh unification variables (one per variable).
+    fn instantiate_unbound(&mut self, ctx: Vec<Pred>) -> Vec<Pred> {
+        fn has(t: &Ty) -> bool {
+            match t {
+                Ty::Con(c) => c.starts_with(UNBOUND_PREFIX),
+                Ty::App(f, x) => has(f) || has(x),
+                _ => false,
+            }
+        }
+        if !ctx.iter().any(|p| p.args.iter().any(has)) {
+            return ctx;
+        }
+        let mut fresh: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+        fn replace(t: &Ty, fresh: &mut std::collections::HashMap<String, Ty>, meta: &mut dyn FnMut() -> Ty) -> Ty {
+            match t {
+                Ty::Con(c) if c.starts_with(UNBOUND_PREFIX) => fresh.entry(c.clone()).or_insert_with(meta).clone(),
+                Ty::App(f, x) => Ty::app(replace(f, fresh, meta), replace(x, fresh, meta)),
+                other => other.clone(),
+            }
+        }
+        ctx.into_iter()
+            .map(|p| Pred {
+                class: p.class,
+                args: p.args.iter().map(|a| replace(a, &mut fresh, &mut || self.meta())).collect(),
+            })
+            .collect()
+    }
+
     /// Finds an instance for a predicate. Returns the dictionary function name and the
     /// instance context instantiated for this predicate.
     pub fn find_instance(&self, want: &Pred) -> Option<(String, Vec<Pred>)> {
@@ -673,7 +706,13 @@ impl Checker {
         if let Some(i) = best.or(if matches.is_empty() { None } else { Some(0) }) {
             let (inst, sub) = matches.swap_remove(i);
             {
-                let args: Vec<Ty> = sub.into_iter().map(|s| s.unwrap_or(Ty::con("Builtin.?"))).collect();
+                // A variable only the context mentions (`coh` of `(coh ~ F o) => C o`) is a
+                // placeholder here; the solver gives it a fresh unification variable.
+                let args: Vec<Ty> = sub
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, s)| s.unwrap_or_else(|| Ty::Con(format!("{UNBOUND_PREFIX}{i}"))))
+                    .collect();
                 let ctx = inst
                     .ctx
                     .iter()

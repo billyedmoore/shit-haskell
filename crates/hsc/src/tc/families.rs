@@ -144,6 +144,38 @@ impl Checker {
         None
     }
 
+    /// The kind of a type, as the name of a type, when it is plain from the type: a promoted
+    /// constructor's is its data type, a literal's Natural or Symbol, and a saturated type
+    /// constructor's Type ("->" when it is not saturated).
+    fn kind_name_of(&self, t: &Ty) -> Option<String> {
+        let t = self.metas.zonk(t);
+        let (head, args) = t.split_apps();
+        let Ty::Con(c) = head else { return None };
+        if let Some(lit) = c.strip_prefix('#') {
+            return Some(if lit.starts_with('"') { "Symbol" } else if lit.starts_with('\'') { "Char" } else { "Natural" }.into());
+        }
+        if let Some((m, occ)) = c.rsplit_once('.') {
+            if let Some(con) = occ.strip_prefix('\'') {
+                return self.env.datacons.get(&format!("{m}.{con}")).map(|d| d.tycon.clone());
+            }
+        }
+        if self.env.families.contains_key(c) {
+            return None;
+        }
+        let arity = if c == super::types::LIST {
+            Some(1)
+        } else if c.starts_with("Builtin.(") {
+            Some(c.matches(',').count() + usize::from(c != "Builtin.()"))
+        } else {
+            self.env.tycons.get(c).map(|i| i.arity)
+        };
+        match arity {
+            Some(n) if args.len() == n => Some("Type".into()),
+            Some(_) => Some("->".into()),
+            None => None,
+        }
+    }
+
     /// One reduction step at the head of `t`, if it is a family application that can reduce.
     fn reduce_head(&self, t: &Ty) -> Option<Ty> {
         let Some((name, args)) = self.family_app(t) else {
@@ -153,10 +185,21 @@ impl Checker {
         let arity = info.arity;
         let args: Vec<Ty> = args.iter().map(|a| self.metas.zonk(a)).collect();
         for eqn in &info.equations {
-            let FamEqn { nvars, args: pats, rhs } = eqn;
+            let FamEqn { nvars, args: pats, rhs, kinds } = eqn;
             let mut sub: Vec<Option<Ty>> = vec![None; *nvars as usize];
             let mut result = Match::Yes;
-            for (p, a) in pats.iter().zip(&args[..arity]) {
+            for (k, (p, a)) in pats.iter().zip(&args[..arity]).enumerate() {
+                // A pattern annotated with a kind matches arguments of that kind only.
+                if let Some(Some(want)) = kinds.get(k) {
+                    match self.kind_name_of(a) {
+                        Some(have) if !same_kind(&have, want) => {
+                            result = Match::No;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => result = Match::Stuck,
+                    }
+                }
                 match match_pat(p, a, &mut sub) {
                     Match::Yes => {}
                     Match::No => {
@@ -168,6 +211,9 @@ impl Checker {
             }
             match result {
                 Match::Yes => {
+                    if std::env::var_os("HSC_DEBUG_FAM").is_some() && sub.iter().any(|x| x.is_none()) {
+                        eprintln!("family {name}: unbound pattern variable in {pats:?} for {args:?}");
+                    }
                     let vals: Vec<Ty> = sub.into_iter().map(|x| x.unwrap_or(Ty::con("Builtin.?"))).collect();
                     let body = subst_gen(rhs, &vals);
                     let extra: Vec<Ty> = args[arity..].to_vec();
@@ -287,14 +333,23 @@ impl Checker {
         }
         let mut tvs = Vec::new();
         let mut pats = Vec::with_capacity(args.len());
+        let mut kinds = Vec::with_capacity(args.len());
         for a in args {
             pats.push(self.convert_type(a, &mut tvs)?);
+            kinds.push(match a {
+                Type::Sig(_, k) => match k.as_ref() {
+                    Type::Con(q, _) => Some(super::convert::global_tycon_name(q)),
+                    _ => None,
+                },
+                _ => None,
+            });
         }
         let rhs_ty = self.convert_type(rhs, &mut tvs)?;
         let eqn = FamEqn {
             nvars: tvs.len() as u32,
             args: pats,
             rhs: rhs_ty,
+            kinds,
         };
         if let Some(info) = self.env.families.get_mut(name) {
             info.equations.push(eqn);
@@ -307,4 +362,22 @@ impl Checker {
 #[allow(dead_code)]
 fn zonk_with(m: &Metas, t: &Ty) -> Ty {
     m.zonk(t)
+}
+
+/// Whether two kind names are the same kind (Type is named in several modules).
+fn same_kind(a: &str, b: &str) -> bool {
+    let is_type = |k: &str| k == "Type" || k.ends_with(".Type") || k.ends_with(".*") || k == "*";
+    if is_type(a) || is_type(b) {
+        return is_type(a) && is_type(b);
+    }
+    let base = |k: &str| k.rsplit('.').next().unwrap_or(k).to_string();
+    // Natural is also written Nat; literals answer the short names.
+    let norm = |k: &str| match base(k).as_str() {
+        "Nat" => "Natural".to_string(),
+        other => other.to_string(),
+    };
+    if !a.contains('.') || !b.contains('.') {
+        return norm(a) == norm(b);
+    }
+    a == b
 }
