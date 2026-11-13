@@ -4,15 +4,16 @@ A Haskell compiler written from scratch in Rust, aiming to be a drop-in replacem
 
 ## Why
 
-This project is an experiment in what AI systems can do with very large rewrites: work so big,
-and with so many interlocking parts, that it can't be reached by making small improvements one at
-a time and keeping whatever looks better. A compiler for a real language is such a rewrite. Its
-parser, type checker, optimiser, code generator and runtime all have to work together before even
-one real program runs, and real programs use a vast surface of the language and its libraries.
+This project tests what AI systems can do with large rewrites that would otherwise be out of
+reach, by hill-climbing: an AI agent (Claude) works in iteration loops, each time finding a way
+hsc differs from GHC, fixing it, and checking the fix against GHC, so that the compiler climbs
+steadily towards GHC parity. A compiler for a real language is a demanding target for this:
+parser, type checker, optimiser, code generator and runtime all have to work together, and real
+programs use a vast surface of the language and its libraries.
 
-hsc was written almost entirely by an AI agent (Claude), working autonomously over long sessions.
-GHC serves only as a test oracle: every behaviour is checked by compiling the same program with
-both compilers and comparing the results. The question is how far that loop can go, from toy
+hsc was written almost entirely by Claude, working autonomously over long sessions. GHC is the
+measure of progress and the test oracle: every behaviour is checked by compiling the same program
+with both compilers and comparing the results. The question is how far the climb can go, from toy
 programs to GHC's own boot libraries' test suites to large real-world projects such as ShellCheck.
 
 ## What it is
