@@ -107,7 +107,66 @@ pub struct Runtime {
 }
 
 pub(super) fn new_cell(t: Thunk) -> Cell {
-    Rc::new(RefCell::new(t))
+    let c = Rc::new(RefCell::new(t));
+    TRACKED.with(|tr| {
+        if let Some((v, limit)) = tr.borrow_mut().as_mut() {
+            let n = ALLOCATED.with(|a| {
+                a.set(a.get() + 1);
+                a.get()
+            });
+            if n == BUDGET.with(|b| b.get()) {
+                // The caller (a splice too costly for the interpreter) runs it another way.
+                std::panic::panic_any(BudgetExceeded);
+            }
+            v.push(Rc::downgrade(&c));
+            // The cells freed since are dropped from the list (a weak reference keeps its cell's
+            // memory), when it has doubled.
+            if v.len() >= *limit {
+                v.retain(|w| w.strong_count() > 0);
+                *limit = (2 * v.len()).max(1 << 16);
+            }
+        }
+    });
+    c
+}
+
+/// The cells allocated on this thread while tracking is on (`track_cells`), and the length at
+/// which the dead ones are dropped next.
+type Tracked = Option<(Vec<std::rc::Weak<RefCell<Thunk>>>, usize)>;
+
+thread_local! {
+    static TRACKED: RefCell<Tracked> = const { RefCell::new(None) };
+}
+
+thread_local! {
+    static ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// The panic payload of an evaluation that allocated more cells than `track_cells` allows.
+pub struct BudgetExceeded;
+
+/// Records every cell this thread allocates from now on, for `free_tracked`; allocating more
+/// than `budget` cells panics with `BudgetExceeded`.
+pub fn track_cells(budget: usize) {
+    TRACKED.with(|tr| *tr.borrow_mut() = Some((Vec::new(), 1 << 16)));
+    ALLOCATED.with(|a| a.set(0));
+    BUDGET.with(|b| b.set(budget));
+}
+
+/// Empties the cells allocated since `track_cells` that are still alive. The interpreter's
+/// reference counts leak cycles (a recursive closure refers to its own frame); a Template
+/// Haskell splice's runtime would otherwise keep everything it allocated for the rest of the
+/// compilation.
+pub fn free_tracked() {
+    let cells = TRACKED.with(|tr| tr.borrow_mut().take()).map(|(v, _)| v).unwrap_or_default();
+    for w in cells {
+        if let Some(c) = w.upgrade() {
+            if let Ok(mut t) = c.try_borrow_mut() {
+                *t = Thunk::Blackhole;
+            }
+        }
+    }
 }
 
 fn blank_frame(nslots: u32, free: Rc<Vec<Cell>>) -> FrameRef {
@@ -119,6 +178,18 @@ fn blank_frame(nslots: u32, free: Rc<Vec<Cell>>) -> FrameRef {
 }
 
 impl Runtime {
+    /// Empties the top-level cells (and the stable pointers and RTS slots), so that the
+    /// reference cycles through them (recursive bindings, the closures that mention them) are
+    /// freed when the runtime is dropped: a Template Haskell splice's runtime would otherwise
+    /// stay in memory for the rest of the compilation.
+    pub fn break_cycles(&self) {
+        for c in &self.cells {
+            *c.borrow_mut() = Thunk::Blackhole;
+        }
+        self.stable.borrow_mut().clear();
+        self.ffi_slots.borrow_mut().clear();
+    }
+
     /// Compiles the program and creates a cell for each top-level binding. Top-level
     /// code is a constant: each binding is evaluated at most once, on first use.
     pub fn new(binds: Vec<TopBind>, prog_name: String) -> Runtime {

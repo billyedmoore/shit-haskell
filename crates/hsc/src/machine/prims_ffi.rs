@@ -64,6 +64,11 @@ fn unbox(m: &mut Machine, v: Word) -> Option<Word> {
 fn addr_arg(m: &mut Machine, k: usize) -> Option<(Word, i64)> {
     let v = force_arg(m, k)?;
     let v = unbox(m, v)?;
+    // A byte array passed itself (an unsafe call's `ByteArray#` or `MutableByteArray#`
+    // argument) stands for its first byte, as GHC passes it.
+    if m.heap_get(v, 0) as u8 == kind::BYTES {
+        return Some((v, 0));
+    }
     if m.heap_get(v, 0) as u8 != kind::ADDR {
         // A null pointer from a literal address.
         return Some((0, 0));

@@ -22,6 +22,11 @@ fn placeholder(i: usize) -> String {
     format!("hsc'splice{i}")
 }
 
+/// The action printing splice `i`'s result, for a native run (see `native_splice_main`).
+fn printer(i: usize) -> String {
+    format!("hsc'print{i}")
+}
+
 /// A qualified name in the Template Haskell library, by module (a `%G:` name, which the renamer
 /// resolves directly, whatever the module imports).
 fn th_var(module: &str, name: &str, loc: Loc) -> Expr {
@@ -148,6 +153,22 @@ fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice],
             clauses: vec![Clause {
                 pats: Vec::new(),
                 rhs: Rhs { body: Body::Plain(typed), wheres: Vec::new() },
+                loc,
+                end: loc,
+            }],
+            loc,
+        });
+        // For a native run of the splices: the action printing the result (`hscPrintSplice`).
+        let io_unit = Type::App(
+            Box::new(Type::Con(QName { qual: Some("%G:GHC.Types".into()), name: "IO".into() }, loc)),
+            Box::new(Type::Con(QName { qual: Some("%G:Builtin".into()), name: "()".into() }, loc)),
+        );
+        let print = app(th_var("GHC.Internal.TH.Syntax", "hscPrintSplice", loc), Expr::Var(QName::unqual(placeholder(i)), loc));
+        decls.push(Decl::Fun {
+            name: printer(i),
+            clauses: vec![Clause {
+                pats: Vec::new(),
+                rhs: Rhs { body: Body::Plain(Expr::Sig(Box::new(print), io_unit, loc)), wheres: Vec::new() },
                 loc,
                 end: loc,
             }],
@@ -344,6 +365,23 @@ pub fn run_decl_splice(binds: &[crate::core::TopBind], module: &str, loc: Loc, p
     })
 }
 
+/// The error of a splice run that exceeded the interpreter's allocation budget: the caller runs
+/// the splices natively (`native_splice_main`).
+pub const SPLICE_BUDGET: &str = "%splice-budget";
+
+/// The panic hook leaves out the budget's panics (they are caught), keeping the others'.
+fn silence_budget_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !info.payload().is::<crate::interp::BudgetExceeded>() {
+                default(info);
+            }
+        }));
+    });
+}
+
 /// Forces the binding that sets the reify table of values (`reify_values_module`), if any.
 fn run_pre(rt: &Runtime, pre: Option<&str>, loc: Loc) -> Result<(), String> {
     if let Some(p) = pre {
@@ -365,7 +403,15 @@ fn with_runtime<T: Send + 'static>(
     let mut all: Vec<&str> = roots.iter().map(String::as_str).collect();
     all.extend_from_slice(crate::native::RTS_GLOBALS);
     all.extend_from_slice(&["GHC.Internal.Exception.Type.displayException", "GHC.Internal.TopHandler.runMainIO"]);
+    let rss = || std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok()).unwrap_or(0) * 4096 / (1 << 20);
+    let progress = std::env::var_os("HSC_PROGRESS").is_some();
+    if progress {
+        eprintln!("  splice runtime: rss {} MB before", rss());
+    }
     let mut binds = crate::native::reachable_cloned(binds, &all);
+    if progress {
+        eprintln!("  splice runtime: {} bindings reachable, rss {} MB", binds.len(), rss());
+    }
     // The program's own optimisations (literal patterns compare directly, known methods are
     // called directly): without them the interpreter's code for the large tables is very slow
     // to build.
@@ -376,19 +422,47 @@ fn with_runtime<T: Send + 'static>(
         .stack_size(4 << 30)
         .spawn(move || -> Result<T, String> {
             crate::interp::conc::set_stack_base();
+            // The interpreter's reference counts leak cycles: a splice allocating more than this
+            // many cells is run natively instead (`SPLICE_BUDGET`).
+            let budget = std::env::var("HSC_SPLICE_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(4_000_000);
+            crate::interp::track_cells(budget);
+            silence_budget_panics();
             let t0 = std::time::Instant::now();
             let n = binds.len();
-            let rt = Runtime::new(binds, "hsc-splice".into());
-            let t1 = t0.elapsed();
-            crate::interp::conc::set_runtime(&rt);
-            let r = f(&rt);
+            let mut t1 = t0.elapsed();
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = Runtime::new(binds, "hsc-splice".into());
+                t1 = t0.elapsed();
+                crate::interp::conc::set_runtime(&rt);
+                let r = f(&rt);
+                rt.break_cycles();
+                r
+            }));
+            crate::interp::conc::clear_runtime();
+            crate::interp::free_tracked();
             if std::env::var_os("HSC_TIME_SPLICES").is_some() {
                 eprintln!("splice runtime of {n} bindings built in {t1:?}, splices ran in {:?}", t0.elapsed() - t1);
             }
-            r
+            match run {
+                Ok(r) => r,
+                Err(p) if p.is::<crate::interp::BudgetExceeded>() => Err(SPLICE_BUDGET.into()),
+                Err(p) => std::panic::resume_unwind(p),
+            }
         })
         .map_err(|e| format!("cannot start the splice thread: {e}"))?;
-    handle.join().map_err(|_| "a Template Haskell splice crashed".to_string())?
+    let r = handle.join().map_err(|_| "a Template Haskell splice crashed".to_string())?;
+    // The splice thread's malloc arena keeps what the runtime freed; it goes back to the system.
+    extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: malloc_trim only releases free memory of the allocator's arenas.
+    unsafe {
+        malloc_trim(0);
+    }
+    if progress {
+        eprintln!("  splice runtime: rss {} MB after", rss());
+    }
+    r
 }
 
 /// The conversion of Template Haskell syntax values to source syntax.
@@ -1294,17 +1368,21 @@ pub fn reify_values_module(values: &[(String, &crate::tc::types::Scheme)], modul
         Expr::List(entries, loc),
     );
     let unit = Type::Con(QName { qual: Some("%G:Builtin".into()), name: "()".into() }, loc);
-    let body = Expr::Sig(Box::new(app(th_var("GHC.Internal.IO.Unsafe", "unsafePerformIO", loc), set)), unit, loc);
-    let decl = Decl::Fun {
-        name: REIFY_VALUES.into(),
+    let io_unit = Type::App(Box::new(Type::Con(QName { qual: Some("%G:GHC.Types".into()), name: "IO".into() }, loc)), Box::new(unit.clone()));
+    let body = Expr::Sig(Box::new(app(th_var("GHC.Internal.IO.Unsafe", "unsafePerformIO", loc), set.clone())), unit, loc);
+    let fun = |name: &str, body: Expr| Decl::Fun {
+        name: name.into(),
         clauses: vec![Clause { pats: Vec::new(), rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() }, loc, end: loc }],
         loc,
     };
-    Module { name: name.to_string(), exports: None, imports: Vec::new(), decls: vec![decl], loc }
+    let decls = vec![fun(REIFY_VALUES, body), fun(REIFY_VALUES_IO, Expr::Sig(Box::new(set), io_unit, loc))];
+    Module { name: name.to_string(), exports: None, imports: Vec::new(), decls, loc }
 }
 
 /// The binding of `reify_values_module`.
 pub const REIFY_VALUES: &str = "hscSetReifyValues";
+/// Its action, for a native run of the splices.
+pub const REIFY_VALUES_IO: &str = "hscSetReifyValuesIO";
 
 impl Reify {
     /// A checked type scheme as a TH `Type`: `forall a b. ctx => t`, its variables at kind
@@ -1354,4 +1432,177 @@ impl Reify {
             _ => self.syn("WildCardT"),
         }
     }
+}
+
+// ----- splices run natively ----------------------------------------------------------------
+
+/// The entry of a native program that runs a splice module's splices (those the interpreter's
+/// budget does not allow): it sets the reify table of values (`pre_io`), then prints each
+/// splice's result in order (`hscPrintSplice`), under the top handler.
+pub fn native_splice_main(module: &str, count: usize, pre_io: Option<String>) -> crate::core::Core {
+    use crate::core::Core::{App, Var};
+    let then = |a: crate::core::Core, b: crate::core::Core| App(Box::new(App(Box::new(Var("GHC.Internal.Base.thenIO".into())), Box::new(a))), Box::new(b));
+    let mut actions: Vec<crate::core::Core> = pre_io.into_iter().map(Var).collect();
+    actions.extend((0..count).map(|i| Var(format!("{module}.{}", printer(i)))));
+    let last = actions.pop().unwrap_or_else(|| App(Box::new(Var("GHC.Internal.Base.returnIO".into())), Box::new(crate::core::Core::Con("Builtin.()".into(), vec![]))));
+    let body = actions.into_iter().rev().fold(last, |acc, a| then(a, acc));
+    let run_main = App(Box::new(Var("GHC.Internal.TopHandler.runMainIO".into())), Box::new(body));
+    then(run_main, Var("GHC.Internal.TopHandler.flushStdHandles".into()))
+}
+
+/// The roots a native splice program needs besides `native_splice_main`'s.
+pub fn native_splice_roots(module: &str, count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("{module}.{}", printer(i))).collect()
+}
+
+/// A serialised value (`hscSerialize`) as an interpreter value, for `Conv`.
+struct Reader<'a> {
+    s: &'a [u8],
+    pos: usize,
+}
+
+fn intern(name: &str) -> &'static str {
+    use std::sync::Mutex;
+    static NAMES: Mutex<Option<std::collections::HashMap<String, &'static str>>> = Mutex::new(None);
+    let mut g = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    if let Some(n) = map.get(name) {
+        return n;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    map.insert(name.to_string(), leaked);
+    leaked
+}
+
+impl Reader<'_> {
+    fn skip_spaces(&mut self) {
+        while self.pos < self.s.len() && self.s[self.pos] == b' ' {
+            self.pos += 1;
+        }
+    }
+
+    fn number(&mut self) -> String {
+        let start = self.pos;
+        while self.pos < self.s.len() && (self.s[self.pos] == b'-' || self.s[self.pos].is_ascii_digit()) {
+            self.pos += 1;
+        }
+        String::from_utf8_lossy(&self.s[start..self.pos]).to_string()
+    }
+
+    fn cell(v: Value) -> crate::interp::Cell {
+        std::rc::Rc::new(std::cell::RefCell::new(crate::interp::Thunk::Done(v)))
+    }
+
+    fn value(&mut self) -> CR<Value> {
+        self.skip_spaces();
+        let bad = || "internal: malformed splice output".to_string();
+        match self.s.get(self.pos) {
+            Some(b'#') => {
+                self.pos += 1;
+                let n = self.number();
+                Ok(Value::Char(n.parse().map_err(|_| bad())?))
+            }
+            Some(b'%') => {
+                self.pos += 1;
+                let n = self.number();
+                Ok(match n.parse::<i64>() {
+                    Ok(i) => Value::Int(i),
+                    Err(_) => Value::Integer(std::rc::Rc::new(crate::interp::bigint::BigInt::parse(&n).ok_or_else(bad)?)),
+                })
+            }
+            Some(b'~') => {
+                self.pos += 1;
+                let num = self.number();
+                self.pos += 1;
+                let den = self.number();
+                let (a, b): (f64, f64) = (num.parse().map_err(|_| bad())?, den.parse().map_err(|_| bad())?);
+                Ok(Value::Double(a / b))
+            }
+            Some(b'@') => {
+                self.pos += 1;
+                let end = self.s[self.pos..].iter().position(|&b| b == b'@').ok_or_else(bad)? + self.pos;
+                let text = String::from_utf8_lossy(&self.s[self.pos..end]).to_string();
+                self.pos = end + 1;
+                let bytes: Vec<u8> = if text.is_empty() { Vec::new() } else { text.split(',').map(|c| c.parse().map_err(|_| bad())).collect::<CR<_>>()? };
+                Ok(Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(bytes))))
+            }
+            Some(b'"') => {
+                self.pos += 1;
+                let end = self.s[self.pos..].iter().position(|&b| b == b'"').ok_or_else(bad)? + self.pos;
+                let text = String::from_utf8_lossy(&self.s[self.pos..end]).to_string();
+                self.pos = end + 1;
+                let codes: Vec<u32> = if text.is_empty() { Vec::new() } else { text.split(',').map(|c| c.parse().map_err(|_| bad())).collect::<CR<_>>()? };
+                let mut list = Value::Con(std::rc::Rc::new(crate::interp::ConVal { name: "[]", args: Vec::new() }));
+                for c in codes.into_iter().rev() {
+                    list = Value::Con(std::rc::Rc::new(crate::interp::ConVal { name: ":", args: vec![Self::cell(Value::Char(c)), Self::cell(list)] }));
+                }
+                Ok(list)
+            }
+            Some(b'(') => {
+                self.pos += 1;
+                let start = self.pos;
+                // A constructor's name runs to the space or parenthesis after it; `(:)`, `(,)`
+                // and `()` are names with parentheses.
+                let mut depth = 0i32;
+                while self.pos < self.s.len() {
+                    match self.s[self.pos] {
+                        b'(' => depth += 1,
+                        b')' if depth > 0 => depth -= 1,
+                        b' ' | b')' if depth == 0 => break,
+                        _ => {}
+                    }
+                    self.pos += 1;
+                }
+                let raw = String::from_utf8_lossy(&self.s[start..self.pos]).to_string();
+                let name = match raw.as_str() {
+                    "(:)" => ":".to_string(),
+                    _ => raw,
+                };
+                let mut args = Vec::new();
+                loop {
+                    self.skip_spaces();
+                    match self.s.get(self.pos) {
+                        Some(b')') => {
+                            self.pos += 1;
+                            break;
+                        }
+                        Some(_) => args.push(self.value()?),
+                        None => return Err(bad()),
+                    }
+                }
+                // The interpreter has no newtype constructors.
+                if matches!(name.as_str(), "OccName" | "ModName" | "PkgName") && args.len() == 1 {
+                    return Ok(args.pop().unwrap_or(Value::Int(0)));
+                }
+                Ok(Value::Con(std::rc::Rc::new(crate::interp::ConVal { name: intern(&name), args: args.into_iter().map(Self::cell).collect() })))
+            }
+            _ => Err(bad()),
+        }
+    }
+}
+
+/// Converts the output of a native splice program: one serialised result per line.
+fn native_lines(out: &str, count: usize) -> CR<Vec<crate::interp::Cell>> {
+    let lines: Vec<&str> = out.lines().collect();
+    if lines.len() < count {
+        return Err(format!("internal: the splice program printed {} results of {count}", lines.len()));
+    }
+    lines[lines.len() - count..]
+        .iter()
+        .map(|l| Reader { s: l.as_bytes(), pos: 0 }.value().map(Reader::cell))
+        .collect()
+}
+
+/// The expressions a native splice program produced.
+pub fn native_exps(out: &str, locs: Vec<Loc>) -> Result<Vec<Expr>, String> {
+    let cells = native_lines(out, locs.len())?;
+    let rt = Runtime::new(Vec::new(), "hsc-splice".into());
+    cells.iter().zip(locs).map(|(c, loc)| Conv { rt: &rt, loc }.exp(c)).collect()
+}
+
+/// The declarations a native declaration-splice program produced.
+pub fn native_decs(out: &str, loc: Loc) -> Result<Vec<Decl>, String> {
+    let cells = native_lines(out, 1)?;
+    let rt = Runtime::new(Vec::new(), "hsc-splice".into());
+    Conv { rt: &rt, loc }.top_decs(&cells[0])
 }

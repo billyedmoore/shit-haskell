@@ -780,13 +780,25 @@ impl Parser {
         Ok(Expr::Tuple(elems, loc))
     }
 
+    /// An element of a list, which in a list pattern may be a view pattern (`[f -> p, q]`).
+    fn list_elem(&mut self) -> PResult<Expr> {
+        let l = self.loc();
+        let e = self.expr()?;
+        if self.at_res(ROp::RArrow) {
+            self.bump();
+            let pat = self.expr()?;
+            return Ok(Expr::ViewPat(Box::new(e), Box::new(pat), l));
+        }
+        Ok(e)
+    }
+
     fn bracket_expr(&mut self, loc: Loc) -> PResult<Expr> {
         self.bump();
         if self.at_special(']') {
             self.bump();
             return Ok(Expr::Con(QName::unqual("[]"), loc));
         }
-        let first = self.expr()?;
+        let first = self.list_elem()?;
         if self.at_res(ROp::DotDot) {
             self.bump();
             let to = if self.at_special(']') {
@@ -819,7 +831,7 @@ impl Parser {
         let mut elems = vec![first];
         if self.at_special(',') {
             self.bump();
-            let second = self.expr()?;
+            let second = self.list_elem()?;
             if self.at_res(ROp::DotDot) {
                 self.bump();
                 let to = if self.at_special(']') {
@@ -839,7 +851,7 @@ impl Parser {
             elems.push(second);
             while self.at_special(',') {
                 self.bump();
-                elems.push(self.expr()?);
+                elems.push(self.list_elem()?);
             }
         }
         self.expect_special(']')?;

@@ -223,6 +223,44 @@ badIO op = do   { qReport True ("Can't do `" ++ op ++ "' in the IO monad")
 hscReifyTable :: IORef [(String, String, Info)]
 hscReifyTable = unsafePerformIO (newIORef [])
 
+-- | hsc: a splice's result written for the compiler, when the splice runs in a native program:
+-- each value is @(Con field ..)@ by its constructor's name, a character @#code@, a number
+-- @%digits@ (with a sign), a fraction @~num/den@, and a string @"code,code,.."@.
+hscSerialize :: Data a => a -> ShowS
+hscSerialize x = case constrRep c of
+    CharConstr ch -> showChar '#' . shows (ord ch)
+    IntConstr i -> showChar '%' . shows i
+    FloatConstr r -> showChar '~' . shows (numerator r) . showChar '/' . shows (denominator r)
+    _ | name == "(:)", Just str <- hscStringOf x -> showChar '"' . commas (map ord str) . showChar '"'
+      -- A literal's bytes (BytesPrimL), copied out of their pointer: @codes@.
+      | name == "Bytes", Just b <- cast x ->
+          showString "(Bytes (FP @" . commas (map ord (bytesOf b)) . showString "@) %0 %" . shows (bytesSize b) . showChar ')'
+      | otherwise -> showChar '(' . showString name . fields (gmapQ (\d -> showChar ' ' . hscSerialize d) x) . showChar ')'
+  where
+    c = toConstr x
+    name = showConstr c
+    bytesOf :: Bytes -> String
+    bytesOf b = unsafePerformIO $ withForeignPtr (bytesPtr b) $ \ptr ->
+      peekCAStringLen (ptr `plusPtr` fromIntegral (bytesOffset b), fromIntegral (bytesSize b))
+    fields [] = id
+    fields (f : fs) = f . fields fs
+    commas [] = id
+    commas [n] = shows n
+    commas (n : ns) = shows n . showChar ',' . commas ns
+
+-- | hsc: a list of characters, found by its structure (no 'cast', which is slow).
+hscStringOf :: Data a => a -> Maybe String
+hscStringOf x = case showConstr (toConstr x) of
+  "[]" -> Just ""
+  "(:)" -> case gmapQ (\d -> (case constrRep (toConstr d) of CharConstr ch -> Just ch; _ -> Nothing, hscStringOf d)) x of
+    [(Just ch, _), (_, Just rest)] -> Just (ch : rest)
+    _ -> Nothing
+  _ -> Nothing
+
+-- | hsc: prints a splice's result (`hscSerialize`), one line.
+hscPrintSplice :: Data a => a -> IO ()
+hscPrintSplice x = hPutStrLn stdout (hscSerialize x "")
+
 -- | hsc: the values of the module being compiled, with their types, for 'reify' (set once
 -- the declarations before the splices are checked).
 {-# NOINLINE hscReifyValues #-}

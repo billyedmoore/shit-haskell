@@ -169,7 +169,15 @@ pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
     }
     let (mut module, mut source, mut flags) = (String::new(), None, Vec::new());
     let (mut text, mut boot): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+    let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
     while let Some(l) = line(&mut pos) {
+        if let Some(v) = l.strip_prefix("header: ") {
+            let (name, n) = v.rsplit_once(' ')?;
+            let n: usize = n.parse().ok()?;
+            headers.push((name.to_string(), bytes.get(pos..pos + n)?.to_vec()));
+            pos += n;
+            continue;
+        }
         if let Some(v) = l.strip_prefix("module: ") {
             module = v.to_string();
         } else if let Some(v) = l.strip_prefix("source: ") {
@@ -189,7 +197,25 @@ pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
     let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("hs").to_string();
     let mut key = text.clone();
     key.extend_from_slice(boot.as_deref().unwrap_or_default());
+    for (n, h) in &headers {
+        key.extend_from_slice(n.as_bytes());
+        key.extend_from_slice(h);
+    }
     let dir = cache_dir("ifaces").join(md5_hex(&key));
+    // The headers the interface carries, in an include directory of their own.
+    if !headers.is_empty() {
+        let inc = dir.join("%include");
+        std::fs::create_dir_all(&inc).ok()?;
+        for (n, h) in &headers {
+            let p = inc.join(n);
+            if !p.is_file() {
+                let tmp = inc.join(format!("{n}.tmp{}", std::process::id()));
+                std::fs::write(&tmp, h).ok()?;
+                std::fs::rename(&tmp, &p).ok()?;
+            }
+        }
+        flags.push(format!("-I{}", inc.display()));
+    }
     let file = dir.join(format!("{}.{ext}", module.replace('.', "/")));
     if !file.is_file() {
         std::fs::create_dir_all(file.parent()?).ok()?;
@@ -229,6 +255,20 @@ pub fn write_interface(path: &Path, module: &str, source: &Path, flags: &[String
     out.push_str(&format!("text: {}\n{text}", text.len()));
     if let Some(b) = boot {
         out.push_str(&format!("boot: {}\n{b}", b.len()));
+    }
+    // A module with capi imports: the headers of its include directories go with it, since the
+    // wrappers are compiled with the program, after the package's sources are gone.
+    if text.contains("capi") {
+        for f in flags {
+            let Some(dir) = f.strip_prefix("-I") else { continue };
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            let mut names: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "h")).collect();
+            names.sort();
+            for h in names {
+                let (Some(name), Ok(content)) = (h.file_name().and_then(|n| n.to_str()), std::fs::read_to_string(&h)) else { continue };
+                out.push_str(&format!("header: {name} {}\n{content}", content.len()));
+            }
+        }
     }
     if std::fs::read_to_string(path).is_ok_and(|t| t == out) {
         return Ok(());
@@ -675,7 +715,8 @@ impl Driver {
         let mut groups_end = 0;
         while let Some(i) = m.decls.iter().position(|d| matches!(d, Decl::Splice(..))) {
             let Decl::Splice(body, loc) = m.decls[i].clone() else { unreachable!() };
-            for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.IO.Unsafe"] {
+            // (The top handler too, for a native run of the splices.)
+            for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.IO.Unsafe", "GHC.Internal.TopHandler"] {
                 self.load(lib)?;
             }
             self.load_booted()?;
@@ -691,7 +732,13 @@ impl Driver {
             self.compile_module(smod, exts.clone(), path)?;
             let pre = self.reify_values(&m.name, exts, path, loc)?;
             self.checker.user_module = user_module;
-            let generated = crate::th::run_decl_splice(&self.binds, &m.name, loc, pre)
+            let pre_io = pre.as_ref().map(|p| format!("{}IO", p));
+            let generated = match crate::th::run_decl_splice(&self.binds, &m.name, loc, pre) {
+                Err(e) if e == crate::th::SPLICE_BUDGET => {
+                    self.native_splices(&m.name, 1, pre_io).and_then(|out| crate::th::native_decs(&out, loc))
+                }
+                r => r,
+            }
                 .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), loc.line, loc.col))?;
             // The module is compiled for real afterwards.
             self.binds.truncate(mark);
@@ -700,6 +747,51 @@ impl Driver {
             m.decls.splice(i..=i, generated);
         }
         Ok(groups_end)
+    }
+
+    /// Runs the splices of a compiled splice module as a native program (built beside the current
+    /// directory and removed after), answering what it printed: one result per splice.
+    fn native_splices(&self, module: &str, count: usize, pre_io: Option<String>) -> Result<String, String> {
+        let t = std::time::Instant::now();
+        let mut binds = self.binds.clone();
+        binds.push(crate::core::TopBind { name: "hsc$main".into(), body: crate::th::native_splice_main(module, count, pre_io) });
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // In hsc's cache directory (a compilation killed while it runs leaves nothing in the
+        // project); old ones are removed.
+        let base = cache_dir("splices");
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for e in entries.flatten() {
+                let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() > 3600);
+                if old {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+        let dir = base.join(format!("{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let exe = dir.join("splices");
+        // As in every program: the RTS functions C code calls, and base's C helpers.
+        let mut c_sources = self.c_sources.clone();
+        c_sources.push((default_lib_dir().join("rts").join("hsc-rts-shim.c"), Vec::new()));
+        let result = write_native_with(&exe.display().to_string(), &binds, &c_sources).and_then(|()| {
+            let t_run = std::time::Instant::now();
+            let out = std::process::Command::new(&exe).output().map_err(|e| format!("{}: {e}", exe.display()))?;
+            if std::env::var_os("HSC_TIME_SPLICES").is_some() {
+                eprintln!("splice program built in {:?}, ran in {:?}", t_run - t, t_run.elapsed());
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !out.status.success() {
+                return Err(format!("Exception when trying to run compile-time code:\n  {}", stderr.trim_end()));
+            }
+            eprint!("{stderr}");
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::env::var_os("HSC_TIME_SPLICES").is_some() {
+            eprintln!("splices of {module} run natively in {:?}", t.elapsed());
+        }
+        result
     }
 
     /// Compiles the module that gives `reify` the types of the values of `module` checked so far
@@ -755,7 +847,7 @@ impl Driver {
             return Ok(());
         }
         let groups_end = groups_end.min(m.decls.len());
-        for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.TH.Quote", "GHC.Internal.IO.Unsafe"] {
+        for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.TH.Quote", "GHC.Internal.IO.Unsafe", "GHC.Internal.TopHandler"] {
             self.load(lib)?;
         }
         // The splices run with everything loaded so far, so the modules known only by their
@@ -791,8 +883,15 @@ impl Driver {
         if timing {
             eprintln!("splices compiled: {:?}", t0.elapsed());
         }
-        let results = crate::th::run_splices(&self.binds, &name, splices.len(), locs, pre)
-            .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))?;
+        let pre_io = pre.as_ref().map(|p| format!("{}IO", p));
+        let results = match crate::th::run_splices(&self.binds, &name, splices.len(), locs.clone(), pre) {
+            // Too costly for the interpreter: the splices run as a native program.
+            Err(e) if e == crate::th::SPLICE_BUDGET => {
+                self.native_splices(&name, splices.len(), pre_io).and_then(|out| crate::th::native_exps(&out, locs))
+            }
+            r => r,
+        }
+        .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))?;
         crate::th::fill_splices(m, &results);
         // The splice module is not part of the program (the module itself is compiled next).
         self.binds.truncate(mark);
@@ -806,6 +905,11 @@ impl Driver {
 
     fn compile_module(&mut self, m: Module, exts: Extensions, path: &Path) -> Result<(), String> {
         let name = m.name.clone();
+        // HSC_PROGRESS: each module compiled, with the compiler's resident memory then.
+        if std::env::var_os("HSC_PROGRESS").is_some() {
+            let rss = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok()).unwrap_or(0);
+            eprintln!("compiling {name} ({} decls, rss {} MB)", m.decls.len(), rss * 4096 / (1 << 20));
+        }
         self.checker.user_module = !path.starts_with(default_lib_dir());
         // Call stacks name a library file as GHC's build does (libraries/<package>/...).
         self.checker.source_name = if self.checker.user_module {
@@ -1169,7 +1273,11 @@ pub fn capi_source(binds: &[TopBind], flags: &[String]) -> Result<Option<(PathBu
     if !path.is_file() {
         std::fs::write(&path, src).map_err(|e| format!("{}: {e}", path.display()))?;
     }
-    Ok(Some((path, flags.to_vec())))
+    // The wrappers pass array and state arguments (`MutableByteArray# s`) as 64-bit integers, which
+    // a pointer parameter receives the same way on x86-64: newer compilers would make that an error.
+    let mut flags = flags.to_vec();
+    flags.extend(["-cc-option=-Wno-int-conversion".to_string(), "-cc-option=-Wno-incompatible-pointer-types".to_string()]);
+    Ok(Some((path, flags)))
 }
 
 /// The name of the binding a program's payload carries for its C libraries (their paths).
@@ -1211,7 +1319,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     // exits, as GHC's `hs_exit` does: `hsc$main` is `runMainIO Main.main >> flushStdHandles`.
     let mut binds = binds.to_vec();
     let has = |n: &str| binds.iter().any(|b| b.name == n);
-    if has("GHC.Internal.TopHandler.runMainIO") && has("Main.main") && has("GHC.Internal.TopHandler.flushStdHandles") && has("GHC.Internal.Base.thenIO") {
+    if !has("hsc$main") && has("GHC.Internal.TopHandler.runMainIO") && has("Main.main") && has("GHC.Internal.TopHandler.flushStdHandles") && has("GHC.Internal.Base.thenIO") {
         use crate::core::Core::{App, Var};
         let run_main = App(Box::new(Var("GHC.Internal.TopHandler.runMainIO".into())), Box::new(Var("Main.main".into())));
         let body = App(

@@ -59,6 +59,8 @@ fn addr_of(rt: &Runtime, c: &Cell) -> Result<(Buf, usize), RtError> {
     };
     match inner {
         Value::Addr(b, o) => Ok((b, o)),
+        // A byte array passed itself (`ByteArray#`, `MutableByteArray#`): its first byte.
+        Value::Bytes(b) => Ok((b, 0)),
         _ => Err(RtError::Fail("internal: expected a pointer argument".into())),
     }
 }

@@ -54,6 +54,11 @@ pub fn set_runtime(rt: &super::Runtime) {
     RUNTIME.store(rt as *const super::Runtime as usize, Ordering::Relaxed);
 }
 
+/// Forgets the runtime `set_runtime` recorded (before it is dropped).
+pub fn clear_runtime() {
+    RUNTIME.store(0, Ordering::Relaxed);
+}
+
 /// Signals have arrived: a thread runs their Haskell handlers (`hscRunPendingSignals`).
 pub fn start_signal_handlers() {
     if !crate::signals::pending() {
