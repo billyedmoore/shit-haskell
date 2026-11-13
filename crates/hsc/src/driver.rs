@@ -449,18 +449,31 @@ impl Driver {
         let Some(dir) = self.pkg_dirs.iter().filter(|d| path.starts_with(d)).max_by_key(|d| d.as_os_str().len()).cloned() else {
             return;
         };
-        let tag: String = dir.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
         for imp in &mut m.imports {
             if imp.package.is_some() || imp.module == m.name || self.renamed.contains_key(&imp.module) {
                 continue;
             }
             let stem = imp.module.replace('.', "/");
-            let Some(own) = Self::find_in_package_dir(&dir, &stem) else { continue };
-            if self.find_module(&imp.module).map(|f| f.path) == Some(own.path) {
+            let found = self.find_module(&imp.module);
+            // The module of its own package; else, when the plain name finds a home module (one of
+            // the program's, as ghc-lib-parser's GHC.Internal.TH.Syntax), the packages' one: a
+            // package's modules never see the program's.
+            let (from_dir, own) = match Self::find_in_package_dir(&dir, &stem) {
+                Some(own) => (dir.clone(), own),
+                None if found.as_ref().is_some_and(|f| f.home) => {
+                    match self.pkg_dirs.iter().find_map(|d| Self::find_in_package_dir(d, &stem).map(|f| (d.clone(), f))) {
+                        Some(hit) => hit,
+                        None => continue,
+                    }
+                }
+                None => continue,
+            };
+            if found.map(|f| f.path) == Some(own.path) {
                 continue;
             }
-            let key = format!("{}_pkg_{}", imp.module, md5_hex(tag.as_bytes()).get(..8).unwrap_or("x"));
-            self.renamed.insert(key.clone(), (imp.module.clone(), dir.clone()));
+            let dtag: String = from_dir.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+            let key = format!("{}_pkg_{}", imp.module, md5_hex(dtag.as_bytes()).get(..8).unwrap_or("x"));
+            self.renamed.insert(key.clone(), (imp.module.clone(), from_dir.clone()));
             if imp.alias.is_none() {
                 imp.alias = Some(imp.module.clone());
             }
