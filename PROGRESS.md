@@ -1,7 +1,7 @@
 # Progress
 
 Reference: GHC 9.12.2 (oracle). Reference sources are extracted under `ref/src` (gitignored).
-The plan of record is `/home/billy/.claude/plans/humming-spinning-zebra.md` (13 milestones).
+The plan of record has 13 milestones, below; open work is tracked in the GitHub issues.
 
 Run the differential suite:
 

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build hsc
+        run: cargo build --release -p hsc
+      - name: Smoke test (interpreter and native)
+        run: |
+          mkdir -p smoke
+          cat > smoke/Main.hs <<'HS'
+          import qualified Data.Map as M
+          main :: IO ()
+          main = do
+            print (sum [1 .. 100 :: Int])
+            print (M.toList (M.fromListWith (+) [(c, 1 :: Int) | c <- "hello world"]))
+          HS
+          target/release/hsc -package containers smoke/Main.hs -o smoke/interp
+          target/release/hsc --native -package containers smoke/Main.hs -o smoke/native
+          ./smoke/interp | tee smoke/interp.txt
+          ./smoke/native | tee smoke/native.txt
+          cmp smoke/interp.txt smoke/native.txt
+
+  corpus:
+    name: Corpus against GHC (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [interpreter, native]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GHC 9.12.2 (the oracle)
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.12.2'
+      - name: Build hsc and difftest
+        run: |
+          cargo build --release -p hsc
+          cargo build -p difftest
+      - name: Run the corpus
+        run: |
+          if [ "${{ matrix.backend }}" = native ]; then
+            printf '#!/bin/sh\nexec %s/target/release/hsc --native "$@"\n' "$PWD" > hsc-native
+            chmod +x hsc-native
+            HSC=$PWD/hsc-native TIMEOUT=600
+          else
+            HSC=target/release/hsc TIMEOUT=180
+          fi
+          ./target/debug/difftest --hsc "$HSC" --timeout "$TIMEOUT" --jobs 4 --work target/difftest tests/ | tee difftest.txt
+          ! grep -E '^(FAIL|BROKEN)' difftest.txt
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: difftest-${{ matrix.backend }}
+          path: difftest.txt
