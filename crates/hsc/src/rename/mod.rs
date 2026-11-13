@@ -89,6 +89,8 @@ pub struct Renamer<'a> {
     /// Binders seen so far in the pattern group being renamed (for duplicate detection).
     pat_seen: Option<HashSet<String>>,
     /// Pattern synonyms of every loaded module and of this one.
+    /// The depth of quotations being renamed (see `value_ref`).
+    in_quote: usize,
     patsyns: HashMap<GName, PatSynDef>,
     /// Renaming a `.hs-boot` file: signatures declare values without bindings.
     boot: bool,
@@ -123,6 +125,7 @@ pub fn rename_module(
         counter: 0,
         pat_seen: None,
         boot,
+        in_quote: 0,
         patsyns: ifaces
             .values()
             .flat_map(|i| i.patsyns.iter().map(|(g, d)| (g.clone(), d.clone())))
@@ -612,6 +615,16 @@ impl<'a> Renamer<'a> {
 
     /// Resolves a variable or constructor in the value namespace.
     fn value_ref(&mut self, q: &QName, loc: Loc, con: bool) -> RR<QName> {
+        let r = self.value_ref_in_scope(q, loc, con);
+        // In a quotation, a variable not in scope is left for the splice site (`UnboundVarE`),
+        // as GHC does.
+        if r.is_err() && self.in_quote > 0 && !con && q.qual.is_none() {
+            return Ok(QName { qual: Some(UNBOUND_IN_QUOTE.into()), name: q.name.clone() });
+        }
+        r
+    }
+
+    fn value_ref_in_scope(&mut self, q: &QName, loc: Loc, con: bool) -> RR<QName> {
         // `%G:M.x` names the global `x` of module `M` directly (a Template Haskell `NameG`).
         if let Some(m) = q.qual.as_deref().and_then(|x| x.strip_prefix("%G:")) {
             return Ok(QName { qual: Some(m.to_string()), name: q.name.clone() });
@@ -1372,7 +1385,9 @@ impl<'a> Renamer<'a> {
             Expr::QuotePat(p, loc) => {
                 let depth = self.locals.len();
                 self.push();
+                self.in_quote += 1;
                 let renamed = self.pat(*p, BindMode::Fresh);
+                self.in_quote -= 1;
                 self.locals.truncate(depth);
                 self.quote_pat(&renamed?, loc)?
             }
@@ -1381,7 +1396,10 @@ impl<'a> Renamer<'a> {
                 // quotation is then the code that builds its syntax (`quote.rs`).
                 match (kind, body) {
                     ('e' | 'T', Some(b)) => {
-                        let renamed = self.expr(*b)?;
+                        self.in_quote += 1;
+                        let renamed = self.expr(*b);
+                        self.in_quote -= 1;
+                        let renamed = renamed?;
                         let built = self.quote_exp(&renamed, loc)?;
                         if kind == 'T' {
                             let coerce = Expr::Var(QName { qual: Some("GHC.Internal.TH.Syntax".into()), name: "unsafeCodeCoerce".into() }, loc);
@@ -2088,6 +2106,9 @@ fn name_duplicate_fields(decls: &mut [Decl]) {
         rename(decls, &counts);
     }
 }
+
+/// The qualifier the renamer gives a variable a quotation uses but does not have in scope.
+pub(crate) const UNBOUND_IN_QUOTE: &str = "%unbound";
 
 /// Builds a top-level entity.
 fn entity(kind: EntKind, module: &str, name: &str, subs: Vec<Entity>, fields: Vec<String>) -> Entity {

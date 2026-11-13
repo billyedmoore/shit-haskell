@@ -105,6 +105,9 @@ impl Q<'_, '_> {
     fn exp(&self, e: &Expr) -> RR<Expr> {
         let loc = self.loc;
         Ok(match e {
+            Expr::Var(q, _) if q.qual.as_deref() == Some(super::UNBOUND_IN_QUOTE) => {
+                app(self.lib("unboundVarE"), app(self.syn("mkName"), self.str(&q.name)))
+            }
             Expr::Var(q, _) => match &q.qual {
                 // A variable of the enclosing code: its value, lifted.
                 None if !self.bound.contains(&q.name) => {

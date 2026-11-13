@@ -714,6 +714,33 @@ fn write_outputs(o: &Opts, module: &str, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `runghc`: compiles the program rooted at `main` with the options' packages and runs it in the
+/// interpreter, with `args` as its arguments. Answers its exit code.
+pub fn run_program(o: &Opts, main: &Path, args: Vec<String>) -> Result<i32, String> {
+    let mut search: Vec<PathBuf> = match &o.search {
+        Some(dirs) => dirs.clone(),
+        None => vec![PathBuf::from(".")],
+    };
+    if o.search.is_none() {
+        if let Some(dir) = main.parent().filter(|d| !d.as_os_str().is_empty()) {
+            search.insert(0, dir.to_path_buf());
+        }
+    }
+    let mut with_env = o.clone();
+    if o.package_env.as_deref() != Some("-") {
+        apply_environment(&mut with_env)?;
+    }
+    let (pkg_dirs, pkg_includes, visible) = package_dirs(&with_env)?;
+    let mut o = with_env;
+    o.flags.extend(pkg_includes.iter().map(|d| format!("-I{}", d.display())));
+    o.flags.extend(visible);
+    let mut d = driver::Driver::new(search, pkg_dirs, o.flags.clone());
+    let binds = driver::compile_with(&mut d, main, &o.flags)?;
+    let prog_name = main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "main".into());
+    crate::ccall::set_program_args(std::iter::once(prog_name.clone()).chain(args).collect());
+    Ok(driver::run_binds_code(binds, prog_name))
+}
+
 /// Builds the executable of a program, unless it is up to date: the record beside it lists the
 /// sources it was built from (with their sizes and modification times) and the flags.
 fn build_program(

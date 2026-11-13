@@ -20,6 +20,6 @@ pairSum :: Q Exp
 pairSum = lamE [varP (mkName "v")] $
   caseE (varE (mkName "v"))
     [ match [p| (0, _) |] (normalB [| "zero first" |]) []
-    , match [p| (x, Just y) |] (normalB [| show ($(varE (mkName "x")) + $(varE (mkName "y"))) |]) []
+    , match [p| (x, Just y) |] (normalB [| show (x + y) |]) []
     , match [p| _ |] (normalB [| "other" |]) []
     ]
