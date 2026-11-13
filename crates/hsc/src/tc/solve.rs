@@ -903,6 +903,14 @@ impl Checker {
                 matches.push((inst, sub));
             }
         }
+        // A data instance's representation (`R:Vector136_1`, what `Vector Bit` reduces to) also
+        // has the instances of its family application (`instance Eq (Vector a)`).
+        if matches.is_empty() {
+            let args: Vec<Ty> = want.args.iter().map(|t| self.family_form(&self.metas.zonk(t))).collect();
+            if args != want.args {
+                return self.find_instance(&Pred { class: want.class.clone(), args });
+            }
+        }
         let rigid = |t: &Ty| super::types::subst_gen(t, &(0..64).map(|i| Ty::Con(format!("%rigid{i}"))).collect::<Vec<_>>());
         let more_general = |a: &InstInfo, b: &InstInfo| -> bool {
             // a's head matches b's (with b's variables rigid): a is at least as general as b.

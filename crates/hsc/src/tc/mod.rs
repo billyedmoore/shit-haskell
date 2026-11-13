@@ -432,6 +432,18 @@ impl Checker {
         Ok(false)
     }
 
+    /// A type with its data instance representations, at the top or inside, as the family
+    /// applications they stand for (for matching instance heads).
+    pub(super) fn family_form(&self, t: &Ty) -> Ty {
+        if let Some(f) = self.rep_as_family(t) {
+            return f;
+        }
+        match t {
+            Ty::App(f, a) => Ty::app(self.family_form(f), self.family_form(a)),
+            other => other.clone(),
+        }
+    }
+
     /// A data instance's representation type applied (`R:MV8_1 s a a`) as the family application
     /// it stands for (`MV s (a, a)`).
     fn rep_as_family(&self, t: &Ty) -> Option<Ty> {

@@ -22,4 +22,19 @@ void unblockUserSignals(void);
 void stopTimer(void);
 void startTimer(void);
 
+/* Haskell Program Coverage (GHC's rts/Hpc.h). hsc's programs are not instrumented: the list of
+   modules is empty. */
+#include <stdbool.h>
+typedef struct _HpcModuleInfo {
+  char *modName;
+  StgWord32 tickCount;
+  StgWord32 hashNo;
+  StgWord64 *tixArr;
+  bool from_file;
+  struct _HpcModuleInfo *next;
+} HpcModuleInfo;
+
+void hs_hpc_module(char *modName, StgWord32 modCount, StgWord32 modHashNo, StgWord64 *tixArr);
+HpcModuleInfo *hs_hpc_rootModule(void);
+
 #endif
