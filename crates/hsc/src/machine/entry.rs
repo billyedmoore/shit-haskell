@@ -238,6 +238,9 @@ pub extern "C" fn hsc_apply_slow(m: *mut Machine) -> i32 {
                 // Under-application: a partial application object, and the arguments are popped.
                 let words = 2 + n;
                 let pap = m.alloc(words);
+                // The allocation may have collected: the function is read again from R1 (a root),
+                // since `f` is the address it had before.
+                let f = m.r1;
                 m.heap_set(pap, heap::header(super::super::native::codegen::PAP, (n + 1) as u32, n as u32));
                 m.heap_set(pap + 8, f);
                 for i in 0..n {

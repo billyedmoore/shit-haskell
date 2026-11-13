@@ -24,7 +24,7 @@ extern "C" {
 }
 
 /// Words of the Haskell stack of a forked thread (reserved; the kernel commits it on use).
-const FORK_STACK_WORDS: usize = 1 << 24;
+const FORK_STACK_WORDS: usize = 1 << 26;
 /// The C stack of a forked thread: nested evaluations of the runtime use it.
 const FORK_C_STACK: usize = 512 << 20;
 /// The time slice of the native threads, in milliseconds.

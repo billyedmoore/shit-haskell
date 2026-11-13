@@ -378,8 +378,11 @@ impl Gen {
                 let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
                 self.expr(scrut, sp);
                 // The info of the return address: its kind at -16 and the size of the frame above it
-                // at -8. Control reaches the label only by a return, never by falling through.
-                let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, p.f.s);
+                // at -8. Control reaches the label only by a return, never by falling through. A case
+                // in a scrutinee (nested) has the outer case's return address above it, not the
+                // frame: its own frame is empty (the collector reads the outer one's next).
+                let size = if p.pushed == 0 { p.f.s } else { 0 };
+                let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
                 self.put_label(&cont);
                 self.emit("addq $8, %rbp");
                 self.emit(&format!("movq %r14, {}", p.slot(*bslot)));

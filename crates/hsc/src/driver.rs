@@ -124,6 +124,9 @@ pub const IFACE_MAGIC: &str = "hsc-interface 2";
 /// The flag that marks a source as already preprocessed (the text an interface carries).
 pub const PREPROCESSED_FLAG: &str = "-hsc-preprocessed";
 
+/// The flag naming an interface module's source as its package's build was given it.
+pub const SOURCE_NAME_FLAG: &str = "-hsc-source-name=";
+
 /// hsc's cache directory for `what` (under `$XDG_CACHE_HOME/hsc` or `~/.cache/hsc`).
 pub fn cache_dir(what: &str) -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
@@ -168,6 +171,7 @@ pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
         return None;
     }
     let (mut module, mut source, mut flags) = (String::new(), None, Vec::new());
+    let mut name: Option<String> = None;
     let (mut text, mut boot): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
     let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
     while let Some(l) = line(&mut pos) {
@@ -182,6 +186,8 @@ pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
             module = v.to_string();
         } else if let Some(v) = l.strip_prefix("source: ") {
             source = Some(PathBuf::from(v));
+        } else if let Some(v) = l.strip_prefix("name: ") {
+            name = Some(v.to_string());
         } else if let Some(v) = l.strip_prefix("flag: ") {
             flags.push(v.to_string());
         } else if let Some(v) = l.strip_prefix("text: ").or_else(|| l.strip_prefix("boot: ")) {
@@ -228,6 +234,9 @@ pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
         std::fs::rename(&tmp, &file).ok()?;
     }
     flags.push(PREPROCESSED_FLAG.to_string());
+    if let Some(n) = name {
+        flags.push(format!("{SOURCE_NAME_FLAG}{n}"));
+    }
     Some((file, flags))
 }
 
@@ -235,7 +244,7 @@ pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
 /// source, so the interface holds the module's preprocessed text and the flags it is compiled
 /// with (those of the preprocessor dropped). The file is left alone when it already says the same,
 /// so that its time stamp shows when the module last changed.
-pub fn write_interface(path: &Path, module: &str, source: &Path, flags: &[String]) -> Result<(), String> {
+pub fn write_interface(path: &Path, module: &str, source: &Path, name: &Path, flags: &[String]) -> Result<(), String> {
     let pre = |p: &Path| -> Result<String, String> {
         let src = read_source(p).map_err(|e| format!("{}: {e}", p.display()))?;
         preprocess_if_needed(src, p, flags)
@@ -243,7 +252,9 @@ pub fn write_interface(path: &Path, module: &str, source: &Path, flags: &[String
     let text = pre(source)?;
     let boot_path = source.with_extension("hs-boot");
     let boot = if boot_path.is_file() { Some(pre(&boot_path)?) } else { None };
-    let mut out = format!("{IFACE_MAGIC}\nmodule: {module}\nsource: {}\n", source.display());
+    // `name`: the source as the compiler was given it (relative to the build), which Template
+    // Haskell's `location` and call stacks show, as GHC's do.
+    let mut out = format!("{IFACE_MAGIC}\nmodule: {module}\nsource: {}\nname: {}\n", source.display(), name.display());
     for f in flags {
         let cpp = f == "-cpp" || f == "-XCPP" || f.starts_with("-I") || f.starts_with("-D") || f.starts_with("-U")
             || f.starts_with("-include=") || f.starts_with("-optP") || f.starts_with("-hsc-pkgver=")
@@ -600,7 +611,15 @@ impl Driver {
         self.loading.pop();
         let has_splices = (exts.is_on("TemplateHaskell") || exts.is_on("QuasiQuotes"))
             && (parsed.decls.iter().any(|d| matches!(d, Decl::Splice(..))) || crate::th::has_splices(&parsed));
-        self.expand_splices(&mut parsed, &exts, &path)?;
+        // A module from an interface is shown by the name its package's build gave it, when
+        // that file is there (Template Haskell's `location` both shows and reads it).
+        let shown: PathBuf = flags
+            .iter()
+            .find_map(|f| f.strip_prefix(SOURCE_NAME_FLAG))
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| path.clone());
+        self.expand_splices(&mut parsed, &exts, &shown)?;
         // What the module adds is saved when it can be loaded back on its own: no splices
         // (their results depend on more than the source), no boot files involved.
         // (A `{-# SOURCE #-}` import depends on the boot file, keyed `{boot}M`.)
@@ -614,7 +633,7 @@ impl Driver {
         let cacheable = cache_file.is_some() && !has_splices && !self.booted.contains(module) && dep_keys.is_some();
         let (snap, keys) = crate::cache::snapshot(&self.checker.env, &self.checker.kinds.tycons);
         let binds_before = self.binds.len();
-        self.compile_module(parsed, exts, &path)?;
+        self.compile_module(parsed, exts, &shown)?;
         if let Some(dep_keys) = dep_keys {
             self.keys.insert(module.to_string(), cache_key(&own_hash, &dep_keys));
             if cacheable {
