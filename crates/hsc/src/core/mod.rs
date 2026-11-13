@@ -60,6 +60,55 @@ pub struct TopBind {
     pub body: Core,
 }
 
+/// Where this compilation starts numbering the local names it makes: a number of its own (from
+/// the time and process), so that the names in Core loaded from the module cache, made by other
+/// compilations, are not made again here (the program-wide passes take local names to be
+/// unique).
+pub fn name_base() -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let mut x = nanos ^ ((std::process::id() as u64) << 32) ^ 0x9e37_79b9_7f4a_7c15;
+        // A mix of the bits (splitmix64), then a range of 2^24 names for this compilation.
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        (x % (1 << 36)) << 24
+    })
+}
+
+/// Replaces every occurrence of each variable the map names by its new name (in one pass).
+pub fn rename_vars(c: &mut Core, map: &std::collections::HashMap<String, String>) {
+    match c {
+        Core::Var(v) => {
+            if let Some(n) = map.get(v.as_str()) {
+                *v = n.clone();
+            }
+        }
+        Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            rename_vars(f, map);
+            rename_vars(a, map);
+        }
+        Core::Lam(_, b) => rename_vars(b, map),
+        Core::Let(binds, body) => {
+            for (_, b) in binds.iter_mut() {
+                rename_vars(b, map);
+            }
+            rename_vars(body, map);
+        }
+        Core::Case(s, _, alts) => {
+            rename_vars(s, map);
+            for a in alts.iter_mut() {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => rename_vars(b, map),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| rename_vars(a, map)),
+    }
+}
+
 /// Replaces every occurrence of the variable `from` by `to`. Names are unique, so no
 /// binder can capture the replacement.
 pub fn rename_var(c: &mut Core, from: &str, to: &str) {

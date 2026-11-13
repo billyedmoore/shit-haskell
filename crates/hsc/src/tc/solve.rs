@@ -929,9 +929,21 @@ impl Checker {
     }
 
     /// Evidence bindings produced at top level are kept as global bindings.
+    /// The evidence of a module's top-level constraints, as top-level bindings named after the
+    /// module (not by this compilation's counter, which a cached module's names would clash with);
+    /// the module's bindings are renamed to match.
     pub fn top_binds_from_evidence(&mut self, binds: Vec<(String, Core)>) {
-        for (name, body) in binds {
-            self.out.push(crate::core::TopBind { name, body });
+        if binds.is_empty() {
+            return;
+        }
+        let map: std::collections::HashMap<String, String> =
+            binds.iter().map(|(n, _)| (n.clone(), format!("{}.ev%{n}", self.module))).collect();
+        for b in self.out.iter_mut() {
+            crate::core::rename_vars(&mut b.body, &map);
+        }
+        for (name, mut body) in binds {
+            crate::core::rename_vars(&mut body, &map);
+            self.out.push(crate::core::TopBind { name: map[&name].clone(), body });
         }
     }
 

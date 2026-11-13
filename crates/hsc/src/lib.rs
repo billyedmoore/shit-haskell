@@ -2,6 +2,7 @@
 //! binary is the driver; an output program links this library (as a static library) with the
 //! object code generated for it.
 
+pub mod cache;
 pub mod ccall;
 pub mod cli;
 pub mod core;

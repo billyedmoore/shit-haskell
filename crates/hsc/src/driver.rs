@@ -1,7 +1,7 @@
 //! The driver: finds and loads modules, runs the renamer and type checker over them in
 //! dependency order, and assembles the program's Core.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::core::TopBind;
@@ -31,6 +31,8 @@ pub struct Driver {
     pub c_sources: Vec<(PathBuf, Vec<String>)>,
     /// The C include and macro flags of every package module loaded (for the capi wrappers).
     pub c_flags: Vec<String>,
+    /// The key of each module loaded (see `cache_key`).
+    keys: HashMap<String, String>,
     /// Modules a package-qualified import names that the plain name would not find (such as a
     /// module importing its namesake from another package): the internal name each is loaded
     /// under, with its real name and the package directory it is in.
@@ -132,7 +134,16 @@ pub fn cache_dir(what: &str) -> PathBuf {
         .join(what)
 }
 
-fn md5_hex(bytes: &[u8]) -> String {
+/// The key of a checked module: its source's hash and the keys of the modules it imports.
+fn cache_key(own_hash: &str, deps: &[(String, String)]) -> String {
+    let mut text = own_hash.to_string();
+    for (d, k) in deps {
+        text.push_str(&format!("|{d}={k}"));
+    }
+    md5_hex(text.as_bytes())
+}
+
+pub(crate) fn md5_hex(bytes: &[u8]) -> String {
     let mut ctx = [0u8; 88];
     crate::interp::md5::init(&mut ctx);
     crate::interp::md5::update(&mut ctx, bytes);
@@ -240,12 +251,16 @@ pub fn default_lib_dir() -> PathBuf {
 impl Driver {
     /// A driver whose own modules are in `search` and whose packages' modules are in `pkg_dirs`.
     pub fn new(search: Vec<PathBuf>, pkg_dirs: Vec<PathBuf>, flags: Vec<String>) -> Driver {
+        // The built-in constructors' wrappers belong to the program, not to the first module
+        // checked (whose cache entry would carry them).
+        let mut checker = Checker::new();
+        let builtin_binds = std::mem::take(&mut checker.out);
         Driver {
             search,
             pkg_dirs,
             ifaces: BTreeMap::new(),
-            checker: Checker::new(),
-            binds: Vec::new(),
+            checker,
+            binds: builtin_binds,
             loaded: BTreeSet::new(),
             booted: BTreeSet::new(),
             loading: Vec::new(),
@@ -254,6 +269,7 @@ impl Driver {
             c_sources: Vec::new(),
             c_flags: Vec::new(),
             renamed: BTreeMap::new(),
+            keys: HashMap::new(),
         }
     }
 
@@ -363,15 +379,17 @@ impl Driver {
     /// Loads the `.hs-boot` file of a module imported through `{-# SOURCE #-}`: its signatures
     /// stand for the module until the module itself is loaded (see `load_booted`).
     fn load_boot(&mut self, module: &str) -> Result<(), String> {
-        if self.loaded.contains(module) || self.booted.contains(module) {
-            return Ok(());
-        }
         let path = self
             .find_boot(module)
             .ok_or_else(|| format!("Could not find module ‘{module}’ (no .hs-boot file for a SOURCE import)"))?;
         let flags = self.find_module(module).map(|f| f.flags).unwrap_or_default();
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
+        // The key importers through `{-# SOURCE #-}` record (see `crate::cache`).
+        self.keys.insert(format!("{{boot}}{module}"), md5_hex(format!("boot\0{module}\0{src}").as_bytes()));
+        if self.loaded.contains(module) || self.booted.contains(module) {
+            return Ok(());
+        }
         let (mut parsed, exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
@@ -456,6 +474,23 @@ impl Driver {
         let t_parse = std::time::Instant::now();
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
+        // The module cache: an entry for this source (and flags) whose imports are unchanged
+        // stands for the module (see `crate::cache`).
+        let own_hash = md5_hex(format!("{module}\0{}\0{}\0{src}", path.display(), flags.join("\u{1}")).as_bytes());
+        let cache_file = crate::cache::dir().map(|d| d.join(format!("{own_hash}.bin")));
+        if let Some(cf) = &cache_file {
+            if std::env::var_os("HSC_DEBUG_CACHE").is_some() && cf.is_file() && crate::cache::load(cf).is_none() {
+                eprintln!("cache: {module}: entry {} does not decode", cf.display());
+            }
+            if let Some(entry) = crate::cache::load(cf) {
+                let t = std::time::Instant::now();
+                let used = self.use_cached(module, entry, &own_hash, &path, home);
+                timing::add("cache load", t);
+                if used {
+                    return Ok(());
+                }
+            }
+        }
         let (mut parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
@@ -481,6 +516,9 @@ impl Driver {
             deps.insert(0, "Prelude".into());
         }
         let source = Self::source_imports(&src);
+        if std::env::var_os("HSC_DEBUG_CACHE").is_some() {
+            eprintln!("full: {module} needs {deps:?} (loading {:?})", self.loading);
+        }
         for d in &deps {
             let loaded = if source.contains(d) { self.load_boot(d) } else { self.load(d) };
             if let Err(e) = loaded {
@@ -491,11 +529,105 @@ impl Driver {
             }
         }
         self.loading.pop();
+        let has_splices = (exts.is_on("TemplateHaskell") || exts.is_on("QuasiQuotes"))
+            && (parsed.decls.iter().any(|d| matches!(d, Decl::Splice(..))) || crate::th::has_splices(&parsed));
         self.expand_splices(&mut parsed, &exts, &path)?;
+        // What the module adds is saved when it can be loaded back on its own: no splices
+        // (their results depend on more than the source), no boot files involved.
+        // (A `{-# SOURCE #-}` import depends on the boot file, keyed `{boot}M`.)
+        let dep_keys: Option<Vec<(String, String)>> = deps
+            .iter()
+            .map(|d| {
+                let name = if source.contains(d) { format!("{{boot}}{d}") } else { d.clone() };
+                self.keys.get(&name).map(|k| (name, k.clone()))
+            })
+            .collect();
+        let cacheable = cache_file.is_some() && !has_splices && !self.booted.contains(module) && dep_keys.is_some();
+        let (snap, keys) = crate::cache::snapshot(&self.checker.env, &self.checker.kinds.tycons);
+        let binds_before = self.binds.len();
         self.compile_module(parsed, exts, &path)?;
+        if let Some(dep_keys) = dep_keys {
+            self.keys.insert(module.to_string(), cache_key(&own_hash, &dep_keys));
+            if cacheable {
+                if let (Some(cf), Some(iface)) = (&cache_file, self.ifaces.get(module)) {
+                    let kinds = &self.checker.kinds;
+                    let mut env = crate::cache::delta(&self.checker.env, &kinds.tycons, &snap, &keys, |k| kinds.resolve(k));
+                    let metas = &self.checker.metas;
+                    let complete = crate::cache::zonk_delta(&mut env, &|t| metas.zonk(t));
+                    let entry = crate::cache::Entry {
+                        deps: dep_keys,
+                        iface: iface.clone(),
+                        binds: self.binds[binds_before..].to_vec(),
+                        env,
+                        explicit_sigs: Vec::new(),
+                    };
+                    if std::env::var_os("HSC_DEBUG_CACHE").is_some() {
+                        let prefix = format!("{module}.");
+                        let foreign: Vec<&str> = entry.binds.iter().map(|b| b.name.as_str()).filter(|n| !n.starts_with(&prefix)).take(6).collect();
+                        if !foreign.is_empty() {
+                            eprintln!("cache: {module} saves others' bindings {foreign:?}");
+                        }
+                    }
+                    if complete {
+                        crate::cache::save(cf, &entry);
+                    } else if std::env::var_os("HSC_DEBUG_CACHE").is_some() {
+                        eprintln!("cache: {module} not saved: unsolved type variables");
+                    }
+                }
+            }
+        }
         self.loaded.insert(module.to_string());
         self.sources.push((module.to_string(), path.clone(), home));
+        if let Some(n) = std::env::var_os("HSC_DEBUG_SCHEME") {
+            let n = n.to_string_lossy().to_string();
+            if let Some(s) = self.checker.env.values.get(&n) {
+                eprintln!("checked {module}: {n} :: {s:?}");
+            }
+        }
         Ok(())
+    }
+
+    /// Loads a module from its cache entry, if the modules it imports (loaded first) are the
+    /// ones it was checked against. Answers whether it did.
+    fn use_cached(&mut self, module: &str, entry: crate::cache::Entry, own_hash: &str, path: &Path, home: bool) -> bool {
+        if std::env::var_os("HSC_DEBUG_CACHE").is_some() {
+            eprintln!("cache: {module} needs {:?}", entry.deps.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>());
+        }
+        self.loading.push(module.to_string());
+        for (dep, _) in &entry.deps {
+            let loaded = match dep.strip_prefix("{boot}") {
+                Some(b) => self.load_boot(b),
+                None => self.load(dep),
+            };
+            if let Err(e) = loaded {
+                if std::env::var_os("HSC_DEBUG_CACHE").is_some() {
+                    eprintln!("cache: {module} not used: {dep}: {e}");
+                }
+                self.loading.pop();
+                return false;
+            }
+        }
+        self.loading.pop();
+        if !entry.deps.iter().all(|(d, k)| self.keys.get(d) == Some(k)) {
+            return false;
+        }
+        self.keys.insert(module.to_string(), cache_key(own_hash, &entry.deps));
+        // (The unifier keeps its own set of the families' names.)
+        for (name, _) in &entry.env.families {
+            self.checker.metas.families.insert(name.clone());
+        }
+        crate::cache::apply(&mut self.checker.env, &mut self.checker.kinds.tycons, entry.env);
+        self.ifaces.insert(module.to_string(), entry.iface);
+        self.binds.extend(entry.binds);
+        self.loaded.insert(module.to_string());
+        self.sources.push((module.to_string(), path.to_path_buf(), home));
+        if let Some(n) = std::env::var_os("HSC_DEBUG_SCHEME") {
+            let n = n.to_string_lossy().to_string();
+            if let Some(s) = self.checker.env.values.get(&n) {
+                eprintln!("cached {module}: {n} :: {s:?}");
+            }
+        }
+        true
     }
 
     /// Runs the Template Haskell splices and quasi-quotations of a module, whose imports are
@@ -695,6 +827,27 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
         ));
     }
     let mut binds = std::mem::take(&mut d.binds);
+    // HSC_DEBUG_BINDS=file: each binding's name and the size of its Core (to compare builds).
+    if let Some(f) = std::env::var_os("HSC_DEBUG_BINDS") {
+        // The Core's hash, with the numbers of generated names left out.
+        let norm = |t: &str| -> String {
+            let mut out = String::with_capacity(t.len());
+            let mut digits = false;
+            for c in t.chars() {
+                if c == '%' || c == '_' {
+                    digits = true;
+                    out.push(c);
+                } else if digits && c.is_ascii_digit() {
+                } else {
+                    digits = false;
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let text: String = binds.iter().map(|b| format!("{} {}\n", norm(&b.name), md5_hex(norm(&crate::core::pretty::show(&b.body)).as_bytes()))).collect();
+        let _ = std::fs::write(f, text);
+    }
     if flags.iter().any(|f| f == "-dcore-lint") {
         crate::core::lint::lint_program(&binds).map_err(|e| format!("Core lint error: {e}"))?;
     }

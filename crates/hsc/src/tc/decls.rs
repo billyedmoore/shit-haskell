@@ -14,6 +14,7 @@ impl Checker {
     /// extended with everything the module defines.
     pub fn check_module(&mut self, m: &Module) -> TR<Vec<TopBind>> {
         self.module = m.name.clone();
+        self.dict_counter = 0;
         let decls = &m.decls;
 
         // 0. Kinds of this module's type constructors.
@@ -197,7 +198,26 @@ impl Checker {
                 }
             }
         } else {
-            let binds = self.infer_binds(&value_decls, true)?;
+            let mut binds = self.infer_binds(&value_decls, true)?;
+            // Evidence that ends up at top level (`d%12` of an ungeneralised group) is named
+            // after the module, like everything at top level (see `top_binds_from_evidence`).
+            let prefix = format!("{}.", self.module);
+            let map: HashMap<String, String> = binds
+                .iter()
+                .filter(|(n, _)| !n.starts_with(&prefix) && !n.contains('.'))
+                .map(|(n, _)| (n.clone(), format!("{prefix}ev%{n}")))
+                .collect();
+            if !map.is_empty() {
+                for (name, body) in binds.iter_mut() {
+                    crate::core::rename_vars(body, &map);
+                    if let Some(n) = map.get(name.as_str()) {
+                        *name = n.clone();
+                    }
+                }
+                for b in self.out.iter_mut() {
+                    crate::core::rename_vars(&mut b.body, &map);
+                }
+            }
             for (name, body) in binds {
                 self.out.push(TopBind { name, body });
             }
@@ -800,13 +820,13 @@ impl Checker {
         let dict = match earlier {
             Some(i) => self.env.instances.remove(i).dict,
             None => {
-                self.counter += 1;
+                self.dict_counter += 1;
                 format!(
                     "{}.$f{}{}_{}",
                     self.module,
                     super::types::unqualify(&class),
                     head.iter().map(|t| head_name(t)).collect::<String>(),
-                    self.counter
+                    self.dict_counter
                 )
             }
         };
@@ -1123,8 +1143,20 @@ impl Checker {
             for field in fields.iter_mut() {
                 crate::core::rename_var(field, &this, &inst.dict);
             }
-            for (name, body) in super_binds.into_iter().chain(method_binds) {
-                self.out.push(TopBind { name, body });
+            // At top level they are named after the dictionary (so after its module), not by
+            // this compilation's counter: a module loaded from the cache keeps its names.
+            let mut binds: Vec<(String, Core)> = super_binds.into_iter().chain(method_binds).collect();
+            let renames: Vec<(String, String)> = binds.iter().map(|(n, _)| (n.clone(), format!("{}%{n}", inst.dict))).collect();
+            for (old, new) in &renames {
+                for field in fields.iter_mut() {
+                    crate::core::rename_var(field, old, new);
+                }
+                for (_, body) in binds.iter_mut() {
+                    crate::core::rename_var(body, old, new);
+                }
+            }
+            for ((_, body), (_, new)) in binds.into_iter().zip(renames) {
+                self.out.push(TopBind { name: new, body });
             }
             self.out.push(TopBind {
                 name: inst.dict.clone(),
@@ -1182,8 +1214,8 @@ impl Checker {
                     let rep = self.convert_type(via, &mut tvs)?;
                     let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
                     let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
-                    let dict = format!("{}.$fVia{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.counter);
-                    self.counter += 1;
+                    let dict = format!("{}.$fVia{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.dict_counter);
+                    self.dict_counter += 1;
                     self.env.instances.push(InstInfo {
                         class: cls_name.clone(),
                         nvars: tvs.len() as u32,
@@ -1244,8 +1276,8 @@ impl Checker {
                 let rep = self.convert_type(&rep_ast, &mut tvs)?;
                 let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
                 let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
-                let dict = format!("{}.$fGND{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.counter);
-                self.counter += 1;
+                let dict = format!("{}.$fGND{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.dict_counter);
+                self.dict_counter += 1;
                 self.env.instances.push(InstInfo {
                     class: cls_name.clone(),
                     nvars: tvs.len() as u32,

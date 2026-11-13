@@ -46,6 +46,16 @@ impl KindEnv {
         Kind::Meta(self.metas.len() as u32 - 1)
     }
 
+    /// A kind with its solved variables substituted (unsolved ones are `Type`): what is saved
+    /// for a module in the module cache.
+    pub fn resolve(&self, k: &Kind) -> Kind {
+        match self.prune(k) {
+            Kind::Arr(a, b) => Kind::Arr(Box::new(self.resolve(&a)), Box::new(self.resolve(&b))),
+            Kind::Meta(_) => Kind::Star,
+            other => other,
+        }
+    }
+
     fn prune(&self, k: &Kind) -> Kind {
         let mut cur = k.clone();
         while let Kind::Meta(m) = cur {

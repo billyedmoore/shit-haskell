@@ -56,6 +56,10 @@ pub struct Checker {
     pub wanted: Vec<Wanted>,
     pub givens: Vec<Given>,
     pub counter: u64,
+    /// Numbers the instance dictionaries of the module being checked. It starts afresh with each
+    /// module, so that a dictionary's name depends on its module only (the module cache keeps
+    /// the names other modules' Core refers to).
+    pub dict_counter: u64,
     pub module: String,
     pub loc: Loc,
     /// Variables bound by the pattern currently being checked, with their types.
@@ -139,7 +143,9 @@ impl Checker {
             vars: HashMap::new(),
             wanted: Vec::new(),
             givens: Vec::new(),
-            counter: 0,
+            // (Numbered from this compilation's own base: see `core::name_base`.)
+            counter: crate::core::name_base() + (1 << 23),
+            dict_counter: 0,
             module: BUILTIN.to_string(),
             loc: Loc::default(),
             pat_bound: Vec::new(),

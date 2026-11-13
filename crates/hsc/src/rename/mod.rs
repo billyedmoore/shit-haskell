@@ -591,7 +591,8 @@ impl<'a> Renamer<'a> {
         // substituted into others, whose own local names must not capture its names.
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
         self.counter += 1;
-        format!("{occ}%{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64 + crate::core::name_base();
+        format!("{occ}%{n}")
     }
 
     fn ambiguous(&self, q: &QName, cands: &[Entity], loc: Loc) -> RnError {
