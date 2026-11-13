@@ -88,3 +88,9 @@ __attribute__((weak)) uint32_t enabled_capabilities = 1;
 
 /* The signal the RTS's interval timer uses (System.Posix.Signals blocks it around some calls). */
 __attribute__((weak)) int rtsTimerSignal(void) { return SIGVTALRM; }
+
+/* Haskell Program Coverage: programs are not instrumented, so no module is registered. */
+__attribute__((weak)) void hs_hpc_module(char *modName, StgWord32 modCount, StgWord32 modHashNo, StgWord64 *tixArr) {
+    (void)modName; (void)modCount; (void)modHashNo; (void)tixArr;
+}
+__attribute__((weak)) HpcModuleInfo *hs_hpc_rootModule(void) { return 0; }

@@ -64,6 +64,12 @@ fn main() -> ExitCode {
     if opts.preprocess_only || opts.dump_ast || opts.run {
         return dev_mode(&opts);
     }
+    // `--abi-hash` of no modules (cabal asks it of a package with only C sources): GHC's hash
+    // of the empty set of interfaces.
+    if opts.abi_hash && opts.inputs.is_empty() {
+        println!("f1c6d8ec5f245fb25a4c98a26aaeb8c2");
+        return ExitCode::SUCCESS;
+    }
     if opts.inputs.is_empty() {
         eprintln!("hsc: no input files\nUsage: For basic information, try the `--help' option.");
         return ExitCode::from(1);

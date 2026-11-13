@@ -200,7 +200,8 @@ pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
     let source = source?;
     let Some(text) = text else { return Some((source, flags)) };
     // The cached copy keeps the module's file name (so it is found as the module) and extension.
-    let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("hs").to_string();
+    // (A literate source's text is already its code: the copy is plain Haskell.)
+    let ext = source.extension().and_then(|e| e.to_str()).map(|e| if e == "lhs" { "hs" } else { e }).unwrap_or("hs").to_string();
     let mut key = text.clone();
     key.extend_from_slice(boot.as_deref().unwrap_or_default());
     for (n, h) in &headers {
@@ -1055,10 +1056,41 @@ pub fn module_name_of(path: &Path, flags: &[String]) -> Result<String, String> {
 /// are replaced rather than rejecting the file.
 pub fn read_source(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
-    Ok(match String::from_utf8(bytes) {
+    let text = match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    })
+    };
+    // A literate source (`.lhs`) is its code, as GHC's unlit leaves it.
+    Ok(if path.extension().is_some_and(|e| e == "lhs") { unlit(&text) } else { text })
+}
+
+/// The code of a literate Haskell source, as GHC's `unlit` gives it: in LaTeX style the lines
+/// between `\begin{code}` and `\end{code}`, otherwise the lines starting with `>` (Bird style),
+/// whose `>` becomes a space. Every other line becomes empty, so lines and columns are kept.
+pub fn unlit(text: &str) -> String {
+    let latex = text.lines().any(|l| l.trim_start().starts_with("\\begin{code}"));
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    for line in text.lines() {
+        if latex {
+            let t = line.trim_start();
+            if t.starts_with("\\begin{code}") {
+                in_code = true;
+            } else if t.starts_with("\\end{code}") {
+                in_code = false;
+            } else if in_code {
+                out.push_str(line);
+            }
+        } else if let Some(code) = line.strip_prefix('>') {
+            out.push(' ');
+            out.push_str(code);
+        } else if line.starts_with('#') {
+            // A CPP directive (`#if`, `#include`) stays, as unlit leaves it.
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Runs the C preprocessor on a source when its `CPP` extension is on. Includes are searched
