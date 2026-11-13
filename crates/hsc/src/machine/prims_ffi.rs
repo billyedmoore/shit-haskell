@@ -19,7 +19,6 @@ extern "C" {
     // As C declares it (newer compilers check the runtime's own symbols): the mode is variadic.
     fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
     fn readlink(path: *const u8, buf: *mut u8, n: usize) -> isize;
-    fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
     fn dup(fd: i32) -> i32;
     fn dup2(fd: i32, to: i32) -> i32;
