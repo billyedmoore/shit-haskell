@@ -6,9 +6,22 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# A newer run of a pull request replaces the older one; every push to main is checked.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    # `bash -eo pipefail`: a command that fails in a pipeline fails the step.
+    shell: bash
+
+env:
+  # The toolchain hsc is developed with (newer ones add lints, which are taken on deliberately).
+  RUST_TOOLCHAIN: '1.92.0'
 
 jobs:
   build:
@@ -17,6 +30,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
       - name: Build hsc
         run: cargo build --release -p hsc
       - name: Smoke test (interpreter and native)
@@ -29,11 +45,13 @@ jobs:
             print (sum [1 .. 100 :: Int])
             print (M.toList (M.fromListWith (+) [(c, 1 :: Int) | c <- "hello world"]))
           HS
+          printf '%s\n' '5050' "[(' ',1),('d',1),('e',1),('h',1),('l',3),('o',2),('r',1),('w',1)]" > smoke/expected.txt
           target/release/hsc -package containers smoke/Main.hs -o smoke/interp
           target/release/hsc --native -package containers smoke/Main.hs -o smoke/native
           ./smoke/interp | tee smoke/interp.txt
           ./smoke/native | tee smoke/native.txt
-          cmp smoke/interp.txt smoke/native.txt
+          diff smoke/expected.txt smoke/interp.txt
+          diff smoke/expected.txt smoke/native.txt
 
   corpus:
     name: Corpus against GHC (${{ matrix.backend }})
@@ -49,6 +67,9 @@ jobs:
         uses: haskell-actions/setup@v2
         with:
           ghc-version: '9.12.2'
+      - name: Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
       - name: Build hsc and difftest
         run: |
           cargo build --release -p hsc
@@ -62,11 +83,22 @@ jobs:
           else
             HSC=target/release/hsc TIMEOUT=180
           fi
+          # difftest exits non-zero on a failure (pipefail passes that on); a broken corpus entry,
+          # or tests that never reported (TOTAL p/t with p < t, or no TOTAL line), fail too.
           ./target/debug/difftest --hsc "$HSC" --timeout "$TIMEOUT" --jobs 4 --work target/difftest tests/ | tee difftest.txt
-          ! grep -E '^(FAIL|BROKEN)' difftest.txt
+          if grep -E '^BROKEN' difftest.txt; then exit 1; fi
+          total=$(grep -E '^TOTAL' difftest.txt) || { echo "no TOTAL line"; exit 1; }
+          pass=$(echo "$total" | sed -E 's/^TOTAL +([0-9]+)\/([0-9]+).*/\1/')
+          all=$(echo "$total" | sed -E 's/^TOTAL +([0-9]+)\/([0-9]+).*/\2/')
+          count=$(ls tests/run/*.hs tests/fail/*.hs 2>/dev/null | wc -l)
+          echo "passed $pass of $all (corpus files: $count)"
+          if [ "$pass" != "$all" ] || [ "$all" != "$count" ]; then exit 1; fi
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: difftest-${{ matrix.backend }}
-          path: difftest.txt
+          path: |
+            difftest.txt
+            target/difftest/report.txt
+          if-no-files-found: ignore
