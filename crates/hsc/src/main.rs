@@ -38,8 +38,27 @@ fn main() -> ExitCode {
     // generated modules): it runs on a thread with a large stack (reserved, committed on use).
     let worker = std::thread::Builder::new().name("hsc".into()).stack_size(1 << 30).spawn(real_main);
     match worker {
-        Ok(h) => h.join().unwrap_or(ExitCode::from(101)),
+        Ok(h) => {
+            // This thread only waits: it blocks every signal, so that one sent to the process
+            // reaches the threads of the program (which mask signals as the program asks).
+            block_all_signals();
+            h.join().unwrap_or(ExitCode::from(101))
+        }
         Err(_) => real_main(),
+    }
+}
+
+fn block_all_signals() {
+    extern "C" {
+        fn pthread_sigmask(how: i32, set: *const [u64; 16], old: *mut [u64; 16]) -> i32;
+        fn sigfillset(set: *mut [u64; 16]) -> i32;
+    }
+    const SIG_BLOCK: i32 = 0;
+    let mut set = [0u64; 16];
+    // SAFETY: the set is a sigset_t-sized buffer; only this thread's mask changes.
+    unsafe {
+        sigfillset(&mut set);
+        pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut());
     }
 }
 
