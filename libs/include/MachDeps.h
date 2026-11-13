@@ -212,3 +212,6 @@
 #ifndef SIZEOF_WORD8
 #define SIZEOF_WORD8 1
 #endif
+
+/* GHC: the pointer tag bits. */
+#define TAG_MASK ((1 << TAG_BITS) - 1)

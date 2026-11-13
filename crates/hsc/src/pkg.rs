@@ -54,6 +54,22 @@ impl Package {
         out
     }
 
+    /// The reexported modules among the exposed ones (`Happy.Paths from unit:Paths_happy_lib`):
+    /// the name, the unit that has the module, and its name there.
+    pub fn reexports(&self) -> Vec<(String, String, String)> {
+        let text = self.get("exposed-modules").unwrap_or("");
+        let mut out = Vec::new();
+        for item in text.split(',') {
+            let words: Vec<&str> = item.split_whitespace().collect();
+            if let [name, "from", source] = words.as_slice() {
+                if let Some((unit, real)) = source.rsplit_once(':') {
+                    out.push((name.to_string(), unit.to_string(), real.to_string()));
+                }
+            }
+        }
+        out
+    }
+
     pub fn set(&mut self, name: &str, value: &str) {
         match self.fields.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
             Some(f) => f.1 = value.to_string(),

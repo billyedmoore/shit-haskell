@@ -479,6 +479,18 @@ fn package_dirs(o: &Opts) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<String>), S
             }
         }
     }
+    // Reexported modules (`Happy.Paths from unit:Paths_happy_lib`), of every package the program
+    // uses (an installed module may import its package's dependency's reexport): the name, the
+    // module it is, and that unit's import directory (`driver::REEXPORT_FLAG`).
+    for p in &pkgs {
+        for (name, unit, real) in p.reexports() {
+            let Some(dir) = stack.by_id(&unit).and_then(|u| u.list("import-dirs").into_iter().next()) else { continue };
+            let flag = format!("{}{name}={real}={dir}", crate::driver::REEXPORT_FLAG);
+            if !visible.contains(&flag) {
+                visible.push(flag);
+            }
+        }
+    }
     let mut dirs = Vec::new();
     let mut includes = Vec::new();
     // The packages named directly come before their dependencies in the search.
