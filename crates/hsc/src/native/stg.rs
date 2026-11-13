@@ -211,8 +211,9 @@ impl Lowering {
                 SExpr::Let(rhs.into_iter().zip(slots).map(|(c, s)| (s, c)).collect(), Box::new(body))
             }
             Core::Case(scrut, binder, alts) => {
-                // A scrutinee is never a case (its return frame would sit inside another one):
-                // a nested case becomes a join point, and a let is floated out of the scrutinee.
+                // A nested case in a scrutinee becomes a join point, and a let is floated out of
+                // the scrutinee. (A scrutinee can still be a case made by `strict`, from `seq` and
+                // its identities: codegen gives its return address an empty frame.)
                 match scrut.as_ref() {
                     Core::Let(binds, body) => {
                         let inner = Core::Let(

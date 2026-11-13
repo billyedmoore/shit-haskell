@@ -619,7 +619,8 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             };
             // SAFETY: this thread has the turn.
             let m = unsafe { &mut *mp };
-            state_pair(m, v)
+            // Other threads may have run meanwhile and used up the reserved room.
+            super::prims_mem::state_pair_rooted(m, v)
         }
         "readMVar#" => {
             let mv = force_arg(m, 0)?;
@@ -632,7 +633,8 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             };
             // SAFETY: this thread has the turn.
             let m = unsafe { &mut *mp };
-            state_pair(m, v)
+            // Other threads may have run meanwhile and used up the reserved room.
+            super::prims_mem::state_pair_rooted(m, v)
         }
         "putMVar#" => {
             let mv = force_arg(m, 0)?;
