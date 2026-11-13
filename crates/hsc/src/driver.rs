@@ -611,15 +611,14 @@ impl Driver {
         self.loading.pop();
         let has_splices = (exts.is_on("TemplateHaskell") || exts.is_on("QuasiQuotes"))
             && (parsed.decls.iter().any(|d| matches!(d, Decl::Splice(..))) || crate::th::has_splices(&parsed));
-        // A module from an interface is shown by the name its package's build gave it, when
-        // that file is there (Template Haskell's `location` both shows and reads it).
-        let shown: PathBuf = flags
-            .iter()
-            .find_map(|f| f.strip_prefix(SOURCE_NAME_FLAG))
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-            .unwrap_or_else(|| path.clone());
-        self.expand_splices(&mut parsed, &exts, &shown)?;
+        // A module from an interface is shown by the name its package's build gave it (in call
+        // stacks and messages, as GHC shows it). Template Haskell's `location` also reads the file
+        // it names, so its splices see that name only when the file is there, and otherwise the
+        // interface's own copy of the text (whose path is not the same each time).
+        let named: Option<PathBuf> = flags.iter().find_map(|f| f.strip_prefix(SOURCE_NAME_FLAG)).map(PathBuf::from);
+        let shown: PathBuf = named.clone().unwrap_or_else(|| path.clone());
+        let splice_path: PathBuf = named.filter(|p| p.is_file()).unwrap_or_else(|| path.clone());
+        self.expand_splices(&mut parsed, &exts, &splice_path)?;
         // What the module adds is saved when it can be loaded back on its own: no splices
         // (their results depend on more than the source), no boot files involved.
         // (A `{-# SOURCE #-}` import depends on the boot file, keyed `{boot}M`.)

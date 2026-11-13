@@ -104,6 +104,8 @@ impl Machine {
     pub fn new(prog: Program) -> Box<Machine> {
         // HSC_HEAP_WORDS: the initial heap (a small one makes collections frequent, for testing).
         let words = std::env::var("HSC_HEAP_WORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(HEAP_WORDS);
+        // At least room for the program's global closures and some slack, whatever was asked.
+        let words = words.max(4 * prog.globals.len() + (1 << 14));
         let mut heap = Heap::new(words);
         let base = heap.addr(0);
         let limit = base + (words as Word) * 8;
@@ -479,9 +481,11 @@ pub fn stack_roots(sp: Word, top: Word, out: &mut Vec<*mut Word>) {
     use crate::native::codegen::frame;
     let mut p = sp;
     let mut top = top;
-    // The frames walked so far (return address, kind, size, position), for a report of where a
-    // frame went wrong.
-    let mut trail: Vec<(Word, Word, Word, Word)> = Vec::new();
+    // The last frames walked (return address, kind, size, position), for a report of where a
+    // frame went wrong: a ring of a few, since stacks can be millions of frames deep.
+    const TRAIL: usize = 32;
+    let mut trail = [(0 as Word, 0 as Word, 0 as Word, 0 as Word); TRAIL];
+    let mut walked = 0usize;
     let first_top = top;
     loop {
         for _ in 0..top {
@@ -495,12 +499,14 @@ pub fn stack_roots(sp: Word, top: Word, out: &mut Vec<*mut Word>) {
         let fkind = unsafe { *((ret - 16) as *const Word) };
         let size = unsafe { *((ret - 8) as *const Word) };
         if !(1..=6).contains(&fkind) {
-            eprintln!("hsc: bad frame at {p:#x} (sp {sp:#x}, top {first_top}): word {ret:#x} (stack_roots is at {:#x}); the frames before it, innermost first:", stack_roots as usize);
-            for (r, k, n, at) in &trail {
+            eprintln!("hsc: bad frame at {p:#x} (sp {sp:#x}, top {first_top}): word {ret:#x} (stack_roots is at {:#x}); the last frames before it, innermost first:", stack_roots as usize);
+            for i in walked.saturating_sub(TRAIL)..walked {
+                let (r, k, n, at) = trail[i % TRAIL];
                 eprintln!("  ret {r:#x} kind {k} size {n} at {at:#x}");
             }
         }
-        trail.push((ret, fkind, size, p));
+        trail[walked % TRAIL] = (ret, fkind, size, p);
+        walked += 1;
         p += 8;
         top = 0;
         match fkind {

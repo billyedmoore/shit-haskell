@@ -12,6 +12,18 @@ pub fn state_pair(m: &mut Machine, v: Word) -> Word {
     con_value(m, "Builtin.(,)", 2, &[0, v])
 }
 
+/// `state_pair` for a value that was got by running Haskell code (or by another thread running),
+/// which may have used up the room `hsc_prim` reserved: the pair's allocation may collect, so the
+/// value is held in a spare argument slot (a root) meanwhile.
+pub fn state_pair_rooted(m: &mut Machine, v: Word) -> Word {
+    let slot = super::ARG_SLOTS - 1;
+    m.args[slot] = v;
+    m.reserve(4);
+    let v = m.args[slot];
+    m.args[slot] = 0;
+    state_pair(m, v)
+}
+
 /// The unit object (the answer of a state-only primitive).
 pub fn unit(m: &mut Machine) -> Word {
     con_value(m, "Builtin.()", 0, &[])
@@ -59,8 +71,11 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             m.args[2] = old;
             let f = m.args[1];
             let Some(res) = m.apply_nested(f, &[old]) else { return Some(0) };
-            // The collector may have moved everything: read the roots again.
-            let (r, old) = (m.args[0], m.args[2]);
+            // The collector may have moved everything, and the answer's allocation may collect
+            // again: `res` is rooted, the room reserved, and the roots read again.
+            m.args[3] = res;
+            m.reserve(8);
+            let (r, old, res) = (m.args[0], m.args[2], m.args[3]);
             let new_contents = m.heap_get(res, 1);
             m.heap_set(r + 8, new_contents);
             con_value(m, "Builtin.(,,)", 3, &[0, old, res])
@@ -73,7 +88,9 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             m.args[2] = old;
             let f = m.args[1];
             let Some(new) = m.apply_nested(f, &[old]) else { return Some(0) };
-            let (r, old) = (m.args[0], m.args[2]);
+            m.args[3] = new;
+            m.reserve(8);
+            let (r, old, new) = (m.args[0], m.args[2], m.args[3]);
             m.heap_set(r + 8, new);
             con_value(m, "Builtin.(,,)", 3, &[0, old, new])
         }
@@ -338,8 +355,9 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             if name.starts_with("clone") && name != "cloneMutableArray#" { a } else { state_pair(m, a) }
         }
         "seq#" => {
+            // Forcing runs Haskell code, which may use up the reserved room.
             let Some(v) = force_arg(m, 0) else { return Some(0) };
-            state_pair(m, v)
+            state_pair_rooted(m, v)
         }
         _ => return element_access(m, name),
     };

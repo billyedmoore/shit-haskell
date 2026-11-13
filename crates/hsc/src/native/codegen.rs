@@ -7,9 +7,10 @@
 //! continuation (a return address) begins. A return address's info (two words before it) gives the
 //! kind and size of the frame directly above it, which is what the collector walks.
 //!
-//! `let` and `case` occur only in tail position with nothing pushed; a case pushes its return
-//! address below the current frame, and its scrutinee is a simple expression (the lowering makes
-//! nested cases join points).
+//! A case pushes its return address below the current frame, whose info gives that frame's size.
+//! Its scrutinee is usually simple (the lowering makes nested cases join points), but may be a
+//! case itself (`seq`): that case's return address then sits below the outer one's, and its info
+//! gives an empty frame (the collector reads the outer return address next).
 
 use std::collections::HashMap;
 use std::fmt::Write;
