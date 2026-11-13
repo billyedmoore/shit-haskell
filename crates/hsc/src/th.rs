@@ -93,16 +93,16 @@ pub fn fill_splices(m: &mut Module, results: &[Expr]) {
 
 /// The module the splices of `m` are compiled in: `m`'s imports, and one binding per splice
 /// that runs it (`unsafePerformIO (runQ splice)`, an `Exp`).
-pub fn splice_module(m: &Module, splices: &[Splice], name: &str, table: Expr) -> Module {
+pub fn splice_module(m: &Module, splices: &[Splice], name: &str, table: Expr, file: &str) -> Module {
     let exp = Type::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Exp".into() }, m.loc);
-    splice_module_at(m.imports.clone(), Vec::new(), splices, name, exp, table)
+    splice_module_at(m.imports.clone(), Vec::new(), splices, name, exp, table, (file, &m.name))
 }
 
 /// The module a declaration splice runs in: the module's name and imports, the declarations
 /// before the splice, and the splice (a `[Dec]`).
-pub fn decl_splice_module(m: &Module, before: Vec<Decl>, body: Expr, loc: Loc, table: Expr) -> Module {
+pub fn decl_splice_module(m: &Module, before: Vec<Decl>, body: Expr, loc: Loc, table: Expr, file: &str) -> Module {
     let decs = Type::List(Box::new(Type::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Dec".into() }, loc)), loc);
-    splice_module_at(m.imports.clone(), before, &[Splice { body, loc }], &m.name, decs, table)
+    splice_module_at(m.imports.clone(), before, &[Splice { body, loc }], &m.name, decs, table, (file, &m.name))
 }
 
 /// The type names quoted (`''T`) in the splices: the types of other modules `reify` may be asked about.
@@ -122,17 +122,25 @@ pub fn quoted_types(splices: &[&Expr]) -> Vec<QName> {
     out
 }
 
-fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice], name: &str, result: Type, table: Expr) -> Module {
+/// `at` is the file and module the splices are in, for `location`.
+fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice], name: &str, result: Type, table: Expr, at: (&str, &str)) -> Module {
     let module_loc = splices.first().map_or(Loc::default(), |s| s.loc);
     let mut decls = before;
     for (i, s) in splices.iter().enumerate() {
         let loc = s.loc;
         // The reify table is set before the splice runs.
         let set_table = app(app(th_var("GHC.Internal.IORef", "writeIORef", loc), th_var("GHC.Internal.TH.Syntax", "hscReifyTable", loc)), table.clone());
-        let then = th_var("GHC.Internal.Base", ">>", loc);
+        let then = || th_var("GHC.Internal.Base", ">>", loc);
+        let str = |x: &str| Expr::Lit(Lit::Str(x.to_string()), loc);
+        let pos = Expr::Tuple(vec![Some(lit_int(&loc.line.to_string(), loc)), Some(lit_int(&loc.col.to_string(), loc))], loc);
+        let mut here = Expr::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Loc".into() }, loc);
+        for x in [str(at.0), str("main"), str(at.1), pos.clone(), pos] {
+            here = app(here, x);
+        }
+        let set_loc = app(app(th_var("GHC.Internal.IORef", "writeIORef", loc), th_var("GHC.Internal.TH.Syntax", "hscLocation", loc)), here);
         let run = app(
             th_var("GHC.Internal.IO.Unsafe", "unsafePerformIO", loc),
-            app(app(then, set_table), app(th_var("GHC.Internal.TH.Syntax", "runQ", loc), s.body.clone())),
+            app(app(then(), set_table), app(app(then(), set_loc), app(th_var("GHC.Internal.TH.Syntax", "runQ", loc), s.body.clone()))),
         );
         let typed = Expr::Sig(Box::new(run), result.clone(), loc);
         decls.push(Decl::Fun {
@@ -308,9 +316,12 @@ pub fn has_splices(m: &Module) -> bool {
 
 /// Runs the splice bindings of a compiled program and converts what each produced (a Template
 /// Haskell `Exp`) to source syntax.
-pub fn run_splices(binds: &[crate::core::TopBind], module: &str, count: usize, locs: Vec<Loc>) -> Result<Vec<Expr>, String> {
+pub fn run_splices(binds: &[crate::core::TopBind], module: &str, count: usize, locs: Vec<Loc>, pre: Option<String>) -> Result<Vec<Expr>, String> {
     let names: Vec<String> = (0..count).map(|i| format!("{module}.{}", placeholder(i))).collect();
-    with_runtime(binds, names.clone(), move |rt| {
+    let mut roots = names.clone();
+    roots.extend(pre.clone());
+    with_runtime(binds, roots, move |rt| {
+        run_pre(rt, pre.as_deref(), locs.first().copied().unwrap_or_default())?;
         let mut out = Vec::with_capacity(count);
         for (name, loc) in names.iter().zip(locs) {
             let cell = rt.global(name).ok_or_else(|| format!("internal: splice {name} was not compiled"))?;
@@ -322,12 +333,24 @@ pub fn run_splices(binds: &[crate::core::TopBind], module: &str, count: usize, l
 
 /// Runs a declaration splice (the first splice binding of `module`, a `[Dec]`) and converts the
 /// declarations it produced.
-pub fn run_decl_splice(binds: &[crate::core::TopBind], module: &str, loc: Loc) -> Result<Vec<Decl>, String> {
+pub fn run_decl_splice(binds: &[crate::core::TopBind], module: &str, loc: Loc, pre: Option<String>) -> Result<Vec<Decl>, String> {
     let name = format!("{module}.{}", placeholder(0));
-    with_runtime(binds, vec![name.clone()], move |rt| {
+    let mut roots = vec![name.clone()];
+    roots.extend(pre.clone());
+    with_runtime(binds, roots, move |rt| {
+        run_pre(rt, pre.as_deref(), loc)?;
         let cell = rt.global(&name).ok_or_else(|| format!("internal: splice {name} was not compiled"))?;
         Conv { rt, loc }.top_decs(&cell)
     })
+}
+
+/// Forces the binding that sets the reify table of values (`reify_values_module`), if any.
+fn run_pre(rt: &Runtime, pre: Option<&str>, loc: Loc) -> Result<(), String> {
+    if let Some(p) = pre {
+        let cell = rt.global(p).ok_or_else(|| format!("internal: {p} was not compiled"))?;
+        Conv { rt, loc }.force(&cell)?;
+    }
+    Ok(())
 }
 
 /// Runs `f` with an interpreter of the bindings that `roots` reach, on a thread of its own with a
@@ -1247,6 +1270,87 @@ impl Reify {
             Type::Sig(x, _) | Type::Forall(_, x) | Type::Qual(_, x) => self.ty(x),
             Type::Lit(Lit::Int(n), _) => app(self.syn("LitT"), app(self.syn("NumTyLit"), Expr::Lit(Lit::Int(n.clone()), loc))),
             Type::Lit(Lit::Str(s), _) => app(self.syn("LitT"), app(self.syn("StrTyLit"), self.str(s))),
+            _ => self.syn("WildCardT"),
+        }
+    }
+}
+
+// ----- reify of values ---------------------------------------------------------------------
+
+/// The module run before a module's splices to give `reify` the types of its values: those of
+/// `module` the checker knows (the declarations before the splices, checked with them), each
+/// as `VarI name type Nothing`. It sets `hscReifyValues` when its one binding is forced.
+pub fn reify_values_module(values: &[(String, &crate::tc::types::Scheme)], module: &str, name: &str, loc: Loc) -> Module {
+    let mut entries = Vec::new();
+    for (occ, scheme) in values {
+        let r = Reify { loc, global: Some(module.to_string()) };
+        let ty = r.scheme(scheme);
+        let nothing = Expr::Con(QName { qual: Some("%G:GHC.Internal.Maybe".into()), name: "Nothing".into() }, loc);
+        let info = app(app(app(r.syn("VarI"), r.own(false, occ)), ty), nothing);
+        entries.push(Expr::Tuple(vec![Some(r.str(module)), Some(r.str(occ)), Some(info)], loc));
+    }
+    let set = app(
+        app(th_var("GHC.Internal.IORef", "writeIORef", loc), th_var("GHC.Internal.TH.Syntax", "hscReifyValues", loc)),
+        Expr::List(entries, loc),
+    );
+    let unit = Type::Con(QName { qual: Some("%G:Builtin".into()), name: "()".into() }, loc);
+    let body = Expr::Sig(Box::new(app(th_var("GHC.Internal.IO.Unsafe", "unsafePerformIO", loc), set)), unit, loc);
+    let decl = Decl::Fun {
+        name: REIFY_VALUES.into(),
+        clauses: vec![Clause { pats: Vec::new(), rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() }, loc, end: loc }],
+        loc,
+    };
+    Module { name: name.to_string(), exports: None, imports: Vec::new(), decls: vec![decl], loc }
+}
+
+/// The binding of `reify_values_module`.
+pub const REIFY_VALUES: &str = "hscSetReifyValues";
+
+impl Reify {
+    /// A checked type scheme as a TH `Type`: `forall a b. ctx => t`, its variables at kind
+    /// `Type`, as GHC reifies a function's type.
+    fn scheme(&self, s: &crate::tc::types::Scheme) -> Expr {
+        let loc = self.loc;
+        let names: Vec<String> = (0..s.nvars as usize).map(|i| s.names.get(i).cloned().unwrap_or_else(|| format!("t{i}"))).collect();
+        let body = self.tc_ty(&s.ty, &names);
+        if s.nvars == 0 && s.preds.is_empty() {
+            return body;
+        }
+        let tvs = names
+            .iter()
+            .map(|n| app(app(app(self.syn("KindedTV"), self.mk_name(n)), self.syn("SpecifiedSpec")), self.syn("StarT")))
+            .collect();
+        let cxt = s.preds.iter().map(|p| self.tc_pred(p, &names)).collect();
+        app(app(app(self.syn("ForallT"), Expr::List(tvs, loc)), Expr::List(cxt, loc)), body)
+    }
+
+    fn tc_pred(&self, p: &crate::tc::types::Pred, names: &[String]) -> Expr {
+        let head = app(self.syn("ConT"), self.global_name(true, &p.class));
+        p.args.iter().fold(head, |acc, a| app(app(self.syn("AppT"), acc), self.tc_ty(a, names)))
+    }
+
+    fn global_name(&self, is_type: bool, key: &str) -> Expr {
+        let occ = crate::tc::types::unqualify(key);
+        let module = key[..key.len() - occ.len()].trim_end_matches('.');
+        Expr::NameQuote(is_type, QName { qual: Some(format!("%G:{module}")), name: occ.into() }, self.loc)
+    }
+
+    fn tc_ty(&self, t: &crate::tc::types::Ty, names: &[String]) -> Expr {
+        use crate::tc::types::Ty;
+        let loc = self.loc;
+        let appt = |f: Expr, a: Expr| app(app(self.syn("AppT"), f), a);
+        match t {
+            Ty::Con(c) => match c.as_str() {
+                crate::tc::types::ARROW => self.syn("ArrowT"),
+                crate::tc::types::LIST => self.syn("ListT"),
+                "Builtin.()" => app(self.syn("TupleT"), Expr::Lit(Lit::Int("0".into()), loc)),
+                n if n.starts_with("Builtin.(,") => app(self.syn("TupleT"), Expr::Lit(Lit::Int((n.len() - "Builtin.(".len()).to_string()), loc)),
+                n if n.contains('.') => app(self.syn("ConT"), self.global_name(true, n)),
+                _ => self.syn("WildCardT"),
+            },
+            Ty::App(f, a) => appt(self.tc_ty(f, names), self.tc_ty(a, names)),
+            Ty::Gen(i) => app(self.syn("VarT"), self.mk_name(names.get(*i as usize).map_or("t", String::as_str))),
+            Ty::Skol(_, n) => app(self.syn("VarT"), self.mk_name(n)),
             _ => self.syn("WildCardT"),
         }
     }

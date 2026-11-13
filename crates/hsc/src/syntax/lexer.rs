@@ -104,6 +104,12 @@ const ASCII_ESCAPES: &[(&str, u32)] = &[
 ];
 
 pub fn lex(src: &str) -> Result<Lexed, LexError> {
+    lex_with(src, true)
+}
+
+/// Lexes a module; without `magic_hash` (MagicHash off) a name does not take a `#` suffix, so
+/// that `(# q, r#)` closes its unboxed tuple.
+pub fn lex_with(src: &str, magic_hash: bool) -> Result<Lexed, LexError> {
     let mut lx = Lexer {
         chars: src.chars().collect(),
         pos: 0,
@@ -111,6 +117,7 @@ pub fn lex(src: &str) -> Result<Lexed, LexError> {
         col: 1,
         pragmas: Vec::new(),
         toks: Vec::new(),
+        magic_hash,
     };
     lx.run()?;
     Ok(Lexed {
@@ -126,6 +133,7 @@ struct Lexer {
     col: u32,
     pragmas: Vec<Pragma>,
     toks: Vec<Token>,
+    magic_hash: bool,
 }
 
 impl Lexer {
@@ -392,7 +400,7 @@ impl Lexer {
             while self.peek(run) == Some('#') {
                 run += 1;
             }
-            if run > 0 && !self.peek(run).is_some_and(|c| is_symbol(c) && c != '#') {
+            if run > 0 && self.magic_hash && !self.peek(run).is_some_and(|c| is_symbol(c) && c != '#') {
                 for _ in 0..run {
                     word.push(self.bump());
                 }

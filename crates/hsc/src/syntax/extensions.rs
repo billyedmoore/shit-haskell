@@ -138,6 +138,12 @@ impl Extensions {
             }
             "Haskell2010" | "Haskell98" => {
                 self.on = HASKELL2010.iter().map(|s| s.to_string()).collect();
+                // GHC's Haskell98 also allows a nested block at its enclosing block's column (as
+                // GHC always did; Cabal's default language) and n+k patterns.
+                if item == "Haskell98" {
+                    self.on.insert("NondecreasingIndentation".to_string());
+                    self.on.insert("NPlusKPatterns".to_string());
+                }
                 return Ok(());
             }
             _ => {}

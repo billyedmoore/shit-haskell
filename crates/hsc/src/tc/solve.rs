@@ -333,9 +333,17 @@ impl Checker {
         let mut work = wanteds;
         let mut binds = Vec::new();
         let mut residual = Vec::new();
+        // The wanteds this round solves from an instance or a quantified given, by evidence: one
+        // met again (a cycle, `Eq (Fix p a)` needing `Eq (p (Fix p a) a)` needing itself through
+        // `Eq2 p`) is the same dictionary, recursively, as GHC builds it.
+        let mut solving: Vec<(Pred, String)> = Vec::new();
         while let Some(w) = work.pop() {
             self.improve(&w.pred)?;
             let pred = self.metas_zonk_pred(&w.pred);
+            if let Some((_, ev)) = solving.iter().find(|(p, _)| *p == pred) {
+                binds.push((w.ev.clone(), Core::Var(ev.clone())));
+                continue;
+            }
             // A wanted tuple of constraints: each is wanted, the evidence is their tuple.
             if let Some(parts) = constraint_tuple_parts(&pred) {
                 let n = parts.len();
@@ -453,6 +461,9 @@ impl Checker {
             }
             // A quantified given whose head (or a superclass of it) matches: a local instance.
             if let Some((ev, ctx)) = self.find_quantified_given(&pred) {
+                if !self.pred_has_metas(&pred) {
+                    solving.push((pred.clone(), w.ev.clone()));
+                }
                 let mut core = ev;
                 let mut evs = Vec::new();
                 for p in ctx {
@@ -468,6 +479,9 @@ impl Checker {
             match self.find_instance(&pred) {
                 Some((inst_dict, ctx)) => {
                     let ctx = self.instantiate_unbound(ctx);
+                    if !self.pred_has_metas(&pred) {
+                        solving.push((pred.clone(), w.ev.clone()));
+                    }
                     let mut args = Vec::with_capacity(ctx.len());
                     for cp in ctx {
                         let ev = self.fresh_name("d");
@@ -624,12 +638,101 @@ impl Checker {
     /// A quantified given that provides a predicate: the given's evidence with the superclass
     /// selections to apply after its context's dictionaries (see `core_apply_base`), and that
     /// context instantiated for the match.
-    fn find_quantified_given(&self, want: &Pred) -> Option<(Core, Vec<Pred>)> {
-        for g in self.givens.iter().rev() {
-            if g.pred.class != QUANTIFIED_CLASS {
-                continue;
+    /// The quantified constraints the givens hold, directly or as superclasses (`Eq1 f` holds
+    /// `forall a. Eq a => Eq (f a)`), with their evidence.
+    fn quantified_givens(&self) -> Vec<(Pred, Core)> {
+        fn walk(c: &Checker, have: &Pred, ev: &Core, depth: usize, out: &mut Vec<(Pred, Core)>) {
+            if have.class == QUANTIFIED_CLASS {
+                out.push((have.clone(), ev.clone()));
+                return;
             }
-            let Ty::Forall(ids, ctx, head) = self.metas.zonk(&g.pred.args[0]) else { continue };
+            if depth > 16 {
+                return;
+            }
+            let Some(info) = c.class(&have.class) else { return };
+            let nsupers = info.nsupers();
+            for (i, sup) in info.supers.iter().enumerate() {
+                let sup_pred = super::types::subst_gen_pred(sup, &have.args);
+                let mut counter = 0usize;
+                let mut fresh = || {
+                    counter += 1;
+                    format!("qg%{depth}_{counter}")
+                };
+                let sel = select_field(ev.clone(), &info.dict_con, nsupers + info.methods.len(), i, &mut fresh);
+                walk(c, &sup_pred, &sel, depth + 1, out);
+            }
+        }
+        let mut out = Vec::new();
+        for g in self.givens.iter().rev() {
+            walk(self, &g.pred, &g.ev, 0, &mut out);
+        }
+        // A quantified given whose head has a quantified superclass (`forall a. Eq a => Eq1 (p a)`,
+        // Eq1's being `forall b. Eq b => Eq (f b)`) holds that one too, under both contexts:
+        // `forall a b. (Eq a, Eq b) => Eq (p a b)`.
+        let mut next = 0;
+        let mut tag = 0usize;
+        while next < out.len() && out.len() < 64 {
+            let (gpred, gev) = out[next].clone();
+            next += 1;
+            let Ty::Forall(ids, ctx, head) = self.metas.zonk(&gpred.args[0]) else { continue };
+            let (h, hargs) = head.split_apps();
+            let Ty::Con(hclass) = h else { continue };
+            let head_pred = Pred { class: hclass.clone(), args: hargs.into_iter().cloned().collect() };
+            // The head's dictionary, from the given applied to its context's dictionaries.
+            tag += 1;
+            let ds: Vec<String> = (0..ctx.len()).map(|k| format!("qx%{tag}_{k}")).collect();
+            let applied = ds.iter().fold(gev.clone(), |f, d| Core::App(Box::new(f), Box::new(Core::Var(d.clone()))));
+            let mut found: Vec<(Ty, Vec<Pred>, Core)> = Vec::new();
+            self.quantified_supers(&head_pred, &applied, 0, &mut found);
+            for (inner, inner_ev_body, _) in found.into_iter().map(|(t, _, e)| (t, e, ())) {
+                let Ty::Forall(ids2, ctx2, head2) = inner else { continue };
+                // The inner variables are renamed apart from the outer ones.
+                let base = 1_000_000 * (tag as u32 + 1);
+                let fresh2: Vec<u32> = ids2.iter().map(|i| base + i).collect();
+                let renamed: Vec<Ty> = fresh2.iter().map(|i| Ty::Bound(*i)).collect();
+                let ctx2: Vec<Pred> = ctx2.iter().map(|p| super::types::subst_bound_pred(p, &ids2, &renamed)).collect();
+                let head2 = super::types::subst_bound(&head2, &ids2, &renamed);
+                let es: Vec<String> = (0..ctx2.len()).map(|k| format!("qy%{tag}_{k}")).collect();
+                let body = es.iter().fold(inner_ev_body, |f, e| Core::App(Box::new(f), Box::new(Core::Var(e.clone()))));
+                let ev = ds.iter().chain(es.iter()).rev().fold(body, |acc, v| Core::Lam(v.clone(), Box::new(acc)));
+                let mut all_ids = ids.clone();
+                all_ids.extend(fresh2);
+                let mut all_ctx = ctx.clone();
+                all_ctx.extend(ctx2);
+                let q = Pred { class: QUANTIFIED_CLASS.into(), args: vec![Ty::Forall(all_ids, all_ctx, Box::new(head2))] };
+                out.push((q, ev));
+            }
+        }
+        out
+    }
+
+    /// The quantified superclasses of a predicate (through its ordinary superclasses too), each
+    /// with its evidence selected from `ev`, the predicate's dictionary.
+    fn quantified_supers(&self, have: &Pred, ev: &Core, depth: usize, out: &mut Vec<(Ty, Vec<Pred>, Core)>) {
+        if depth > 6 {
+            return;
+        }
+        let Some(info) = self.class(&have.class) else { return };
+        let nsupers = info.nsupers();
+        for (i, sup) in info.supers.iter().enumerate() {
+            let sup_pred = super::types::subst_gen_pred(sup, &have.args);
+            let mut counter = 0usize;
+            let mut fresh = || {
+                counter += 1;
+                format!("qz%{depth}_{i}_{counter}")
+            };
+            let sel = select_field(ev.clone(), &info.dict_con, nsupers + info.methods.len(), i, &mut fresh);
+            if sup_pred.class == QUANTIFIED_CLASS {
+                out.push((sup_pred.args[0].clone(), Vec::new(), sel));
+            } else {
+                self.quantified_supers(&sup_pred, &sel, depth + 1, out);
+            }
+        }
+    }
+
+    fn find_quantified_given(&self, want: &Pred) -> Option<(Core, Vec<Pred>)> {
+        for (gpred, gev) in self.quantified_givens() {
+            let Ty::Forall(ids, ctx, head) = self.metas.zonk(&gpred.args[0]) else { continue };
             let gens: Vec<Ty> = (0..ids.len()).map(|k| Ty::Gen(k as u32)).collect();
             let head = super::types::subst_bound(&head, &ids, &gens);
             let (h, hargs) = head.split_apps();
@@ -656,7 +759,7 @@ impl Checker {
                     };
                     core = select_field(core, &con, n, i, &mut fresh);
                 }
-                return Some((core_with_base(core, g.ev.clone()), ctx));
+                return Some((core_with_base(core, gev.clone()), ctx));
             }
         }
         None

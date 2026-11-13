@@ -110,7 +110,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let words = limbs.len();
             m.reserve(words + 2);
             let bp = m.alloc(1 + words);
-            m.heap_set(bp, super::heap::header(super::heap::kind::BYTES, words as u32, 0));
+            m.heap_set(bp, super::heap::header(super::heap::kind::BYTES, words as u32, 8 * words as u32));
             for (i, l) in limbs.iter().enumerate() {
                 m.heap_set(bp + 8 + 8 * i as Word, *l);
             }

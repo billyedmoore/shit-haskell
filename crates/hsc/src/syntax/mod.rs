@@ -52,12 +52,18 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
             })?;
         }
     }
+    // Names end in `#` only with MagicHash.
+    let lexed = if !exts.is_on("MagicHash") && src.contains('#') {
+        lexer::lex_with(src, false).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?
+    } else {
+        lexed
+    };
     let th_quotes = exts.is_on("TemplateHaskell") || exts.is_on("TemplateHaskellQuotes");
     // QuasiQuotes: `[q|text|]` is rewritten to an application the splice pass recognises, and
     // the source lexed again.
     let lexed = if exts.is_on("QuasiQuotes") {
         match rewrite_quasiquotes(src, th_quotes) {
-            Some(rewritten) => lexer::lex(&rewritten).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
+            Some(rewritten) => lexer::lex_with(&rewritten, exts.is_on("MagicHash")).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
             None => lexed,
         }
     } else {

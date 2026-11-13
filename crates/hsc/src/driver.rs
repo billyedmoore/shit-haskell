@@ -360,6 +360,32 @@ impl Driver {
         }
     }
 
+    /// Points a package module's imports at its own package's modules: a module of the same name
+    /// in the program (time-compat's `Data.Time.Calendar.Private` beside time's) is not the one
+    /// it means. Such an import is loaded under an internal name, as a package-qualified one is.
+    fn resolve_own_package_imports(&mut self, m: &mut Module, path: &Path) {
+        let Some(dir) = self.pkg_dirs.iter().filter(|d| path.starts_with(d)).max_by_key(|d| d.as_os_str().len()).cloned() else {
+            return;
+        };
+        let tag: String = dir.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        for imp in &mut m.imports {
+            if imp.package.is_some() || imp.module == m.name || self.renamed.contains_key(&imp.module) {
+                continue;
+            }
+            let stem = imp.module.replace('.', "/");
+            let Some(own) = Self::find_in_package_dir(&dir, &stem) else { continue };
+            if self.find_module(&imp.module).map(|f| f.path) == Some(own.path) {
+                continue;
+            }
+            let key = format!("{}_pkg_{}", imp.module, md5_hex(tag.as_bytes()).get(..8).unwrap_or("x"));
+            self.renamed.insert(key.clone(), (imp.module.clone(), dir.clone()));
+            if imp.alias.is_none() {
+                imp.alias = Some(imp.module.clone());
+            }
+            imp.module = key;
+        }
+    }
+
     fn find_source(&self, module: &str) -> Option<PathBuf> {
         self.find_module(module).map(|f| f.path)
     }
@@ -499,6 +525,9 @@ impl Driver {
             parsed.name = module.to_string();
         }
         self.resolve_package_imports(&mut parsed);
+        if !home {
+            self.resolve_own_package_imports(&mut parsed, &path);
+        }
         // The GHC packages compile with NoImplicitPrelude as a package default (their cabal files).
         let path_text = path.to_string_lossy();
         if ["/libs/ghc-internal/", "/libs/ghc-prim/", "/libs/ghc-bignum/", "/libs/base/"].iter().any(|p| path_text.contains(p)) {
@@ -656,12 +685,13 @@ impl Driver {
             m.decls.splice(..i, before.decls.iter().cloned());
             let imported = self.quoted_data(&[&body], &m.name);
             let table = crate::th::reify_table(&before.decls, &m.name, &imported, loc);
-            let smod = crate::th::decl_splice_module(m, before.decls, body, loc, table);
+            let smod = crate::th::decl_splice_module(m, before.decls, body, loc, table, &path.display().to_string());
             let mark = self.binds.len();
             let user_module = self.checker.user_module;
             self.compile_module(smod, exts.clone(), path)?;
+            let pre = self.reify_values(&m.name, exts, path, loc)?;
             self.checker.user_module = user_module;
-            let generated = crate::th::run_decl_splice(&self.binds, &m.name, loc)
+            let generated = crate::th::run_decl_splice(&self.binds, &m.name, loc, pre)
                 .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), loc.line, loc.col))?;
             // The module is compiled for real afterwards.
             self.binds.truncate(mark);
@@ -670,6 +700,37 @@ impl Driver {
             m.decls.splice(i..=i, generated);
         }
         Ok(groups_end)
+    }
+
+    /// Compiles the module that gives `reify` the types of the values of `module` checked so far
+    /// (the declarations before its splices), answering the binding that sets them; the caller
+    /// drops the module's bindings with the splice module's.
+    fn reify_values(&mut self, module: &str, exts: &Extensions, path: &Path, loc: crate::syntax::ast::Loc) -> Result<Option<String>, String> {
+        let prefix = format!("{module}.");
+        let mut values: Vec<(String, crate::tc::types::Scheme)> = self
+            .checker
+            .env
+            .values
+            .iter()
+            .filter_map(|(k, s)| {
+                let occ = k.strip_prefix(&prefix)?;
+                let plain = occ.starts_with(|c: char| c.is_lowercase() || c == '_') && occ.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'');
+                (plain && !occ.starts_with("hsc'splice")).then(|| (occ.to_string(), s.clone()))
+            })
+            .collect();
+        if values.is_empty() {
+            return Ok(None);
+        }
+        values.sort_by(|a, b| a.0.cmp(&b.0));
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let name = format!("HscReifyValues{}", COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let refs: Vec<(String, &crate::tc::types::Scheme)> = values.iter().map(|(n, s)| (n.clone(), s)).collect();
+        let vm = crate::th::reify_values_module(&refs, module, &name, loc);
+        let mut exts = exts.clone();
+        exts.apply("NoImplicitPrelude")?;
+        self.compile_module(vm, exts, path)?;
+        self.ifaces.remove(&name);
+        Ok(Some(format!("{name}.{}", crate::th::REIFY_VALUES)))
     }
 
     /// The data types of other modules that splices quote by name (`''T`), which `reify` may be
@@ -720,16 +781,17 @@ impl Driver {
         let bodies: Vec<&crate::syntax::ast::Expr> = splices.iter().map(|s| &s.body).collect();
         let imported = self.quoted_data(&bodies, &m.name);
         let table = crate::th::reify_table(&earlier, &m.name, &imported, first);
-        let mut smod = crate::th::splice_module(m, &splices, &name, table);
+        let mut smod = crate::th::splice_module(m, &splices, &name, table, &path.display().to_string());
         smod.decls.splice(0..0, earlier);
         let user_module = self.checker.user_module;
         let mark = self.binds.len();
         self.compile_module(smod, exts.clone(), path)?;
+        let pre = if own { self.reify_values(&m.name, exts, path, first)? } else { None };
         self.checker.user_module = user_module;
         if timing {
             eprintln!("splices compiled: {:?}", t0.elapsed());
         }
-        let results = crate::th::run_splices(&self.binds, &name, splices.len(), locs)
+        let results = crate::th::run_splices(&self.binds, &name, splices.len(), locs, pre)
             .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))?;
         crate::th::fill_splices(m, &results);
         // The splice module is not part of the program (the module itself is compiled next).
@@ -761,6 +823,7 @@ impl Driver {
         let boot = self.checker.boot;
         self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
         self.checker.overloaded_lists = exts.is_on("OverloadedLists");
+        self.checker.monomorphism_restriction = exts.is_on("MonomorphismRestriction");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         let t = std::time::Instant::now();
         let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot)

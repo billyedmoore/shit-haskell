@@ -235,7 +235,7 @@ impl Parser {
                     return Ok(Type::Con(QName::unqual("()"), loc));
                 }
                 // UnboxedTuples: `(# t1, t2 #)` is an ordinary tuple type here.
-                if self.at_varsym("#") && self.raw().space_after {
+                if self.at_varsym("#") && (self.raw().space_after || self.exts.is_on("UnboxedTuples") || self.exts.is_on("UnboxedSums")) {
                     self.bump();
                     if self.at_varsym("#") {
                         self.bump();

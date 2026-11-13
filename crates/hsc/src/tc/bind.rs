@@ -210,6 +210,7 @@ impl Checker {
         }
 
         let wanteds = std::mem::replace(&mut self.wanted, outer_wanted);
+
         // Solved at the group's own level: types the solver makes (a functional dependency's
         // improvement) belong to the group and can be generalised (Cabal's `tmpDir = targetDir
         // </> makeRelativePathEx ..`).
@@ -217,9 +218,10 @@ impl Checker {
         self.level = outer_level;
         let (ev_binds, residual) = solved?;
 
+        // (With NoMonomorphismRestriction a variable binding is generalised too.)
         let restricted = items.iter().any(|it| match &it.kind {
             Kind::Pat { .. } => true,
-            Kind::Fun(clauses) => clauses.first().is_some_and(|c| c.pats.is_empty()),
+            Kind::Fun(clauses) => self.monomorphism_restriction && clauses.first().is_some_and(|c| c.pats.is_empty()),
         });
 
         // Metas of the group's types that are local to it can be generalised.
@@ -230,6 +232,39 @@ impl Checker {
             for m in ms {
                 if self.metas.levels[m as usize] > outer_level && !qmetas.contains(&m) {
                     qmetas.push(m);
+                }
+            }
+        }
+
+        // The generalised variables grow through the constraints: a variable of the group only a
+        // constraint on a generalised one mentions is generalised too (`e` of
+        // `MonadReader (Environment e) m`, `m` being generalised), as GHC's growThetaTyVars does.
+        if !restricted {
+            let pred_metas: Vec<Vec<u32>> = residual
+                .iter()
+                .map(|w| {
+                    let p = self.metas_zonk_pred(&w.pred);
+                    let mut ms = Vec::new();
+                    for a in &p.args {
+                        self.metas.free_metas(a, &mut ms);
+                    }
+                    ms
+                })
+                .collect();
+            loop {
+                let mut grew = false;
+                for ms in &pred_metas {
+                    if ms.iter().any(|m| qmetas.contains(m)) {
+                        for m in ms {
+                            if self.metas.levels[*m as usize] > outer_level && !qmetas.contains(m) {
+                                qmetas.push(*m);
+                                grew = true;
+                            }
+                        }
+                    }
+                }
+                if !grew {
+                    break;
                 }
             }
         }
@@ -288,8 +323,12 @@ impl Checker {
 
         let gen = |t: &Ty, metas: &Metas| -> Ty { generalise_ty(metas, t, &qmetas) };
         let names: Vec<String> = (0..qmetas.len()).map(|i| format!("t{i}")).collect();
+        let debug_groups = std::env::var_os("HSC_DEBUG_GROUPS").is_some();
         for (k, t) in &mono {
             let ty = gen(t, &self.metas);
+            if debug_groups {
+                eprintln!("group {:?}: {k} :: {} (quantified {})", mono.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), self.show(&self.metas.zonk(t)), qmetas.len());
+            }
             let preds: Vec<Pred> = qpreds
                 .iter()
                 .map(|p| Pred {

@@ -26,6 +26,9 @@ extern "C" {
     fn ftruncate(fd: i32, len: i64) -> i32;
     fn dup(fd: i32) -> i32;
     fn dup2(fd: i32, to: i32) -> i32;
+    fn fstat(fd: i32, buf: *mut u8) -> i32;
+    fn stat(path: *const u8, buf: *mut u8) -> i32;
+    fn lstat(path: *const u8, buf: *mut u8) -> i32;
 }
 
 /// The descriptor record `poll` takes.
@@ -370,6 +373,32 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
                 return ret_int(-1);
             }
             ret_int(fd as i64)
+        })(),
+        // The RTS shim's wrappers of fstat, stat and lstat (which set errno).
+        "__hscore_fstat" => (|| {
+            let fd = int_of(rt, &args[0])? as i32;
+            let (buf, off) = addr_of(rt, &args[1])?;
+            let mut data = buf.borrow_mut();
+            if data.len() < off + STAT_SIZE as usize {
+                return ret_int(-1);
+            }
+            // SAFETY: the buffer holds a whole `struct stat` from `off`.
+            ret_int(unsafe { fstat(fd, data[off..].as_mut_ptr()) } as i64)
+        })(),
+        "__hscore_stat" | "__hscore_lstat" => (|| {
+            let (path, poff) = addr_of(rt, &args[0])?;
+            let mut bytes: Vec<u8> = path.borrow()[poff..].iter().take_while(|&&b| b != 0).copied().collect();
+            bytes.push(0);
+            let (buf, off) = addr_of(rt, &args[1])?;
+            let mut data = buf.borrow_mut();
+            if data.len() < off + STAT_SIZE as usize {
+                return ret_int(-1);
+            }
+            // SAFETY: the path is NUL-terminated; the buffer holds a whole `struct stat`.
+            let r = unsafe {
+                if name == "__hscore_stat" { stat(bytes.as_ptr(), data[off..].as_mut_ptr()) } else { lstat(bytes.as_ptr(), data[off..].as_mut_ptr()) }
+            };
+            ret_int(r as i64)
         })(),
         // stat, fstat and lstat are the real C functions (the RTS shim's), which set errno.
         "__hscore_st_dev" => stat_field(rt, &args[0], 0, 8),

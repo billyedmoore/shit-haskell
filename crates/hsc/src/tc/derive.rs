@@ -1523,6 +1523,16 @@ fn fold_expr(checker: &mut Checker, t: &Type, last: &str, f: &str, x: Expr, acc:
         Type::Var(n, _) if n == last => app(local(f, loc), vec![x, acc]),
         Type::App(g, arg) if !mentions(g, last) => fold_inner(checker, arg, last, f, x, acc, loc),
         Type::List(e, _) => fold_inner(checker, e, last, f, x, acc, loc),
+        // A tuple: its components folded right to left (`(\(t1, t2) -> f1 t1 (f2 t2 acc)) x`).
+        Type::Tuple(ts, _) => {
+            let names = fresh_vars(checker, "t", ts.len());
+            let mut body = acc;
+            for (ty, n) in ts.iter().zip(&names).rev() {
+                body = fold_expr(checker, ty, last, f, local(n, loc), body, loc);
+            }
+            let pat = Pat::Tuple(names.iter().map(|n| Pat::Var(n.clone(), loc)).collect(), loc);
+            app(Expr::Lam(vec![pat], Box::new(body), loc), vec![x])
+        }
         _ => acc,
     }
 }
@@ -1574,6 +1584,24 @@ fn trav_expr(checker: &mut Checker, t: &Type, last: &str, f: &str, x: Expr, loc:
         Type::Var(n, _) if n == last => app(local(f, loc), vec![x]),
         Type::App(g, arg) if !mentions(g, last) => trav_inner(checker, arg, last, f, x, loc),
         Type::List(e, _) => trav_inner(checker, e, last, f, x, loc),
+        // A tuple: its components traversed in order, rebuilt as a tuple
+        // (`(\(t1, t2) -> pure (\a1 a2 -> (a1, a2)) <*> .. <*> ..) x`).
+        Type::Tuple(ts, _) => {
+            let names = fresh_vars(checker, "t", ts.len());
+            let outs = fresh_vars(checker, "a", ts.len());
+            let rebuild = Expr::Lam(
+                outs.iter().map(|o| Pat::Var(o.clone(), loc)).collect(),
+                Box::new(Expr::Tuple(outs.iter().map(|o| Some(local(o, loc))).collect(), loc)),
+                loc,
+            );
+            let mut action = app(base_var("pure", loc), vec![rebuild]);
+            for (ty, n) in ts.iter().zip(&names) {
+                let step = trav_expr(checker, ty, last, f, local(n, loc), loc);
+                action = app(base_var("<*>", loc), vec![action, step]);
+            }
+            let pat = Pat::Tuple(names.iter().map(|n| Pat::Var(n.clone(), loc)).collect(), loc);
+            app(Expr::Lam(vec![pat], Box::new(action), loc), vec![x])
+        }
         _ => app(base_var("pure", loc), vec![x]),
     }
 }

@@ -178,7 +178,7 @@ instance Quasi IO where
   qNewName = newNameIO
 
   qReport True  msg = hPutStrLn stderr ("Template Haskell error: " ++ msg)
-  qReport False msg = hPutStrLn stderr ("Template Haskell error: " ++ msg)
+  qReport False msg = hscWarning msg
 
   qLookupName _ _       = badIO "lookupName"
   qReify                = hscReify
@@ -189,8 +189,9 @@ instance Quasi IO where
   qReifyAnnotations _   = badIO "reifyAnnotations"
   qReifyModule _        = badIO "reifyModule"
   qReifyConStrictness _ = badIO "reifyConStrictness"
-  qLocation             = badIO "currentLocation"
-  qRecover _ _          = badIO "recover" -- Maybe we could fix this?
+  qLocation             = readIORef hscLocation
+  -- hsc: splices run in IO, so a failure is an exception the handler replaces.
+  qRecover h m          = m `catch` \e -> const h (e :: SomeException)
   qGetPackageRoot       = badIO "getProjectRoot"
   qAddDependentFile _   = badIO "addDependentFile"
   qAddTempFile _        = badIO "addTempFile"
@@ -222,15 +223,34 @@ badIO op = do   { qReport True ("Can't do `" ++ op ++ "' in the IO monad")
 hscReifyTable :: IORef [(String, String, Info)]
 hscReifyTable = unsafePerformIO (newIORef [])
 
+-- | hsc: the values of the module being compiled, with their types, for 'reify' (set once
+-- the declarations before the splices are checked).
+{-# NOINLINE hscReifyValues #-}
+hscReifyValues :: IORef [(String, String, Info)]
+hscReifyValues = unsafePerformIO (newIORef [])
+
 hscReify :: Name -> IO Info
 hscReify n@(Name (OccName occ) flavour) = do
-  table <- readIORef hscReifyTable
+  types <- readIORef hscReifyTable
+  values <- readIORef hscReifyValues
+  let table = types ++ values
   let matches (m, o, _) = o == occ && case flavour of
         NameG _ _ (ModName m') -> m == m'
         _ -> True
   case [i | e@(_, _, i) <- table, matches e] of
     (i : _) -> pure i
-    [] -> badIO ("reify " ++ show n)
+    [] -> fail ("\8216" ++ occ ++ "\8217 is not in scope at a reify")
+
+-- | hsc: where the splice that is running is, set by the compiler before it runs the splice.
+{-# NOINLINE hscLocation #-}
+hscLocation :: IORef Loc
+hscLocation = unsafePerformIO (newIORef (Loc "<splice>" "main" "Main" (1, 1) (1, 1)))
+
+-- | A warning a splice reported, printed as GHC prints it (at the splice).
+hscWarning :: String -> IO ()
+hscWarning msg = do
+  Loc f _ _ (l, c) _ <- readIORef hscLocation
+  hPutStrLn stderr (f ++ ":" ++ show l ++ ":" ++ show c ++ ": warning: [GHC-39584]\n    " ++ msg)
 
 -- Global variable to generate unique symbols
 counter :: IORef Uniq

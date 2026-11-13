@@ -31,8 +31,9 @@ import GHC.Prim
 import GHC.Types
 import GHC.Classes
 
--- | A native bignum; never looked into by Haskell code.
-data BigNat#
+-- | A magnitude, as GHC's: a byte array of 64-bit limbs, least significant first (the
+-- runtime's integer primitives read and write it).
+type BigNat# = ByteArray#
 
 -- | An integer: small values in IS, otherwise a magnitude with a sign (IP positive, IN negative).
 data Integer = IS Int# | IP BigNat# | IN BigNat#

@@ -95,6 +95,8 @@ pub struct Checker {
     pub newtype_deriving: bool,
     /// Quantified constraints are kept while a signature's context is converted.
     pub allow_quantified: bool,
+    /// MonomorphismRestriction (on unless the module turns it off).
+    pub monomorphism_restriction: bool,
     /// The monads of the typed quotations being checked, innermost last (their splices share them).
     pub quote_monads: Vec<Ty>,
     /// The flexible kind variables of the signature being checked. Each clause of its body
@@ -163,6 +165,7 @@ impl Checker {
             overloaded_lists: false,
             newtype_deriving: false,
             allow_quantified: false,
+            monomorphism_restriction: true,
             quote_monads: Vec::new(),
             flex_kinds: Vec::new(),
             explicit_sigs: std::collections::HashSet::new(),
@@ -272,10 +275,34 @@ impl Checker {
     /// Structural unification with families: applications are decomposed, so only the
     /// equalities whose head is a stuck family application are deferred.
     fn unify_fam(&mut self, actual: &Ty, expected: &Ty) -> TR<()> {
+        // A data family application against an application of an unknown (`MV s (a, a)` and
+        // `v s (a, a)` from a class method): data families are generative, so the unknown is the
+        // family partly applied, as GHC solves it, rather than the instance's representation.
+        if self.env.families.values().any(|f| !f.equations.is_empty()) {
+            let (a0, e0) = (self.metas.zonk(actual), self.metas.zonk(expected));
+            if self.align_data_families(&a0, &e0, 0, true)? {
+                return Ok(());
+            }
+        }
         let a = self.normalize(actual);
         let e = self.normalize(expected);
         let a_meta = matches!(self.metas.prune(&a), Ty::Meta(_));
         let e_meta = matches!(self.metas.prune(&e), Ty::Meta(_));
+        // `m ~ ST (PrimState m)`: the variable occurs only under a stuck family application, which
+        // may reduce once the variable is known (GHC does not report it as an occurs check), so
+        // the equality waits.
+        for (v, other, v_meta) in [(&a, &e, a_meta), (&e, &a, e_meta)] {
+            if let (true, Ty::Meta(i)) = (v_meta, self.metas.prune(v)) {
+                if !matches!(self.metas.prune(other), Ty::Meta(_)) && self.has_family(other) {
+                    let mut free = Vec::new();
+                    self.metas.free_metas(other, &mut free);
+                    if free.contains(&i) {
+                        self.deferred_eqs.push((a.clone(), e.clone(), self.loc));
+                        return Ok(());
+                    }
+                }
+            }
+        }
         if a_meta || e_meta || !(self.has_family(&a) || self.has_family(&e)) {
             return self.unify_at_raw(&a, &e);
         }
@@ -332,6 +359,107 @@ impl Checker {
     }
 
     /// Whether a family is a data family: its instances' right-hand sides are representation types.
+    /// The data family applications (or their representations) facing an application of an
+    /// unknown, anywhere in two types being unified: the unknown is the family partly applied.
+    /// Answers whether it unified the two types itself (the caller unifies them otherwise). With
+    /// `full` off (a pattern's type, refined rather than unified) only the families are aligned.
+    fn align_data_families(&mut self, a: &Ty, b: &Ty, depth: usize, full: bool) -> TR<bool> {
+        if depth > 32 {
+            return Ok(false);
+        }
+        let (a, b) = (self.metas.prune(a), self.metas.prune(b));
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            // A side that reduces to a data instance (`Mutable V r Any` to `MV r Any`'s
+            // representation) is taken as that family application.
+            let x = match self.rep_as_family(x) {
+                Some(f) => f,
+                None if self.has_family(x) => {
+                    let xn = self.normalize(x);
+                    self.rep_as_family(&xn).unwrap_or_else(|| x.clone())
+                }
+                None => x.clone(),
+            };
+            let Some((fam, fargs)) = self.family_app(&x) else { continue };
+            if !self.is_data_family(&fam) {
+                continue;
+            }
+            let (yh, yargs) = y.split_apps();
+            // How many of `y`'s arguments face the family's last ones: all of an unknown's, or
+            // those a type family takes beyond its arity (`Mutable v s a`, Mutable having one).
+            let k = match self.metas.prune(yh) {
+                Ty::Meta(_) => yargs.len(),
+                Ty::Con(g) => match self.env.families.get(&g) {
+                    Some(info) if info.arity < yargs.len() && !self.is_data_family(&g) => yargs.len() - info.arity,
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            let n = fargs.len();
+            if k == 0 || k > n {
+                continue;
+            }
+            let head = Ty::apps(Ty::Con(fam.clone()), fargs[..n - k].to_vec());
+            let yhead = Ty::apps(yh.clone(), yargs[..yargs.len() - k].iter().map(|t| (*t).clone()).collect());
+            let ytail: Vec<Ty> = yargs[yargs.len() - k..].iter().map(|t| (*t).clone()).collect();
+            self.unify_fam(&yhead, &head)?;
+            for (b, f) in ytail.iter().zip(&fargs[n - k..]) {
+                self.unify_fam(b, f)?;
+            }
+            return Ok(true);
+        }
+        if let (Ty::App(f1, x1), Ty::App(f2, x2)) = (&a, &b) {
+            // Where the heads are the same constructor (`ST s _` against `ST s _`), not a family,
+            // the arguments are aligned (or unified) pairwise.
+            let (h1, n1) = (a.split_apps().0.clone(), a.split_apps().1.len());
+            let (h2, n2) = (b.split_apps().0.clone(), b.split_apps().1.len());
+            let plain = matches!(&h1, Ty::Con(c) if !self.env.families.contains_key(c));
+            if h1 == h2 && n1 == n2 && plain {
+                let (f1, x1, f2, x2) = (f1.clone(), x1.clone(), f2.clone(), x2.clone());
+                let done_f = self.align_data_families(&f1, &f2, depth + 1, full)?;
+                let done_x = self.align_data_families(&x1, &x2, depth + 1, full)?;
+                if !full {
+                    return Ok(false);
+                }
+                if !done_f {
+                    self.unify_fam(&f1, &f2)?;
+                }
+                if !done_x {
+                    self.unify_fam(&x1, &x2)?;
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// A data instance's representation type applied (`R:MV8_1 s a a`) as the family application
+    /// it stands for (`MV s (a, a)`).
+    fn rep_as_family(&self, t: &Ty) -> Option<Ty> {
+        let (head, args) = t.split_apps();
+        let Ty::Con(rep) = head else { return None };
+        if !rep.contains("R:") {
+            return None;
+        }
+        for (fam, info) in &self.env.families {
+            for q in &info.equations {
+                let (rh, rargs) = q.rhs.split_apps();
+                if !matches!(rh, Ty::Con(c) if c == rep) || rargs.len() != args.len() {
+                    continue;
+                }
+                let mut sub: Vec<Ty> = (0..q.nvars).map(Ty::Gen).collect();
+                for (ra, a) in rargs.iter().zip(&args) {
+                    match ra {
+                        Ty::Gen(i) if (*i as usize) < sub.len() => sub[*i as usize] = (*a).clone(),
+                        _ => return None,
+                    }
+                }
+                let pats: Vec<Ty> = q.args.iter().map(|p| types::subst_gen(p, &sub)).collect();
+                return Some(Ty::apps(Ty::Con(fam.clone()), pats));
+            }
+        }
+        None
+    }
+
     fn is_data_family(&self, name: &str) -> bool {
         self.env.families.get(name).is_some_and(|f| {
             !f.equations.is_empty() && f.equations.iter().all(|q| matches!(q.rhs.split_apps().0, Ty::Con(c) if c.contains("R:")))

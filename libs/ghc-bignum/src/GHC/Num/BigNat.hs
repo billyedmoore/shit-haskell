@@ -4,9 +4,16 @@ module GHC.Num.BigNat (BigNat(..), BigNat#, unBigNat, bigNatIndex#, bigNatSize#,
 
 import GHC.Prim
 import GHC.Types
+import GHC.Classes
 import GHC.Num.Integer
 
 data BigNat = BN# { unBigNat :: BigNat# }
+
+instance Eq BigNat where
+  BN# a == BN# b = integerEq (integerFromBigNat# a) (integerFromBigNat# b)
+
+instance Ord BigNat where
+  compare (BN# a) (BN# b) = integerCompare (integerFromBigNat# a) (integerFromBigNat# b)
 
 -- | The i-th 64-bit word of a bignum (little-endian), 0 beyond its end.
 foreign import prim "bigNatIndex" bigNatIndex# :: BigNat# -> Int# -> Word#

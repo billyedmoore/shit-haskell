@@ -411,9 +411,18 @@ impl Checker {
         let nparams = class_vars.len() as u32;
         let mut tvs = class_vars.clone();
         let mut supers = Vec::new();
+        // A superclass may be a quantified constraint (`class (forall a. Eq a => Eq (f a)) => Eq1 f`).
+        let outer = std::mem::replace(&mut self.allow_quantified, true);
         for c in &cd.context {
-            supers.extend(self.convert_context_item(c, &mut tvs)?);
+            match self.convert_context_item(c, &mut tvs) {
+                Ok(ps) => supers.extend(ps),
+                Err(e) => {
+                    self.allow_quantified = outer;
+                    return Err(e);
+                }
+            }
         }
+        self.allow_quantified = outer;
         let class_pred = Pred {
             class: class_key.clone(),
             args: (0..nparams).map(Ty::Gen).collect(),
@@ -1203,13 +1212,8 @@ impl Checker {
                     if !self.env.classes.contains_key(&cls_name) {
                         continue;
                     }
-                    let eta = is_constructor_class(&cls_name);
-                    let kept: Vec<String> = dd
-                        .tyvars
-                        .iter()
-                        .map(|t| t.name.clone())
-                        .take(dd.tyvars.len().saturating_sub(if eta { 1 } else { 0 }))
-                        .collect();
+                    let eta = self.constructor_class_arity(&cls_name);
+                    let kept: Vec<String> = dd.tyvars.iter().map(|t| t.name.clone()).take(dd.tyvars.len().saturating_sub(eta)).collect();
                     let mut tvs = kept.clone();
                     let rep = self.convert_type(via, &mut tvs)?;
                     let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
@@ -1230,12 +1234,12 @@ impl Checker {
             }
             let Some(field_ty) = newtype_field.clone() else { continue };
             for cls in &d.classes {
-                let short = match cls {
+                let mut cls_con = cls;
+                while let Type::App(f, _) = cls_con {
+                    cls_con = f;
+                }
+                let short = match cls_con {
                     Type::Con(q, _) => q.name.clone(),
-                    Type::App(f, _) => match f.as_ref() {
-                        Type::Con(q, _) => q.name.clone(),
-                        _ => continue,
-                    },
                     _ => continue,
                 };
                 // Generic, Generic1, Data and Lift are derived stock for a newtype too, as GHC does
@@ -1245,7 +1249,15 @@ impl Checker {
                 if !via_newtype || d.strategy == Some(Strategy::Anyclass) {
                     continue;
                 }
-                let cls_name = match cls {
+                // A class applied to its leading arguments (`FilterableWithIndex i`): the instance
+                // is at those, with the derived type last.
+                let mut pre_args: Vec<Type> = Vec::new();
+                let mut cls_head = cls;
+                while let Type::App(f, x) = cls_head {
+                    pre_args.insert(0, (**x).clone());
+                    cls_head = f;
+                }
+                let cls_name = match cls_head {
                     Type::Con(q, _) => global_tycon_name(q),
                     _ => continue,
                 };
@@ -1254,35 +1266,46 @@ impl Checker {
                 }
                 // Constructor classes (Functor, Monad, ...) are derived for the type without
                 // its last parameter, so the representation loses its last argument too.
-                let last = dd.tyvars.last().map(|t| t.name.clone());
-                let eta = is_constructor_class(&cls_name);
-                let kept: Vec<String> = dd
-                    .tyvars
-                    .iter()
-                    .map(|t| t.name.clone())
-                    .take(dd.tyvars.len().saturating_sub(if eta { 1 } else { 0 }))
-                    .collect();
-                let rep_ast = if eta {
-                    match (&field_ty, &last) {
-                        (Type::App(g, arg), Some(l)) if matches!(arg.as_ref(), Type::Var(v, _) if v == l) => {
-                            (**g).clone()
+                let eta = self.constructor_class_arity(&cls_name);
+                if eta > dd.tyvars.len() {
+                    continue;
+                }
+                let kept: Vec<String> = dd.tyvars.iter().map(|t| t.name.clone()).take(dd.tyvars.len() - eta).collect();
+                // The representation without the dropped parameters (`bi a b` is `bi` for a
+                // Bifunctor), which it must end in.
+                let mut rep_ast = field_ty.clone();
+                let mut ok = true;
+                for tv in dd.tyvars.iter().rev().take(eta) {
+                    match rep_ast {
+                        Type::App(g, arg) if matches!(arg.as_ref(), Type::Var(v, _) if *v == tv.name) => rep_ast = *g,
+                        _ => {
+                            ok = false;
+                            break;
                         }
-                        _ => continue,
                     }
-                } else {
-                    field_ty.clone()
-                };
+                }
+                if !ok {
+                    continue;
+                }
                 let mut tvs = kept.clone();
                 let rep = self.convert_type(&rep_ast, &mut tvs)?;
+                let mut pre: Vec<Ty> = Vec::with_capacity(pre_args.len());
+                for t in &pre_args {
+                    pre.push(self.convert_type(t, &mut tvs)?);
+                }
                 let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
                 let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
                 let dict = format!("{}.$fGND{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.dict_counter);
                 self.dict_counter += 1;
+                let mut ctx_args = pre.clone();
+                ctx_args.push(rep);
+                let mut heads = pre;
+                heads.push(head);
                 self.env.instances.push(InstInfo {
                     class: cls_name.clone(),
                     nvars: tvs.len() as u32,
-                    ctx: vec![Pred { class: cls_name.clone(), args: vec![rep] }],
-                    head: vec![head],
+                    ctx: vec![Pred { class: cls_name.clone(), args: ctx_args }],
+                    head: heads,
                     dict: dict.clone(),
                 });
                 let d_name = self.fresh_name("gd");
@@ -1456,6 +1479,49 @@ impl Checker {
 }
 
 /// Classes whose parameter has kind `Type -> Type`, derived for a newtype's constructor.
+impl Checker {
+    /// How many arguments a class's (last) parameter takes, when it is a type constructor
+    /// (1 for Functor or Contravariant, 2 for Bifunctor): what a method's type applies it to, or
+    /// what a superclass's parameter takes.
+    fn constructor_class_arity(&self, cls: &str) -> usize {
+        fn applied(t: &Ty, p: u32) -> usize {
+            match t {
+                Ty::App(f, a) => {
+                    let (head, args) = t.split_apps();
+                    let here = if matches!(head, Ty::Gen(g) if *g == p) { args.len() } else { 0 };
+                    here.max(applied(f, p)).max(applied(a, p))
+                }
+                Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => {
+                    ps.iter().flat_map(|q| q.args.iter()).map(|x| applied(x, p)).max().unwrap_or(0).max(applied(b, p))
+                }
+                _ => 0,
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![cls.to_string()];
+        while let Some(c) = todo.pop() {
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            if is_constructor_class(&c) {
+                return 1;
+            }
+            let Some(info) = self.env.classes.get(&c) else { continue };
+            let p = info.nparams.saturating_sub(1);
+            let n = info.methods.iter().map(|(_, m)| applied(&m.ty, p)).max().unwrap_or(0);
+            if n > 0 {
+                return n;
+            }
+            for sup in &info.supers {
+                if sup.args.last() == Some(&Ty::Gen(p)) {
+                    todo.push(sup.class.clone());
+                }
+            }
+        }
+        0
+    }
+}
+
 fn is_constructor_class(cls: &str) -> bool {
     let short = super::types::unqualify(cls);
     matches!(

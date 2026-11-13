@@ -1194,6 +1194,12 @@ impl Checker {
         }
         // Refinement: the result type may be more specific than the scrutinee (GADTs). Families
         // are reduced first, so that a reducible family application refines like its value.
+        // A data instance's constructor against an unknown applied (`t r` for `V Any`): the unknown
+        // is the family (see `align_data_families`).
+        if self.env.families.values().any(|f| !f.equations.is_empty()) {
+            let (c0, t0) = (self.metas.zonk(&cur), self.metas.zonk(ty));
+            let _ = self.align_data_families(&c0, &t0, 0, false)?;
+        }
         let cur_n = self.normalize(&cur);
         let ty_n = self.normalize(ty);
         let refinements = self.metas.skol_binds.len();

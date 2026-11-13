@@ -588,8 +588,9 @@ impl Parser {
             self.bump();
             return Ok(Expr::Con(QName::unqual("()"), loc));
         }
-        // UnboxedTuples: `(# a, b #)` is an ordinary tuple here.
-        if self.at_varsym("#") && self.raw().space_after {
+        // UnboxedTuples: `(# a, b #)` is an ordinary tuple here. With the extension on, `(#`
+        // opens one even with no space after it (`(#q, r#)`).
+        if self.at_varsym("#") && (self.raw().space_after || self.exts.is_on("UnboxedTuples") || self.exts.is_on("UnboxedSums")) {
             self.bump();
             if self.at_varsym("#") {
                 self.bump();
@@ -978,7 +979,8 @@ fn rec_stmt(stmts: Vec<Stmt>, loc: Loc) -> Stmt {
     );
     Stmt::Bind {
         pat,
-        expr: Expr::App(Box::new(base("mfix")), Box::new(lam)),
+        // `mfix` of Control.Monad.Fix, whether or not the module imports it.
+        expr: Expr::App(Box::new(Expr::Var(QName { qual: Some("%G:GHC.Internal.Control.Monad.Fix".into()), name: "mfix".into() }, loc)), Box::new(lam)),
         loc,
     }
 }

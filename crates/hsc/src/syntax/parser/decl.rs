@@ -495,7 +495,13 @@ impl Parser {
         }
         let (name, tyvars) = self.decl_head(head)?;
         self.expect_res(ROp::Eq)?;
-        let rhs = self.sigtype()?;
+        let mut rhs = self.sigtype()?;
+        // `type T = t :: kind`: a right-hand side with a kind signature.
+        if self.at_res(ROp::DColon) {
+            self.bump();
+            let kind = self.sigtype()?;
+            rhs = Type::Sig(Box::new(rhs), Box::new(kind));
+        }
         Ok(Decl::TypeSyn {
             name,
             tyvars,
@@ -1192,10 +1198,10 @@ impl Parser {
 
     fn standalone_deriving(&mut self, loc: Loc) -> PResult<Decl> {
         self.expect_kw(Kw::Deriving)?;
-        // DerivingVia: `deriving via (V) instance C T`.
+        // DerivingVia: `deriving via (V) instance C T`, or `deriving via Maybe a instance ..`.
         let via = if self.at_varid("via") {
             self.bump();
-            Some(self.atype()?)
+            Some(self.btype()?)
         } else {
             None
         };

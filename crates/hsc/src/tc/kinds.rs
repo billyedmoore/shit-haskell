@@ -251,12 +251,11 @@ impl Checker {
         Ok(())
     }
 
-    /// Kinds written in signatures: `Type`, `k1 -> k2`, and names of kinds.
+    /// Kinds written in signatures: `Type`, `k1 -> k2`, kind variables, and `forall r.` (as in
+    /// `(Type -> Type) -> forall r. TYPE r -> Type`, whose `TYPE r` is a type's kind here).
     fn kind_from_type(&mut self, t: &Type) -> Kind {
-        match t {
-            Type::Fun(a, b) => arr(self.kind_from_type(a), self.kind_from_type(b)),
-            _ => Kind::Star,
-        }
+        let mut kvars = HashMap::new();
+        self.kind_from_type_vars(t, &mut kvars)
     }
 
     /// A kind written in a signature. Kind variables get one unification variable each, shared

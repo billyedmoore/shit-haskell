@@ -222,7 +222,8 @@ pub fn integer_value(m: &mut Machine, b: BigInt) -> Word {
             let words = limbs.len();
             m.reserve(words + 4);
             let bp = m.alloc(1 + words);
-            m.heap_set(bp, heap::header(kind::BYTES, words as u32, 0));
+            // The byte length makes it a ByteArray#, as GHC's BigNat# is.
+            m.heap_set(bp, heap::header(kind::BYTES, words as u32, 8 * words as u32));
             for (i, l) in limbs.iter().enumerate() {
                 m.heap_set(bp + 8 + 8 * i as Word, *l);
             }

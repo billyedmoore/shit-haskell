@@ -36,6 +36,7 @@ pub fn integer_from_value(rt: &Runtime, v: &Value) -> Result<Option<BigInt>, RtE
             },
             ("GHC.Num.Integer.IP" | "GHC.Num.Integer.IN", Some(cell)) => match rt.force(cell)? {
                 Value::Integer(b) => Some(if c.name == "GHC.Num.Integer.IN" { b.neg() } else { (*b).clone() }),
+                Value::Bytes(b) => Some(bignat_value(&b.borrow(), c.name == "GHC.Num.Integer.IN")),
                 _ => None,
             },
             _ => None,
@@ -44,12 +45,43 @@ pub fn integer_from_value(rt: &Runtime, v: &Value) -> Result<Option<BigInt>, RtE
     })
 }
 
-/// An `Integer` value in GHC's representation: `IS` when it fits an `Int`, else `IP`/`IN`.
+/// An `Integer` value in GHC's representation: `IS` when it fits an `Int`, else `IP`/`IN`
+/// with its magnitude as a `BigNat#`.
 pub fn integer_con(b: BigInt) -> Value {
     match b.to_i64() {
         Some(i) => con_value("GHC.Num.Integer.IS", vec![Value::Int(i)]),
-        None if b.is_neg() => con_value("GHC.Num.Integer.IN", vec![Value::Integer(Rc::new(b.abs()))]),
-        None => con_value("GHC.Num.Integer.IP", vec![Value::Integer(Rc::new(b))]),
+        None if b.is_neg() => con_value("GHC.Num.Integer.IN", vec![bignat_bytes(&b.abs())]),
+        None => con_value("GHC.Num.Integer.IP", vec![bignat_bytes(&b)]),
+    }
+}
+
+/// A `BigNat#` (as in GHC, a `ByteArray#` of 64-bit limbs, least significant first) of a
+/// magnitude.
+pub fn bignat_bytes(b: &BigInt) -> Value {
+    let n = super::bigint::limb64_count(b);
+    let mut bytes = Vec::with_capacity(8 * n);
+    for i in 0..n {
+        bytes.extend_from_slice(&super::bigint::limb64(b, i).to_le_bytes());
+    }
+    Value::Bytes(Rc::new(RefCell::new(bytes)))
+}
+
+/// The number a `BigNat#`'s limbs are, negated for an `IN`.
+pub fn bignat_value(bytes: &[u8], neg: bool) -> BigInt {
+    let limbs: Vec<u64> = bytes.chunks(8).map(|c| {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        u64::from_le_bytes(w)
+    }).collect();
+    BigInt::from_u64_limbs(neg, &limbs)
+}
+
+/// A `BigNat#` argument's number (a native bignum is accepted too).
+fn bignat(rt: &Runtime, c: &Cell) -> Result<BigInt, RtError> {
+    match rt.force(c)? {
+        Value::Bytes(b) => Ok(bignat_value(&b.borrow(), false)),
+        Value::Integer(b) => Ok((*b).clone()),
+        _ => Err(RtError::Fail("internal: expected a BigNat".into())),
     }
 }
 
@@ -572,20 +604,17 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             Ok(Value::Double(super::bigint::ldexp(m, e)))
         }
         "bigNatIndex" => {
-            let b = integer(rt, &args[0])?;
+            let b = bignat(rt, &args[0])?;
             let i = int(rt, &args[1])?.max(0) as usize;
             int_v(super::bigint::limb64(&b, i) as i64)
         }
         "bigNatSize" => {
-            let b = integer(rt, &args[0])?;
+            let b = bignat(rt, &args[0])?;
             int_v(super::bigint::limb64_count(&b) as i64)
         }
-        // A BigNat# is the magnitude of an Integer, as a native bignum.
-        "integerBigNat" => Ok(Value::Integer(Rc::new(integer(rt, &args[0])?.abs()))),
-        "integerFromBigNat" => match rt.force(&args[0])? {
-            Value::Integer(b) => integer_v((*b).clone()),
-            _ => Err(RtError::Fail("internal: expected a BigNat".into())),
-        },
+        // A BigNat# is the magnitude of an Integer, as its limbs.
+        "integerBigNat" => Ok(bignat_bytes(&integer(rt, &args[0])?.abs())),
+        "integerFromBigNat" => integer_v(bignat(rt, &args[0])?),
         // GHC's primops over unboxed types. Unboxed values share the boxed representation, so
         // these are the same operations as the boxed ones, with Int# results for comparisons.
         "+#" | "plusWord#" => int_v(int(rt, &args[0])?.wrapping_add(int(rt, &args[1])?)),
