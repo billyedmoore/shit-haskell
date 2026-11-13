@@ -1,14 +1,23 @@
-/* Stand-in for the RTS's rts/Signals.h, for the Haskell base sources that include it: the
- * signal numbers and the action codes that GHC's RTS defines. Values as in GHC's header (Linux). */
-#ifndef HSC_RTS_SIGNALS_H
-#define HSC_RTS_SIGNALS_H
+/* -----------------------------------------------------------------------------
+ *
+ * (c) The GHC Team, 1998-2009
+ *
+ * RTS signal handling
+ *
+ * Do not #include this file directly: #include "Rts.h" instead.
+ *
+ * To understand the structure of the RTS headers, see the wiki:
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/source-tree/includes
+ *
+ * ---------------------------------------------------------------------------*/
 
-#define CONST_SIGINT 2
+#pragma once
 
-#define STG_SIG_DFL (-1)
-#define STG_SIG_IGN (-2)
-#define STG_SIG_ERR (-3)
-#define STG_SIG_HAN (-4)
-#define STG_SIG_RST (-5)
+/* NB. #included in Haskell code, no prototypes in here. */
 
-#endif
+/* arguments to stg_sig_install() */
+#define STG_SIG_DFL   (-1)
+#define STG_SIG_IGN   (-2)
+#define STG_SIG_ERR   (-3)
+#define STG_SIG_HAN   (-4)
+#define STG_SIG_RST   (-5)

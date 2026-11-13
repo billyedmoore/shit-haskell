@@ -34,6 +34,16 @@ fn tune_allocator() {
 }
 
 fn main() -> ExitCode {
+    // The compiler recurses over deep syntax and Core (long lists, operator chains, large
+    // generated modules): it runs on a thread with a large stack (reserved, committed on use).
+    let worker = std::thread::Builder::new().name("hsc".into()).stack_size(1 << 30).spawn(real_main);
+    match worker {
+        Ok(h) => h.join().unwrap_or(ExitCode::from(101)),
+        Err(_) => real_main(),
+    }
+}
+
+fn real_main() -> ExitCode {
     tune_allocator();
     if let Some(payload) = embedded_payload() {
         return ExitCode::from(driver::run_payload_bytes(payload) as u8);

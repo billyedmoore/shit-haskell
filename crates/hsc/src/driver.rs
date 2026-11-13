@@ -124,6 +124,9 @@ pub const IFACE_MAGIC: &str = "hsc-interface 2";
 /// The flag that marks a source as already preprocessed (the text an interface carries).
 pub const PREPROCESSED_FLAG: &str = "-hsc-preprocessed";
 
+/// The flag of a reexported module of a package in scope: `-hsc-reexport=NAME=MODULE=DIR`.
+pub const REEXPORT_FLAG: &str = "-hsc-reexport=";
+
 /// The flag naming an interface module's source as its package's build was given it.
 pub const SOURCE_NAME_FLAG: &str = "-hsc-source-name=";
 
@@ -259,7 +262,7 @@ pub fn write_interface(path: &Path, module: &str, source: &Path, name: &Path, fl
     for f in flags {
         let cpp = f == "-cpp" || f == "-XCPP" || f.starts_with("-I") || f.starts_with("-D") || f.starts_with("-U")
             || f.starts_with("-include=") || f.starts_with("-optP") || f.starts_with("-hsc-pkgver=")
-            || f.starts_with("-hsc-archive=") || f.starts_with("-hsc-lib=");
+            || f.starts_with("-hsc-archive=") || f.starts_with("-hsc-lib=") || f.starts_with(REEXPORT_FLAG);
         if !cpp {
             out.push_str(&format!("flag: {f}\n"));
         }
@@ -385,6 +388,33 @@ impl Driver {
     /// plain module name would resolve elsewhere is loaded under an internal name of its own
     /// (still referred to by its real name in the importing module).
     fn resolve_package_imports(&mut self, m: &mut Module) {
+        // A reexported module (`reexported-modules: Paths_happy_lib as Happy.Paths`) is its module
+        // of the providing package, loaded under an internal name and imported as the name.
+        let reexports: Vec<(String, String, PathBuf)> = self
+            .flags
+            .iter()
+            .filter_map(|f| f.strip_prefix(REEXPORT_FLAG))
+            .filter_map(|r| {
+                let (name, rest) = r.split_once('=')?;
+                let (real, dir) = rest.split_once('=')?;
+                Some((name.to_string(), real.to_string(), PathBuf::from(dir)))
+            })
+            .collect();
+        for imp in &mut m.imports {
+            if imp.package.is_some() || self.renamed.contains_key(&imp.module) {
+                continue;
+            }
+            let Some((_, real, dir)) = reexports.iter().find(|(n, _, _)| *n == imp.module) else { continue };
+            if self.find_module(&imp.module).is_some() {
+                continue;
+            }
+            let key = format!("{}_reexport_{}", real, md5_hex(dir.to_string_lossy().as_bytes()).get(..8).unwrap_or("x"));
+            self.renamed.insert(key.clone(), (real.clone(), dir.clone()));
+            if imp.alias.is_none() {
+                imp.alias = Some(imp.module.clone());
+            }
+            imp.module = key;
+        }
         for imp in &mut m.imports {
             let Some(pkg) = imp.package.clone() else { continue };
             if pkg == "this" {

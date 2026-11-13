@@ -215,3 +215,6 @@
 #define HAVE_UNISTD_H 1
 #define HAVE_UNSETENV 1
 #define HAVE_DECL_CLOCK_PROCESS_CPUTIME_ID 1
+
+/* The number of SIGINT (as GHC's configure finds it; GHC.TopHandler uses it). */
+#define CONST_SIGINT 2
