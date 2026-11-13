@@ -20,7 +20,8 @@ extern "C" {
     fn getppid() -> i32;
     fn __errno_location() -> *mut i32;
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
-    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    // As C declares it (newer compilers check the runtime's own symbols): the mode is variadic.
+    fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
     fn readlink(path: *const u8, buf: *mut u8, n: usize) -> isize;
     fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
@@ -370,7 +371,7 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             let flags = int_of(rt, &args[1])? as i32;
             let mode = int_of(rt, &args[2])? as u32;
             // SAFETY: bytes is NUL-terminated and lives for the call.
-            let fd = unsafe { open(bytes.as_ptr(), flags, mode) };
+            let fd = unsafe { open(bytes.as_ptr().cast(), flags, mode as std::ffi::c_uint) };
             if fd < 0 {
                 return ret_int(-1);
             }

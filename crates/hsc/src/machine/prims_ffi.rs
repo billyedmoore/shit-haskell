@@ -16,7 +16,8 @@ extern "C" {
     fn lseek(fd: i32, off: i64, whence: i32) -> i64;
     fn getpid() -> i32;
     fn getppid() -> i32;
-    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    // As C declares it (newer compilers check the runtime's own symbols): the mode is variadic.
+    fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
     fn readlink(path: *const u8, buf: *mut u8, n: usize) -> isize;
     fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
@@ -325,7 +326,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             }
             bytes.push(0);
             // SAFETY: the path is NUL-terminated and outlives the call.
-            let fd = unsafe { open(bytes.as_ptr(), flags, mode) };
+            let fd = unsafe { open(bytes.as_ptr().cast(), flags, mode as std::ffi::c_uint) };
             ret_int(m, if fd < 0 { -1 } else { fd as i64 })
         }
         "readlink" => {
