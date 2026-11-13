@@ -705,10 +705,10 @@ fn abi_hash(o: &Opts, search: &[PathBuf], modules: &[&String]) -> Result<i32, St
 fn write_outputs(o: &Opts, module: &str, path: &Path) -> Result<(), String> {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let hi_dir = o.hidir.clone().or_else(|| o.odir.clone());
-    driver::write_interface(&out_path(&hi_dir, module, path, &o.hisuf), module, &abs, &o.flags)?;
+    driver::write_interface(&out_path(&hi_dir, module, path, &o.hisuf), module, &abs, path, &o.flags)?;
     empty_object(&out_path(&o.odir, module, path, &o.osuf))?;
     if o.dynamic_too {
-        driver::write_interface(&out_path(&hi_dir, module, path, &o.dynhisuf), module, &abs, &o.flags)?;
+        driver::write_interface(&out_path(&hi_dir, module, path, &o.dynhisuf), module, &abs, path, &o.flags)?;
         empty_object(&out_path(&o.odir, module, path, &o.dynosuf))?;
     }
     Ok(())
