@@ -523,9 +523,9 @@ impl Checker {
                 self.loc = *loc;
                 self.err("Template Haskell splices are not supported yet")
             }
-            Expr::NameQuote(_, _, loc) => {
+            Expr::NameQuote(_, _, loc) | Expr::QuoteType(_, loc) | Expr::QuotePat(_, loc) => {
                 self.loc = *loc;
-                self.err("internal: a name quotation reached the type checker")
+                self.err("internal: a quotation reached the type checker")
             }
             Expr::Quote(kind, body, loc) => {
                 // A quotation has the type GHC gives it: `Quote m => m Exp` (or `m [Dec]`, `m Type`,

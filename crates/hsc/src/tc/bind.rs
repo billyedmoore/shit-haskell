@@ -744,7 +744,7 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
             out.insert(qkey(q));
         }
         Expr::IPVar(..) => {}
-        Expr::Con(..) | Expr::Lit(..) | Expr::Wild(_) | Expr::Quote(_, None, _) | Expr::NameQuote(..) => {}
+        Expr::Con(..) | Expr::Lit(..) | Expr::Wild(_) | Expr::Quote(_, None, _) | Expr::NameQuote(..) | Expr::QuoteType(..) | Expr::QuotePat(..) => {}
         Expr::Quote(_, Some(b), _) | Expr::Splice(_, b, _) => collect_expr(b, out),
         Expr::App(f, a) => {
             collect_expr(f, out);

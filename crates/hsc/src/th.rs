@@ -43,7 +43,7 @@ pub fn take_splices(m: &mut Module) -> Vec<Splice> {
 fn take_one(e: &mut Expr, out: &mut Vec<Splice>) -> bool {
     match e {
         // A quotation's splices are part of it.
-        Expr::Quote(..) => true,
+        Expr::Quote(..) | Expr::QuoteType(..) | Expr::QuotePat(..) => true,
         Expr::Splice(typed, body, loc) => {
             let loc = *loc;
             let inner = std::mem::replace(body.as_mut(), Expr::Wild(loc));

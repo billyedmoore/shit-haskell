@@ -1365,6 +1365,17 @@ impl<'a> Renamer<'a> {
                 }
             }
             Expr::Splice(typed, e, loc) => Expr::Splice(typed, Box::new(self.expr(*e)?), loc),
+            Expr::QuoteType(t, loc) => {
+                let renamed = self.ty(t)?;
+                self.quote_type(&renamed, loc)?
+            }
+            Expr::QuotePat(p, loc) => {
+                let depth = self.locals.len();
+                self.push();
+                let renamed = self.pat(*p, BindMode::Fresh);
+                self.locals.truncate(depth);
+                self.quote_pat(&renamed?, loc)?
+            }
             Expr::Quote(kind, body, loc) => {
                 // The names in a quoted expression are resolved as in any expression; the
                 // quotation is then the code that builds its syntax (`quote.rs`).

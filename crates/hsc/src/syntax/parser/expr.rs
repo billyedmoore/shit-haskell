@@ -467,8 +467,21 @@ impl Parser {
                     self.bump();
                     return Ok(Expr::Quote(kind, Some(Box::new(body)), loc));
                 }
-                // Declaration, type and pattern quotations are not looked into (yet): their tokens
-                // are skipped, nested brackets included.
+                if kind == 't' || kind == 'p' {
+                    let quoted = if kind == 't' {
+                        Expr::QuoteType(self.sigtype()?, loc)
+                    } else {
+                        let e = self.expr()?;
+                        Expr::QuotePat(Box::new(self.expr_to_pat(e)?), loc)
+                    };
+                    if !matches!(self.tok(), Tok::QuoteClose(false)) {
+                        return self.unexpected();
+                    }
+                    self.bump();
+                    return Ok(quoted);
+                }
+                // Declaration quotations are not looked into (yet): their tokens are skipped,
+                // nested brackets included.
                 let mut depth = 1;
                 loop {
                     match self.tok() {

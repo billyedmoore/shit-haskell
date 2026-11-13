@@ -299,6 +299,10 @@ pub enum Expr {
     /// A Template Haskell quotation: 'e' `[| e |]`, 'T' `[|| e ||]` (with their expressions),
     /// 'd' `[d| .. |]`, 't' `[t| .. |]`, 'p' `[p| .. |]`.
     Quote(char, Option<Box<Expr>>, Loc),
+    /// `[t| type |]`.
+    QuoteType(Type, Loc),
+    /// `[p| pattern |]`.
+    QuotePat(Box<Pat>, Loc),
     /// A Template Haskell name quotation: `'f`, `'Con` (false) or `''T` (true).
     NameQuote(bool, QName, Loc),
     /// A Template Haskell splice: `$(e)`, `$x` (false) or `$$(e)` (true, typed).
@@ -334,6 +338,8 @@ impl Expr {
             | Expr::LazyPat(_, l)
             | Expr::BangPat(_, l)
             | Expr::Quote(_, _, l)
+            | Expr::QuoteType(_, l)
+            | Expr::QuotePat(_, l)
             | Expr::NameQuote(_, _, l)
             | Expr::Splice(_, _, l) => *l,
             Expr::App(f, _) => f.loc(),

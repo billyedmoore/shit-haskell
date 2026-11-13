@@ -17,6 +17,8 @@ struct Q<'r, 'a> {
     /// The variables bound inside the quotation (renamed names).
     bound: HashSet<String>,
     loc: Loc,
+    /// Binders are named by their source name (the renamed `x%12` is `x`).
+    source_binders: bool,
 }
 
 fn app(f: Expr, a: Expr) -> Expr {
@@ -28,8 +30,19 @@ impl<'a> Renamer<'a> {
     pub(super) fn quote_exp(&self, e: &Expr, loc: Loc) -> RR<Expr> {
         let mut bound = HashSet::new();
         bound_in_expr(e, &mut bound);
-        let q = Q { rn: self, bound, loc };
+        let q = Q { rn: self, bound, loc, source_binders: false };
         q.exp(e)
+    }
+
+    /// The code building a quoted type (`[t| .. |]`), of type `Quote m => m Type`.
+    pub(super) fn quote_type(&self, t: &Type, loc: Loc) -> RR<Expr> {
+        Q { rn: self, bound: HashSet::new(), loc, source_binders: false }.ty(t)
+    }
+
+    /// The code building a quoted pattern (`[p| .. |]`): its variables are named as written, so
+    /// that the code a splice puts around it can use them (as GHC's are).
+    pub(super) fn quote_pat(&self, p: &Pat, loc: Loc) -> RR<Expr> {
+        Q { rn: self, bound: HashSet::new(), loc, source_binders: true }.pat(p)
     }
 }
 
@@ -83,6 +96,7 @@ impl Q<'_, '_> {
     }
 
     fn binder(&self, n: &str) -> Expr {
+        let n = if self.source_binders { n.split('%').next().unwrap_or(n) } else { n };
         app(self.syn("mkName"), self.str(n))
     }
 
