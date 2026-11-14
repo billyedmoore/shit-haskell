@@ -235,6 +235,10 @@ impl Metas {
 
     /// Fully substitutes all solved metas and refined rigid variables.
     pub fn zonk(&self, t: &Ty) -> Ty {
+        self.zonk_inner(t)
+    }
+
+    fn zonk_inner(&self, t: &Ty) -> Ty {
         match t {
             Ty::Meta(i) => match &self.subst[*i as usize] {
                 Some(s) => self.zonk(s),
@@ -338,7 +342,8 @@ impl Metas {
         if self.is_family_app(&a) || self.is_family_app(&b) {
             match (&a, &b) {
                 (Ty::Skol(x, _), t) | (t, Ty::Skol(x, _)) if !self.is_family_app(&Ty::Skol(*x, String::new())) => {
-                    if !matches!(t, Ty::Skol(..)) {
+                    // Not to a type containing it (`b ~ Body b GhcPs`): that is no refinement.
+                    if !matches!(t, Ty::Skol(..)) && !self.skol_in(*x, t) {
                         self.skol_binds.insert(*x, t.clone());
                     }
                 }
@@ -351,7 +356,9 @@ impl Metas {
             // An unknown type is determined by the other side, not refined around.
             (Ty::Meta(_), _) | (_, Ty::Meta(_)) => self.unify(&a, &b),
             (Ty::Skol(x, _), t) | (t, Ty::Skol(x, _)) => {
-                self.skol_binds.insert(*x, t.clone());
+                if !self.skol_in(*x, t) {
+                    self.skol_binds.insert(*x, t.clone());
+                }
                 Ok(())
             }
             (Ty::App(f1, a1), Ty::App(f2, a2)) => {
@@ -359,6 +366,23 @@ impl Metas {
                 self.unify_refine(a1, a2)
             }
             _ => self.unify(&a, &b),
+        }
+    }
+
+    /// Whether rigid variable `x` occurs in `t` (through the substitutions).
+    fn skol_in(&self, x: u32, t: &Ty) -> bool {
+        let r = self.skol_in_(x, t);
+        if r && std::env::var_os("HSC_DEBUG_SKOL").is_some() {
+            eprintln!("skolem {x} not refined to {t:?}");
+        }
+        r
+    }
+
+    fn skol_in_(&self, x: u32, t: &Ty) -> bool {
+        match self.prune(t) {
+            Ty::Skol(y, _) => y == x,
+            Ty::App(f, a) => self.skol_in_(x, &f) || self.skol_in_(x, &a),
+            _ => false,
         }
     }
 

@@ -50,6 +50,10 @@ pub struct Given {
 pub struct Checker {
     /// MonoLocalBinds: local bindings that are not closed are not generalised.
     pub mono_local_binds: bool,
+    /// Rigid variables equal to an application that mentions them (a superclass equality
+    /// `b ~ (Body b) GhcPs`): where a unification fails, the variable is taken as that
+    /// application, which decomposes against an unknown applied (`body0 (GhcPass p0)`).
+    pub skol_apps: HashMap<u32, (String, Ty)>,
     /// Local bindings that were generalised (closed ones, MonoLocalBinds): a binding that uses
     /// only these and top-level names is closed too.
     pub closed_locals: std::collections::HashSet<String>,
@@ -150,6 +154,7 @@ impl Checker {
     pub fn new() -> Checker {
         let mut c = Checker {
             mono_local_binds: false,
+            skol_apps: HashMap::new(),
             closed_locals: std::collections::HashSet::new(),
             applicative_do: false,
             coercions: Vec::new(),
@@ -279,6 +284,18 @@ impl Checker {
         self.unify_fam(actual, expected)
     }
 
+    /// A type with each rigid variable of `skol_apps` replaced by its application (once).
+    pub(super) fn expand_skol_apps(&self, t: &Ty) -> Ty {
+        match self.metas.prune(t) {
+            Ty::Skol(id, _) => match self.skol_apps.get(&id) {
+                Some((_, app)) => app.clone(),
+                None => self.metas.prune(t),
+            },
+            Ty::App(f, x) => Ty::app(self.expand_skol_apps(&f), self.expand_skol_apps(&x)),
+            other => other,
+        }
+    }
+
     fn saturated_family(&self, t: &Ty) -> bool {
         match self.family_app(t) {
             Some((name, args)) => self.env.families.get(&name).is_some_and(|f| f.arity == args.len()),
@@ -318,7 +335,14 @@ impl Checker {
             }
         }
         if a_meta || e_meta || !(self.has_family(&a) || self.has_family(&e)) {
-            return self.unify_at_raw(&a, &e);
+            let r = self.unify_at_raw(&a, &e);
+            if r.is_err() && !self.skol_apps.is_empty() {
+                let (a2, e2) = (self.expand_skol_apps(&a), self.expand_skol_apps(&e));
+                if a2 != a || e2 != e {
+                    return self.unify_fam(&a2, &e2);
+                }
+            }
+            return r;
         }
         // A data family is injective: `F t1 .. tn ~ R u1 ..` with `R` the representation of the
         // instance `F p1 .. pn` fixes the arguments to that instance's patterns.

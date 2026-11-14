@@ -29,6 +29,14 @@ triple = do
   z <- note "z" "three"
   return $ (x, y, z)
 
+-- A `let` that uses no bound variable (ghc-lib-parser's `let layout = ..` in HdkA's do).
+withLet :: Int -> Collect (Int, Int)
+withLet k = do
+  a <- note "a" k
+  let twice = k * 2
+  b <- note "b" twice
+  pure (a, b)
+
 main :: IO ()
 main = do
   let Collect (w, r) = triple
@@ -40,3 +48,5 @@ main = do
     b <- pure 2
     pure (a + b :: Int)
   print n
+  let Collect (w3, r3) = withLet 5
+  print (w3, r3)

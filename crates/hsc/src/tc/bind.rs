@@ -55,6 +55,11 @@ impl Checker {
                 let explicit = matches!(ty, crate::syntax::ast::Type::Forall(..));
                 let mut kvs = Vec::new();
                 kind_vars_of(ty, false, &mut kvs);
+                // A local binding with a closed signature (one not mentioning an enclosing scoped
+                // type variable) is closed (MonoLocalBinds).
+                if !top && !mentions_skolem(&scheme.ty) && !scheme.preds.iter().any(|p| p.args.iter().any(mentions_skolem)) {
+                    self.closed_locals.extend(names.iter().cloned());
+                }
                 for n in names {
                     self.sig_kind_vars.insert(if top { format!("{module}.{n}") } else { n.clone() }, kvs.clone());
                     if explicit {
@@ -158,6 +163,7 @@ impl Checker {
         // enclosing body determines).
         let not_closed = self.mono_local_binds && items.iter().all(|it| it.keys.iter().all(|k| !k.contains('.') || k.contains('%'))) && {
             let own: Vec<&String> = items.iter().flat_map(|it| it.keys.iter()).collect();
+            let scoped = self.scoped_names();
             items.iter().any(|it| {
                 let mut names = HashSet::new();
                 let mut tyvar = false;
@@ -165,15 +171,15 @@ impl Checker {
                     Kind::Fun(clauses) => {
                         for c in clauses.iter() {
                             collect_clause(c, &mut names);
-                            tyvar |= super::expr::rhs_mentions_type_var(&c.rhs);
+                            tyvar |= super::expr::rhs_mentions_scoped(&c.rhs, &scoped);
                         }
                     }
                     Kind::Pat { rhs, .. } => {
                         collect_rhs(rhs, &mut names);
-                        tyvar |= super::expr::rhs_mentions_type_var(rhs);
+                        tyvar |= super::expr::rhs_mentions_scoped(rhs, &scoped);
                     }
                 }
-                tyvar || names.iter().any(|n| n.contains('%') && !own.contains(&n) && self.vars.contains_key(n) && !self.closed_locals.contains(n))
+                tyvar || names.iter().any(|n| !own.contains(&n) && self.open_local(n))
             })
         };
         if self.mono_local_binds && !not_closed {
@@ -1024,5 +1030,15 @@ fn annotate_pat(p: &Pat, sig: &dyn Fn(&str) -> Option<crate::syntax::ast::Type>)
         Pat::Tuple(ps, loc) => Pat::Tuple(ps.iter().map(|x| annotate_pat(x, sig)).collect(), *loc),
         Pat::Con(q, ps, loc) => Pat::Con(q.clone(), ps.iter().map(|x| annotate_pat(x, sig)).collect(), *loc),
         other => other.clone(),
+    }
+}
+
+/// Whether a type mentions a rigid type variable (an enclosing scoped one, in a signature).
+fn mentions_skolem(t: &Ty) -> bool {
+    match t {
+        Ty::Skol(..) => true,
+        Ty::App(f, x) => mentions_skolem(f) || mentions_skolem(x),
+        Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => mentions_skolem(b) || ps.iter().any(|p| p.args.iter().any(mentions_skolem)),
+        _ => false,
     }
 }
