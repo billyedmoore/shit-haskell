@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 202 of 202 programs agree with GHC on both back ends.
+- **Corpus:** 203 of 203 programs agree with GHC on both back ends.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -30,7 +30,8 @@ the GitHub issues.
     and its output on real scripts.
   - hlint's dependencies build up to and including ghc-lib-parser and mono-traversable.
 - **Weakness: speed.** Generated code is 10–500× slower than `ghc -O0` (baseline below), and
-  large packages compile slowly, which now limits how fast the rest of the work can go.
+  large packages compile slowly, which limits how fast the rest of the work can go. A cold
+  compile of ghc-lib-parser takes 53 s, down from 171 s now that types share their parts.
 
 ## Working rules
 
@@ -58,6 +59,8 @@ the GitHub issues.
 - Compile times are comparable to GHC's for the same packages.
 
 **Compile time first**, since it limits every iteration:
+- Types share their parts, so copying, zonking and normalising a large type are cheap (done:
+  a derived `Generic` of 200 constructors checks in 2.2 s against GHC's 3.8 s).
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and

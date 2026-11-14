@@ -175,6 +175,15 @@ impl<T: Bin> Bin for Option<T> {
     }
 }
 
+impl<T: Bin> Bin for std::rc::Rc<T> {
+    fn put(&self, w: &mut W) {
+        (**self).put(w);
+    }
+    fn get(r: &mut R) -> Option<Self> {
+        Some(std::rc::Rc::new(T::get(r)?))
+    }
+}
+
 impl<T: Bin> Bin for Box<T> {
     fn put(&self, w: &mut W) {
         (**self).put(w);
