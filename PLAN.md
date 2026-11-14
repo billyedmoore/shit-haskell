@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 218 differential tests for both back ends, compared with GHC.
+- **Corpus:** 219 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -123,6 +123,14 @@ the GitHub issues.
   The package has 50 padded step modules plus a seed; GHC may load interfaces lazily. Warm
   full parser imports take 1.843 → 1.755 s (seven alternating pairs, both compilers using
   the same vendored library tree through `HSC_LIBDIR`).
+- Fingerprinting uses fixed MD5 constants and constant compression steps, retaining the RTS
+  context layout and streaming behavior. Native `tools/fingerprintbench.py` hashes 128 MiB
+  across eight calls: 0.273 → 0.236 s, versus GHC's 0.169/0.168 s at `-O0`/`-O1`
+  (median of three alternating runs; the 0.9×`-O1` target is 0.151 s and remains unmet).
+  Warm `tools/interfacebench.py` package clients take 0.063 → 0.055 s, versus GHC's
+  0.061/0.061 s (seven alternating runs, common hsc library directory). Full parser warm
+  timings were inconclusive: 1.914 → 2.065 s over seven pairs, then 1.831 → 1.812 s
+  over 21 pairs; no full-parser improvement is claimed for this change.
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and
