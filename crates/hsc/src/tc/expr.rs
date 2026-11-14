@@ -209,6 +209,10 @@ impl Checker {
     /// A lambda. With an expected type its parameters and body are checked against the parts of
     /// that type, so that a GADT pattern refines the known types rather than fixing new ones.
     fn lambda(&mut self, pats: &[Pat], body: &Expr, loc: Loc, expected: Option<&Ty>) -> TR<(Core, Ty)> {
+        self.with_application_scope(|tc| tc.lambda_body(pats, body, loc, expected))
+    }
+
+    fn lambda_body(&mut self, pats: &[Pat], body: &Expr, loc: Loc, expected: Option<&Ty>) -> TR<(Core, Ty)> {
         self.loc = loc;
         let mark = self.alt_begin();
         let mut arg_tys: Vec<Ty> = Vec::with_capacity(pats.len());
@@ -895,6 +899,10 @@ impl Checker {
     /// Checks an argument of a constrained (rank-N) parameter type: its predicates are
     /// givens, and the argument becomes a function of their dictionaries.
     fn check_qual_arg(&mut self, a: &Expr, preds: &[Pred], body: &Ty) -> TR<Core> {
+        self.with_application_scope(|tc| tc.check_qual_arg_body(a, preds, body))
+    }
+
+    fn check_qual_arg_body(&mut self, a: &Expr, preds: &[Pred], body: &Ty) -> TR<Core> {
         let dparams: Vec<String> = preds.iter().map(|_| self.fresh_name("dq")).collect();
         let givens_len = self.givens.len();
         for (p, d) in preds.iter().zip(&dparams) {

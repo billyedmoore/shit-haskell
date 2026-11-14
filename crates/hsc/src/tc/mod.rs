@@ -845,15 +845,26 @@ impl Default for Checker {
 pub struct AltMark {
     givens: usize,
     skol: std::collections::HashMap<u32, Ty>,
+    apps: HashMap<u32, (String, Ty)>,
     outer: Vec<Wanted>,
     scoped: usize,
 }
 
 impl Checker {
+    /// Application forms come from givens. Keep those of the enclosing scope,
+    /// including when checking the inner scope reports an error.
+    fn with_application_scope<T>(&mut self, body: impl FnOnce(&mut Self) -> TR<T>) -> TR<T> {
+        let apps = self.skol_apps.clone();
+        let result = body(self);
+        self.skol_apps = apps;
+        result
+    }
+
     pub fn alt_begin(&mut self) -> AltMark {
         AltMark {
             givens: self.givens.len(),
             skol: self.metas.skol_binds.clone(),
+            apps: self.skol_apps.clone(),
             outer: std::mem::take(&mut self.wanted),
             scoped: self.scoped.len(),
         }
@@ -875,27 +886,29 @@ impl Checker {
 
     /// Whether the scope begun at `mark` has introduced givens or refinements so far.
     pub fn alt_introduced(&self, mark: &AltMark) -> bool {
-        self.givens.len() > mark.givens || self.metas.skol_binds.len() != mark.skol.len()
+        self.givens.len() > mark.givens || self.metas.skol_binds.len() != mark.skol.len() || self.skol_apps != mark.apps
     }
 
     /// Ends an alternative, answering the evidence bindings of the constraints solved in it (to
     /// be placed where its givens are bound).
     pub fn alt_end_binds(&mut self, mark: AltMark) -> TR<Vec<(String, Core)>> {
+        let introduced = self.alt_introduced(&mark);
         let inner = std::mem::replace(&mut self.wanted, mark.outer);
-        let introduced = self.givens.len() > mark.givens || self.metas.skol_binds.len() != mark.skol.len();
-        let binds = if introduced {
-            let (binds, residual) = self.solve(inner)?;
-            self.wanted.extend(residual);
-            binds
+        let result = if introduced {
+            self.solve(inner).map(|(binds, residual)| {
+                self.wanted.extend(residual);
+                binds
+            })
         } else {
             self.wanted.extend(inner);
-            Vec::new()
+            Ok(Vec::new())
         };
         self.givens.truncate(mark.givens);
         self.metas.skol_binds = mark.skol;
+        self.skol_apps = mark.apps;
         // Type variables that a pattern signature bound are in scope in its alternative only.
         self.scoped.truncate(mark.scoped);
-        Ok(binds)
+        result
     }
 }
 
@@ -919,4 +932,53 @@ pub fn select_field(dict: Core, dict_con: &str, nfields: usize, index: usize, fr
         fresh(),
         vec![Alt::Con(dict_con.to_string(), vars, chosen)],
     )
+}
+
+#[cfg(test)]
+mod application_scope_tests {
+    use super::*;
+
+    fn app(phase: &str) -> (String, Ty) {
+        ("b".into(), Ty::app(Ty::con("Body"), Ty::con(phase)))
+    }
+
+    #[test]
+    fn application_scopes_restore_outer_entries_after_nested_success_and_error() {
+        let mut tc = Checker::new();
+        tc.skol_apps.insert(1, app("outer"));
+        let initial = tc.skol_apps.clone();
+        tc.with_application_scope(|tc| {
+            tc.skol_apps.insert(1, app("middle"));
+            let middle = tc.skol_apps.clone();
+            let result: TR<()> = tc.with_application_scope(|tc| {
+                tc.skol_apps.insert(1, app("inner"));
+                tc.skol_apps.insert(2, app("new"));
+                tc.err("inner failure")
+            });
+            assert!(result.is_err());
+            assert_eq!(tc.skol_apps, middle);
+            Ok(())
+        }).unwrap();
+        assert_eq!(tc.skol_apps, initial);
+    }
+
+    #[test]
+    fn alternative_restores_replaced_application_and_refinements_after_solver_error() {
+        let mut tc = Checker::new();
+        tc.skol_apps.insert(1, app("outer"));
+        let initial = tc.skol_apps.clone();
+        let mark = tc.alt_begin();
+        tc.skol_apps.insert(1, app("inner"));
+        assert!(tc.alt_introduced(&mark));
+        tc.metas.skol_binds.insert(7, Ty::con("Refined"));
+        tc.givens.push(Given { pred: Pred { class: "C".into(), args: Vec::new() }, ev: Core::Var("d".into()) });
+        tc.wanted.push(Wanted {
+            pred: Pred { class: solve::EQ_CLASS.into(), args: vec![Ty::con("A"), Ty::con("B")] },
+            ev: "bad".into(), loc: Loc { line: 1, col: 1 },
+        });
+        assert!(tc.alt_end_binds(mark).is_err());
+        assert_eq!(tc.skol_apps, initial);
+        assert!(tc.metas.skol_binds.is_empty());
+        assert!(tc.givens.is_empty());
+    }
 }
