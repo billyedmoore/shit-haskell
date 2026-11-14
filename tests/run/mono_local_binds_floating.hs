@@ -32,9 +32,19 @@ sums = (steps 10 [1, 2], steps 16 [3])
     steps base ds = foldl (step base) 0 ds
     step base n d = base * n + fromIntegral (d :: Int)
 
+-- A local function using a signed sibling (with a closed signature) is closed too (GHC's
+-- `hs_applicative_stmt`, used at two types, calling `hs_lstmts`).
+lengths :: (Int, Int)
+lengths = (count "abc", count [True])
+  where
+    measure :: [a] -> Int
+    measure = length
+    count xs = measure xs + 0
+
 main :: IO ()
 main = do
   let Node (k, a) s = mark "!" (Node (1, "x") "n")
   print (k, a, s)
   print pairUp
   print sums
+  print lengths

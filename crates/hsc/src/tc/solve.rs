@@ -296,6 +296,31 @@ impl Checker {
             let (a, b) = (g.pred.args[0].clone(), g.pred.args[1].clone());
             let _ = self.metas.unify_refine(&a, &b);
         }
+        // The superclass equalities of a class given: one equating a rigid variable to an
+        // application that mentions it (`b ~ (Body b) GhcPs`) is kept as that variable's form.
+        if let Some(info) = self.class(&g.pred.class).cloned() {
+            for sp in &info.supers {
+                if !is_eq_class(&sp.class) || sp.args.len() != 2 {
+                    continue;
+                }
+                let args: Vec<Ty> = sp.args.iter().map(|t| self.metas.zonk(&subst_gen(t, &g.pred.args))).collect();
+                let mut skol_form = false;
+                for (v, other) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+                    if let Ty::Skol(id, name) = v {
+                        if matches!(other, Ty::App(..)) && skol_occurs(*id, other) {
+                            self.skol_apps.insert(*id, (name.clone(), other.clone()));
+                            skol_form = true;
+                        }
+                    }
+                }
+                // One equating a family application (`Anno (GRHS GhcPs (LocatedA (Body b
+                // GhcPs))) ~ EpAnnCO` of `AnnoBody b`) is given, for that application to reduce.
+                if !skol_form && (self.family_app(&args[0]).is_some() || self.family_app(&args[1]).is_some()) {
+                    let ev = Core::Con("Builtin.()".into(), vec![]);
+                    self.givens.push(Given { pred: Pred { class: sp.class.clone(), args }, ev });
+                }
+            }
+        }
         let family = self.env.families.contains_key(&g.pred.class);
         // A constraint family that reduces gives what it reduces to (its evidence is their tuple).
         if family {
@@ -369,7 +394,11 @@ impl Checker {
         let mut solving: Vec<(Pred, String)> = Vec::new();
         while let Some(w) = work.pop() {
             self.improve(&w.pred)?;
-            let pred = self.metas_zonk_pred(&w.pred);
+            let mut pred = self.metas_zonk_pred(&w.pred);
+            // An application a rigid variable equals (`Body b GhcPs` for `b`) is that variable.
+            if !self.skol_apps.is_empty() {
+                pred.args = pred.args.iter().map(|a| self.contract_skol_apps(a)).collect();
+            }
             if let Some((_, ev)) = solving.iter().find(|(p, _)| *p == pred) {
                 binds.push((w.ev.clone(), Core::Var(ev.clone())));
                 continue;
@@ -1257,4 +1286,29 @@ fn constraint_tuple_parts(p: &Pred) -> Option<Vec<Pred>> {
             })
             .collect(),
     )
+}
+
+impl Checker {
+    /// A type with each application a rigid variable equals (see `skol_apps`) replaced by it.
+    pub(super) fn contract_skol_apps(&self, t: &Ty) -> Ty {
+        // Innermost first: `Body (Body b GhcPs) GhcPs` is `Body b GhcPs`, which is `b`.
+        let t = match t {
+            Ty::App(f, x) => Ty::app(self.contract_skol_apps(f), self.contract_skol_apps(x)),
+            other => other.clone(),
+        };
+        for (id, (name, app)) in &self.skol_apps {
+            if self.metas.zonk(app) == t {
+                return Ty::Skol(*id, name.clone());
+            }
+        }
+        t
+    }
+}
+
+fn skol_occurs(id: u32, t: &Ty) -> bool {
+    match t {
+        Ty::Skol(j, _) => *j == id,
+        Ty::App(f, x) => skol_occurs(id, f) || skol_occurs(id, x),
+        _ => false,
+    }
 }

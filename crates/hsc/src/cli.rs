@@ -567,7 +567,7 @@ fn empty_object(path: &Path) -> Result<(), String> {
 /// Runs a compilation. Answers the exit status.
 pub fn compile(o: &Opts) -> Result<i32, String> {
     // C inputs go to the C compiler.
-    let c_inputs: Vec<&String> = o.inputs.iter().filter(|i| is_c_input(i)).collect();
+    let c_inputs: Vec<&String> = o.inputs.iter().filter(|i| is_c_input(i) || i.ends_with(".cmm")).collect();
     for c in &c_inputs {
         // A C file's object keeps its path under the output directory (`cbits/a.c` gives
         // `odir/cbits/a.o`), as GHC places it.
@@ -578,6 +578,12 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
         };
         if let Some(d) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
+        // Cmm (a package's `cmm-sources`, ghc-heap's HeapPrim.cmm): hsc has no Cmm, and the
+        // primitives it defines are not called; its object is empty.
+        if c.ends_with(".cmm") {
+            empty_object(&out)?;
+            continue;
         }
         let st = std::process::Command::new("gcc")
             .arg("-c")
@@ -594,7 +600,7 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
             return Ok(1);
         }
     }
-    let hs_inputs: Vec<&String> = o.inputs.iter().filter(|i| !is_c_input(i) && !i.ends_with(".o") && !i.ends_with(".a")).collect();
+    let hs_inputs: Vec<&String> = o.inputs.iter().filter(|i| !is_c_input(i) && !i.ends_with(".cmm") && !i.ends_with(".o") && !i.ends_with(".a")).collect();
     if hs_inputs.is_empty() {
         if c_inputs.is_empty() {
             return Err("no input files".into());

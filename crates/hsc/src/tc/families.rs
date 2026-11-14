@@ -284,6 +284,20 @@ impl Checker {
 
     /// One reduction step at the head of `t`, if it is a family application that can reduce.
     pub(super) fn reduce_head(&self, t: &Ty) -> Option<Ty> {
+        let r = self.reduce_head_once(t);
+        // A rigid variable equal to an application (see `skol_apps`) may match as that.
+        if r.is_none() && !self.skol_apps.is_empty() {
+            if let Some((name, args)) = self.family_app(t) {
+                let expanded: Vec<Ty> = args.iter().map(|a| self.expand_skol_apps(&self.metas.zonk(a))).collect();
+                if expanded != args {
+                    return self.reduce_head_once(&Ty::apps(Ty::con(&name), expanded));
+                }
+            }
+        }
+        r
+    }
+
+    fn reduce_head_once(&self, t: &Ty) -> Option<Ty> {
         let Some((name, args)) = self.family_app(t) else {
             return self.partial_family_reduce(t);
         };
@@ -389,15 +403,24 @@ impl Checker {
 
     /// The other side of a given equality one of whose sides is the family application `t`.
     fn given_family_equality(&self, t: &Ty) -> Option<Ty> {
+        // Compared with the applications rigid variables equal contracted (see `skol_apps`).
+        let contracted = !self.skol_apps.is_empty();
+        let t = &if contracted { self.contract_skol_apps(t) } else { t.clone() };
         for g in self.givens.iter().rev() {
             if !super::solve::is_eq_class(&g.pred.class) || g.pred.args.len() != 2 {
                 continue;
             }
-            let (a, b) = (self.metas.zonk(&g.pred.args[0]), self.metas.zonk(&g.pred.args[1]));
-            if a == *t && b != *t {
+            let (mut a, mut b) = (self.metas.zonk(&g.pred.args[0]), self.metas.zonk(&g.pred.args[1]));
+            if contracted {
+                a = self.contract_skol_apps(&a);
+                b = self.contract_skol_apps(&b);
+            }
+            // Never towards a type containing the one rewritten (`NoGhcTcPass p` is not
+            // `NoGhcTcPass (NoGhcTcPass p)`, IsPass's superclass read backwards).
+            if a == *t && b != *t && !contains_ty(&b, t) {
                 return Some(b);
             }
-            if b == *t && a != *t {
+            if b == *t && a != *t && !contains_ty(&a, t) {
                 return Some(a);
             }
         }
@@ -544,4 +567,13 @@ fn same_kind(a: &str, b: &str) -> bool {
         return norm(a) == norm(b);
     }
     a == b
+}
+
+/// Whether `t` occurs in `outer`.
+fn contains_ty(outer: &Ty, t: &Ty) -> bool {
+    outer == t
+        || match outer {
+            Ty::App(f, x) => contains_ty(f, t) || contains_ty(x, t),
+            _ => false,
+        }
 }

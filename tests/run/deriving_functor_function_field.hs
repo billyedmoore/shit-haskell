@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveFunctor, RankNTypes #-}
 -- A derived Functor for a newtype over a function into a functor variable (ghc-lib-parser's
 -- `newtype UniqDSMT m result = UDSMT' (DUniqSupply -> m (result, DUniqSupply)) deriving Functor`):
 -- the instance needs `Functor m`.
@@ -7,6 +7,13 @@ module Main where
 newtype StateT s m a = StateT (s -> m (a, s)) deriving (Functor)
 
 newtype Reader r m a = Reader (r -> Int -> m a) deriving (Functor)
+
+-- A polymorphic field (GHC's `newtype CmdLineP s a = CmdLineP (forall m. Monad m => StateT s m a)
+-- deriving Functor`).
+newtype Poly s a = Poly (forall m. Monad m => StateT s m a) deriving (Functor)
+
+runPoly :: Poly s a -> s -> Maybe (a, s)
+runPoly (Poly p) = runStateT p
 
 runStateT :: StateT s m a -> s -> m (a, s)
 runStateT (StateT f) = f
@@ -20,3 +27,4 @@ main = do
   print (r :: (Int, Int))
   print (runStateT (fmap show (StateT (\s -> Just (s, s)))) 'x')
   print (runReader (fmap length (Reader (\r _ -> [r, r]))) "abc")
+  print (runPoly (fmap negate (Poly (StateT (\s -> return (s, s + 1))))) (4 :: Int))

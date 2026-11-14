@@ -1525,6 +1525,8 @@ fn mentions(t: &Type, v: &str) -> bool {
         Type::List(e, _) => mentions(e, v),
         Type::Tuple(ts, _) => ts.iter().any(|x| mentions(x, v)),
         Type::Sig(x, _) => mentions(x, v),
+        Type::Forall(bs, body) => !bs.iter().any(|b| b.name == v) && mentions(body, v),
+        Type::Qual(ctx, body) => ctx.iter().any(|c| mentions(c, v)) || mentions(body, v),
         _ => false,
     }
 }
@@ -1541,6 +1543,9 @@ fn map_fn(checker: &mut Checker, t: &Type, last: &str, f: &str, loc: Loc) -> Opt
     }
     match t {
         Type::Var(n, _) if n == last => Some(local(f, loc)),
+        // A polymorphic field (`forall m. Monad m => StateT s m a`): mapped at each instance;
+        // the constructor's argument is checked at the polymorphic type again.
+        Type::Forall(_, body) | Type::Qual(_, body) => map_fn(checker, body, last, f, loc),
         Type::App(g, arg) if !mentions(g, last) => {
             let inner = map_fn(checker, arg, last, f, loc)?;
             Some(app(base_var("fmap", loc), vec![inner]))

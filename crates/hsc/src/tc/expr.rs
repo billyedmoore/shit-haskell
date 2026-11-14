@@ -1766,7 +1766,7 @@ impl Checker {
                     }
                     if let [c] = clauses.as_slice() {
                         if let Body::Plain(e @ Expr::Case(..)) = &c.rhs.body {
-                            if c.pats.is_empty() && c.rhs.wheres.is_empty() && !is_closed_rhs(e) {
+                            if c.pats.is_empty() && c.rhs.wheres.is_empty() && !self.is_closed_rhs(e) {
                                 return Some(Deferred::Var(name.clone(), e.clone(), Ty::Con(String::new())));
                             }
                         }
@@ -1774,7 +1774,7 @@ impl Checker {
                     // A function that mentions a scoped type variable (`pp_implicit ext = .. case
                     // ghcPass @p of ..`): checked as a `\case`-like lambda over its clauses.
                     let arity = clauses.first()?.pats.len();
-                    if arity > 0 && clauses.iter().all(|c| c.pats.len() == arity) && clauses.iter().any(|c| mentions_type_var_rhs(&c.rhs)) {
+                    if arity > 0 && clauses.iter().all(|c| c.pats.len() == arity) && self.clauses_not_closed(name, clauses) {
                         return Some(Deferred::Var(name.clone(), clauses_lambda(clauses, *loc), Ty::Con(String::new())));
                     }
                     None
@@ -1783,7 +1783,7 @@ impl Checker {
                 // its variables simple and any signature monomorphic.
                 Decl::PatBind { pat, rhs, loc } => {
                     let Body::Plain(e @ Expr::Case(..)) = &rhs.body else { return None };
-                    if is_closed_rhs(e) || !simple_pattern(pat) {
+                    if self.is_closed_rhs(e) || !simple_pattern(pat) {
                         return None;
                     }
                     let vars: Vec<String> = crate::rename::pat_vars(pat).into_iter().map(|(v, _)| v).collect();
@@ -1840,6 +1840,42 @@ impl Checker {
         }
         let binds = self.infer_local(&rest)?;
         Ok((binds, deferred))
+    }
+
+    /// The names of the scoped type variables in scope.
+    pub(super) fn scoped_names(&self) -> Vec<String> {
+        self.scoped.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// Whether a name is a local variable of the enclosing scope that is not closed.
+    pub(super) fn open_local(&self, n: &str) -> bool {
+        n.contains('%') && self.vars.contains_key(n) && !self.closed_locals.contains(n)
+    }
+
+    /// Whether a binding's right-hand side is closed (MonoLocalBinds): it mentions no local of
+    /// the enclosing scope that is not closed, and no scoped type variable.
+    fn is_closed_rhs(&self, e: &Expr) -> bool {
+        let names = super::bind::referenced_names(e);
+        !names.iter().any(|n| self.open_local(n)) && !mentions_type_var(e, &self.scoped_names())
+    }
+
+    /// Whether a local function is not closed (MonoLocalBinds): it mentions a scoped type
+    /// variable, or a local variable of the enclosing scope that is not itself closed
+    /// (ghc-lib-parser's `fixAssign stmt = case stmt of ..`, mentioning `platform`).
+    fn clauses_not_closed(&self, name: &str, clauses: &[Clause]) -> bool {
+        let scoped = self.scoped_names();
+        if clauses.iter().any(|c| rhs_mentions_scoped(&c.rhs, &scoped)) {
+            return true;
+        }
+        let mut names = std::collections::HashSet::new();
+        for c in clauses {
+            names.extend(super::bind::referenced_names(&Expr::Case(
+                Box::new(Expr::Wild(Loc::default())),
+                vec![AstAlt { pat: Pat::Wild(Loc::default()), rhs: c.rhs.clone(), loc: Loc::default() }],
+                Loc::default(),
+            )));
+        }
+        names.iter().any(|n| n != name && self.open_local(n))
     }
 
     /// Checks the deferred bindings (see `infer_local_deferring`) at the types their uses gave.
@@ -1965,74 +2001,75 @@ pub fn prim_lit(p: &crate::syntax::token::PrimLit, negative: bool) -> (Core, &'s
     }
 }
 
-/// Whether a binding's right-hand side is closed (MonoLocalBinds): it mentions no local
-/// variable and no type variable (approximately: a local's renamed name has a `%`).
-fn is_closed_rhs(e: &Expr) -> bool {
-    let names = super::bind::referenced_names(e);
-    !names.iter().any(|n| n.contains('%')) && !mentions_type_var(e)
-}
-
-/// Whether an expression has a type variable in a visible type application or an annotation,
-/// anywhere inside it (a scoped type variable: the binding is not closed).
-fn mentions_type_var(e: &Expr) -> bool {
-    fn ty_has_var(t: &Type) -> bool {
+/// Whether an expression has a scoped type variable (one of `scoped`, in scope from an
+/// enclosing signature) in a visible type application or an annotation, anywhere inside it:
+/// the binding is then not closed. Variables a nested `forall` binds are not scoped ones.
+fn mentions_type_var(e: &Expr, scoped: &[String]) -> bool {
+    fn ty_has_var(t: &Type, scoped: &[String], bound: &mut Vec<String>) -> bool {
         match t {
-            Type::Var(..) => true,
-            Type::App(a, b) | Type::Fun(a, b) => ty_has_var(a) || ty_has_var(b),
-            Type::List(a, _) => ty_has_var(a),
-            Type::Tuple(ts, _) => ts.iter().any(ty_has_var),
-            Type::Forall(_, b) | Type::Qual(_, b) => ty_has_var(b),
-            Type::Sig(a, _) => ty_has_var(a),
+            Type::Var(v, _) => scoped.contains(v) && !bound.contains(v),
+            Type::App(a, b) | Type::Fun(a, b) => ty_has_var(a, scoped, bound) || ty_has_var(b, scoped, bound),
+            Type::List(a, _) => ty_has_var(a, scoped, bound),
+            Type::Tuple(ts, _) => ts.iter().any(|x| ty_has_var(x, scoped, bound)),
+            Type::Forall(bs, b) => {
+                let mark = bound.len();
+                bound.extend(bs.iter().map(|x| x.name.clone()));
+                let r = ty_has_var(b, scoped, bound);
+                bound.truncate(mark);
+                r
+            }
+            Type::Qual(ctx, b) => ctx.iter().any(|c| ty_has_var(c, scoped, bound)) || ty_has_var(b, scoped, bound),
+            Type::Sig(a, _) => ty_has_var(a, scoped, bound),
             _ => false,
         }
     }
-    fn stmt(s: &Stmt) -> bool {
-        match s {
-            Stmt::Bind { expr, .. } | Stmt::Expr { expr, .. } => mentions_type_var(expr),
-            Stmt::Let { decls, .. } => decls.iter().any(decl),
-        }
-    }
-    fn rhs(r: &Rhs) -> bool {
-        let body = match &r.body {
-            Body::Plain(e) => mentions_type_var(e),
-            Body::Guarded(gs) => gs.iter().any(|(conds, e)| conds.iter().any(stmt) || mentions_type_var(e)),
-        };
-        body || r.wheres.iter().any(decl)
-    }
-    fn decl(d: &Decl) -> bool {
-        match d {
-            Decl::Fun { clauses, .. } => clauses.iter().any(|c| rhs(&c.rhs)),
-            Decl::PatBind { rhs: r, .. } => rhs(r),
-            _ => false,
-        }
-    }
+    let ty = |t: &Type| ty_has_var(t, scoped, &mut Vec::new());
+    let ex = |x: &Expr| mentions_type_var(x, scoped);
+    let stmt = |s: &Stmt| match s {
+        Stmt::Bind { expr, .. } | Stmt::Expr { expr, .. } => ex(expr),
+        Stmt::Let { decls, .. } => decls.iter().any(|d| decl_mentions_type_var(d, scoped)),
+    };
     match e {
-        Expr::TyApp(f, t, _) => ty_has_var(t) || mentions_type_var(f),
-        Expr::Sig(x, t, _) => ty_has_var(t) || mentions_type_var(x),
-        Expr::App(f, x) => mentions_type_var(f) || mentions_type_var(x),
-        Expr::OpChain(items, _) => items.iter().any(|i| matches!(i, crate::syntax::ast::OpItem::Operand(x) if mentions_type_var(x))),
-        Expr::Lam(_, b, _) => mentions_type_var(b),
-        Expr::Let(ds, b, _) => ds.iter().any(decl) || mentions_type_var(b),
-        Expr::If(c, t, f, _) => mentions_type_var(c) || mentions_type_var(t) || mentions_type_var(f),
-        Expr::MultiIf(alts, _) => alts.iter().any(|(conds, x)| conds.iter().any(stmt) || mentions_type_var(x)),
-        Expr::Case(s, alts, _) => mentions_type_var(s) || alts.iter().any(|a| rhs(&a.rhs)),
-        Expr::LamCase(alts, _) => alts.iter().any(|a| rhs(&a.rhs)),
+        Expr::TyApp(f, t, _) => ty(t) || ex(f),
+        Expr::Sig(x, t, _) => ty(t) || ex(x),
+        Expr::App(f, x) => ex(f) || ex(x),
+        Expr::OpChain(items, _) => items.iter().any(|i| matches!(i, crate::syntax::ast::OpItem::Operand(x) if ex(x))),
+        Expr::Lam(_, b, _) => ex(b),
+        Expr::Let(ds, b, _) => ds.iter().any(|d| decl_mentions_type_var(d, scoped)) || ex(b),
+        Expr::If(c, t, f, _) => ex(c) || ex(t) || ex(f),
+        Expr::MultiIf(alts, _) => alts.iter().any(|(conds, x)| conds.iter().any(stmt) || ex(x)),
+        Expr::Case(s, alts, _) => ex(s) || alts.iter().any(|a| rhs_mentions_scoped(&a.rhs, scoped)),
+        Expr::LamCase(alts, _) => alts.iter().any(|a| rhs_mentions_scoped(&a.rhs, scoped)),
         Expr::Do(ss, _) => ss.iter().any(stmt),
-        Expr::Tuple(xs, _) => xs.iter().flatten().any(mentions_type_var),
-        Expr::List(xs, _) => xs.iter().any(mentions_type_var),
-        Expr::LeftSection(x, _, _) | Expr::RightSection(_, x, _) => mentions_type_var(x),
-        Expr::RecCon { fields, .. } => fields.iter().any(|(_, v)| v.as_ref().is_some_and(mentions_type_var)),
-        Expr::RecUpd(x, fields, _) => mentions_type_var(x) || fields.iter().any(|(_, v)| v.as_ref().is_some_and(mentions_type_var)),
+        Expr::Tuple(xs, _) => xs.iter().flatten().any(ex),
+        Expr::List(xs, _) => xs.iter().any(ex),
+        Expr::LeftSection(x, _, _) | Expr::RightSection(_, x, _) => ex(x),
+        Expr::RecCon { fields, .. } => fields.iter().any(|(_, v)| v.as_ref().is_some_and(ex)),
+        Expr::RecUpd(x, fields, _) => ex(x) || fields.iter().any(|(_, v)| v.as_ref().is_some_and(ex)),
         _ => false,
     }
 }
 
-pub(super) fn rhs_mentions_type_var(r: &Rhs) -> bool {
-    mentions_type_var_rhs(r)
+fn decl_mentions_type_var(d: &Decl, scoped: &[String]) -> bool {
+    match d {
+        Decl::Fun { clauses, .. } => clauses.iter().any(|c| rhs_mentions_scoped(&c.rhs, scoped)),
+        Decl::PatBind { rhs, .. } => rhs_mentions_scoped(rhs, scoped),
+        _ => false,
+    }
 }
 
-fn mentions_type_var_rhs(r: &Rhs) -> bool {
-    mentions_type_var(&Expr::Case(Box::new(Expr::Wild(Loc::default())), vec![AstAlt { pat: Pat::Wild(Loc::default()), rhs: r.clone(), loc: Loc::default() }], Loc::default()))
+/// Whether a right-hand side mentions a scoped type variable (see `mentions_type_var`).
+pub(super) fn rhs_mentions_scoped(r: &Rhs, scoped: &[String]) -> bool {
+    let body = match &r.body {
+        Body::Plain(e) => mentions_type_var(e, scoped),
+        Body::Guarded(gs) => gs.iter().any(|(conds, e)| {
+            conds.iter().any(|s| match s {
+                Stmt::Bind { expr, .. } | Stmt::Expr { expr, .. } => mentions_type_var(expr, scoped),
+                Stmt::Let { decls, .. } => decls.iter().any(|d| decl_mentions_type_var(d, scoped)),
+            }) || mentions_type_var(e, scoped)
+        }),
+    };
+    body || r.wheres.iter().any(|d| decl_mentions_type_var(d, scoped))
 }
 
 /// A function's clauses as one lambda: `\x1 .. xn -> case (x1, .., xn) of` the clauses (one
@@ -2088,11 +2125,20 @@ fn applicative_do(stmts: &[Stmt], loc: Loc) -> Option<Expr> {
     let mut pats = Vec::new();
     let mut actions = Vec::new();
     let mut bound: Vec<String> = Vec::new();
+    // `let`s that use no bound variable go around the whole expression.
+    let mut lets: Vec<Vec<Decl>> = Vec::new();
     for st in init {
         let (pat, action) = match st {
             Stmt::Bind { pat, expr, .. } => (pat.clone(), expr.clone()),
             Stmt::Expr { expr, loc } => (Pat::Wild(*loc), expr.clone()),
-            Stmt::Let { .. } => return None,
+            Stmt::Let { decls, .. } => {
+                let used = super::bind::decls_referenced_names(decls);
+                if bound.iter().any(|b| used.contains(b)) {
+                    return None;
+                }
+                lets.push(decls.clone());
+                continue;
+            }
         };
         // A refutable pattern would need MonadFail; a later action using a bound variable, Monad.
         if !irrefutable_simple(&pat) {
@@ -2108,20 +2154,26 @@ fn applicative_do(stmts: &[Stmt], loc: Loc) -> Option<Expr> {
     }
     let global = |n: &str| Expr::Var(QName { qual: Some("GHC.Internal.Base".into()), name: n.into() }, loc);
     let f = Expr::Lam(pats, Box::new(body), loc);
-    let mut acc = app(app(global("fmap"), f), actions[0].clone());
+    let first = actions.first()?.clone();
+    let mut acc = app(app(global("fmap"), f), first);
     for a in &actions[1..] {
         acc = app(app(global("<*>"), acc), a.clone());
+    }
+    for decls in lets.into_iter().rev() {
+        acc = Expr::Let(decls, Box::new(acc), loc);
     }
     Some(acc)
 }
 
 /// The `e` of `pure e`, `return e`, `pure $ e` or `return $ e`.
 fn returned(e: &Expr) -> Option<Expr> {
-    let is_ret = |f: &Expr| matches!(f, Expr::Var(q, _) if q.name == "pure" || q.name == "return");
+    // The base library's `pure` and `return` (and `$`), not a module's own.
+    let base = |q: &QName| q.qual.as_deref().is_some_and(|m| m.starts_with("GHC.Internal.") || m == "GHC.Base");
+    let is_ret = |f: &Expr| matches!(f, Expr::Var(q, _) if (q.name == "pure" || q.name == "return") && base(q));
     match e {
         Expr::App(f, x) if is_ret(f) => Some((**x).clone()),
         // `pure $ e`, its operator resolved.
-        Expr::App(f, x) if matches!(f.as_ref(), Expr::App(d, r) if matches!(d.as_ref(), Expr::Var(q, _) if q.name == "$") && is_ret(r)) => {
+        Expr::App(f, x) if matches!(f.as_ref(), Expr::App(d, r) if matches!(d.as_ref(), Expr::Var(q, _) if q.name == "$" && base(q)) && is_ret(r)) => {
             Some((**x).clone())
         }
         Expr::OpChain(items, _) => match items.as_slice() {
@@ -2136,11 +2188,8 @@ fn returned(e: &Expr) -> Option<Expr> {
     }
 }
 
-/// A pattern whose match cannot fail: variables, wildcards, lazy patterns and tuples of them.
+/// A pattern ApplicativeDo takes: a variable, a wildcard or a lazy pattern. A strict pattern
+/// (a tuple) is matched with `>>=`, as in GHC, which would otherwise make the program lazier.
 fn irrefutable_simple(p: &Pat) -> bool {
-    match p {
-        Pat::Var(..) | Pat::Wild(..) | Pat::Lazy(..) => true,
-        Pat::Tuple(ps, _) => ps.iter().all(irrefutable_simple),
-        _ => false,
-    }
+    matches!(p, Pat::Var(..) | Pat::Wild(..) | Pat::Lazy(..))
 }

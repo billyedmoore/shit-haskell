@@ -73,6 +73,27 @@ lookupAll mode xs = map check (pick xs)
       WantNames -> (filter (/= ""), id)
       WantSizes -> (take 2, length)
 
+-- A local function without a signature that matches a GADT and mentions an enclosing variable
+-- (GHC's `fixAssign stmt = case stmt of CmmAssign .. | reg == MachSp -> stmt`).
+data O
+data C
+
+data Node e x where
+  Assign :: String -> Int -> Node O O
+  Branch :: Int -> Node O C
+
+fixNode :: Int -> Node e x -> Node e x
+fixNode base n = fix n
+  where
+    fix node = case node of
+      Assign r v | r == "sp" -> node
+                 | otherwise -> Assign r (v + base)
+      Branch l -> Branch (l + base)
+
+showNode :: Node e x -> String
+showNode (Assign r v) = r ++ "=" ++ show v
+showNode (Branch l) = "goto " ++ show l
+
 main :: IO ()
 main = do
   putStrLn (describe (linear @'Parsed))
@@ -82,3 +103,4 @@ main = do
   putStrLn (showImport (Import (Info True) "Prelude" :: Import 'Parsed))
   putStrLn (showImport (Import (Info False) "Data.List" :: Import 'Parsed))
   print (lookupAll WantNames ["a", "", "bc"], lookupAll WantSizes ["a", "", "bc"])
+  mapM_ putStrLn [showNode (fixNode 10 (Assign "sp" 1)), showNode (fixNode 10 (Assign "r1" 1)), showNode (fixNode 10 (Branch 3))]
