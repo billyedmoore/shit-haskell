@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 217 differential tests for both back ends, compared with GHC.
+- **Corpus:** 218 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -33,8 +33,8 @@ the GitHub issues.
   large packages compile slowly, which limits how fast the rest of the work can go. A cold
   compile of all 425 exposed ghc-lib-parser modules with a fresh module cache takes a median
   28.5 s, down from 29.7 s before type substitution retained unchanged shared
-  application branches (paired runs; measurements below). Warm builds now take 1.94 s versus 11.16 s before
-  completed boot interfaces could use the module cache (three alternating pairs).
+  application branches (paired runs; measurements below). Warm builds take 1.75 s versus 1.84 s
+  before reusing the resolved source for boot-file lookup (seven alternating pairs).
 
 ## Working rules
 
@@ -92,6 +92,7 @@ the GitHub issues.
   The warm comparison against GHC is reproducible with `tools/compilebench.py --workload boot-cache`: the 50-cycle
   workload takes 0.066 → 0.026 s (median of three alternating warm runs), versus GHC's
   0.254 s at `-O0` and 0.275 s at `-O1`; both compilers keep their cached build artifacts.
+  The full parser import set warmed from 11.16 → 1.94 s (three alternating pairs).
 - Application-equality contraction substitutes solved type variables into each pattern once
   per walk, preserving matching order and observing new substitutions on the next call.
   `tools/compilebench.py --workload application-equalities` checks 500 bindings with 16 nested
@@ -114,6 +115,14 @@ the GitHub issues.
   a closed 128-layer type: 0.159 → 0.047 s, versus GHC's 0.200/0.202 s at `-O0`/`-O1`.
   The full parser import set with a fresh checked-module cache per run takes
   29.67 → 28.54 s; type checking takes 18.09 → 17.36 s (three alternating pairs).
+- Source and boot lookup reuse the already resolved source path and package flags. This
+  avoids rereading and hashing a source-carrying interface just to locate its boot file;
+  adjacent-file priority, fallback search and missing-boot validation are retained.
+  `tools/interfacebench.py` builds a package with each compiler and measures a warm client
+  against its installed interfaces: 0.087 → 0.065 s; GHC takes 0.091/0.093 s at `-O0`/`-O1`.
+  The package has 50 padded step modules plus a seed; GHC may load interfaces lazily. Warm
+  full parser imports take 1.843 → 1.755 s (seven alternating pairs, both compilers using
+  the same vendored library tree through `HSC_LIBDIR`).
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and
