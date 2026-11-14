@@ -1,7 +1,8 @@
 # Progress
 
 Reference: GHC 9.12.2 (oracle). Reference sources are extracted under `ref/src` (gitignored).
-The plan of record has 13 milestones, below; open work is tracked in the GitHub issues.
+The plan is in `PLAN.md`; the table below records the status of the original 13 milestones, and
+open work is tracked in the GitHub issues.
 
 Run the differential suite:
 
