@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 213 differential tests for both back ends, compared with GHC.
+- **Corpus:** 214 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -32,8 +32,8 @@ the GitHub issues.
 - **Weakness: speed.** Generated code is 10–500× slower than `ghc -O0` (baseline below), and
   large packages compile slowly, which limits how fast the rest of the work can go. A cold
   compile of all 425 exposed ghc-lib-parser modules with a fresh module cache takes a median
-  33.3 s, down from 51.8 s before cache bookkeeping recorded just each module's additions
-  (paired runs; measurements below). Warm builds now take 1.94 s versus 11.16 s before
+  32.7 s, down from 36.1 s before application-equality patterns were substituted once per
+  type walk (paired runs; measurements below). Warm builds now take 1.94 s versus 11.16 s before
   completed boot interfaces could use the module cache (three alternating pairs).
 
 ## Working rules
@@ -54,7 +54,7 @@ the GitHub issues.
 - Every speed pull request includes graphs of before, after, and GHC, with the measurement
   commands and conditions; run-time graphs show both `-O0` and `-O1` and the 0.9× target.
 - This file is kept up to date as work lands.
-- Keep iterating until the roadmap is complete. If execution or usage limits interrupt work,
+- Use goal mode and keep iterating until the roadmap is complete. If execution or usage limits interrupt work,
   checkpoint the current state and resume work when execution becomes available
   after the reset, without waiting for another instruction to continue.
 
@@ -92,6 +92,15 @@ the GitHub issues.
   The warm comparison against GHC is reproducible with `tools/compilebench.py --workload boot-cache`: the 50-cycle
   workload takes 0.066 → 0.026 s (median of three alternating warm runs), versus GHC's
   0.254 s at `-O0` and 0.275 s at `-O1`; both compilers keep their cached build artifacts.
+- Application-equality contraction substitutes solved type variables into each pattern once
+  per walk, preserving matching order and observing new substitutions on the next call.
+  `tools/compilebench.py --workload application-equalities` checks 500 bindings with 16 nested
+  applications each: 12.38 → 2.83 s (median of three alternating runs; GHC `-fno-code` takes
+  0.467 s at `-O0` and 0.497 s at `-O1`). All hsc checked-module caching is disabled in this
+  focused front-end measurement. The full parser import set, caching enabled with a fresh
+  checked-module cache per run, takes 36.13 → 32.73 s; type checking falls
+  from 24.19 → 20.66 s (three alternating pairs). Scoping the saved
+  application equalities remains follow-up work.
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and

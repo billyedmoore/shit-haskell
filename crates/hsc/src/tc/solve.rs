@@ -1293,17 +1293,27 @@ fn constraint_tuple_parts(p: &Pred) -> Option<Vec<Pred>> {
 impl Checker {
     /// A type with each application a rigid variable equals (see `skol_apps`) replaced by it.
     pub(super) fn contract_skol_apps(&self, t: &Ty) -> Ty {
-        // Innermost first: `Body (Body b GhcPs) GhcPs` is `Body b GhcPs`, which is `b`.
-        let t = match t {
-            Ty::App(f, x) => Ty::app(self.contract_skol_apps(f), self.contract_skol_apps(x)),
-            other => other.clone(),
-        };
-        for (id, (name, app)) in &self.skol_apps {
-            if self.metas.zonk(app) == t {
-                return Ty::Skol(*id, name.clone());
+        // Substitution is constant during this walk. Resolve each pattern once,
+        // rather than again at every node (and retain the map's matching order).
+        let apps: Vec<_> = self.skol_apps.iter().map(|(id, (name, app))| (*id, name, self.metas.zonk(app))).collect();
+        fn walk(t: &Ty, apps: &[(u32, &String, Ty)]) -> Ty {
+            // Innermost first: `Body (Body b GhcPs) GhcPs` becomes `b`.
+            let t = match t {
+                Ty::App(f, x) => Ty::app(walk(f, apps), walk(x, apps)),
+                other => other.clone(),
+            };
+            for (id, name, app) in apps {
+                if *app == t {
+                    return Ty::Skol(*id, (*name).clone());
+                }
             }
+            t
         }
-        t
+        if apps.is_empty() {
+            t.clone()
+        } else {
+            walk(t, &apps)
+        }
     }
 }
 
@@ -1312,5 +1322,30 @@ fn skol_occurs(id: u32, t: &Ty) -> bool {
         Ty::Skol(j, _) => *j == id,
         Ty::App(f, x) => skol_occurs(id, f) || skol_occurs(id, x),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod application_contraction_tests {
+    use super::*;
+
+    #[test]
+    fn nested_applications_contract_after_substitution_and_refresh_on_the_next_call() {
+        let mut tc = Checker::new();
+        let b = tc.metas.fresh_skolem("b");
+        let Ty::Skol(id, _) = &b else { unreachable!() };
+        let id = *id;
+        let phase = tc.meta();
+        let body = |x: Ty, p: Ty| Ty::apps(Ty::con("Body"), vec![x, p]);
+        tc.skol_apps.insert(id, ("b".into(), body(b.clone(), phase.clone())));
+        let nested = body(body(b.clone(), Ty::con("Parsed")), Ty::con("Parsed"));
+        assert_eq!(tc.contract_skol_apps(&nested), nested);
+        tc.metas.unify(&phase, &Ty::con("Parsed")).unwrap();
+        assert_eq!(tc.contract_skol_apps(&nested), b);
+        // The pass must compare after contracting children, not just match the root.
+        let wrapped = Ty::list(nested);
+        assert_eq!(tc.contract_skol_apps(&wrapped), Ty::list(b));
+        tc.skol_apps.clear();
+        assert_eq!(tc.contract_skol_apps(&wrapped), wrapped);
     }
 }
