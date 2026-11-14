@@ -561,11 +561,11 @@ impl Driver {
         self.find_module(module).map(|f| f.path)
     }
 
-    fn find_boot(&self, module: &str) -> Option<PathBuf> {
+    fn find_boot(&self, module: &str, source: Option<&Path>) -> Option<PathBuf> {
         let rel = format!("{}.hs-boot", module.replace('.', "/"));
         // A package module's boot file is beside its source.
-        if let Some(f) = self.find_module(module) {
-            let p = f.path.with_extension("hs-boot");
+        if let Some(source) = source {
+            let p = source.with_extension("hs-boot");
             if p.is_file() {
                 return Some(p);
             }
@@ -576,14 +576,18 @@ impl Driver {
     /// Loads the `.hs-boot` file of a module imported through `{-# SOURCE #-}`: its signatures
     /// stand for the module until the module itself is loaded (see `load_booted`).
     fn load_boot(&mut self, module: &str) -> Result<(), String> {
-        let path = self.find_boot(module).ok_or_else(|| format!("Could not find module ‘{module}’ (no .hs-boot file for a SOURCE import)"))?;
+        // Resolving a package interface reads and hashes its embedded source. Reuse
+        // that result for its boot path and flags instead of resolving it again.
+        let found = self.find_module(module);
+        let path = self.find_boot(module, found.as_ref().map(|f| f.path.as_path()))
+            .ok_or_else(|| format!("Could not find module ‘{module}’ (no .hs-boot file for a SOURCE import)"))?;
         if self.loaded.contains(module) {
             return Ok(());
         }
         if self.booted.contains(module) {
             return Ok(());
         }
-        let flags = self.find_module(module).map(|f| f.flags).unwrap_or_default();
+        let flags = found.map(|f| f.flags).unwrap_or_default();
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
         let (mut parsed, mut exts) =
@@ -720,7 +724,7 @@ impl Driver {
         // The module cache: an entry for this source (and flags) whose imports are unchanged
         // stands for the module (see `crate::cache`).
         // An implementation's cache also depends on the declarations in its boot file.
-        let boot_src = if let Some(boot_path) = self.find_boot(module) {
+        let boot_src = if let Some(boot_path) = self.find_boot(module, Some(&path)) {
             let text = read_source(&boot_path).map_err(|e| format!("{}: {e}", boot_path.display()))?;
             preprocess_if_needed(text, &boot_path, &flags)?
         } else { String::new() };
@@ -1422,12 +1426,32 @@ mod cache_tests {
         boot.write("A.hs-boot", "module A where\ndata T");
         let driver = || Driver::new(vec![source.0.clone(), boot.0.clone()], Vec::new(), Vec::new());
         let mut first = driver();
-        assert_eq!(first.find_boot("A"), Some(boot.0.join("A.hs-boot")));
+        assert_eq!(first.find_boot("A", Some(&source.0.join("A.hs"))), Some(boot.0.join("A.hs-boot")));
         first.load("A").unwrap();
         boot.write("A.hs-boot", "module A where\ndata T = T");
         let mut second = driver();
         second.load("A").unwrap();
         assert_ne!(first.keys["A"], second.keys["A"]);
+    }
+
+    #[test]
+    fn interface_source_and_boot_keep_the_same_package_flags() {
+        let source = Sources::new();
+        let package = Sources::new();
+        std::fs::write(source.0.join("A.hs"), "module A where\ndata T = T\n").unwrap();
+        std::fs::write(source.0.join("A.hs-boot"), "module A where\ndata T\n").unwrap();
+        let path = source.0.join("A.hs");
+        write_interface(&package.0.join("A.hi"), "A", &path, &path, &["-XNoImplicitPrelude".into()]).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(source.0.join("A.hs-boot")).unwrap();
+        // No Prelude is available in this driver: the interface's package flag is
+        // required for both the extracted boot file and its implementation.
+        let mut d = Driver::new(Vec::new(), vec![package.0.clone()], Vec::new());
+        d.load_boot("A").unwrap();
+        assert!(d.booted.contains("A"));
+        assert!(d.checker.env.tycons["A.T"].cons.is_empty());
+        d.load("A").unwrap();
+        assert_eq!(d.checker.env.tycons["A.T"].cons, ["A.T"]);
     }
 
     #[test]
