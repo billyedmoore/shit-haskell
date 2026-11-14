@@ -202,7 +202,11 @@ impl Checker {
                 }
             }
         } else {
+            let t_binds = std::time::Instant::now();
             let mut binds = self.infer_binds(&value_decls, true)?;
+            if std::env::var_os("HSC_TIME_TC").is_some() && t_binds.elapsed().as_millis() >= 200 {
+                eprintln!("tc {}: top-level values: {} ms", self.module, t_binds.elapsed().as_millis());
+            }
             // Evidence that ends up at top level (`d%12` of an ungeneralised group) is named
             // after the module, like everything at top level (see `top_binds_from_evidence`).
             let prefix = format!("{}.", self.module);
@@ -232,8 +236,13 @@ impl Checker {
             for cd in &class_decls {
                 self.class_defaults(cd)?;
             }
+            let slow = std::env::var_os("HSC_TIME_TC").is_some();
             for id in &all_insts {
+                let t = std::time::Instant::now();
                 self.instance_body(id)?;
+                if slow && t.elapsed().as_millis() >= 200 {
+                    eprintln!("tc {}: instance {:?}: {} ms", self.module, id.head, t.elapsed().as_millis());
+                }
             }
         }
 

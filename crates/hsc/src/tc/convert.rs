@@ -86,7 +86,7 @@ impl Checker {
                 self.bound_scope.truncate(mark);
                 match inner? {
                     Ty::Qual(preds, t) => Ty::Forall(ids, preds, t),
-                    other => Ty::Forall(ids, Vec::new(), Box::new(other)),
+                    other => Ty::Forall(ids, Vec::new(), std::rc::Rc::new(other)),
                 }
             }
             // A constrained type nested in a signature (rank-N): see `Ty::Qual`.
@@ -99,7 +99,7 @@ impl Checker {
                 if preds.is_empty() {
                     body
                 } else {
-                    Ty::Qual(preds, Box::new(body))
+                    Ty::Qual(preds, std::rc::Rc::new(body))
                 }
             }
             Type::OpChain(..) => return self.err("internal: unresolved type operator"),

@@ -284,6 +284,26 @@ impl Checker {
         self.unify_fam(actual, expected)
     }
 
+    /// Whether a type mentions a type family or a data instance's representation (through the
+    /// solved unification variables), without copying it.
+    pub(super) fn mentions_family(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Meta(i) => match &self.metas.subst[*i as usize] {
+                Some(s) => self.mentions_family(s),
+                None => false,
+            },
+            Ty::Skol(id, _) => match self.metas.skol_binds.get(id) {
+                Some(s) => self.mentions_family(s),
+                None => false,
+            },
+            Ty::Con(c) => c.contains("R:") || self.env.families.contains_key(c),
+            Ty::App(f, x) => self.mentions_family(f) || self.mentions_family(x),
+            // Anything else (qualified or polymorphic types) takes the general path.
+            Ty::Gen(_) | Ty::Bound(_) => false,
+            _ => true,
+        }
+    }
+
     /// A type with each rigid variable of `skol_apps` replaced by its application (once).
     pub(super) fn expand_skol_apps(&self, t: &Ty) -> Ty {
         match self.metas.prune(t) {
@@ -306,6 +326,17 @@ impl Checker {
     /// Structural unification with families: applications are decomposed, so only the
     /// equalities whose head is a stuck family application are deferred.
     fn unify_fam(&mut self, actual: &Ty, expected: &Ty) -> TR<()> {
+        // Neither side mentions a family or a data instance's representation: plain unification,
+        // without the copies the family handling makes of both types at each level (the large
+        // `Rep` of a derived Generic instance was quadratic).
+        // (Inside a GADT alternative, types are zonked first so that its refinements are what
+        // the unknowns are solved to: the general path.)
+        if self.metas.skol_binds.is_empty() && !self.mentions_family(actual) && !self.mentions_family(expected) {
+            let r = self.unify_at_raw(actual, expected);
+            if r.is_ok() || self.skol_apps.is_empty() {
+                return r;
+            }
+        }
         // A data family application against an application of an unknown (`MV s (a, a)` and
         // `v s (a, a)` from a class method): data families are generative, so the unknown is the
         // family partly applied, as GHC solves it, rather than the instance's representation.

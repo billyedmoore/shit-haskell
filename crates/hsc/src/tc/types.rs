@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 pub const ARROW: &str = "Builtin.->";
 pub const LIST: &str = "Builtin.[]";
@@ -10,7 +11,9 @@ pub const LIST: &str = "Builtin.[]";
 pub enum Ty {
     /// A type constructor by global name.
     Con(String),
-    App(Box<Ty>, Box<Ty>),
+    /// An application. The parts are shared: a type is copied often (a unification variable's
+    /// solution, each pruning), and a large one (a derived `Rep`) must not be copied whole.
+    App(Rc<Ty>, Rc<Ty>),
     /// A unification variable.
     Meta(u32),
     /// A rigid type variable from a signature; the id makes it unique.
@@ -19,12 +22,12 @@ pub enum Ty {
     Gen(u32),
     /// A constrained type in argument position, `C a => t` (rank-N): a value of it is a
     /// function of the dictionaries of its predicates.
-    Qual(Vec<Pred>, Box<Ty>),
+    Qual(Vec<Pred>, Rc<Ty>),
     /// A variable bound by a nested `forall` (rank-N), by a unique id.
     Bound(u32),
     /// A nested `forall ids. preds => t`: a polymorphic type, instantiated where it is used
     /// and skolemised where it is checked against.
-    Forall(Vec<u32>, Vec<Pred>, Box<Ty>),
+    Forall(Vec<u32>, Vec<Pred>, Rc<Ty>),
 }
 
 impl Ty {
@@ -33,7 +36,7 @@ impl Ty {
     }
 
     pub fn app(f: Ty, a: Ty) -> Ty {
-        Ty::App(Box::new(f), Box::new(a))
+        Ty::App(Rc::new(f), Rc::new(a))
     }
 
     pub fn apps(head: Ty, args: Vec<Ty>) -> Ty {
@@ -125,11 +128,11 @@ pub fn subst_gen(t: &Ty, args: &[Ty]) -> Ty {
     match t {
         Ty::Gen(i) => args.get(*i as usize).cloned().unwrap_or(Ty::Gen(*i)),
         Ty::App(f, a) => Ty::app(subst_gen(f, args), subst_gen(a, args)),
-        Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_gen_pred(p, args)).collect(), Box::new(subst_gen(b, args))),
+        Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_gen_pred(p, args)).collect(), Rc::new(subst_gen(b, args))),
         Ty::Forall(ids, ps, b) => Ty::Forall(
             ids.clone(),
             ps.iter().map(|p| subst_gen_pred(p, args)).collect(),
-            Box::new(subst_gen(b, args)),
+            Rc::new(subst_gen(b, args)),
         ),
         other => other.clone(),
     }
@@ -143,7 +146,7 @@ pub fn subst_bound(t: &Ty, ids: &[u32], tys: &[Ty]) -> Ty {
             None => t.clone(),
         },
         Ty::App(f, a) => Ty::app(subst_bound(f, ids, tys), subst_bound(a, ids, tys)),
-        Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(), Box::new(subst_bound(b, ids, tys))),
+        Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(), Rc::new(subst_bound(b, ids, tys))),
         Ty::Forall(is, ps, b) => {
             // An inner quantifier of the same variable shadows it (a synonym's `forall`, expanded
             // twice in one type, binds the same variable twice).
@@ -153,10 +156,10 @@ pub fn subst_bound(t: &Ty, ids: &[u32], tys: &[Ty]) -> Ty {
                 return Ty::Forall(
                     is.clone(),
                     ps.iter().map(|p| subst_bound_pred(p, &ids2, &tys2)).collect(),
-                    Box::new(subst_bound(b, &ids2, &tys2)),
+                    Rc::new(subst_bound(b, &ids2, &tys2)),
                 );
             }
-            Ty::Forall(is.clone(), ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(), Box::new(subst_bound(b, ids, tys)))
+            Ty::Forall(is.clone(), ps.iter().map(|p| subst_bound_pred(p, ids, tys)).collect(), Rc::new(subst_bound(b, ids, tys)))
         }
         other => other.clone(),
     }
@@ -248,14 +251,33 @@ impl Metas {
                 Some(s) => self.zonk(s),
                 None => t.clone(),
             },
-            Ty::App(f, a) => Ty::app(self.zonk(f), self.zonk(a)),
-            Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| self.zonk_pred(p)).collect(), Box::new(self.zonk(b))),
+            Ty::App(f, a) => Ty::App(self.zonk_rc(f), self.zonk_rc(a)),
+            Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| self.zonk_pred(p)).collect(), Rc::new(self.zonk(b))),
             Ty::Forall(ids, ps, b) => Ty::Forall(
                 ids.clone(),
                 ps.iter().map(|p| self.zonk_pred(p)).collect(),
-                Box::new(self.zonk(b)),
+                Rc::new(self.zonk(b)),
             ),
             other => other.clone(),
+        }
+    }
+
+    /// A shared part zonked: the same part when nothing in it is solved, so that zonking a large
+    /// type that is already zonked copies nothing.
+    fn zonk_rc(&self, t: &Rc<Ty>) -> Rc<Ty> {
+        match &**t {
+            Ty::Con(_) | Ty::Gen(_) | Ty::Bound(_) => t.clone(),
+            Ty::Meta(i) if self.subst[*i as usize].is_none() => t.clone(),
+            Ty::Skol(id, _) if !self.skol_binds.contains_key(id) => t.clone(),
+            Ty::App(f, a) => {
+                let (f2, a2) = (self.zonk_rc(f), self.zonk_rc(a));
+                if Rc::ptr_eq(&f2, f) && Rc::ptr_eq(&a2, a) {
+                    t.clone()
+                } else {
+                    Rc::new(Ty::App(f2, a2))
+                }
+            }
+            _ => Rc::new(self.zonk_inner(t)),
         }
     }
 

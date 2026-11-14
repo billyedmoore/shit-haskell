@@ -768,7 +768,7 @@ impl Checker {
                 all_ids.extend(fresh2);
                 let mut all_ctx = ctx.clone();
                 all_ctx.extend(ctx2);
-                let q = Pred { class: QUANTIFIED_CLASS.into(), args: vec![Ty::Forall(all_ids, all_ctx, Box::new(head2))] };
+                let q = Pred { class: QUANTIFIED_CLASS.into(), args: vec![Ty::Forall(all_ids, all_ctx, std::rc::Rc::new(head2))] };
                 out.push((q, ev));
             }
         }

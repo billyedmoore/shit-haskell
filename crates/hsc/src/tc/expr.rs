@@ -351,7 +351,7 @@ impl Checker {
                     // takes its dictionaries before the next argument.
                     Ty::Qual(ps, body) => {
                         found.extend(ps);
-                        tf = *body;
+                        tf = (*body).clone();
                     }
                     _ => break,
                 }
@@ -382,7 +382,7 @@ impl Checker {
                 }
                 Ty::Qual(ps, body) if !spine.is_empty() => {
                     pending_dicts.extend(ps);
-                    tf = *body;
+                    tf = (*body).clone();
                 }
                 _ => break,
             }
@@ -957,7 +957,7 @@ impl Checker {
             match self.metas.prune(&ty) {
                 Ty::Qual(ps, body) => {
                     core = self.apply_dicts(core, ps, loc);
-                    ty = *body;
+                    ty = (*body).clone();
                 }
                 Ty::Forall(ids, ps, body) => {
                     // A polymorphic variable: instantiated at every use.
@@ -1232,12 +1232,13 @@ impl Checker {
         // are reduced first, so that a reducible family application refines like its value.
         // A data instance's constructor against an unknown applied (`t r` for `V Any`): the unknown
         // is the family (see `align_data_families`).
-        if self.env.families.values().any(|f| !f.equations.is_empty()) {
+        // (Without families on either side, none of this applies, and it would copy both types.)
+        let families = !self.metas.skol_binds.is_empty() || self.mentions_family(&cur) || self.mentions_family(ty);
+        if families && self.env.families.values().any(|f| !f.equations.is_empty()) {
             let (c0, t0) = (self.metas.zonk(&cur), self.metas.zonk(ty));
             let _ = self.align_data_families(&c0, &t0, 0, false)?;
         }
-        let cur_n = self.normalize(&cur);
-        let ty_n = self.normalize(ty);
+        let (cur_n, ty_n) = if families { (self.normalize(&cur), self.normalize(ty)) } else { (cur.clone(), ty.clone()) };
         let refinements = self.metas.skol_binds.len();
         let refined = self.metas.unify_refine(&cur_n, &ty_n);
         // A refinement can make a family given reduce to more equalities.

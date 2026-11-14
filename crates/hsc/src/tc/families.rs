@@ -371,31 +371,56 @@ impl Checker {
     }
 
     fn normalize_zonked(&self, t: &Ty, depth: usize) -> Ty {
+        let rc = std::rc::Rc::new(t.clone());
+        (*self.normalize_rc(&rc, depth)).clone()
+    }
+
+    /// Whether the head of a type's application spine is a type family (or the type is one).
+    fn family_headed(&self, t: &Ty) -> bool {
+        let mut h = t;
+        while let Ty::App(f, _) = h {
+            h = f;
+        }
+        matches!(h, Ty::Con(c) if self.env.families.contains_key(c))
+    }
+
+    /// `normalize_zonked` on a shared part: the same part when nothing in it reduces, so that a
+    /// large type without families is neither copied nor compared.
+    fn normalize_rc(&self, t: &std::rc::Rc<Ty>, depth: usize) -> std::rc::Rc<Ty> {
+        use std::rc::Rc;
         if depth > 200 {
             return t.clone();
         }
-        if let Some(r) = self.reduce_head(t) {
-            return self.normalize_zonked(&self.metas.zonk(&r), depth + 1);
-        }
-        let n = match t {
-            Ty::App(f, a) => Ty::app(
-                self.normalize_zonked(f, depth + 1),
-                self.normalize_zonked(a, depth + 1),
-            ),
-            other => other.clone(),
-        };
-        // With its arguments reduced, the application itself may reduce now
-        // (`IfM (Nothing ||? Nothing) c d`).
-        if n != *t {
-            if let Some(r) = self.reduce_head(&n) {
-                return self.normalize_zonked(&self.metas.zonk(&r), depth + 1);
+        let headed = self.family_headed(t);
+        if headed {
+            if let Some(r) = self.reduce_head(t) {
+                return self.normalize_rc(&Rc::new(self.metas.zonk(&r)), depth + 1);
             }
         }
+        let n = match &**t {
+            Ty::App(f, a) => {
+                let (f2, a2) = (self.normalize_rc(f, depth + 1), self.normalize_rc(a, depth + 1));
+                if Rc::ptr_eq(&f2, f) && Rc::ptr_eq(&a2, a) {
+                    t.clone()
+                } else {
+                    // With its arguments reduced, the application itself may reduce now
+                    // (`IfM (Nothing ||? Nothing) c d`).
+                    let n = Rc::new(Ty::App(f2, a2));
+                    if headed {
+                        if let Some(r) = self.reduce_head(&n) {
+                            return self.normalize_rc(&Rc::new(self.metas.zonk(&r)), depth + 1);
+                        }
+                    }
+                    n
+                }
+            }
+            _ => t.clone(),
+        };
         // A stuck family application that a given equality names (`Weights_ (Rep a) ~ L c` in a
         // context) stands for the other side.
-        if self.family_app(&n).is_some() {
+        if headed && self.family_app(&n).is_some() {
             if let Some(r) = self.given_family_equality(&n) {
-                return self.normalize_zonked(&r, depth + 1);
+                return self.normalize_rc(&Rc::new(r), depth + 1);
             }
         }
         n
@@ -518,7 +543,7 @@ impl Checker {
             }
             pats.pop();
             kinds.pop();
-            rhs_ty = *f;
+            rhs_ty = (*f).clone();
         }
         let eqn = FamEqn {
             nvars: tvs.len() as u32,
