@@ -363,7 +363,8 @@ impl Parser {
                 let f = self.qvar()?;
                 let val = if self.at_res(ROp::Eq) {
                     self.bump();
-                    Some(self.expr()?)
+                    // In a pattern, a field may be a view pattern (`C { f = view -> p }`).
+                    Some(self.list_elem()?)
                 } else {
                     None
                 };
@@ -826,6 +827,9 @@ impl Parser {
                 branches.push(quals);
             }
             self.expect_special(']')?;
+            if self.exts.is_on("MonadComprehensions") && branches.len() == 1 {
+                return Ok(monad_comprehension(first, branches.pop().unwrap_or_default(), loc));
+            }
             return Ok(Expr::ListComp(Box::new(first), branches, loc));
         }
         let mut elems = vec![first];
@@ -1027,4 +1031,22 @@ fn integral_decimal(s: &str) -> Option<String> {
     }
     let digits = digits.trim_start_matches('0');
     Some(if digits.is_empty() { "0".to_string() } else { digits.to_string() })
+}
+
+/// A monad comprehension (`MonadComprehensions`): `[e | quals]` is `do { quals; return e }`, a
+/// guard being `guard cond`.
+fn monad_comprehension(body: Expr, quals: Vec<Stmt>, loc: Loc) -> Expr {
+    let global = |m: &str, n: &str| Expr::Var(QName { qual: Some(format!("%G:{m}")), name: n.into() }, loc);
+    let mut stmts: Vec<Stmt> = quals
+        .into_iter()
+        .map(|q| match q {
+            Stmt::Expr { expr, loc } => {
+                Stmt::Expr { expr: Expr::App(Box::new(global("GHC.Internal.Control.Monad", "guard")), Box::new(expr)), loc }
+            }
+            other => other,
+        })
+        .collect();
+    let ret = Expr::App(Box::new(global("GHC.Internal.Base", "return")), Box::new(body));
+    stmts.push(Stmt::Expr { expr: ret, loc });
+    Expr::Do(stmts, loc)
 }

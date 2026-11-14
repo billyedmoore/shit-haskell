@@ -186,7 +186,27 @@ impl<'a> Renamer<'a> {
         // Pattern synonyms: each definition is renamed now, so that uses in patterns can expand
         // it; implicitly bidirectional ones and explicit builders become functions `$bP`.
         let mut builders = Vec::new();
-        for d in &m.decls {
+        // Each after the synonyms its pattern uses (`pattern BinOpApp x op y = OpVal op `App` ..`
+        // before `pattern OpVal ..`), so that their uses in it expand.
+        let mut order: Vec<&Decl> = Vec::new();
+        {
+            let syns: Vec<&Decl> = m.decls.iter().filter(|d| matches!(d, Decl::PatSyn { .. })).collect();
+            let name_of = |d: &Decl| if let Decl::PatSyn { name, .. } = d { name.clone() } else { String::new() };
+            let mut pending: Vec<&Decl> = syns.clone();
+            while !pending.is_empty() {
+                let names: Vec<String> = pending.iter().map(|d| name_of(d)).collect();
+                let ready = pending.iter().position(|d| {
+                    let Decl::PatSyn { name, pat, .. } = d else { return true };
+                    let mut used = Vec::new();
+                    pat_con_names(pat, &mut used);
+                    !used.iter().any(|u| u != name && names.contains(u))
+                });
+                // A cycle: the rest in the order written.
+                let i = ready.unwrap_or(0);
+                order.push(pending.remove(i));
+            }
+        }
+        for d in order {
             if let Decl::PatSyn { name, args, pat, dir, loc } = d {
                 let sig = m.decls.iter().find_map(|s| match s {
                     Decl::PatSynSig { names, ty, .. } if names.iter().any(|n| n == name) => Some(ty.clone()),
@@ -284,17 +304,11 @@ impl<'a> Renamer<'a> {
         let occ = e.occ().to_string();
         if unqualified {
             let map = if is_value { &mut self.vals } else { &mut self.types };
-            let list = map.entry(occ.clone()).or_default();
-            if !list.iter().any(|x| x.global == e.global) {
-                list.push(e.clone());
-            }
+            merge_entity(map.entry(occ.clone()).or_default(), e.clone());
         }
         if let Some(q) = qualifier {
             let map = if is_value { &mut self.qvals } else { &mut self.qtypes };
-            let list = map.entry((q.to_string(), occ)).or_default();
-            if !list.iter().any(|x| x.global == e.global) {
-                list.push(e);
-            }
+            merge_entity(map.entry((q.to_string(), occ)).or_default(), e);
         }
     }
 
@@ -1529,10 +1543,12 @@ impl<'a> Renamer<'a> {
             Expr::LeftSection(e, op, loc) => {
                 let e = self.expr(*e)?;
                 let op = self.op_name(&op, loc)?;
+                let op = self.builder_op(op);
                 Expr::LeftSection(Box::new(e), op, loc)
             }
             Expr::RightSection(op, e, loc) => {
                 let op = self.op_name(&op, loc)?;
+                let op = self.builder_op(op);
                 let e = self.expr(*e)?;
                 Expr::RightSection(op, Box::new(e), loc)
             }
@@ -1635,6 +1651,14 @@ impl<'a> Renamer<'a> {
         }
     }
 
+    /// A bidirectional pattern synonym used as an operator (`` x `P` y ``) is its builder.
+    fn builder_op(&self, op: QName) -> QName {
+        match self.patsyn_of(&op) {
+            Some(def) if def.builder => QName { qual: op.qual.clone(), name: builder_name(&op.name) },
+            _ => op,
+        }
+    }
+
     fn op_expr(op: QName, loc: Loc) -> Expr {
         if is_con_name(&op.name) {
             Expr::Con(op, loc)
@@ -1652,6 +1676,7 @@ impl<'a> Renamer<'a> {
                 OpItem::Op(q, l) => {
                     let qn = self.op_name(&q, l)?;
                     let (assoc, prec) = self.fixity_of(&qn);
+                    let qn = self.builder_op(qn);
                     toks.push(Tk::Op {
                         op: qn,
                         name: q.name.clone(),
@@ -1988,8 +2013,10 @@ impl<'a> Renamer<'a> {
                 IEItem::Module(m) => {
                     if *m == self.module {
                         out.extend(self.own.iter().cloned());
-                    } else {
-                        // `module M` exports the entities in scope both unqualified and as `M.x`.
+                    }
+                    {
+                        // `module M` exports the entities in scope both unqualified and as `M.x`
+                        // (the module's own name too, when an import has it as its alias).
                         for (map, unqual) in [(&self.qvals, &self.vals), (&self.qtypes, &self.types)] {
                             for ((q, _occ), list) in map {
                                 if q == m {
@@ -2300,6 +2327,22 @@ fn merge_contexts(t: &Type) -> Type {
     }
 }
 
+/// Adds an entity to the ones a name has in scope. The same entity imported again (through
+/// another module) brings the children that import has: a type exported abstractly by one module
+/// and with its constructors by another has them in scope.
+fn merge_entity(list: &mut Vec<Entity>, e: Entity) {
+    match list.iter_mut().find(|x| x.global == e.global) {
+        Some(x) => {
+            for s in e.subs {
+                if !x.subs.iter().any(|y| y.global == s.global && y.kind.is_value() == s.kind.is_value()) {
+                    x.subs.push(s);
+                }
+            }
+        }
+        None => list.push(e),
+    }
+}
+
 pub fn builder_name(synonym: &str) -> String {
     format!("$b{synonym}")
 }
@@ -2490,4 +2533,29 @@ fn typed_args(args: Vec<Pat>, tys: &[Option<Type>], loc: Loc) -> Vec<Pat> {
             None => a,
         })
         .collect()
+}
+
+/// The constructor names (unqualified) a pattern mentions.
+fn pat_con_names(p: &Pat, out: &mut Vec<String>) {
+    match p {
+        Pat::Con(q, ps, _) => {
+            out.push(q.name.clone());
+            ps.iter().for_each(|x| pat_con_names(x, out));
+        }
+        Pat::Rec { con, fields, .. } => {
+            out.push(con.name.clone());
+            fields.iter().filter_map(|(_, x)| x.as_ref()).for_each(|x| pat_con_names(x, out));
+        }
+        Pat::Tuple(ps, _) | Pat::List(ps, _) => ps.iter().for_each(|x| pat_con_names(x, out)),
+        Pat::As(_, x, _) | Pat::Lazy(x, _) | Pat::Bang(x, _) | Pat::Sig(x, _, _) | Pat::View(_, x, _) => pat_con_names(x, out),
+        Pat::OpChain(items, _) => {
+            for it in items {
+                match it {
+                    crate::syntax::ast::PatOpItem::Operand(x) => pat_con_names(x, out),
+                    crate::syntax::ast::PatOpItem::Op(q, _) => out.push(q.name.clone()),
+                }
+            }
+        }
+        _ => {}
+    }
 }

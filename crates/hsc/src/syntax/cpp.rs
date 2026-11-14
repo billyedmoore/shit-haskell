@@ -16,6 +16,7 @@ const PREDEFINED: &[(&str, &str)] = &[
     ("__GLASGOW_HASKELL__", "912"),
     ("__GLASGOW_HASKELL_FULL_VERSION__", "\"9.12.2\""),
     ("__GLASGOW_HASKELL_PATCHLEVEL1__", "2"),
+    ("__GLASGOW_HASKELL_PATCHLEVEL2__", "0"),
     ("linux_HOST_OS", "1"),
     ("x86_64_HOST_ARCH", "1"),
     ("linux_BUILD_OS", "1"),
@@ -84,10 +85,15 @@ pub fn wants_cpp(src: &str, flags: &[String]) -> bool {
         let Some(end) = after.find("#-}") else { break };
         let body = after[..end].trim();
         let mut words = body.split(|c: char| c.is_whitespace() || c == ',');
-        if words.next().is_some_and(|w| w.eq_ignore_ascii_case("LANGUAGE"))
-            && words.any(|w| w == "CPP")
-        {
-            return true;
+        match words.next() {
+            Some(w) if w.eq_ignore_ascii_case("LANGUAGE") && words.any(|w| w == "CPP") => return true,
+            // `{-# OPTIONS_GHC -cpp #-}` (or `-XCPP`) turns it on too.
+            Some(w) if (w.eq_ignore_ascii_case("OPTIONS_GHC") || w.eq_ignore_ascii_case("OPTIONS"))
+                && words.any(|w| w == "-cpp" || w == "-XCPP") =>
+            {
+                return true
+            }
+            _ => {}
         }
         rest = &after[end..];
     }
@@ -99,6 +105,7 @@ impl Preprocessor {
         let defs = PREDEFINED
             .iter()
             .map(|(k, v)| (k.to_string(), Macro::Object(v.to_string())))
+            .chain(std::iter::once(("MIN_VERSION_GLASGOW_HASKELL".to_string(), min_version_ghc())))
             .collect();
         Preprocessor { defs, include_dirs, file: String::new(), versions: None }
     }
@@ -189,6 +196,9 @@ impl Preprocessor {
                 {
                     let directive = trimmed[1..].trim_start();
                     let (word, rest) = split_word(directive);
+                    // A directive's C comments are not part of it (`#define N 1 /* why */`).
+                    let rest_text = strip_block_comments(rest);
+                    let rest = rest_text.as_str();
                     match word {
                         "if" => {
                             let on = active && self.eval_cond(rest)?;
@@ -452,7 +462,7 @@ impl Preprocessor {
         }
         let expanded = self.expand_line(&with_defined, 0)?;
         let mut p = ExprParser { toks: tokenize(&expanded)?, pos: 0 };
-        let v = p.ternary()?;
+        let v = p.ternary().map_err(|e| format!("{e}: {} (as {})", expr.trim(), expanded.trim()))?;
         if p.pos != p.toks.len() {
             return Err(format!("invalid #if expression: {expr}"));
         }
@@ -822,6 +832,14 @@ impl ExprParser {
     }
 }
 
+/// `MIN_VERSION_GLASGOW_HASKELL(ma,mi,pl1,pl2)`, as GHC's ghcversion.h defines it.
+fn min_version_ghc() -> Macro {
+    let params = ["ma", "mi", "pl1", "pl2"].map(String::from).to_vec();
+    Macro::Function(params, MIN_VERSION_GHC_BODY.to_string())
+}
+
+const MIN_VERSION_GHC_BODY: &str = "( ((ma)*100+(mi)) < __GLASGOW_HASKELL__ || ((ma)*100+(mi)) == __GLASGOW_HASKELL__ && (pl1) < __GLASGOW_HASKELL_PATCHLEVEL1__ || ((ma)*100+(mi)) == __GLASGOW_HASKELL__ && (pl1) == __GLASGOW_HASKELL_PATCHLEVEL1__ && (pl2) <= __GLASGOW_HASKELL_PATCHLEVEL2__ )";
+
 /// Used by `MIN_VERSION_*` tests: the table entry for a package, if known.
 pub fn package_version(pkg: &str) -> Option<[u32; 3]> {
     PACKAGE_VERSIONS.iter().find(|(p, _)| *p == pkg).map(|(_, v)| *v)
@@ -836,10 +854,31 @@ pub fn c_macro_definitions() -> String {
             out.push_str(&format!("#ifndef {k}\n#define {k} {v}\n#endif\n"));
         }
     }
+    out.push_str(&format!("#ifndef MIN_VERSION_GLASGOW_HASKELL\n#define MIN_VERSION_GLASGOW_HASKELL(ma,mi,pl1,pl2) {MIN_VERSION_GHC_BODY}\n#endif\n"));
     for (p, [a, b, c]) in PACKAGE_VERSIONS {
         out.push_str(&format!(
             "#define MIN_VERSION_{p}(x,y,z) ((x)<{a} || ((x)=={a} && ((y)<{b} || ((y)=={b} && (z)<={c}))))\n"
         ));
     }
+    out
+}
+
+/// A directive's text without its `/* .. */` comments (each one is a space, as in C).
+fn strip_block_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => {
+                out.push(' ');
+                rest = &rest[start + 2 + end + 2..];
+            }
+            None => {
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
     out
 }

@@ -923,6 +923,8 @@ impl Parser {
         }
         if self.at_special('{') {
             self.bump();
+            // Record braces open an explicit layout context (the `}` may be at the block's column).
+            self.ctx.push(Ctx::Explicit);
             let mut groups: Vec<(Vec<String>, Field)> = Vec::new();
             while !self.at_special('}') {
                 let mut fnames = Vec::new();
@@ -952,6 +954,7 @@ impl Parser {
                 }
             }
             self.bump();
+            self.ctx.pop();
             self.expect_res(ROp::RArrow)?;
             let result = self.sigtype()?;
             return Ok(names
@@ -1345,6 +1348,7 @@ impl Parser {
         let record = self.at_special('{');
         if record {
             self.bump();
+            self.ctx.push(Ctx::Explicit);
             args.clear();
             while !self.at_special('}') {
                 match self.tok().clone() {
@@ -1359,6 +1363,7 @@ impl Parser {
                 }
             }
             self.bump();
+            self.ctx.pop();
         }
         let (pat, dir) = if self.at_res(ROp::Eq) {
             self.bump();

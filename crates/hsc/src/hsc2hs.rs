@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Bumped when the translation changes, so that cached translations are made again.
-const TRANSLATOR_VERSION: &str = "hsc2hs-4";
+const TRANSLATOR_VERSION: &str = "hsc2hs-5";
 
 const KEYWORDS: &[&str] = &[
     "const", "const_str", "type", "peek", "poke", "ptr", "offset", "size", "alignment", "enum", "let", "def", "comment",
@@ -81,7 +81,13 @@ fn split(src: &str) -> Vec<Part> {
             i += 1;
             continue;
         }
-        // `##` before a keyword stands for a single `#`.
+        // `##` stands for a single `#` (`##if` for a C directive in the output, `I## x` for a
+        // MagicHash name, `(## s, 1## ##)` for an unboxed tuple).
+        if chars.get(i + 1) == Some(&'#') {
+            text.push('#');
+            i += 2;
+            continue;
+        }
         let braced = chars.get(i + 1) == Some(&'{');
         let start = if braced { i + 2 } else { i + 1 };
         let mut j = start;
@@ -97,19 +103,6 @@ fn split(src: &str) -> Vec<Part> {
         }
         let kw: String = chars[kw_start..j].iter().collect();
         let prev_ident = i > 0 && is_ident(chars[i - 1]);
-        if chars.get(i + 1) == Some(&'#') && !prev_ident {
-            // `##keyword`: a literal `#`.
-            let mut k = i + 2;
-            while k < chars.len() && chars[k].is_alphanumeric() {
-                k += 1;
-            }
-            let w: String = chars[i + 2..k].iter().collect();
-            if KEYWORDS.contains(&w.as_str()) {
-                text.push('#');
-                i += 2;
-                continue;
-            }
-        }
         // C preprocessor directives count only at the start of a line.
         let line_start = chars[..i].iter().rev().take_while(|&&ch| ch != '\n').all(|ch| ch.is_whitespace());
         let cpp_mid_line = CPP.contains(&kw.as_str()) && !braced && !line_start;
@@ -384,4 +377,29 @@ pub fn translate(path: &Path, flags: &[String]) -> Result<PathBuf, String> {
     std::fs::write(&out, &run.stdout).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_dir_all(&dir);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(src: &str) -> String {
+        split(src)
+            .into_iter()
+            .map(|p| match p {
+                Part::Text(t) => t,
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    /// `##` is a literal `#` wherever it is (as hsc2hs has it): after a MagicHash name, in an
+    /// unboxed tuple, and before a C directive.
+    #[test]
+    fn double_hash_is_one_hash() {
+        assert_eq!(text_of("x = unpackCStringUtf8## addr\n"), "x = unpackCStringUtf8# addr\n");
+        assert_eq!(text_of("(## s', 1## ##) -> I## (addr2Int## a)\n"), "(# s', 1# #) -> I# (addr2Int# a)\n");
+        assert_eq!(text_of("##if defined(PROFILING)\n"), "#if defined(PROFILING)\n");
+        assert_eq!(text_of("f :: Int# -> Int#\n"), "f :: Int# -> Int#\n");
+    }
 }

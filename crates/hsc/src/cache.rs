@@ -335,7 +335,7 @@ bin_struct!(TyConInfo { arity, cons });
 bin_struct!(DataCon { name, tycon, tag, arity, scheme, fields, newtype, strict });
 bin_struct!(Synonym { nparams, rhs });
 bin_struct!(ClassInfo { name, nparams, supers, methods, defaults, default_schemes, dict_con, fundeps });
-bin_struct!(InstInfo { class, nvars, ctx, head, dict });
+bin_struct!(InstInfo { class, nvars, ctx, head, dict, kinds });
 bin_struct!(FamEqn { nvars, args, rhs, kinds });
 bin_struct!(FamilyInfo { arity, closed, equations, injective });
 

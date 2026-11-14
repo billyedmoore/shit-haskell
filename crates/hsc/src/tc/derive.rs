@@ -3,6 +3,7 @@
 //! deriving, including the `Show` output format.
 
 use super::{Checker, TR};
+use super::types::Ty;
 use crate::syntax::ast::{
     Alt, Body, Clause, ConDecl, ConFields, DataDecl, Decl, Expr, InstDecl, Lit, Loc, Pat, QName, Rhs,
     Strategy, Type,
@@ -292,6 +293,11 @@ fn collect_needs(t: &Type, last: Option<&str>, add: &mut dyn FnMut(&Type)) {
     // element needs (`[a]` needs `Show a`), a tuple what each component needs.
     match t {
         Type::List(e, _) => return collect_needs(e, last, add),
+        // A function field (`s -> m (a, s)`): what its argument and result need.
+        Type::Fun(a, b) => {
+            collect_needs(a, last, add);
+            return collect_needs(b, last, add);
+        }
         Type::Tuple(ts, _) => {
             for x in ts {
                 collect_needs(x, last, add);
@@ -1429,6 +1435,88 @@ pub(super) fn field_types(c: &ConDecl) -> Vec<Type> {
     }
 }
 
+/// A constructor's field types with type synonyms expanded, for the derivations that follow a
+/// field's structure (Functor, Foldable, Traversable): `[LFormula a]` with
+/// `type LFormula a = Located String (Formula a)` maps inside the `Located`.
+fn expanded_field_types(checker: &Checker, c: &ConDecl) -> Vec<Type> {
+    field_types(c).iter().map(|t| expand_synonyms(checker, t, 0)).collect()
+}
+
+fn expand_synonyms(checker: &Checker, t: &Type, depth: usize) -> Type {
+    if depth > 50 {
+        return t.clone();
+    }
+    let mut head = t;
+    let mut args: Vec<&Type> = Vec::new();
+    while let Type::App(f, x) = head {
+        args.push(x);
+        head = f;
+    }
+    args.reverse();
+    if let Type::Con(q, _) = head {
+        let key = checker.resolve_type(&super::expr::qkey(q));
+        if let Some(syn) = checker.env.synonyms.get(&key) {
+            let n = syn.nparams as usize;
+            if args.len() >= n {
+                let params: Vec<Type> = args[..n].iter().map(|a| (*a).clone()).collect();
+                if let Some(rhs) = ty_to_ast(&syn.rhs, &params) {
+                    let whole = args[n..].iter().fold(rhs, |acc, a| Type::App(Box::new(acc), Box::new((*a).clone())));
+                    return expand_synonyms(checker, &whole, depth + 1);
+                }
+            }
+        }
+    }
+    let go = |x: &Type| Box::new(expand_synonyms(checker, x, depth + 1));
+    match t {
+        Type::App(f, x) => Type::App(go(f), go(x)),
+        Type::Fun(a, b) => Type::Fun(go(a), go(b)),
+        Type::List(e, l) => Type::List(go(e), *l),
+        Type::Tuple(ts, l) => Type::Tuple(ts.iter().map(|x| expand_synonyms(checker, x, depth + 1)).collect(), *l),
+        _ => t.clone(),
+    }
+}
+
+/// A checked type (a synonym's right-hand side) as syntax, its parameters `Gen(i)` being
+/// `params[i]`. None for what syntax cannot say here (unification variables).
+fn ty_to_ast(t: &Ty, params: &[Type]) -> Option<Type> {
+    let loc = Loc::default();
+    let (head, args) = t.split_apps();
+    let args: Vec<Type> = args.into_iter().map(|a| ty_to_ast(a, params)).collect::<Option<_>>()?;
+    let con = match head {
+        Ty::Gen(i) => params.get(*i as usize)?.clone(),
+        Ty::Con(c) if c == super::types::ARROW && args.len() == 2 => {
+            return Some(Type::Fun(Box::new(args[0].clone()), Box::new(args[1].clone())));
+        }
+        Ty::Con(c) if c == super::types::LIST && args.len() == 1 => return Some(Type::List(Box::new(args[0].clone()), loc)),
+        Ty::Con(c) if c.starts_with("Builtin.(,") && c.len() - "Builtin.()".len() + 1 == args.len() => {
+            return Some(Type::Tuple(args, loc));
+        }
+        Ty::Con(c) => {
+            let q = match global_split(c) {
+                Some((m, n)) => QName { qual: Some(m.to_string()), name: n.to_string() },
+                None => QName::unqual(c.clone()),
+            };
+            Type::Con(q, loc)
+        }
+        _ => return None,
+    };
+    Some(args.into_iter().fold(con, |acc, a| Type::App(Box::new(acc), Box::new(a))))
+}
+
+/// A global name's module and occurrence (`GHC.Types.Int`, `GHC.Base.:|`).
+fn global_split(c: &str) -> Option<(&str, &str)> {
+    let mut start = 0;
+    while let Some(dot) = c[start..].find('.').map(|i| i + start) {
+        let rest = &c[dot + 1..];
+        // The occurrence: what follows the last dot that a module component's capital follows.
+        if !rest.starts_with(|ch: char| ch.is_ascii_uppercase()) || !rest.contains('.') {
+            return if dot > 0 && !rest.is_empty() { Some((&c[..dot], rest)) } else { None };
+        }
+        start = dot + 1;
+    }
+    None
+}
+
 /// Whether a type mentions a type variable.
 fn mentions(t: &Type, v: &str) -> bool {
     match t {
@@ -1496,10 +1584,10 @@ fn derive_functor(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
     let mut clauses = Vec::new();
     for c in &dd.cons {
         let f = checker.fresh_name("f");
-        let n = field_types(c).len();
-        let xs = fresh_vars(checker, "x", n);
+        let ftys = expanded_field_types(checker, c);
+        let xs = fresh_vars(checker, "x", ftys.len());
         let mut args = Vec::new();
-        for (t, x) in field_types(c).iter().zip(&xs) {
+        for (t, x) in ftys.iter().zip(&xs) {
             args.push(match map_fn(checker, t, &last, &f, loc) {
                 Some(m) => app(m, vec![local(x, loc)]),
                 None => local(x, loc),
@@ -1557,10 +1645,10 @@ fn derive_foldable(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
     for c in &dd.cons {
         let f = checker.fresh_name("f");
         let z = checker.fresh_name("z");
-        let n = field_types(c).len();
-        let xs = fresh_vars(checker, "x", n);
+        let ftys = expanded_field_types(checker, c);
+        let xs = fresh_vars(checker, "x", ftys.len());
         let mut acc = local(&z, loc);
-        for (t, x) in field_types(c).iter().zip(&xs).rev() {
+        for (t, x) in ftys.iter().zip(&xs).rev() {
             acc = fold_expr(checker, t, &last, &f, local(x, loc), acc, loc);
         }
         clauses.push(clause(
@@ -1622,10 +1710,10 @@ fn derive_traversable(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
     let mut clauses = Vec::new();
     for c in &dd.cons {
         let f = checker.fresh_name("f");
-        let n = field_types(c).len();
-        let xs = fresh_vars(checker, "x", n);
+        let ftys = expanded_field_types(checker, c);
+        let xs = fresh_vars(checker, "x", ftys.len());
         let mut action = app(base_var("pure", loc), vec![con_expr(&module, &c.name, loc)]);
-        for (t, x) in field_types(c).iter().zip(&xs) {
+        for (t, x) in ftys.iter().zip(&xs) {
             let a = trav_expr(checker, t, &last, &f, local(x, loc), loc);
             action = app(base_var("<*>", loc), vec![action, a]);
         }
