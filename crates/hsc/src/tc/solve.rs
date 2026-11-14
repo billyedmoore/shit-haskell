@@ -165,6 +165,26 @@ impl Checker {
                 let app = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrApp".into());
                 Core::App(Box::new(Core::App(Box::new(app), Box::new(rf))), Box::new(rx))
             }
+            // A variable of kind Symbol, Nat or Char with a `KnownSymbol`/`KnownNat`/`KnownChar`
+            // given (and no Typeable one): its representation is built from the literal's value.
+            Ty::Skol(..) if args.is_empty() && self.find_given(pred).is_none() => {
+                let known = [
+                    ("GHC.Internal.TypeLits.KnownSymbol", "typeSymbolTypeRep"),
+                    ("GHC.Internal.TypeNats.KnownNat", "typeNatTypeRep"),
+                    ("GHC.Internal.TypeLits.KnownChar", "typeCharTypeRep"),
+                ];
+                let found = known.iter().find_map(|(c, f)| {
+                    let want = Pred { class: (*c).into(), args: vec![t.clone()] };
+                    self.find_given(&want).map(|ev| (*f, ev))
+                });
+                match found {
+                    Some((f, ev)) => {
+                        let mk = Core::Var(format!("GHC.Internal.Data.Typeable.Internal.{f}"));
+                        Core::App(Box::new(mk), Box::new(ev))
+                    }
+                    None => return Ok(None),
+                }
+            }
             _ => return Ok(None),
         };
         Ok(Some(Core::Con(class, vec![rep])))
@@ -277,6 +297,16 @@ impl Checker {
             let _ = self.metas.unify_refine(&a, &b);
         }
         let family = self.env.families.contains_key(&g.pred.class);
+        // A constraint family that reduces gives what it reduces to (its evidence is their tuple).
+        if family {
+            if let Some(parts) = self.constraint_family_parts(&g.pred.class, &g.pred.args) {
+                let n = parts.len();
+                for (i, part) in parts.into_iter().enumerate() {
+                    let ev = if n == 1 { g.ev.clone() } else { super::select_field(g.ev.clone(), &Ty::tuple_con(n), n, i, &mut || self.fresh_name("cg")) };
+                    self.add_given(Given { pred: part, ev });
+                }
+            }
+        }
         self.givens.push(g);
         if family {
             self.refine_family_givens();
@@ -364,15 +394,22 @@ impl Checker {
             // A constraint family (`type family C a :: Constraint`) that reduces to no class
             // constraints holds; its evidence is unused.
             if self.env.families.contains_key(&pred.class) {
-                let applied = Ty::apps(Ty::con(&pred.class), pred.args.clone());
-                let reduced = self.normalize(&applied);
-                if reduced != applied {
-                    let preds = super::convert::ty_to_preds(&reduced);
-                    for p in preds {
+                // Its evidence is the tuple of the dictionaries of what it reduces to (a given of
+                // it provides them: `KnownConstructor con` gives `KnownNat (GhcDiagnosticCode con)`).
+                if let Some(parts) = self.constraint_family_parts(&pred.class, &pred.args) {
+                    let mut evs = Vec::with_capacity(parts.len());
+                    for p in parts {
                         let ev = self.fresh_name("cf");
+                        evs.push(Core::Var(ev.clone()));
                         work.push(Wanted { pred: p, ev, loc: w.loc });
                     }
-                    binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
+                    let n = evs.len();
+                    let ev = match n {
+                        0 => Core::Con("Builtin.()".into(), vec![]),
+                        1 => evs.pop().unwrap_or(Core::Con("Builtin.()".into(), vec![])),
+                        _ => Core::Con(Ty::tuple_con(n), evs),
+                    };
+                    binds.push((w.ev.clone(), ev));
                     continue;
                 }
                 // A stuck family constraint is taken to hold: its evidence is never inspected,
@@ -404,6 +441,9 @@ impl Checker {
             }
             // Representational equality is not checked (coercions are erased), so it always holds.
             if pred.class == "GHC.Types.Coercible" {
+                if pred.args.len() == 2 {
+                    self.coercions.push((pred.args[0].clone(), pred.args[1].clone()));
+                }
                 binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
                 continue;
             }
@@ -883,6 +923,41 @@ impl Checker {
 
     /// Finds an instance for a predicate. Returns the dictionary function name and the
     /// instance context instantiated for this predicate.
+    /// The runtime representation of a type's kind, as a kind annotation names it (`Int#` is
+    /// "IntRep", a data type "BoxedRep Lifted"); None when not known here.
+    fn rep_of_type(&self, t: &Ty) -> Option<String> {
+        let t = self.metas.zonk(t);
+        let Ty::Con(c) = t.split_apps().0 else { return None };
+        if let Some(prim) = c.strip_prefix("GHC.Prim.") {
+            let rep = match prim {
+                "Int#" => "IntRep",
+                "Int8#" => "Int8Rep",
+                "Int16#" => "Int16Rep",
+                "Int32#" => "Int32Rep",
+                "Int64#" => "Int64Rep",
+                "Word#" | "Char#" => "WordRep",
+                "Word8#" => "Word8Rep",
+                "Word16#" => "Word16Rep",
+                "Word32#" => "Word32Rep",
+                "Word64#" => "Word64Rep",
+                "Double#" => "DoubleRep",
+                "Float#" => "FloatRep",
+                "Addr#" | "StablePtr#" => "AddrRep",
+                "Array#" | "MutableArray#" | "SmallArray#" | "SmallMutableArray#" | "ByteArray#" | "MutableByteArray#" | "MutVar#" | "MVar#"
+                | "TVar#" | "Weak#" | "ThreadId#" | "StableName#" | "BCO" | "Compact#" | "PromptTag#" | "StackSnapshot#" | "IOPort#" => {
+                    "BoxedRep Unlifted"
+                }
+                _ => return None,
+            };
+            return Some(rep.into());
+        }
+        if c.starts_with("Builtin.(#") || self.env.families.contains_key(c) {
+            return None;
+        }
+        let known = c == super::types::LIST || c == super::types::ARROW || c.starts_with("Builtin.(") || self.env.tycons.contains_key(c);
+        known.then(|| "BoxedRep Lifted".to_string())
+    }
+
     pub fn find_instance(&self, want: &Pred) -> Option<(String, Vec<Pred>)> {
         // Every matching instance; the most specific is chosen (an instance whose head another one's
         // head matches is more specific), as GHC chooses among overlapping instances. Kinds are not
@@ -891,6 +966,14 @@ impl Checker {
         let mut matches: Vec<(&InstInfo, Vec<Option<Ty>>)> = Vec::new();
         for inst in &self.env.instances {
             if inst.class != want.class || inst.head.len() != want.args.len() {
+                continue;
+            }
+            // An instance for a kind (`(a :: TYPE 'IntRep)`) is for types of that representation.
+            let kind_ok = inst.kinds.iter().zip(&want.args).all(|(k, t)| match (k, self.rep_of_type(t)) {
+                (Some(want_rep), Some(have)) => *want_rep == have,
+                _ => true,
+            });
+            if !kind_ok {
                 continue;
             }
             let mut sub: Vec<Option<Ty>> = vec![None; inst.nvars as usize];
@@ -994,6 +1077,14 @@ impl Checker {
                     .map(|w| self.metas_zonk_pred(&w.pred))
                     .filter(|p| p.args.iter().any(|a| matches!(self.metas.prune(a), Ty::Meta(x) if x == m)))
                     .collect();
+                // A variable that a coercion relates to a type is that type, as the nominal
+                // role of a parameter (`coerce Set.intersection :: ModuleSet -> ...`, Set's
+                // parameter being nominal) makes it in GHC.
+                if let Some(t) = self.coercible_partner(m) {
+                    self.metas.subst[m as usize] = Some(t);
+                    progress = true;
+                    continue;
+                }
                 // A type that only `Typeable` constrains is a kind argument this checker does not
                 // track (kinds are not inferred for signatures); it is taken as unit.
                 if preds_on_m.iter().all(|p| p.class == TYPEABLE_CLASS) && !preds_on_m.is_empty() {
@@ -1037,6 +1128,53 @@ impl Checker {
             residual = rest;
         }
         Ok(residual)
+    }
+
+    /// The type opposite unification variable `m` in a solved coercion with both sides headed
+    /// by the same constructor, if any. Coercions without variables left are dropped.
+    fn coercible_partner(&mut self, m: u32) -> Option<Ty> {
+        fn walk(c: &Checker, a: &Ty, b: &Ty, m: u32) -> Option<Ty> {
+            let (a, b) = (c.metas.prune(a), c.metas.prune(b));
+            match (&a, &b) {
+                (Ty::Meta(x), Ty::Meta(y)) if x == y => None,
+                (Ty::Meta(x), _) if *x == m && !c.occurs_meta(m, &b) => Some(b.clone()),
+                (_, Ty::Meta(y)) if *y == m && !c.occurs_meta(m, &a) => Some(a.clone()),
+                (Ty::App(f1, x1), Ty::App(f2, x2)) if c.same_head(&a, &b) => walk(c, f1, f2, m).or_else(|| walk(c, x1, x2, m)),
+                _ => None,
+            }
+        }
+        let pairs = std::mem::take(&mut self.coercions);
+        let kept: Vec<(Ty, Ty)> = pairs.into_iter().filter(|(a, b)| self.has_metas(a) || self.has_metas(b)).collect();
+        let found = kept.iter().find_map(|(a, b)| if self.same_head(a, b) { walk(self, a, b, m) } else { None });
+        self.coercions = kept;
+        found
+    }
+
+    /// Whether two types are applications of the same type constructor (after pruning).
+    fn same_head(&self, a: &Ty, b: &Ty) -> bool {
+        fn head(c: &Checker, t: &Ty) -> Option<String> {
+            match c.metas.prune(t) {
+                Ty::Con(n) => Some(n),
+                Ty::App(f, _) => head(c, &f),
+                _ => None,
+            }
+        }
+        // A newtype's coercion relates it to its representation, not argument-wise.
+        match (head(self, a), head(self, b)) {
+            (Some(x), Some(y)) => {
+                let newtype = self.env.tycons.get(&x).and_then(|t| t.cons.first()).and_then(|c| self.env.datacons.get(c)).is_some_and(|d| d.newtype);
+                x == y && !newtype && !self.env.families.contains_key(&x)
+            }
+            _ => false,
+        }
+    }
+
+    fn occurs_meta(&self, m: u32, t: &Ty) -> bool {
+        match self.metas.prune(t) {
+            Ty::Meta(x) => x == m,
+            Ty::App(f, x) => self.occurs_meta(m, &f) || self.occurs_meta(m, &x),
+            _ => false,
+        }
     }
 
     /// Evidence bindings produced at top level are kept as global bindings.

@@ -1,5 +1,7 @@
 //! Expression and pattern checking, with elaboration to Core.
 
+use std::collections::HashMap;
+
 use super::types::{subst_gen, subst_gen_pred, Pred, Scheme, Ty};
 use super::{Checker, TR, Wanted};
 use crate::core::matcher::{compile_body, compile_rows, CBody, CGuard, CPat, Row};
@@ -74,11 +76,20 @@ impl Checker {
             }
             Expr::Let(decls, body, loc) if !decls.iter().any(|d| matches!(d, Decl::IPBind { .. })) => {
                 self.loc = *loc;
-                let binds = self.infer_local(decls)?;
+                let (mut binds, deferred) = self.infer_local_deferring(decls)?;
                 let cb = self.check(body, ty)?;
+                binds.extend(self.finish_deferred(deferred)?);
                 Ok(self.wrap_let_forcing(binds, cb))
             }
             Expr::App(..) => Ok(self.infer_spine(e, Some(ty))?.0),
+            // A record construction against its expected type: the result type is known before
+            // the fields are checked, so that a field's family type can reduce.
+            Expr::RecCon { con, fields, loc, .. } if self.env.datacons.contains_key(&qkey(con)) => {
+                self.loc = *loc;
+                let (core, t) = self.infer_rec_con_at(con, fields, *loc, Some(ty))?;
+                self.unify_at(ty, &t)?;
+                Ok(core)
+            }
             // A comprehension is checked at its expected type, so that the refinement of a generator's
             // pattern (a GADT match) reaches the element expression.
             Expr::ListComp(body, branches, loc) if branches.len() == 1 => {
@@ -329,10 +340,21 @@ impl Checker {
             // A polymorphic result applied to further arguments (`unPut p k` with a rank-N field) is
             // instantiated first.
             let mut found: Vec<Pred> = Vec::new();
-            while let Ty::Forall(ids, ps, body) = self.metas.prune(&tf) {
-                let args: Vec<Ty> = ids.iter().map(|_| self.meta()).collect();
-                found.extend(ps.iter().map(|p| super::types::subst_bound_pred(p, &ids, &args)));
-                tf = super::types::subst_bound(&body, &ids, &args);
+            loop {
+                match self.metas.prune(&tf) {
+                    Ty::Forall(ids, ps, body) => {
+                        let args: Vec<Ty> = ids.iter().map(|_| self.meta()).collect();
+                        found.extend(ps.iter().map(|p| super::types::subst_bound_pred(p, &ids, &args)));
+                        tf = super::types::subst_bound(&body, &ids, &args);
+                    }
+                    // A constrained result (a field `Render doc => Renderer doc -> Int -> doc`)
+                    // takes its dictionaries before the next argument.
+                    Ty::Qual(ps, body) => {
+                        found.extend(ps);
+                        tf = *body;
+                    }
+                    _ => break,
+                }
             }
             if !found.is_empty() {
                 mid_dicts.push((params.len(), found));
@@ -611,8 +633,9 @@ impl Checker {
             }
             Expr::Let(decls, body, loc) => {
                 self.loc = *loc;
-                let binds = self.infer_local(decls)?;
+                let (mut binds, deferred) = self.infer_local_deferring(decls)?;
                 let (cb, tb) = self.infer(body)?;
+                binds.extend(self.finish_deferred(deferred)?);
                 Ok((self.wrap_let_forcing(binds, cb), tb))
             }
             Expr::If(c, t, f, loc) => {
@@ -675,6 +698,11 @@ impl Checker {
             }
             Expr::Do(stmts, loc) => {
                 self.loc = *loc;
+                if self.applicative_do {
+                    if let Some(e) = applicative_do(stmts, *loc) {
+                        return self.infer(&e);
+                    }
+                }
                 let desugared = self.desugar_do(stmts, *loc)?;
                 self.infer(&desugared)
             }
@@ -770,7 +798,8 @@ impl Checker {
             Expr::ListComp(body, branches, loc) => {
                 self.loc = *loc;
                 if branches.len() != 1 {
-                    return self.err("Parallel list comprehensions are not supported yet");
+                    let desugared = self.desugar_parallel_comp(body, branches, *loc);
+                    return self.infer(&desugared);
                 }
                 let desugared = self.desugar_comp(body, &branches[0], *loc);
                 self.infer(&desugared)
@@ -900,6 +929,13 @@ impl Checker {
             })
             .collect();
         let ty = subst_gen(&scheme.ty, &args);
+        // `coerce :: a -> b` (a primitive, its `Coercible a b` not checked): the two types are
+        // kept to resolve a variable otherwise ambiguous (see `coercible_partner`).
+        if name == "GHC.Prim.coerce" {
+            if let Some((a, b)) = ty.as_fun() {
+                self.coercions.push((a.clone(), b.clone()));
+            }
+        }
         let preds: Vec<Pred> = scheme.preds.iter().map(|p| subst_gen_pred(p, &args)).collect();
         let mut core = Core::Var(name.to_string());
         for p in preds {
@@ -1215,9 +1251,20 @@ impl Checker {
                 return self.err(format!("Couldn't match expected type ‘{t}’ with actual type ‘{r}’"));
             }
         }
+        // A scrutinee type stuck on a family of unknowns (`XRec pass (HsType pass)` in a local
+        // function without a signature) is not refined: its equality with the pattern's type
+        // waits as a wanted, as GHC has it.
+        let deferred_from = self.deferred_eqs.len();
+        if self.has_family(&ty_n) && self.has_metas(&self.metas.zonk(&ty_n)) {
+            self.unify_at(&cur_n, &ty_n)?;
+        }
         // Variables that do not occur in the scrutinee type are existential: rigid.
         let mut scrut_metas = Vec::new();
         self.metas.free_metas(&self.metas.zonk(ty), &mut scrut_metas);
+        for (a, b, _) in self.deferred_eqs[deferred_from..].to_vec() {
+            self.metas.free_metas(&self.metas.zonk(&a), &mut scrut_metas);
+            self.metas.free_metas(&self.metas.zonk(&b), &mut scrut_metas);
+        }
         for v in &vars {
             if let Ty::Meta(m) = self.metas.prune(v) {
                 if !scrut_metas.contains(&m) {
@@ -1342,15 +1389,16 @@ impl Checker {
             let body = self.alt_end(mark, inner)?;
             return Ok(CBody::Where(binds, Box::new(body)));
         }
-        let wheres = if rhs.wheres.is_empty() {
-            Vec::new()
+        let (mut wheres, deferred) = if rhs.wheres.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            self.infer_local(&rhs.wheres)?
+            self.infer_local_deferring(&rhs.wheres)?
         };
         let body = match &rhs.body {
             Body::Plain(e) => CBody::Expr(self.check(e, ty)?),
             Body::Guarded(alts) => CBody::Guards(self.guard_alts(alts, ty)?),
         };
+        wheres.extend(self.finish_deferred(deferred)?);
         Ok(if wheres.is_empty() {
             body
         } else {
@@ -1490,6 +1538,49 @@ impl Checker {
         }
     }
 
+    /// A parallel comprehension `[e | qs1 | qs2 | ..]` (ParallelListComp): each branch is the
+    /// list of the variables it binds, the lists are zipped, and `e` is drawn from the zip
+    /// (`[e | ((x1, ..), ((y1, ..), ..)) <- zip [(x1, ..) | qs1] (zip [(y1, ..) | qs2] ..)]`).
+    fn desugar_parallel_comp(&mut self, body: &Expr, branches: &[Vec<Stmt>], loc: Loc) -> Expr {
+        let mut lists: Vec<(Pat, Expr)> = Vec::new();
+        for b in branches {
+            let mut vars: Vec<String> = Vec::new();
+            for st in b {
+                match st {
+                    Stmt::Bind { pat, .. } => vars.extend(crate::rename::pat_vars(pat).into_iter().map(|(v, _)| v)),
+                    Stmt::Let { decls, .. } => {
+                        for d in decls {
+                            match d {
+                                Decl::Fun { name, .. } => vars.push(name.clone()),
+                                Decl::PatBind { pat, .. } => vars.extend(crate::rename::pat_vars(pat).into_iter().map(|(v, _)| v)),
+                                _ => {}
+                            }
+                        }
+                    }
+                    Stmt::Expr { .. } => {}
+                }
+            }
+            let pat = match vars.as_slice() {
+                [one] => Pat::Var(one.clone(), loc),
+                _ => Pat::Tuple(vars.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), loc),
+            };
+            let tuple = match vars.as_slice() {
+                [one] => var(one, loc),
+                _ => Expr::Tuple(vars.iter().map(|v| Some(var(v, loc))).collect(), loc),
+            };
+            let list = self.desugar_comp(&tuple, b, loc);
+            lists.push((pat, list));
+        }
+        let Some((mut pat, mut list)) = lists.pop() else {
+            return Expr::List(vec![], loc);
+        };
+        while let Some((p, l)) = lists.pop() {
+            list = app(app(prelude("zip", loc), l), list);
+            pat = Pat::Tuple(vec![p, pat], loc);
+        }
+        self.desugar_comp(body, &[Stmt::Bind { pat, expr: list, loc }], loc)
+    }
+
     fn desugar_comp(&mut self, body: &Expr, quals: &[Stmt], loc: Loc) -> Expr {
         let Some((first, rest)) = quals.split_first() else {
             return Expr::List(vec![body.clone()], loc);
@@ -1594,6 +1685,10 @@ impl Checker {
     }
 
     fn infer_rec_con(&mut self, con: &QName, fields: &[(QName, Option<Expr>)], loc: Loc) -> TR<(Core, Ty)> {
+        self.infer_rec_con_at(con, fields, loc, None)
+    }
+
+    fn infer_rec_con_at(&mut self, con: &QName, fields: &[(QName, Option<Expr>)], loc: Loc, expected: Option<&Ty>) -> TR<(Core, Ty)> {
         let key = qkey(con);
         let info = self.env.datacons.get(&key).cloned().ok_or_else(|| super::TcError {
             loc,
@@ -1611,6 +1706,9 @@ impl Checker {
             };
             arg_tys.push(a);
             cur = r;
+        }
+        if let Some(t) = expected {
+            self.unify_at(t, &cur)?;
         }
         let mut args: Vec<Option<Core>> = vec![None; info.arity];
         for (f, value) in fields {
@@ -1642,6 +1740,146 @@ impl Checker {
         self.infer_binds(decls, false)
     }
 
+    /// Local bindings, with those whose type the body determines left for later (see
+    /// `finish_deferred`): under MonoLocalBinds a binding that is not closed has a monomorphic
+    /// type, and one that is a `case` (a GADT match, whose alternatives refine its type
+    /// differently: ghc-lib-parser's `x = case ghcPass @p of GhcPs -> noAnn; ..`) is checked
+    /// after its use fixes that type, as GHC's untouchable variables have it.
+    pub fn infer_local_deferring(&mut self, decls: &[Decl]) -> TR<(Vec<(String, Core)>, Vec<Deferred>)> {
+        if !self.mono_local_binds {
+            return Ok((self.infer_local(decls)?, Vec::new()));
+        }
+        let mut sig_of: HashMap<String, Type> = HashMap::new();
+        for d in decls {
+            if let Decl::Sig { names, ty, .. } = d {
+                for n in names {
+                    sig_of.insert(n.clone(), ty.clone());
+                }
+            }
+        }
+        // Which declarations wait (by position), and as what.
+        let candidate = |d: &Decl| -> Option<Deferred> {
+            match d {
+                Decl::Fun { name, clauses, loc } => {
+                    if sig_of.contains_key(name) {
+                        return None;
+                    }
+                    if let [c] = clauses.as_slice() {
+                        if let Body::Plain(e @ Expr::Case(..)) = &c.rhs.body {
+                            if c.pats.is_empty() && c.rhs.wheres.is_empty() && !is_closed_rhs(e) {
+                                return Some(Deferred::Var(name.clone(), e.clone(), Ty::Con(String::new())));
+                            }
+                        }
+                    }
+                    // A function that mentions a scoped type variable (`pp_implicit ext = .. case
+                    // ghcPass @p of ..`): checked as a `\case`-like lambda over its clauses.
+                    let arity = clauses.first()?.pats.len();
+                    if arity > 0 && clauses.iter().all(|c| c.pats.len() == arity) && clauses.iter().any(|c| mentions_type_var_rhs(&c.rhs)) {
+                        return Some(Deferred::Var(name.clone(), clauses_lambda(clauses, *loc), Ty::Con(String::new())));
+                    }
+                    None
+                }
+                // A pattern binding of a `case` (`(rm_fun, check_fun) = case lookup_mode of ..`),
+                // its variables simple and any signature monomorphic.
+                Decl::PatBind { pat, rhs, loc } => {
+                    let Body::Plain(e @ Expr::Case(..)) = &rhs.body else { return None };
+                    if is_closed_rhs(e) || !simple_pattern(pat) {
+                        return None;
+                    }
+                    let vars: Vec<String> = crate::rename::pat_vars(pat).into_iter().map(|(v, _)| v).collect();
+                    if vars.iter().any(|v| matches!(sig_of.get(v), Some(Type::Forall(..)) | Some(Type::Qual(..)))) {
+                        return None;
+                    }
+                    Some(Deferred::Pat { pat: pat.clone(), rhs: rhs.clone(), vars: vars.into_iter().map(|v| (v, Ty::Con(String::new()))).collect(), loc: *loc })
+                }
+                _ => None,
+            }
+        };
+        let defined = |x: &Deferred| -> Vec<String> {
+            match x {
+                Deferred::Var(n, ..) => vec![n.clone()],
+                Deferred::Pat { vars, .. } => vars.iter().map(|(v, _)| v.clone()).collect(),
+            }
+        };
+        // A binding the others use is checked with them.
+        let others: Vec<Decl> = decls.iter().filter(|d| candidate(d).is_none()).cloned().collect();
+        let used = super::bind::decls_referenced_names(&others);
+        let mut deferred: Vec<Deferred> = Vec::new();
+        let mut rest: Vec<Decl> = Vec::new();
+        let mut deferred_names: Vec<String> = Vec::new();
+        for d in decls {
+            match candidate(d) {
+                Some(x) if !defined(&x).iter().any(|n| used.contains(n)) => {
+                    deferred_names.extend(defined(&x));
+                    deferred.push(x);
+                }
+                _ => rest.push(d.clone()),
+            }
+        }
+        // The signatures of deferred pattern variables are used here, not by the others.
+        rest.retain(|d| !matches!(d, Decl::Sig { names, .. } if names.iter().all(|n| deferred_names.contains(n))));
+        for x in deferred.iter_mut() {
+            match x {
+                Deferred::Var(n, _, t) => {
+                    *t = self.meta();
+                    self.vars.insert(n.clone(), Scheme::mono(t.clone()));
+                }
+                Deferred::Pat { vars, .. } => {
+                    for (v, t) in vars.iter_mut() {
+                        *t = self.meta();
+                        if let Some(sig) = sig_of.get(v) {
+                            let sc = self.sig_scheme(sig, &[])?;
+                            if sc.nvars == 0 && sc.preds.is_empty() {
+                                self.unify_at(&sc.ty, t)?;
+                            }
+                        }
+                        self.vars.insert(v.clone(), Scheme::mono(t.clone()));
+                    }
+                }
+            }
+        }
+        let binds = self.infer_local(&rest)?;
+        Ok((binds, deferred))
+    }
+
+    /// Checks the deferred bindings (see `infer_local_deferring`) at the types their uses gave.
+    pub fn finish_deferred(&mut self, deferred: Vec<Deferred>) -> TR<Vec<(String, Core)>> {
+        let mut out = Vec::new();
+        for x in deferred {
+            match x {
+                Deferred::Var(n, e, t) => {
+                    let core = self.check(&e, &t)?;
+                    out.push((n, core));
+                }
+                Deferred::Pat { pat, rhs, vars, loc } => {
+                    self.loc = loc;
+                    // The pattern first, its variables at their types, then the right-hand side
+                    // against the pattern's type.
+                    let t = self.meta();
+                    let cpat = self.check_pat(&pat, &t)?;
+                    for (v, vt) in &vars {
+                        let bound = self.vars[v].ty.clone();
+                        self.unify_at(&bound, vt)?;
+                    }
+                    let body = self.rhs_body(&rhs, &t)?;
+                    let s = self.fresh_name("pb");
+                    let mut fresh = |b: &str| self.fresh_name(b);
+                    let rhs_core = compile_body(&body, Core::Fail("Non-exhaustive guards in pattern binding".into()), &mut fresh);
+                    out.push((s.clone(), rhs_core));
+                    for (v, _) in &vars {
+                        let extract = compile_rows(
+                            std::slice::from_ref(&s),
+                            &[Row { pats: vec![cpat.clone()], body: CBody::Expr(Core::Var(v.clone())) }],
+                            Core::Fail("Irrefutable pattern failed".into()),
+                            &mut fresh,
+                        );
+                        out.push((v.clone(), extract));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// The boxing constructors of unboxed types (`I#` and friends), which are identities here.
@@ -1724,5 +1962,185 @@ pub fn prim_lit(p: &crate::syntax::token::PrimLit, negative: bool) -> (Core, &'s
         PrimLit::Double(s) => (Core::Lit(CLit::Double(format!("{sign}{s}").parse().unwrap_or(0.0))), "GHC.Prim.Double#"),
         PrimLit::Char(c) => (Core::Lit(CLit::Char(*c)), "GHC.Prim.Char#"),
         PrimLit::Str(s) => (Core::Lit(CLit::Addr(s.clone())), "GHC.Prim.Addr#"),
+    }
+}
+
+/// Whether a binding's right-hand side is closed (MonoLocalBinds): it mentions no local
+/// variable and no type variable (approximately: a local's renamed name has a `%`).
+fn is_closed_rhs(e: &Expr) -> bool {
+    let names = super::bind::referenced_names(e);
+    !names.iter().any(|n| n.contains('%')) && !mentions_type_var(e)
+}
+
+/// Whether an expression has a type variable in a visible type application or an annotation,
+/// anywhere inside it (a scoped type variable: the binding is not closed).
+fn mentions_type_var(e: &Expr) -> bool {
+    fn ty_has_var(t: &Type) -> bool {
+        match t {
+            Type::Var(..) => true,
+            Type::App(a, b) | Type::Fun(a, b) => ty_has_var(a) || ty_has_var(b),
+            Type::List(a, _) => ty_has_var(a),
+            Type::Tuple(ts, _) => ts.iter().any(ty_has_var),
+            Type::Forall(_, b) | Type::Qual(_, b) => ty_has_var(b),
+            Type::Sig(a, _) => ty_has_var(a),
+            _ => false,
+        }
+    }
+    fn stmt(s: &Stmt) -> bool {
+        match s {
+            Stmt::Bind { expr, .. } | Stmt::Expr { expr, .. } => mentions_type_var(expr),
+            Stmt::Let { decls, .. } => decls.iter().any(decl),
+        }
+    }
+    fn rhs(r: &Rhs) -> bool {
+        let body = match &r.body {
+            Body::Plain(e) => mentions_type_var(e),
+            Body::Guarded(gs) => gs.iter().any(|(conds, e)| conds.iter().any(stmt) || mentions_type_var(e)),
+        };
+        body || r.wheres.iter().any(decl)
+    }
+    fn decl(d: &Decl) -> bool {
+        match d {
+            Decl::Fun { clauses, .. } => clauses.iter().any(|c| rhs(&c.rhs)),
+            Decl::PatBind { rhs: r, .. } => rhs(r),
+            _ => false,
+        }
+    }
+    match e {
+        Expr::TyApp(f, t, _) => ty_has_var(t) || mentions_type_var(f),
+        Expr::Sig(x, t, _) => ty_has_var(t) || mentions_type_var(x),
+        Expr::App(f, x) => mentions_type_var(f) || mentions_type_var(x),
+        Expr::OpChain(items, _) => items.iter().any(|i| matches!(i, crate::syntax::ast::OpItem::Operand(x) if mentions_type_var(x))),
+        Expr::Lam(_, b, _) => mentions_type_var(b),
+        Expr::Let(ds, b, _) => ds.iter().any(decl) || mentions_type_var(b),
+        Expr::If(c, t, f, _) => mentions_type_var(c) || mentions_type_var(t) || mentions_type_var(f),
+        Expr::MultiIf(alts, _) => alts.iter().any(|(conds, x)| conds.iter().any(stmt) || mentions_type_var(x)),
+        Expr::Case(s, alts, _) => mentions_type_var(s) || alts.iter().any(|a| rhs(&a.rhs)),
+        Expr::LamCase(alts, _) => alts.iter().any(|a| rhs(&a.rhs)),
+        Expr::Do(ss, _) => ss.iter().any(stmt),
+        Expr::Tuple(xs, _) => xs.iter().flatten().any(mentions_type_var),
+        Expr::List(xs, _) => xs.iter().any(mentions_type_var),
+        Expr::LeftSection(x, _, _) | Expr::RightSection(_, x, _) => mentions_type_var(x),
+        Expr::RecCon { fields, .. } => fields.iter().any(|(_, v)| v.as_ref().is_some_and(mentions_type_var)),
+        Expr::RecUpd(x, fields, _) => mentions_type_var(x) || fields.iter().any(|(_, v)| v.as_ref().is_some_and(mentions_type_var)),
+        _ => false,
+    }
+}
+
+pub(super) fn rhs_mentions_type_var(r: &Rhs) -> bool {
+    mentions_type_var_rhs(r)
+}
+
+fn mentions_type_var_rhs(r: &Rhs) -> bool {
+    mentions_type_var(&Expr::Case(Box::new(Expr::Wild(Loc::default())), vec![AstAlt { pat: Pat::Wild(Loc::default()), rhs: r.clone(), loc: Loc::default() }], Loc::default()))
+}
+
+/// A function's clauses as one lambda: `\x1 .. xn -> case (x1, .., xn) of` the clauses (one
+/// argument: no tuple).
+fn clauses_lambda(clauses: &[Clause], loc: Loc) -> Expr {
+    let n = clauses[0].pats.len();
+    let names: Vec<String> = (0..n).map(|i| format!("dfx%{i}")).collect();
+    let scrut = if n == 1 {
+        var(&names[0], loc)
+    } else {
+        Expr::Tuple(names.iter().map(|v| Some(var(v, loc))).collect(), loc)
+    };
+    let alts = clauses
+        .iter()
+        .map(|c| AstAlt {
+            pat: if n == 1 { c.pats[0].clone() } else { Pat::Tuple(c.pats.clone(), c.loc) },
+            rhs: c.rhs.clone(),
+            loc: c.loc,
+        })
+        .collect();
+    Expr::Lam(names.iter().map(|v| Pat::Var(v.clone(), loc)).collect(), Box::new(Expr::Case(Box::new(scrut), alts, loc)), loc)
+}
+
+/// A binding deferred until its use has given its type (see `infer_local_deferring`).
+pub enum Deferred {
+    /// A variable (or a function, as a lambda) and the type its uses gave it.
+    Var(String, Expr, Ty),
+    /// A pattern binding, with its variables' types.
+    Pat { pat: Pat, rhs: Rhs, vars: Vec<(String, Ty)>, loc: Loc },
+}
+
+/// A pattern of variables, tuples and laziness only (a banged binding is forced before the body,
+/// so it is not deferred).
+fn simple_pattern(p: &Pat) -> bool {
+    match p {
+        Pat::Var(..) | Pat::Wild(..) => true,
+        Pat::Tuple(ps, _) => ps.iter().all(simple_pattern),
+        Pat::Lazy(q, ..) => simple_pattern(q),
+        _ => false,
+    }
+}
+
+/// ApplicativeDo for a block of independent statements ending in `pure e` or `return e` (with
+/// or without `$`): `(\p1 .. pn -> e) <$> e1 <*> .. <*> en`, which needs only Applicative (one
+/// statement: only Functor). Other blocks are desugared with `>>=` as usual.
+fn applicative_do(stmts: &[Stmt], loc: Loc) -> Option<Expr> {
+    let (last, init) = stmts.split_last()?;
+    let Stmt::Expr { expr: last, .. } = last else { return None };
+    let body = returned(last)?;
+    if init.is_empty() {
+        return None;
+    }
+    let mut pats = Vec::new();
+    let mut actions = Vec::new();
+    let mut bound: Vec<String> = Vec::new();
+    for st in init {
+        let (pat, action) = match st {
+            Stmt::Bind { pat, expr, .. } => (pat.clone(), expr.clone()),
+            Stmt::Expr { expr, loc } => (Pat::Wild(*loc), expr.clone()),
+            Stmt::Let { .. } => return None,
+        };
+        // A refutable pattern would need MonadFail; a later action using a bound variable, Monad.
+        if !irrefutable_simple(&pat) {
+            return None;
+        }
+        let used = super::bind::referenced_names(&action);
+        if bound.iter().any(|b| used.contains(b)) {
+            return None;
+        }
+        bound.extend(crate::rename::pat_vars(&pat).into_iter().map(|(v, _)| v));
+        pats.push(pat);
+        actions.push(action);
+    }
+    let global = |n: &str| Expr::Var(QName { qual: Some("GHC.Internal.Base".into()), name: n.into() }, loc);
+    let f = Expr::Lam(pats, Box::new(body), loc);
+    let mut acc = app(app(global("fmap"), f), actions[0].clone());
+    for a in &actions[1..] {
+        acc = app(app(global("<*>"), acc), a.clone());
+    }
+    Some(acc)
+}
+
+/// The `e` of `pure e`, `return e`, `pure $ e` or `return $ e`.
+fn returned(e: &Expr) -> Option<Expr> {
+    let is_ret = |f: &Expr| matches!(f, Expr::Var(q, _) if q.name == "pure" || q.name == "return");
+    match e {
+        Expr::App(f, x) if is_ret(f) => Some((**x).clone()),
+        // `pure $ e`, its operator resolved.
+        Expr::App(f, x) if matches!(f.as_ref(), Expr::App(d, r) if matches!(d.as_ref(), Expr::Var(q, _) if q.name == "$") && is_ret(r)) => {
+            Some((**x).clone())
+        }
+        Expr::OpChain(items, _) => match items.as_slice() {
+            [crate::syntax::ast::OpItem::Operand(f), crate::syntax::ast::OpItem::Op(op, _), crate::syntax::ast::OpItem::Operand(x)]
+                if is_ret(f) && op.name == "$" =>
+            {
+                Some(x.clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A pattern whose match cannot fail: variables, wildcards, lazy patterns and tuples of them.
+fn irrefutable_simple(p: &Pat) -> bool {
+    match p {
+        Pat::Var(..) | Pat::Wild(..) | Pat::Lazy(..) => true,
+        Pat::Tuple(ps, _) => ps.iter().all(irrefutable_simple),
+        _ => false,
     }
 }

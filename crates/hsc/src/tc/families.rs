@@ -163,6 +163,12 @@ impl Checker {
             if !rhs_args[split..].iter().zip(trailing).all(|(r, p)| **r == *p) {
                 continue;
             }
+            // The rest of the right-hand side must not mention the missing arguments
+            // (`XRec (GhcPass p) a = Located (Anno a) a` is no `Located (Anno _)` partly applied).
+            let missing: Vec<u32> = trailing.iter().filter_map(|p| if let Ty::Gen(i) = p { Some(*i) } else { None }).collect();
+            if rhs_args[..split].iter().any(|a| missing.iter().any(|&i| mentions_gen(a, i))) {
+                continue;
+            }
             let mut rebuilt = rhs_head.clone();
             for a in &rhs_args[..split] {
                 rebuilt = Ty::app(rebuilt, (*a).clone());
@@ -277,7 +283,7 @@ impl Checker {
     }
 
     /// One reduction step at the head of `t`, if it is a family application that can reduce.
-    fn reduce_head(&self, t: &Ty) -> Option<Ty> {
+    pub(super) fn reduce_head(&self, t: &Ty) -> Option<Ty> {
         let Some((name, args)) = self.family_app(t) else {
             return self.partial_family_reduce(t);
         };
@@ -325,12 +331,23 @@ impl Checker {
                     let extra: Vec<Ty> = args[arity..].to_vec();
                     return Some(Ty::apps(body, extra));
                 }
-                // An equation that might still match blocks the later ones.
-                Match::Stuck => return None,
+                // An equation that might still match blocks the later ones of a closed family; an
+                // open family's instances are compatible, so another that matches gives the answer.
+                Match::Stuck if info.closed => return None,
+                Match::Stuck => continue,
                 Match::No => continue,
             }
         }
         None
+    }
+
+    /// One reduction of a constraint family application (its arguments normalised first): the
+    /// constraints it stands for, before they reduce further themselves. The wanted and the given
+    /// side agree on these, so the evidence is the tuple of their dictionaries.
+    pub(super) fn constraint_family_parts(&self, class: &str, args: &[Ty]) -> Option<Vec<super::types::Pred>> {
+        let applied = Ty::apps(Ty::con(class), args.iter().map(|a| self.normalize(a)).collect());
+        let reduced = self.reduce_head(&applied)?;
+        Some(super::convert::ty_to_preds(&self.metas.zonk(&reduced)))
     }
 
     /// Reduces every reducible family application in a type, to a fixed point.
@@ -407,8 +424,19 @@ impl Checker {
         for (a, b, loc) in pending {
             let a2 = self.normalize(&a);
             let b2 = self.normalize(&b);
+            if std::env::var_os("HSC_DEBUG_DEFER").is_some() {
+                eprintln!("deferred: {} ~ {}  now  {} ~ {}", self.show(&a), self.show(&b), self.show(&a2), self.show(&b2));
+            }
+            // Unchanged since it was deferred: still stuck (only new information can help).
+            if a2 == a && b2 == b {
+                self.deferred_eqs.push((a, b, loc));
+                continue;
+            }
             if self.has_family(&a2) || self.has_family(&b2) {
-                self.deferred_eqs.push((a2, b2, loc));
+                // Still stuck, but an injective family can improve it (`SyntaxExprGhc t ~
+                // SyntaxExprGhc p` gives `t ~ p`); what stays stuck is deferred again.
+                self.loc = loc;
+                self.unify_fam(&a2, &b2)?;
             } else {
                 self.loc = loc;
                 self.unify_at_raw(&a2, &b2)?;

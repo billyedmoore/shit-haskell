@@ -7,13 +7,17 @@ use super::env::{ClassInfo, InstInfo, Synonym, TyConInfo};
 use super::types::{subst_gen, Pred, Scheme, Ty};
 use super::{count_args, Checker, Given, TcError, Wanted, TR};
 use crate::core::{Alt, Core, TopBind};
-use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Module, Type};
+use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Module, QName, Type};
 
 impl Checker {
     /// Checks a renamed module and returns its Core bindings. The environment is
     /// extended with everything the module defines.
     pub fn check_module(&mut self, m: &Module) -> TR<Vec<TopBind>> {
         self.module = m.name.clone();
+        self.coercions.clear();
+        // Equalities a previous module left stuck are of no use to this one.
+        self.deferred_eqs.clear();
+        self.closed_locals.clear();
         self.dict_counter = 0;
         let decls = &m.decls;
 
@@ -802,7 +806,7 @@ impl Checker {
         }
         let mut tvs = Vec::new();
         let mut head = Vec::new();
-        for a in args {
+        for a in &args {
             // A head may name a data family instance: it is the representation type then.
             let converted = self.convert_type(a, &mut tvs)?;
             head.push(self.normalize(&converted));
@@ -821,11 +825,12 @@ impl Checker {
         converted?;
         // A module can be registered twice (first as a boot file, then for real): the same instance
         // keeps its dictionary name, so that what was compiled against the first still refers to it.
+        let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
         let earlier = self
             .env
             .instances
             .iter()
-            .position(|i| i.class == class && i.head == head && i.dict.starts_with(&format!("{}.$f", self.module)));
+            .position(|i| i.class == class && i.head == head && i.kinds == kinds && i.dict.starts_with(&format!("{}.$f", self.module)));
         let dict = match earlier {
             Some(i) => self.env.instances.remove(i).dict,
             None => {
@@ -845,6 +850,7 @@ impl Checker {
             ctx,
             head,
             dict,
+            kinds,
         });
         Ok(())
     }
@@ -977,6 +983,7 @@ impl Checker {
         // Find this instance's registered info by its head.
         let mut tvs = Vec::new();
         let mut head_check = Vec::new();
+        let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
         for a in args {
             let converted = self.convert_type(a, &mut tvs)?;
             head_check.push(self.normalize(&converted));
@@ -986,7 +993,7 @@ impl Checker {
             .instances
             .iter()
             .rev()
-            .find(|i| i.class == class && i.head == head_check)
+            .find(|i| i.class == class && i.head == head_check && (i.kinds.is_empty() || i.kinds == kinds))
             .cloned()
             .expect("instance registered");
         let info = self.class(&class).cloned().expect("class registered");
@@ -1226,6 +1233,7 @@ impl Checker {
                         ctx: vec![Pred { class: cls_name.clone(), args: vec![rep] }],
                         head: vec![head],
                         dict: dict.clone(),
+                        kinds: Vec::new(),
                     });
                     let d_name = self.fresh_name("gd");
                     self.out.push(TopBind { name: dict, body: Core::Lam(d_name.clone(), Box::new(Core::Var(d_name))) });
@@ -1307,6 +1315,7 @@ impl Checker {
                     ctx: vec![Pred { class: cls_name.clone(), args: ctx_args }],
                     head: heads,
                     dict: dict.clone(),
+                    kinds: Vec::new(),
                 });
                 let d_name = self.fresh_name("gd");
                 self.out.push(TopBind {
@@ -1596,4 +1605,30 @@ pub fn instantiate_method(mscheme: &Scheme, nparams: u32, head: &[Ty]) -> Scheme
 enum FfiResult {
     Bool,
     Box(String),
+}
+
+/// The runtime representation a kind annotation names (`(a :: TYPE 'IntRep)`, `(a :: Type)`), as
+/// `rep_of_type` names a type's.
+fn annotated_rep(t: &Type) -> Option<String> {
+    let Type::Sig(_, k) = t else { return None };
+    fn last(q: &QName) -> String {
+        q.name.trim_start_matches('\'').to_string()
+    }
+    match k.as_ref() {
+        Type::Con(q, _) if last(q) == "Type" || q.name == "*" => Some("BoxedRep Lifted".into()),
+        Type::Con(q, _) if last(q) == "UnliftedType" => Some("BoxedRep Unlifted".into()),
+        Type::App(f, r) if matches!(f.as_ref(), Type::Con(q, _) if last(q) == "TYPE") => match r.as_ref() {
+            Type::Con(q, _) => Some(match last(q).as_str() {
+                "LiftedRep" => "BoxedRep Lifted".to_string(),
+                "UnliftedRep" => "BoxedRep Unlifted".to_string(),
+                other => other.to_string(),
+            }),
+            Type::App(b, l) => match (b.as_ref(), l.as_ref()) {
+                (Type::Con(b, _), Type::Con(l, _)) if last(b) == "BoxedRep" => Some(format!("BoxedRep {}", last(l))),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
 }

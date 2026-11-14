@@ -48,6 +48,16 @@ pub struct Given {
 }
 
 pub struct Checker {
+    /// MonoLocalBinds: local bindings that are not closed are not generalised.
+    pub mono_local_binds: bool,
+    /// Local bindings that were generalised (closed ones, MonoLocalBinds): a binding that uses
+    /// only these and top-level names is closed too.
+    pub closed_locals: std::collections::HashSet<String>,
+    /// ApplicativeDo: `do` blocks of independent statements need only Applicative.
+    pub applicative_do: bool,
+    /// The `Coercible a b` constraints solved so far that still mention unification variables:
+    /// a variable left ambiguous is the type opposite it (see `coercible_partner`).
+    pub coercions: Vec<(Ty, Ty)>,
     pub env: Env,
     pub metas: Metas,
     pub level: u32,
@@ -139,6 +149,10 @@ pub const WIRED_MODULES: &[&str] = &[
 impl Checker {
     pub fn new() -> Checker {
         let mut c = Checker {
+            mono_local_binds: false,
+            closed_locals: std::collections::HashSet::new(),
+            applicative_do: false,
+            coercions: Vec::new(),
             env: Env::default(),
             metas: Metas::default(),
             level: 0,
@@ -214,7 +228,7 @@ impl Checker {
         // GHC library modules that define these names themselves; elsewhere a module's own `foldr`
         // (Data.ByteString's) is not the one desugaring means.
         let own = format!("{}.{occ}", self.module);
-        if self.module.starts_with("GHC.") && (self.vars.contains_key(&own) || self.env.values.contains_key(&own)) {
+        if !self.user_module && self.module.starts_with("GHC.") && (self.vars.contains_key(&own) || self.env.values.contains_key(&own)) {
             return own;
         }
         // The real library's definition is preferred when it is loaded: a name written `Base.x`
@@ -507,7 +521,8 @@ impl Checker {
             return None;
         }
         Some((|| {
-            self.unify_at_raw(&rhs, &other)?;
+            // The right-hand side may itself apply families (`XRec (GhcPass p) a = GenLocated (Anno a) a`).
+            self.unify_fam(&rhs, &other)?;
             for &i in &injective {
                 self.unify_fam(&args[i], &pats[i])?;
             }
@@ -515,7 +530,7 @@ impl Checker {
         })())
     }
 
-    fn has_metas(&self, t: &Ty) -> bool {
+    pub(super) fn has_metas(&self, t: &Ty) -> bool {
         match self.metas.prune(t) {
             Ty::Meta(_) => true,
             Ty::App(f, x) => self.has_metas(&f) || self.has_metas(&x),

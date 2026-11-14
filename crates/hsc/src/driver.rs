@@ -332,25 +332,80 @@ impl Driver {
     /// by source).
     pub fn find_module(&self, module: &str) -> Option<Found> {
         if let Some((real, dir)) = self.renamed.get(module) {
+            if self.search.contains(dir) {
+                return self.find_home_in(dir, &real.replace('.', "/"));
+            }
             return Self::find_in_package_dir(dir, &real.replace('.', "/"));
         }
         let stem = module.replace('.', "/");
+        // A module of ghc-internal (the package the compiler wires in) is always its own: a
+        // program's module of the same name is loaded under an internal name (see
+        // `resolve_home_wired_imports`).
+        if let Some(found) = self.wired_dir().and_then(|d| Self::find_in_package_dir(d, &stem)) {
+            return Some(found);
+        }
         for d in &self.search {
-            for ext in ["hs", "lhs"] {
-                let p = d.join(format!("{stem}.{ext}"));
-                if p.is_file() {
-                    return Some(Found { path: p, flags: self.flags.clone(), home: true });
-                }
-            }
-            // A `.hsc` module is translated by hsc2hs first.
-            let p = d.join(format!("{stem}.hsc"));
-            if p.is_file() {
-                if let Ok(hs) = crate::hsc2hs::translate(&p, &self.flags) {
-                    return Some(Found { path: hs, flags: self.flags.clone(), home: true });
-                }
+            if let Some(found) = self.find_home_in(d, &stem) {
+                return Some(found);
             }
         }
         self.pkg_dirs.iter().find_map(|d| Self::find_in_package_dir(d, &stem))
+    }
+
+    /// The import directory of ghc-internal, if it is among the packages.
+    fn wired_dir(&self) -> Option<&PathBuf> {
+        self.pkg_dirs.iter().find(|d| Self::dir_of_package(d, "ghc-internal"))
+    }
+
+    /// A program's module (by its path stem) in one of its `-i` directories.
+    fn find_home_in(&self, d: &Path, stem: &str) -> Option<Found> {
+        for ext in ["hs", "lhs"] {
+            let p = d.join(format!("{stem}.{ext}"));
+            if p.is_file() {
+                return Some(Found { path: p, flags: self.flags.clone(), home: true });
+            }
+        }
+        // A `.hsc` module is translated by hsc2hs first.
+        let p = d.join(format!("{stem}.hsc"));
+        if p.is_file() {
+            if let Ok(hs) = crate::hsc2hs::translate(&p, &self.flags) {
+                return Some(Found { path: hs, flags: self.flags.clone(), home: true });
+            }
+        }
+        None
+    }
+
+    /// Points a program module's imports of its own modules named like ghc-internal's
+    /// (ghc-lib-parser's `GHC.Internal.TH.Syntax`) at those: each is loaded under an internal
+    /// name, as the compiler and the libraries refer to ghc-internal's by the real one.
+    fn resolve_home_wired_imports(&mut self, m: &mut Module) {
+        for imp in &mut m.imports {
+            if imp.package.is_some() || self.renamed.contains_key(&imp.module) {
+                continue;
+            }
+            if let Some(key) = self.home_wired_key(&imp.module) {
+                if imp.alias.is_none() {
+                    imp.alias = Some(imp.module.clone());
+                }
+                imp.module = key;
+            }
+        }
+    }
+
+    /// The internal name a program's module named like one of ghc-internal's is loaded under
+    /// (registering it), or None when the name is not such a module.
+    pub fn home_wired_key(&mut self, module: &str) -> Option<String> {
+        let stem = module.replace('.', "/");
+        let wired = self.wired_dir().and_then(|d| Self::find_in_package_dir(d, &stem))?;
+        let dir = self.search.iter().find(|d| self.find_home_in(d, &stem).is_some_and(|f| f.path != wired.path))?.clone();
+        let key = format!("{module}_home");
+        self.renamed.insert(key.clone(), (module.to_string(), dir));
+        Some(key)
+    }
+
+    /// The real name of a module loaded under an internal one.
+    pub fn real_name<'a>(&'a self, module: &'a str) -> &'a str {
+        self.renamed.get(module).map(|(r, _)| r.as_str()).unwrap_or(module)
     }
 
     /// A module (by its path stem) in one package import directory.
@@ -616,11 +671,25 @@ impl Driver {
             format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
         })?;
         timing::add("parse", t_parse);
-        if self.renamed.contains_key(module) {
+        if let Some((real, _)) = self.renamed.get(module) {
+            // Loaded under an internal name: `module M` of its own name in its export list (base's
+            // `module GHC.Internal.TH.Syntax`) is still the module itself.
+            let real = real.clone();
+            if let Some(items) = &mut parsed.exports {
+                for item in items.iter_mut() {
+                    if let crate::syntax::ast::IEItem::Module(m) = item {
+                        if *m == real {
+                            *m = module.to_string();
+                        }
+                    }
+                }
+            }
             parsed.name = module.to_string();
         }
         self.resolve_package_imports(&mut parsed);
-        if !home {
+        if home {
+            self.resolve_home_wired_imports(&mut parsed);
+        } else {
             self.resolve_own_package_imports(&mut parsed, &path);
         }
         // The GHC packages compile with NoImplicitPrelude as a package default (their cabal files).
@@ -632,6 +701,9 @@ impl Driver {
         let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
         if exts.is_on("OverloadedStrings") && module != "GHC.Internal.Data.String" && !path_text.contains("/libs/ghc-prim/") {
             deps.push("GHC.Internal.Data.String".into());
+        }
+        if exts.is_on("MonadComprehensions") && !path_text.contains("/libs/ghc-internal/") && !path_text.contains("/libs/ghc-prim/") {
+            deps.push("GHC.Internal.Control.Monad".into());
         }
         if exts.is_on("OverloadedLists") && module != "GHC.Internal.IsList" && !path_text.contains("/libs/ghc-prim/") {
             deps.push("GHC.Internal.IsList".into());
@@ -990,6 +1062,8 @@ impl Driver {
         self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
         self.checker.overloaded_lists = exts.is_on("OverloadedLists");
         self.checker.monomorphism_restriction = exts.is_on("MonomorphismRestriction");
+        self.checker.mono_local_binds = exts.is_on("MonoLocalBinds");
+        self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         let t = std::time::Instant::now();
         let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot)
@@ -1020,6 +1094,7 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
         format!("{}:{}:{}: error:\n    {}", main_file.display(), e.line, e.col, e.msg)
     })?;
     d.resolve_package_imports(&mut parsed);
+    d.resolve_home_wired_imports(&mut parsed);
     let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
     if exts.is_on("ImplicitPrelude") && !deps.iter().any(|x| x == "Prelude") {
         deps.insert(0, "Prelude".into());
@@ -1029,6 +1104,9 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
     }
     if exts.is_on("OverloadedLists") {
         deps.push("GHC.Internal.IsList".into());
+    }
+    if exts.is_on("MonadComprehensions") {
+        deps.push("GHC.Internal.Control.Monad".into());
     }
     let source = Driver::source_imports(&src);
     for dep in &deps {

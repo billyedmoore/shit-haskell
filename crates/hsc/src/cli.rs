@@ -645,8 +645,10 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
             }
             targets.push((driver::module_name_of(&path, &o.flags)?, path));
         } else {
-            let d = driver::Driver::new(search.clone(), Vec::new(), o.flags.clone());
-            let f = d.find_module(inp).ok_or_else(|| {
+            let mut d = driver::Driver::new(search.clone(), pkg_dirs.clone(), o.flags.clone());
+            // The program's module of that name, before a package's (see `home_wired_key`).
+            let key = d.home_wired_key(inp).unwrap_or_else(|| inp.to_string());
+            let f = d.find_module(&key).filter(|f| f.home).ok_or_else(|| {
                 format!("<no location info>: error:\n    Could not find module ‘{inp}’\n    It is not a module in the current program, or in any known package.")
             })?;
             targets.push((inp.to_string(), f.path));
@@ -676,14 +678,15 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
         if m == "Main" {
             driver::compile_with(&mut d, path, &o.flags)?;
         } else {
-            d.load(m)?;
+            let key = d.home_wired_key(m).unwrap_or_else(|| m.clone());
+            d.load(&key)?;
         }
     }
     for (m, path, home) in d.sources.clone() {
         if !home {
             continue;
         }
-        write_outputs(o, &m, &path)?;
+        write_outputs(o, d.real_name(&m), &path)?;
     }
     Ok(0)
 }

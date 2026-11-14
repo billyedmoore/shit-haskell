@@ -152,6 +152,35 @@ impl Checker {
 
     /// Infers a strongly connected group of unsigned bindings, and generalises it.
     fn infer_scc(&mut self, items: &[&Item]) -> TR<Vec<(String, Core)>> {
+        // MonoLocalBinds: a local group that is not closed (it mentions a variable of the
+        // enclosing scope, or a scoped type variable) is not generalised; its constraints are the
+        // enclosing binding's (ghc-lib-parser's `addUnpackedness`, whose `noAnn` only the
+        // enclosing body determines).
+        let not_closed = self.mono_local_binds && items.iter().all(|it| it.keys.iter().all(|k| !k.contains('.') || k.contains('%'))) && {
+            let own: Vec<&String> = items.iter().flat_map(|it| it.keys.iter()).collect();
+            items.iter().any(|it| {
+                let mut names = HashSet::new();
+                let mut tyvar = false;
+                match &it.kind {
+                    Kind::Fun(clauses) => {
+                        for c in clauses.iter() {
+                            collect_clause(c, &mut names);
+                            tyvar |= super::expr::rhs_mentions_type_var(&c.rhs);
+                        }
+                    }
+                    Kind::Pat { rhs, .. } => {
+                        collect_rhs(rhs, &mut names);
+                        tyvar |= super::expr::rhs_mentions_type_var(rhs);
+                    }
+                }
+                tyvar || names.iter().any(|n| n.contains('%') && !own.contains(&n) && self.vars.contains_key(n) && !self.closed_locals.contains(n))
+            })
+        };
+        if self.mono_local_binds && !not_closed {
+            for it in items {
+                self.closed_locals.extend(it.keys.iter().cloned());
+            }
+        }
         let outer_level = self.level;
         self.level += 1;
         let outer_wanted = std::mem::take(&mut self.wanted);
@@ -219,10 +248,11 @@ impl Checker {
         let (ev_binds, residual) = solved?;
 
         // (With NoMonomorphismRestriction a variable binding is generalised too.)
-        let restricted = items.iter().any(|it| match &it.kind {
-            Kind::Pat { .. } => true,
-            Kind::Fun(clauses) => self.monomorphism_restriction && clauses.first().is_some_and(|c| c.pats.is_empty()),
-        });
+        let restricted = not_closed
+            || items.iter().any(|it| match &it.kind {
+                Kind::Pat { .. } => true,
+                Kind::Fun(clauses) => self.monomorphism_restriction && clauses.first().is_some_and(|c| c.pats.is_empty()),
+            });
 
         // Metas of the group's types that are local to it can be generalised.
         let mut qmetas: Vec<u32> = Vec::new();
@@ -232,6 +262,25 @@ impl Checker {
             for m in ms {
                 if self.metas.levels[m as usize] > outer_level && !qmetas.contains(&m) {
                     qmetas.push(m);
+                }
+            }
+        }
+
+        // A group that is not closed is not generalised (MonoLocalBinds), and a variable in an
+        // equality still waiting on a family is not either: the equality would lose it.
+        {
+            let mut pinned: Vec<u32> = Vec::new();
+            if not_closed {
+                pinned.extend(qmetas.iter().copied());
+            }
+            for (a, b, _) in &self.deferred_eqs {
+                self.metas.free_metas(&self.metas.zonk(a), &mut pinned);
+                self.metas.free_metas(&self.metas.zonk(b), &mut pinned);
+            }
+            for m in pinned {
+                if qmetas.contains(&m) {
+                    self.metas.levels[m as usize] = outer_level;
+                    qmetas.retain(|x| *x != m);
                 }
             }
         }
@@ -712,6 +761,20 @@ fn tarjan(n: usize, edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
 }
 
 // ----- free variables, for dependency analysis ------------------------------
+
+/// The names an expression refers to (over-approximated: bound ones too).
+pub fn referenced_names(e: &Expr) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_expr(e, &mut out);
+    out
+}
+
+/// The names declarations refer to (over-approximated).
+pub fn decls_referenced_names(ds: &[Decl]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    ds.iter().for_each(|d| collect_decl(d, &mut out));
+    out
+}
 
 fn collect_clause(c: &Clause, out: &mut HashSet<String>) {
     c.pats.iter().for_each(|p| collect_pat(p, out));

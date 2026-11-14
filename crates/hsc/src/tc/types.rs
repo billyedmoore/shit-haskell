@@ -328,6 +328,11 @@ impl Metas {
     pub fn unify_refine(&mut self, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         let a = self.prune(a);
         let b = self.prune(b);
+        // An unknown equal to a family application is that application (a pattern variable's
+        // type `IdGhcP p` in a field `XRec (GhcPass p) (IdP (GhcPass p))`).
+        if let (Ty::Meta(_), _) | (_, Ty::Meta(_)) = (&a, &b) {
+            return self.unify(&a, &b);
+        }
         // A rigid variable equal to an irreducible family application stands for it (`g ~ F a`).
         // Otherwise a family application cannot be refined, and its equality is not used.
         if self.is_family_app(&a) || self.is_family_app(&b) {

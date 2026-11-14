@@ -178,6 +178,15 @@ impl Checker {
 
     /// Splits a signature into its predicates and body, collecting type variables.
     pub fn sig_parts(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<(Vec<Pred>, Ty)> {
+        // A signature's own `forall` binds its variables afresh: an enclosing scoped variable of
+        // the same name (`go :: forall p. ..` inside `f :: forall p. ..`) is shadowed.
+        let saved = self.scoped.clone();
+        let r = self.sig_parts_in(t, tvs);
+        self.scoped = saved;
+        r
+    }
+
+    fn sig_parts_in(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<(Vec<Pred>, Ty)> {
         let mut preds = Vec::new();
         let mut cur = t;
         loop {
@@ -186,6 +195,7 @@ impl Checker {
                     for b in binders {
                         tvar_index(tvs, &b.name);
                     }
+                    self.scoped.retain(|(n, _)| !binders.iter().any(|b| b.name == *n));
                     cur = body;
                 }
                 Type::Qual(ctx, body) => {

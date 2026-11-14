@@ -72,6 +72,9 @@ pub struct InstInfo {
     pub head: Vec<Ty>,
     /// Global name of the dictionary function (a value when `ctx` is empty).
     pub dict: String,
+    /// The runtime representation each head argument's kind annotation names (`(a :: TYPE
+    /// 'IntRep)` is "IntRep"): instances can differ only in these (ghc-heap's `HasHeapRep`).
+    pub kinds: Vec<Option<String>>,
 }
 
 /// One equation of a type family: patterns over `Gen(0..nvars)`, and the right-hand side.
