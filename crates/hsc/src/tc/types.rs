@@ -127,14 +127,29 @@ impl Scheme {
 pub fn subst_gen(t: &Ty, args: &[Ty]) -> Ty {
     match t {
         Ty::Gen(i) => args.get(*i as usize).cloned().unwrap_or(Ty::Gen(*i)),
-        Ty::App(f, a) => Ty::app(subst_gen(f, args), subst_gen(a, args)),
-        Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_gen_pred(p, args)).collect(), Rc::new(subst_gen(b, args))),
+        Ty::App(f, a) => Ty::App(subst_gen_rc(f, args), subst_gen_rc(a, args)),
+        Ty::Qual(ps, b) => Ty::Qual(ps.iter().map(|p| subst_gen_pred(p, args)).collect(), subst_gen_rc(b, args)),
         Ty::Forall(ids, ps, b) => Ty::Forall(
             ids.clone(),
             ps.iter().map(|p| subst_gen_pred(p, args)).collect(),
-            Rc::new(subst_gen(b, args)),
+            subst_gen_rc(b, args),
         ),
         other => other.clone(),
+    }
+}
+
+/// Substitute a shared part without rebuilding branches that contain no replaced
+/// variables. Types are immutable; each instantiation still supplies fresh metas.
+fn subst_gen_rc(t: &Rc<Ty>, args: &[Ty]) -> Rc<Ty> {
+    match &**t {
+        Ty::Con(_) | Ty::Meta(_) | Ty::Skol(..) | Ty::Bound(_) => t.clone(),
+        Ty::Gen(i) if args.get(*i as usize).is_none() => t.clone(),
+        Ty::App(f, a) => {
+            let (f2, a2) = (subst_gen_rc(f, args), subst_gen_rc(a, args));
+            if Rc::ptr_eq(f, &f2) && Rc::ptr_eq(a, &a2) { t.clone() }
+            else { Rc::new(Ty::App(f2, a2)) }
+        }
+        _ => Rc::new(subst_gen(t, args)),
     }
 }
 
@@ -545,5 +560,57 @@ fn gen_name(i: u32) -> String {
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", show_ty(&Metas::default(), self))
+    }
+}
+
+#[cfg(test)]
+mod substitution_sharing_tests {
+    use super::*;
+
+    #[test]
+    fn shared_closed_parts_do_not_share_instantiation_variables() {
+        let fixed = Rc::new(Ty::app(Ty::con("Closed"), Ty::con("Payload")));
+        let scheme = Scheme {
+            nvars: 1, names: vec!["a".into()], preds: Vec::new(),
+            ty: Ty::App(fixed.clone(), Rc::new(Ty::Gen(0))),
+        };
+        let mut metas = Metas::default();
+        let (first, _, first_args) = metas.instantiate(&scheme, 0);
+        let (second, _, second_args) = metas.instantiate(&scheme, 0);
+        let (Ty::App(f1, a1), Ty::App(f2, a2)) = (&first, &second) else { panic!("application") };
+        assert!(Rc::ptr_eq(&fixed, f1) && Rc::ptr_eq(&fixed, f2));
+        assert_ne!(first_args, second_args);
+        metas.unify(a1, &Ty::con("Int")).unwrap();
+        assert_eq!(metas.zonk(a1), Ty::con("Int"));
+        assert_eq!(metas.zonk(a2), second_args[0]);
+        assert!(matches!(scheme.ty, Ty::App(_, ref a) if **a == Ty::Gen(0)));
+    }
+
+    #[test]
+    fn empty_substitution_still_canonicalizes_nested_constraint_variables() {
+        let qualified = Ty::Qual(
+            vec![Pred {
+                class: super::super::convert::CONSTRAINT_VAR.into(),
+                args: vec![Ty::app(Ty::con("C"), Ty::con("T"))],
+            }],
+            Rc::new(Ty::con("Result")),
+        );
+        let input = Ty::app(Ty::con("Wrapper"), qualified);
+        let expected = Ty::app(Ty::con("Wrapper"), Ty::Qual(
+            vec![Pred { class: "C".into(), args: vec![Ty::con("T")] }], Rc::new(Ty::con("Result")),
+        ));
+        assert_eq!(subst_gen(&input, &[]), expected);
+        let quantified = Ty::app(Ty::con("Wrapper"), Ty::Forall(
+            vec![9], vec![Pred {
+                class: super::super::convert::CONSTRAINT_VAR.into(),
+                args: vec![Ty::app(Ty::con("C"), Ty::con("T"))],
+            }], Rc::new(Ty::Bound(9)),
+        ));
+        let expected = Ty::app(Ty::con("Wrapper"), Ty::Forall(
+            vec![9], vec![Pred { class: "C".into(), args: vec![Ty::con("T")] }], Rc::new(Ty::Bound(9)),
+        ));
+        assert_eq!(subst_gen(&quantified, &[]), expected);
+        let missing = Ty::app(Ty::con("Wrapper"), Ty::Gen(7));
+        assert_eq!(subst_gen(&missing, &[Ty::con("Unused")]), missing);
     }
 }

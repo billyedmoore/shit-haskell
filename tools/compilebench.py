@@ -11,6 +11,8 @@ one untimed warmup to create hsc's placeholder objects before measuring the fron
 compilers get an untimed build; GHC keeps its native objects, hsc its checked modules.
 --workload application-equalities checks nested applications under recursive
 superclass equalities, as used by ghc-lib-parser's annotation constraints.
+--workload type-substitution repeatedly instantiates monomorphic functions with
+a large closed type, isolating copying of unchanged type application branches.
 Run without other compiler/test jobs competing for CPU.
 """
 
@@ -69,6 +71,19 @@ def application_equalities_source():
     return "\n".join(lines) + "\n"
 
 
+def type_substitution_source():
+    closed = "Result"
+    for _ in range(128):
+        closed = f"Box ({closed})"
+    lines = ["{-# LANGUAGE NoImplicitPrelude #-}", "module TypeSubstitution where",
+             "data Result = Result", "data Box a = Box a", f"type Closed = {closed}",
+             "callee :: Closed -> Closed", "callee x = x"]
+    for i in range(500):
+        lines += [f"probe{i} :: Closed -> Closed",
+                  f"probe{i} x = callee (callee (callee (callee x)))"]
+    return "\n".join(lines) + "\n"
+
+
 def module_sources(work):
     """A dependency chain makes the accumulated environment grow at each snapshot."""
     (work / "Seed.hs").write_text(
@@ -122,7 +137,7 @@ def main():
     parser.add_argument("--after", required=True)
     parser.add_argument("--ghc", default="ghc")
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--workload", choices=("instance-lookup", "module-cache", "boot-cache", "application-equalities"), default="instance-lookup")
+    parser.add_argument("--workload", choices=("instance-lookup", "module-cache", "boot-cache", "application-equalities", "type-substitution"), default="instance-lookup")
     parser.add_argument("--work", type=Path, default=Path("target/compilebench"))
     args = parser.parse_args()
     if args.runs < 1:
@@ -143,6 +158,11 @@ def main():
         hs.write_text(application_equalities_source())
         mode = ["-c"]
         title = "Nested application equalities front end (seconds)"
+    elif args.workload == "type-substitution":
+        hs = work / "TypeSubstitution.hs"
+        hs.write_text(type_substitution_source())
+        mode = ["-c"]
+        title = "Closed type substitution front end (seconds)"
     else:
         hs = work / "InstanceLookup.hs"
         hs.write_text(source())
