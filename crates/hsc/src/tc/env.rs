@@ -3,6 +3,72 @@
 use super::types::{Pred, Scheme, Ty};
 use std::collections::HashMap;
 
+/// A global environment only gains keys. Remember their insertion order so a module's
+/// additions can be collected without copying or scanning every earlier module's keys.
+pub struct EnvMap<V> {
+    entries: HashMap<String, V>,
+    added: Vec<String>,
+}
+
+impl<V> Default for EnvMap<V> {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), added: Vec::new() }
+    }
+}
+
+impl<V> EnvMap<V> {
+    pub fn mark(&self) -> usize {
+        self.added.len()
+    }
+
+    pub fn added_since(&self, mark: usize) -> impl Iterator<Item = (&String, &V)> {
+        self.added[mark..].iter().map(|k| (k, &self.entries[k]))
+    }
+
+    pub fn insert(&mut self, key: String, value: V) -> Option<V> {
+        match self.entries.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => Some(e.insert(value)),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                self.added.push(e.key().clone());
+                e.insert(value);
+                None
+            }
+        }
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.entries.get_mut(key)
+    }
+
+    pub fn get_or_insert_default(&mut self, key: String) -> &mut V where V: Default {
+        match self.entries.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                self.added.push(e.key().clone());
+                e.insert(V::default())
+            }
+        }
+    }
+}
+
+// Expose read-only HashMap operations; every insertion must go through the journal above.
+impl<V> std::ops::Deref for EnvMap<V> {
+    type Target = HashMap<String, V>;
+    fn deref(&self) -> &Self::Target { &self.entries }
+}
+
+impl<'a, V> IntoIterator for &'a EnvMap<V> {
+    type Item = (&'a String, &'a V);
+    type IntoIter = std::collections::hash_map::Iter<'a, String, V>;
+    fn into_iter(self) -> Self::IntoIter { self.entries.iter() }
+}
+
+impl<V> Extend<(String, V)> for EnvMap<V> {
+    fn extend<T: IntoIterator<Item = (String, V)>>(&mut self, iter: T) {
+        for (key, value) in iter { self.insert(key, value); }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TyConInfo {
     pub arity: usize,
@@ -201,16 +267,16 @@ pub struct FamilyInfo {
 pub struct Env {
     /// Data declarations by global type name, with the module that declares them; standalone
     /// deriving needs the constructors of types declared elsewhere.
-    pub data_decls: HashMap<String, (String, crate::syntax::ast::DataDecl)>,
+    pub data_decls: EnvMap<(String, crate::syntax::ast::DataDecl)>,
     /// Type families by global name.
-    pub families: HashMap<String, FamilyInfo>,
-    pub tycons: HashMap<String, TyConInfo>,
-    pub synonyms: HashMap<String, Synonym>,
-    pub datacons: HashMap<String, DataCon>,
-    pub classes: HashMap<String, ClassInfo>,
+    pub families: EnvMap<FamilyInfo>,
+    pub tycons: EnvMap<TyConInfo>,
+    pub synonyms: EnvMap<Synonym>,
+    pub datacons: EnvMap<DataCon>,
+    pub classes: EnvMap<ClassInfo>,
     pub instances: Instances,
     /// Types of all top-level values, including constructors, selectors and methods.
-    pub values: HashMap<String, Scheme>,
+    pub values: EnvMap<Scheme>,
     /// Record field name to (constructor, position) pairs.
-    pub fields: HashMap<String, Vec<(String, usize)>>,
+    pub fields: EnvMap<Vec<(String, usize)>>,
 }

@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 204 differential tests for both back ends, compared with GHC.
+- **Corpus:** 205 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -31,8 +31,9 @@ the GitHub issues.
   - hlint's dependencies build up to and including ghc-lib-parser and mono-traversable.
 - **Weakness: speed.** Generated code is 10–500× slower than `ghc -O0` (baseline below), and
   large packages compile slowly, which limits how fast the rest of the work can go. A cold
-  compile of all 425 exposed ghc-lib-parser modules takes a median 63.1 s, down from 72.8 s
-  before class-indexed instance lookup (paired runs; measurements below).
+  compile of all 425 exposed ghc-lib-parser modules with a fresh module cache takes a median
+  33.3 s, down from 51.8 s before cache bookkeeping recorded just each module's additions
+  (paired runs; measurements below).
 
 ## Working rules
 
@@ -71,6 +72,14 @@ the GitHub issues.
   47.5 → 39.1 s). The focused `tools/compilebench.py` front-end benchmark takes 0.371 → 0.129 s;
   GHC 9.12.2 with `-fno-code` takes 1.070 s at `-O0` and 1.067 s at `-O1`. These are compile-time
   measurements, including process startup; the native run-time baseline below is unchanged.
+- Cache bookkeeping journals first insertions into the global type and kind environments.
+  Key snapshots keep nine lengths, and deltas visit just the new keys; open-family equation
+  tails retain their separate count snapshot. Uncacheable modules skip snapshots (done).
+  With caching enabled and a fresh module cache for each run, ghc-lib-parser's full import
+  set compiles in 51.8 → 33.3 s (median of three alternating pairs, source extraction shared).
+  `tools/compilebench.py --workload module-cache` measures a 200-module dependency chain
+  against GHC; it disables the checked-module cache and prepares placeholder objects in an
+  untimed warmup. `HSC_TIME` now reports interface reads and cache snapshots separately.
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and

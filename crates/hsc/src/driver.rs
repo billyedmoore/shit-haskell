@@ -89,6 +89,22 @@ pub mod timing {
 
     static TOTALS: Mutex<Vec<(&'static str, Duration)>> = Mutex::new(Vec::new());
 
+    /// An operation's elapsed time, including early returns. Nested operations have inclusive
+    /// totals, so the reported phases need not add up to the wall-clock total.
+    pub struct Scope(Option<(&'static str, Instant)>);
+
+    pub fn scope(phase: &'static str) -> Scope {
+        Scope(enabled().then(|| (phase, Instant::now())))
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if let Some((phase, start)) = self.0 {
+                add(phase, start);
+            }
+        }
+    }
+
     pub fn enabled() -> bool {
         std::env::var_os("HSC_TIME").is_some()
     }
@@ -161,6 +177,7 @@ pub(crate) fn md5_hex(bytes: &[u8]) -> String {
 /// build directory is gone once it is installed: the text is put in a cache file named by its
 /// contents, whose path is answered.
 pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
+    let _time = timing::scope("interfaces");
     let bytes = std::fs::read(path).ok()?;
     let mut pos = 0usize;
     let mut line = |pos: &mut usize| -> Option<String> {
@@ -746,15 +763,18 @@ impl Driver {
             })
             .collect();
         let cacheable = cache_file.is_some() && !has_splices && !self.booted.contains(module) && dep_keys.is_some();
-        let (snap, keys) = crate::cache::snapshot(&self.checker.env, &self.checker.kinds.tycons);
+        let snapshot = cacheable.then(|| {
+            let _time = timing::scope("cache snapshot");
+            crate::cache::snapshot(&self.checker.env, &self.checker.kinds.tycons)
+        });
         let binds_before = self.binds.len();
         self.compile_module(parsed, exts, &shown)?;
         if let Some(dep_keys) = dep_keys {
             self.keys.insert(module.to_string(), cache_key(&own_hash, &dep_keys));
-            if cacheable {
+            if let Some(snap) = snapshot {
                 if let (Some(cf), Some(iface)) = (&cache_file, self.ifaces.get(module)) {
                     let kinds = &self.checker.kinds;
-                    let mut env = crate::cache::delta(&self.checker.env, &kinds.tycons, &snap, &keys, |k| kinds.resolve(k));
+                    let mut env = crate::cache::delta(&self.checker.env, &kinds.tycons, &snap, |k| kinds.resolve(k));
                     let metas = &self.checker.metas;
                     let complete = crate::cache::zonk_delta(&mut env, &|t| metas.zonk(t));
                     let entry = crate::cache::Entry {

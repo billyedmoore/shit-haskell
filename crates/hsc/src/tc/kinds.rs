@@ -36,7 +36,7 @@ fn show(k: &Kind) -> String {
 /// The kinds of type constructors, and the metas of the kind checker.
 #[derive(Default)]
 pub struct KindEnv {
-    pub tycons: HashMap<String, Kind>,
+    pub tycons: super::env::EnvMap<Kind>,
     metas: Vec<Option<Kind>>,
 }
 
