@@ -33,6 +33,9 @@ pub struct Driver {
     pub c_flags: Vec<String>,
     /// The key of each module loaded (see `cache_key`).
     keys: HashMap<String, String>,
+    /// Imports observed when a boot interface was checked. SOURCE edges are also
+    /// revalidated against their current boot/full context when the key is used.
+    boot_deps: HashMap<String, Vec<String>>,
     /// Modules a package-qualified import names that the plain name would not find (such as a
     /// module importing its namesake from another package): the internal name each is loaded
     /// under, with its real name and the package directory it is in.
@@ -342,6 +345,7 @@ impl Driver {
             c_flags: Vec::new(),
             renamed: BTreeMap::new(),
             keys: HashMap::new(),
+            boot_deps: HashMap::new(),
         }
     }
 
@@ -572,35 +576,81 @@ impl Driver {
     /// Loads the `.hs-boot` file of a module imported through `{-# SOURCE #-}`: its signatures
     /// stand for the module until the module itself is loaded (see `load_booted`).
     fn load_boot(&mut self, module: &str) -> Result<(), String> {
-        let path = self
-            .find_boot(module)
-            .ok_or_else(|| format!("Could not find module ‘{module}’ (no .hs-boot file for a SOURCE import)"))?;
+        let path = self.find_boot(module).ok_or_else(|| format!("Could not find module ‘{module}’ (no .hs-boot file for a SOURCE import)"))?;
+        if self.loaded.contains(module) {
+            return Ok(());
+        }
+        if self.booted.contains(module) {
+            return Ok(());
+        }
         let flags = self.find_module(module).map(|f| f.flags).unwrap_or_default();
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
-        // The key importers through `{-# SOURCE #-}` record (see `crate::cache`).
-        self.keys.insert(format!("{{boot}}{module}"), md5_hex(format!("boot\0{module}\0{src}").as_bytes()));
-        if self.loaded.contains(module) || self.booted.contains(module) {
-            return Ok(());
-        }
-        let (mut parsed, exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
-            format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
-        })?;
+        let (mut parsed, mut exts) =
+            crate::syntax::parse_module_source(&src, &flags).map_err(|e| format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg))?;
         strip_boot_bodies(&mut parsed);
-        let source = Self::source_imports(&src);
-        for imp in parsed.imports.clone() {
-            if source.contains(&imp.module) {
-                self.load_boot(&imp.module)?;
-            } else {
-                self.load(&imp.module)?;
-            }
+        let path_text = path.to_string_lossy();
+        if ["/libs/ghc-internal/", "/libs/ghc-prim/", "/libs/ghc-bignum/", "/libs/base/"].iter().any(|p| path_text.contains(p)) {
+            exts.apply("NoImplicitPrelude")?;
         }
+        let source = Self::source_imports(&src);
+        let mut dep_names = Vec::new();
+        let mut deps: Vec<_> = parsed.imports.iter().map(|i| i.module.clone()).collect();
+        if exts.is_on("ImplicitPrelude") && module != "Prelude" && !deps.iter().any(|d| d == "Prelude") {
+            deps.insert(0, "Prelude".into());
+        }
+        for dep in deps {
+            if source.contains(&dep) {
+                self.load_boot(&dep)?;
+            } else {
+                self.load(&dep)?;
+            }
+            let name = if source.contains(&dep) { format!("{{boot}}{dep}") } else { dep };
+            dep_names.push(name);
+        }
+        let dep_keys: Option<Vec<_>> = dep_names.iter().map(|name| self.dependency_key(name).map(|key| (name.clone(), key))).collect();
         self.checker.boot = true;
         let result = self.compile_module(parsed, exts, &path);
         self.checker.boot = false;
         result?;
+        let own = format!("boot\0{module}\0{}\0{}\0{src}\0{}", path.display(), flags.join("\u{1}"), self.instance_key(module));
+        if let Some(deps) = dep_keys {
+            self.keys.insert(format!("{{boot}}{module}"), cache_key(&md5_hex(own.as_bytes()), &deps));
+            self.boot_deps.insert(module.to_string(), dep_names);
+        }
         self.booted.insert(module.to_string());
         Ok(())
+    }
+
+    fn instance_key(&self, module: &str) -> String {
+        crate::cache::instance_key(&self.checker.env, module, |t| self.checker.metas.zonk(t))
+    }
+
+    fn boot_key(&self, module: &str) -> Option<String> {
+        self.booted.contains(module).then(|| self.dependency_key(&format!("{{boot}}{module}"))).flatten()
+    }
+
+    /// SOURCE dependencies use the interface actually present after *all* imports
+    /// have loaded. Later imports may complete a boot module or add orphan instances.
+    fn dependency_key(&self, name: &str) -> Option<String> {
+        self.dependency_key_inner(name, &mut HashSet::new())
+    }
+
+    fn dependency_key_inner(&self, name: &str, visiting: &mut HashSet<String>) -> Option<String> {
+        let Some(module) = name.strip_prefix("{boot}") else { return self.keys.get(name).cloned() };
+        if self.loaded.contains(module) {
+            return Some(md5_hex(format!("full\0{}\0{}", self.keys.get(module)?, self.instance_key(module)).as_bytes()));
+        }
+        if !visiting.insert(module.to_string()) { return None; }
+        let deps: Option<Vec<_>> = self.boot_deps.get(module)?.iter().map(|dep| {
+            self.dependency_key_inner(dep, visiting).map(|key| (dep.clone(), key))
+        }).collect();
+        visiting.remove(module);
+        Some(cache_key(&format!("boot\0{}\0{}", self.keys.get(name)?, self.instance_key(module)), &deps?))
+    }
+
+    fn completed_key(&self, module: &str, own: &str, deps: &[(String, String)], boot: &Option<String>) -> String {
+        cache_key(&format!("{own}\0{boot:?}\0{}", self.instance_key(module)), deps)
     }
 
     /// After the program is loaded: every module that was only known through its boot file is
@@ -669,7 +719,12 @@ impl Driver {
         let src = preprocess_if_needed(src, &path, &flags)?;
         // The module cache: an entry for this source (and flags) whose imports are unchanged
         // stands for the module (see `crate::cache`).
-        let own_hash = md5_hex(format!("{module}\0{}\0{}\0{src}", path.display(), flags.join("\u{1}")).as_bytes());
+        // An implementation's cache also depends on the declarations in its boot file.
+        let boot_src = if let Some(boot_path) = self.find_boot(module) {
+            let text = read_source(&boot_path).map_err(|e| format!("{}: {e}", boot_path.display()))?;
+            preprocess_if_needed(text, &boot_path, &flags)?
+        } else { String::new() };
+        let own_hash = md5_hex(format!("{module}\0{}\0{}\0{src}\0{boot_src}", path.display(), flags.join("\u{1}")).as_bytes());
         let cache_file = crate::cache::dir().map(|d| d.join(format!("{own_hash}.bin")));
         if let Some(cf) = &cache_file {
             if std::env::var_os("HSC_DEBUG_CACHE").is_some() && cf.is_file() && crate::cache::load(cf).is_none() {
@@ -753,24 +808,48 @@ impl Driver {
         let splice_path: PathBuf = named.filter(|p| p.is_file()).unwrap_or_else(|| path.clone());
         self.expand_splices(&mut parsed, &exts, &splice_path)?;
         // What the module adds is saved when it can be loaded back on its own: no splices
-        // (their results depend on more than the source), no boot files involved.
+        // (their results depend on more than the source).
         // (A `{-# SOURCE #-}` import depends on the boot file, keyed `{boot}M`.)
         let dep_keys: Option<Vec<(String, String)>> = deps
             .iter()
             .map(|d| {
                 let name = if source.contains(d) { format!("{{boot}}{d}") } else { d.clone() };
-                self.keys.get(&name).map(|k| (name, k.clone()))
+                self.dependency_key(&name).map(|k| (name, k))
             })
             .collect();
-        let cacheable = cache_file.is_some() && !has_splices && !self.booted.contains(module) && dep_keys.is_some();
-        let snapshot = cacheable.then(|| {
+        let completing_boot = self.booted.contains(module);
+        let boot_key = self.boot_key(module);
+        let cacheable = cache_file.is_some() && !has_splices && dep_keys.is_some() && (!completing_boot || boot_key.is_some());
+        let mut snapshot = cacheable.then(|| {
             let _time = timing::scope("cache snapshot");
-            crate::cache::snapshot(&self.checker.env, &self.checker.kinds.tycons)
-        });
+            if completing_boot {
+                crate::cache::snapshot_boot(&self.checker.env, &self.checker.kinds.tycons, module)
+            } else {
+                Some(crate::cache::snapshot(&self.checker.env, &self.checker.kinds.tycons))
+            }
+        }).flatten();
+        let boot_instances: Vec<_> = if completing_boot {
+            let prefix = format!("{module}.$f");
+            // Standalone deriving in a SOURCE consumer can create an A-prefixed
+            // dictionary with an implementation already present. Only stubs need
+            // supplying by A itself.
+            let implemented: HashSet<&str> = self.binds.iter().map(|b| b.name.as_str()).collect();
+            self.checker.env.instances.iter().filter(|i| i.dict.starts_with(&prefix) && !implemented.contains(i.dict.as_str())).cloned().collect()
+        } else { Vec::new() };
         let binds_before = self.binds.len();
         self.compile_module(parsed, exts, &shown)?;
-        if let Some(dep_keys) = dep_keys {
-            self.keys.insert(module.to_string(), cache_key(&own_hash, &dep_keys));
+        let mut new_binds = self.binds.split_off(binds_before);
+        if completing_boot {
+            if !self.checker.complete_boot_instances(&boot_instances, &mut new_binds).map_err(|e| e.msg)? {
+                snapshot = None;
+            }
+            let names: HashSet<&str> = new_binds.iter().map(|b| b.name.as_str()).collect();
+            self.binds.retain(|b| !names.contains(b.name.as_str()));
+        }
+        let binds_before = self.binds.len();
+        self.binds.extend(new_binds);
+        if let Some(dep_keys) = dep_keys.filter(|_| !completing_boot || boot_key.is_some()) {
+            self.keys.insert(module.to_string(), self.completed_key(module, &own_hash, &dep_keys, &boot_key));
             if let Some(snap) = snapshot {
                 if let (Some(cf), Some(iface)) = (&cache_file, self.ifaces.get(module)) {
                     let kinds = &self.checker.kinds;
@@ -778,6 +857,7 @@ impl Driver {
                     let metas = &self.checker.metas;
                     let complete = crate::cache::zonk_delta(&mut env, &|t| metas.zonk(t));
                     let entry = crate::cache::Entry {
+                        boot_key,
                         deps: dep_keys,
                         iface: iface.clone(),
                         binds: self.binds[binds_before..].to_vec(),
@@ -831,16 +911,27 @@ impl Driver {
             }
         }
         self.loading.pop();
-        if !entry.deps.iter().all(|(d, k)| self.keys.get(d) == Some(k)) {
+        if !entry.deps.iter().all(|(d, k)| self.dependency_key(d).as_ref() == Some(k)) {
             return false;
         }
-        self.keys.insert(module.to_string(), cache_key(own_hash, &entry.deps));
+        let boot_key = self.boot_key(module);
+        if entry.boot_key != boot_key || (self.booted.contains(module) && boot_key.is_none()) {
+            return false;
+        }
+        if self.booted.contains(module) && !crate::cache::boot_cacheable(&self.checker.env, module) {
+            return false;
+        }
         // (The unifier keeps its own set of the families' names.)
         for (name, _) in &entry.env.families {
             self.checker.metas.families.insert(name.clone());
         }
         crate::cache::apply(&mut self.checker.env, &mut self.checker.kinds.tycons, entry.env);
+        self.keys.insert(module.to_string(), self.completed_key(module, own_hash, &entry.deps, &entry.boot_key));
         self.ifaces.insert(module.to_string(), entry.iface);
+        if self.booted.contains(module) {
+            let names: HashSet<&str> = entry.binds.iter().map(|b| b.name.as_str()).collect();
+            self.binds.retain(|b| !names.contains(b.name.as_str()));
+        }
         self.binds.extend(entry.binds);
         self.loaded.insert(module.to_string());
         self.sources.push((module.to_string(), path.to_path_buf(), home));
@@ -1276,6 +1367,131 @@ fn strip_boot_bodies(m: &mut Module) {
         }
     }
     m.decls.retain(|d| !matches!(d, Decl::Fun { .. } | Decl::PatBind { .. }));
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    struct Sources(PathBuf);
+    impl Sources {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!("hsc-boot-cache-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn write(&self, name: &str, text: &str) {
+            std::fs::write(self.0.join(name), format!("{{-# LANGUAGE NoImplicitPrelude #-}}\n{text}\n")).unwrap();
+        }
+        fn driver(&self) -> Driver {
+            Driver::new(vec![self.0.clone()], Vec::new(), Vec::new())
+        }
+    }
+    impl Drop for Sources {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn boot_key_tracks_transitive_imports_and_full_interface_mode() {
+        let s = Sources::new();
+        s.write("Dep.hs", "module Dep where\ndata D = D");
+        s.write("A.hs", "module A where\nimport Dep\ndata T = T D");
+        s.write("A.hs-boot", "module A where\nimport Dep\ndata T = T D");
+        let mut first = s.driver();
+        first.load_boot("A").unwrap();
+        let boot = first.dependency_key("{boot}A").unwrap();
+        first.load_boot("A").unwrap();
+        assert_eq!(first.dependency_key("{boot}A"), Some(boot.clone()));
+        first.load("A").unwrap();
+        first.load_boot("A").unwrap();
+        assert_ne!(first.dependency_key("{boot}A"), Some(boot.clone()));
+        s.write("Dep.hs", "module Dep where\ndata D = Changed");
+        let mut second = s.driver();
+        second.load_boot("A").unwrap();
+        assert_ne!(second.dependency_key("{boot}A"), Some(boot));
+    }
+
+    #[test]
+    fn implementation_hash_tracks_boot_file_resolved_in_another_search_directory() {
+        let source = Sources::new();
+        let boot = Sources::new();
+        source.write("A.hs", "module A where\ndata T = T");
+        boot.write("A.hs-boot", "module A where\ndata T");
+        let driver = || Driver::new(vec![source.0.clone(), boot.0.clone()], Vec::new(), Vec::new());
+        let mut first = driver();
+        assert_eq!(first.find_boot("A"), Some(boot.0.join("A.hs-boot")));
+        first.load("A").unwrap();
+        boot.write("A.hs-boot", "module A where\ndata T = T");
+        let mut second = driver();
+        second.load("A").unwrap();
+        assert_ne!(first.keys["A"], second.keys["A"]);
+    }
+
+    #[test]
+    fn nested_source_boot_context_tracks_completion_and_shared_dependencies() {
+        let s = Sources::new();
+        s.write("D.hs", "module D where\ndata T = T");
+        s.write("D.hs-boot", "module D where\ndata T");
+        s.write("B.hs-boot", "module B where\nimport {-# SOURCE #-} D\ndata B");
+        s.write("C.hs-boot", "module C where\nimport {-# SOURCE #-} D\ndata C");
+        s.write("A.hs", "module A where\nimport D\ndata U = U T");
+        s.write("A.hs-boot", "module A where\nimport {-# SOURCE #-} B\nimport {-# SOURCE #-} C\ndata U");
+        let mut d = s.driver();
+        d.load_boot("A").unwrap();
+        let first = d.boot_key("A").unwrap();
+        d.boot_deps.get_mut("D").unwrap().push("{boot}A".into());
+        assert!(d.boot_key("A").is_none());
+        d.boot_deps.get_mut("D").unwrap().pop();
+        assert_eq!(d.boot_key("A"), Some(first.clone()));
+        let base = d.keys.remove("{boot}D").unwrap();
+        assert!(d.boot_key("A").is_none());
+        d.keys.insert("{boot}D".into(), base);
+        assert_eq!(d.boot_key("A"), Some(first.clone()));
+        d.load("D").unwrap();
+        assert_ne!(d.boot_key("A"), Some(first));
+        d.load("A").unwrap();
+        assert!(d.keys.contains_key("A"));
+    }
+
+    #[test]
+    fn cache_rejects_different_precompletion_boot_context() {
+        let s = Sources::new();
+        s.write("A.hs-boot", "module A where\ndata T");
+        let mut d = s.driver();
+        d.load_boot("A").unwrap();
+        let before = d.boot_key("A");
+        d.checker.env.instances.push(crate::tc::env::InstInfo {
+            class: "External.C".into(),
+            nvars: 0,
+            ctx: Vec::new(),
+            head: vec![crate::tc::types::Ty::con("A.T")],
+            dict: "A.$fOrphan".into(),
+            kinds: Vec::new(),
+        });
+        assert_ne!(d.boot_key("A"), before);
+        let entry = crate::cache::Entry {
+            boot_key: None,
+            deps: Vec::new(),
+            iface: d.ifaces["A"].clone(),
+            binds: Vec::new(),
+            env: crate::cache::EnvDelta::default(),
+            explicit_sigs: Vec::new(),
+        };
+        assert!(!d.use_cached("A", entry, "source", &s.0.join("A.hs"), true));
+        assert!(!d.loaded.contains("A"));
+        let entry = crate::cache::Entry {
+            boot_key: d.boot_key("A"),
+            deps: Vec::new(),
+            iface: d.ifaces["A"].clone(),
+            binds: Vec::new(),
+            env: crate::cache::EnvDelta::default(),
+            explicit_sigs: Vec::new(),
+        };
+        assert!(d.use_cached("A", entry, "source", &s.0.join("A.hs"), true));
+    }
 }
 
 /// Runs a compiled program (its Core, decoded) on a thread with a large stack, since evaluation

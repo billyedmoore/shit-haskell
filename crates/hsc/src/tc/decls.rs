@@ -10,6 +10,139 @@ use crate::core::{Alt, Core, TopBind};
 use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Module, QName, Type};
 
 impl Checker {
+    /// Compare quantified heads independently of each registration path's variable order.
+    fn alpha_heads(a: &[Ty], b: &[Ty], lr: &mut HashMap<u32, u32>, rl: &mut HashMap<u32, u32>) -> bool {
+        fn same(a: &Ty, b: &Ty, lr: &mut HashMap<u32, u32>, rl: &mut HashMap<u32, u32>) -> bool {
+            match (a, b) {
+                (Ty::Gen(i), Ty::Gen(j)) => {
+                    if let Some(old) = lr.get(i) {
+                        return old == j;
+                    }
+                    if rl.contains_key(j) {
+                        return false;
+                    }
+                    lr.insert(*i, *j);
+                    rl.insert(*j, *i);
+                    true
+                }
+                (Ty::App(f, x), Ty::App(g, y)) => same(f, g, lr, rl) && same(x, y, lr, rl),
+                _ => a == b,
+            }
+        }
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same(x, y, lr, rl))
+    }
+
+    fn instance_reps(&self, head: &[Ty], kinds: &[Option<String>]) -> Vec<Option<String>> {
+        head.iter().enumerate().map(|(i, t)| self.rep_of_type(t).or_else(|| kinds.get(i).cloned().flatten())).collect()
+    }
+
+    fn prior_instance(&self, class: &str, head: &[Ty], kinds: &[Option<String>], ctx: &[Pred]) -> Option<usize> {
+        let prefix = format!("{}.$f", self.module);
+        let reps = self.instance_reps(head, kinds);
+        self.env.instances.position(class, |old| {
+            let mut lr = HashMap::new();
+            let mut rl = HashMap::new();
+            old.dict.starts_with(&prefix)
+                && self.instance_reps(&old.head, &old.kinds) == reps
+                && Self::alpha_heads(&old.head, head, &mut lr, &mut rl)
+                && old.ctx.len() == ctx.len()
+                && old.ctx.iter().zip(ctx).all(|(a, b)| a.class == b.class && Self::alpha_heads(&a.args, &b.args, &mut lr, &mut rl))
+        })
+    }
+
+    fn fresh_derived_dict(&mut self, strategy: &str, class: &str, tycon: &str) -> String {
+        loop {
+            let counter = self.dict_counter;
+            self.dict_counter += 1;
+            let name = format!("{}.$f{strategy}{}{tycon}_{counter}", self.module, super::types::unqualify(class));
+            if !self.env.instances.has_dict(&name) { return name; }
+        }
+    }
+
+    /// A single compatible implementation can supply a boot dictionary whose kind was
+    /// not fixed during checking, adapting its context for prior SOURCE callers. Don't
+    /// cache this completion until kind and dictionary-context equivalence is established.
+    pub(crate) fn complete_boot_instances(&mut self, boot: &[InstInfo], binds: &mut Vec<TopBind>) -> TR<bool> {
+        let names: std::collections::HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
+        let mut certain = true;
+        for old in boot {
+            if names.contains(&old.dict) {
+                continue;
+            }
+            let candidates: Vec<InstInfo> = self
+                .env
+                .instances
+                .for_class(&old.class)
+                .filter(|i| {
+                    names.contains(&i.dict) && {
+                        let mut lr = HashMap::new();
+                        let mut rl = HashMap::new();
+                        Self::alpha_heads(&old.head, &i.head, &mut lr, &mut rl)
+                            && self
+                                .instance_reps(&old.head, &old.kinds)
+                                .iter()
+                                .zip(self.instance_reps(&i.head, &i.kinds))
+                                .all(|(a, b)| a.is_none() || b.is_none() || *a == b)
+                    }
+                })
+                .cloned()
+                .collect();
+            if candidates.len() != 1 {
+                return self.err(format!("Cannot complete SOURCE instance ‘{}’: implementation is ambiguous or missing", old.dict));
+            }
+            // The implementation may request a different, solvable context (GND uses
+            // Eq [a] where the boot declaration exposes Eq a). Build evidence from
+            // the boot caller's arguments instead of aliasing incompatible functions.
+            let actual = &candidates[0];
+            let mut lr = HashMap::new();
+            let mut rl = HashMap::new();
+            Self::alpha_heads(&old.head, &actual.head, &mut lr, &mut rl);
+            let skolems: Vec<_> = (0..old.nvars).map(|_| self.metas.fresh_skolem("boot")).collect();
+            let actual_vars: Vec<_> =
+                (0..actual.nvars).map(|i| rl.get(&i).and_then(|j| skolems.get(*j as usize)).cloned().unwrap_or_else(|| self.meta())).collect();
+            let params: Vec<_> = old.ctx.iter().map(|_| self.fresh_name("bootd")).collect();
+            let givens = self.givens.len();
+            let refinements = self.metas.skol_binds.clone();
+            let applications = self.skol_apps.clone();
+            let deferred = std::mem::take(&mut self.deferred_eqs);
+            for (p, name) in old.ctx.iter().zip(&params) {
+                self.add_given(Given { pred: super::types::subst_gen_pred(p, &skolems), ev: Core::Var(name.clone()) });
+            }
+            let mut body = Core::Var(actual.dict.clone());
+            let mut wanted = Vec::new();
+            for p in &actual.ctx {
+                let ev = self.fresh_name("bootw");
+                wanted.push(Wanted { pred: super::types::subst_gen_pred(p, &actual_vars), ev: ev.clone(), loc: self.loc });
+                body = Core::App(Box::new(body), Box::new(Core::Var(ev)));
+            }
+            let solved = self.solve(wanted).and_then(|solved| {
+                self.retry_deferred()?;
+                if !self.deferred_eqs.is_empty() {
+                    return self.err(format!("Cannot complete SOURCE instance ‘{}’: unresolved context equality", old.dict));
+                }
+                Ok(solved)
+            });
+            self.givens.truncate(givens);
+            self.metas.skol_binds = refinements;
+            self.skol_apps = applications;
+            self.deferred_eqs = deferred;
+            let (evidence, residual) = solved?;
+            if !residual.is_empty() {
+                return self.err(format!("Cannot complete SOURCE instance ‘{}’: implementation context is not implied by its boot declaration", old.dict));
+            }
+            body = Core::Let(evidence, Box::new(body));
+            for p in params.into_iter().rev() {
+                body = Core::Lam(p, Box::new(body));
+            }
+            binds.push(TopBind { name: old.dict.clone(), body });
+            if let Some(i) = self.env.instances.position(&old.class, |i| i.dict == old.dict) {
+                self.env.instances.remove(i);
+            }
+            certain = false;
+        }
+        Ok(certain)
+    }
+
     /// Checks a renamed module and returns its Core bindings. The environment is
     /// extended with everything the module defines.
     pub fn check_module(&mut self, m: &Module) -> TR<Vec<TopBind>> {
@@ -835,21 +968,18 @@ impl Checker {
         // A module can be registered twice (first as a boot file, then for real): the same instance
         // keeps its dictionary name, so that what was compiled against the first still refers to it.
         let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
-        let earlier = self
-            .env
-            .instances
-            .position(&class, |i| i.head == head && i.kinds == kinds && i.dict.starts_with(&format!("{}.$f", self.module)));
+        let earlier = self.prior_instance(&class, &head, &kinds, &ctx);
         let dict = match earlier {
             Some(i) => self.env.instances.remove(i).dict,
             None => {
-                self.dict_counter += 1;
-                format!(
-                    "{}.$f{}{}_{}",
-                    self.module,
-                    super::types::unqualify(&class),
-                    head.iter().map(|t| head_name(t)).collect::<String>(),
-                    self.dict_counter
-                )
+                // The boot interface may reserve a name for a later instance (two
+                // representation-indexed heads can have the same readable prefix).
+                loop {
+                    self.dict_counter += 1;
+                    let name = format!("{}.$f{}{}_{}", self.module, super::types::unqualify(&class),
+                        head.iter().map(head_name).collect::<String>(), self.dict_counter);
+                    if !self.env.instances.has_dict(&name) { break name; }
+                }
             }
         };
         self.env.instances.push(InstInfo {
@@ -1233,12 +1363,15 @@ impl Checker {
                     let rep = self.convert_type(via, &mut tvs)?;
                     let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
                     let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
-                    let dict = format!("{}.$fVia{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.dict_counter);
-                    self.dict_counter += 1;
+                    let ctx = vec![Pred { class: cls_name.clone(), args: vec![rep] }];
+                    let dict = match self.prior_instance(&cls_name, std::slice::from_ref(&head), &[], &ctx) {
+                        Some(i) => { self.dict_counter += 1; self.env.instances.remove(i).dict },
+                        None => self.fresh_derived_dict("Via", &cls_name, &dd.name),
+                    };
                     self.env.instances.push(InstInfo {
                         class: cls_name.clone(),
                         nvars: tvs.len() as u32,
-                        ctx: vec![Pred { class: cls_name.clone(), args: vec![rep] }],
+                        ctx,
                         head: vec![head],
                         dict: dict.clone(),
                         kinds: Vec::new(),
@@ -1311,16 +1444,19 @@ impl Checker {
                 }
                 let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
                 let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
-                let dict = format!("{}.$fGND{}{}_{}", self.module, super::types::unqualify(&cls_name), dd.name, self.dict_counter);
-                self.dict_counter += 1;
                 let mut ctx_args = pre.clone();
                 ctx_args.push(rep);
                 let mut heads = pre;
                 heads.push(head);
+                let ctx = vec![Pred { class: cls_name.clone(), args: ctx_args }];
+                let dict = match self.prior_instance(&cls_name, &heads, &[], &ctx) {
+                    Some(i) => { self.dict_counter += 1; self.env.instances.remove(i).dict },
+                    None => self.fresh_derived_dict("GND", &cls_name, &dd.name),
+                };
                 self.env.instances.push(InstInfo {
                     class: cls_name.clone(),
                     nvars: tvs.len() as u32,
-                    ctx: vec![Pred { class: cls_name.clone(), args: ctx_args }],
+                    ctx,
                     head: heads,
                     dict: dict.clone(),
                     kinds: Vec::new(),
@@ -1638,5 +1774,28 @@ fn annotated_rep(t: &Type) -> Option<String> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod boot_dictionary_tests {
+    use super::*;
+
+    #[test]
+    fn deriving_names_do_not_replace_a_boot_dictionary_of_another_class() {
+        for strategy in ["GND", "Via"] {
+            let mut tc = Checker::new();
+            tc.module = "A".into();
+            tc.dict_counter = 1;
+            // The ordinary class GNDScore (or ViaScore) shares the derived-name prefix.
+            let reserved = format!("A.$f{strategy}ScoreN_1");
+            tc.env.instances.push(InstInfo {
+                class: format!("A.{strategy}Score"), nvars: 0, ctx: Vec::new(),
+                head: vec![Ty::con("A.N")], dict: reserved.clone(), kinds: Vec::new(),
+            });
+            let fresh = tc.fresh_derived_dict(strategy, "A.Score", "N");
+            assert_eq!(fresh, format!("A.$f{strategy}ScoreN_2"));
+            assert!(tc.env.instances.has_dict(&reserved));
+        }
     }
 }

@@ -496,6 +496,11 @@ impl Checker {
     /// Registers a family from its declaration.
     pub fn register_family(&mut self, name: &str, arity: usize, closed: bool) {
         self.metas.families.insert(name.to_string());
+        // A SOURCE consumer may already have extended an open family declared in the
+        // boot interface. Completing the declaration must retain those equations.
+        if !closed && self.env.families.get(name).is_some_and(|f| !f.closed && f.arity == arity) {
+            return;
+        }
         self.env.families.insert(
             name.to_string(),
             FamilyInfo {
