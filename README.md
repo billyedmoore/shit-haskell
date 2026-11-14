@@ -30,9 +30,10 @@ programs to GHC's own boot libraries' test suites to large real-world projects s
 
 Work in progress. Programs of the test corpus give the same output as GHC on both back ends; most
 boot packages pass their own test suites. ShellCheck 0.11 and its ~45 dependencies (aeson, vector,
-text, ...) build, and its test suite nearly passes. Generated code is far slower than GHC's.
-[PROGRESS.md](PROGRESS.md) has the details by milestone, and the
-[issues](https://github.com/billyedmoore/shit-haskell/issues) track what is next.
+text, ...) build and match the GHC build (its whole test suite, and its output on real scripts);
+hlint's dependencies build up to and including ghc-lib-parser. Generated code is far slower than
+GHC's, which is what [PLAN.md](PLAN.md) addresses next. [PROGRESS.md](PROGRESS.md) has the details
+by milestone, and the [issues](https://github.com/billyedmoore/shit-haskell/issues) track open work.
 
 ## Building and using
 
