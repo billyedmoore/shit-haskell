@@ -428,7 +428,7 @@ impl Checker {
         // GADT refinements made by the binding's patterns end with it.
         let refinements = self.metas.skol_binds.clone();
         let outer_flex = std::mem::take(&mut self.flex_kinds);
-        let r = self.check_signed_body(key, clauses, scheme, loc);
+        let r = self.with_application_scope(|tc| tc.check_signed_body(key, clauses, scheme, loc));
         self.flex_kinds = outer_flex;
         self.metas.skol_binds = refinements;
         r
@@ -569,6 +569,10 @@ impl Checker {
     }
 
     pub fn fun_clauses(&mut self, clauses: &[Clause], ty: &Ty, name: &str) -> TR<Core> {
+        self.with_application_scope(|tc| tc.fun_clauses_body(clauses, ty, name))
+    }
+
+    fn fun_clauses_body(&mut self, clauses: &[Clause], ty: &Ty, name: &str) -> TR<Core> {
         let arity = clauses.first().map(|c| c.pats.len()).unwrap_or(0);
         if arity == 0 {
             let clause = clauses.first().expect("at least one clause");

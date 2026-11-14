@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 214 differential tests for both back ends, compared with GHC.
+- **Corpus:** 216 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -32,8 +32,8 @@ the GitHub issues.
 - **Weakness: speed.** Generated code is 10–500× slower than `ghc -O0` (baseline below), and
   large packages compile slowly, which limits how fast the rest of the work can go. A cold
   compile of all 425 exposed ghc-lib-parser modules with a fresh module cache takes a median
-  32.7 s, down from 36.1 s before application-equality patterns were substituted once per
-  type walk (paired runs; measurements below). Warm builds now take 1.94 s versus 11.16 s before
+  29.6 s, down from 31.3 s before saved application equalities were limited to their
+  scope (paired runs; measurements below). Warm builds now take 1.94 s versus 11.16 s before
   completed boot interfaces could use the module cache (three alternating pairs).
 
 ## Working rules
@@ -99,8 +99,14 @@ the GitHub issues.
   0.467 s at `-O0` and 0.497 s at `-O1`). All hsc checked-module caching is disabled in this
   focused front-end measurement. The full parser import set, caching enabled with a fresh
   checked-module cache per run, takes 36.13 → 32.73 s; type checking falls
-  from 24.19 → 20.66 s (three alternating pairs). Scoping the saved
-  application equalities remains follow-up work.
+  from 24.19 → 20.66 s (three alternating pairs).
+- Saved application equalities now follow the scope of their givens, retaining outer forms
+  through nested signatures, rank-N arguments and GADT alternatives. Ending a branch restores
+  forms even on solver errors; replacing an existing form counts as a local change. This also
+  rejects a later GADT clause that previously borrowed an equality from its sibling. The same
+  focused workload takes 2.843 → 0.384 s, versus GHC's 0.466/0.490 s at `-O0`/`-O1`.
+  With a fresh checked-module cache for each run, the full parser import set takes
+  31.32 → 29.64 s; type checking takes 19.27 → 18.23 s (three alternating pairs).
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and

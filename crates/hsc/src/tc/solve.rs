@@ -675,6 +675,10 @@ impl Checker {
     /// Solves a wanted quantified constraint: the evidence is `\ctx-dicts -> evidence of the head`,
     /// the head solved with fresh rigid variables and the context as givens.
     fn solve_quantified(&mut self, pred: &Pred, loc: crate::syntax::ast::Loc) -> TR<Core> {
+        self.with_application_scope(|tc| tc.solve_quantified_body(pred, loc))
+    }
+
+    fn solve_quantified_body(&mut self, pred: &Pred, loc: crate::syntax::ast::Loc) -> TR<Core> {
         let Ty::Forall(ids, ctx, head) = self.metas.zonk(&pred.args[0]) else {
             return self.err("internal: malformed quantified constraint");
         };

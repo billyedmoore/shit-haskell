@@ -677,7 +677,7 @@ impl Checker {
     fn class_defaults(&mut self, cd: &ClassDecl) -> TR<()> {
         // GADT refinements made inside the declaration end with it.
         let refinements = self.metas.skol_binds.clone();
-        let r = self.class_defaults_body(cd);
+        let r = self.with_application_scope(|tc| tc.class_defaults_body(cd));
         self.metas.skol_binds = refinements;
         r
     }
@@ -1097,7 +1097,7 @@ impl Checker {
     fn instance_body(&mut self, id: &InstDecl) -> TR<()> {
         // GADT refinements made inside the declaration end with it.
         let refinements = self.metas.skol_binds.clone();
-        let r = self.instance_body_body(id);
+        let r = self.with_application_scope(|tc| tc.instance_body_body(id));
         self.metas.skol_binds = refinements;
         r
     }
