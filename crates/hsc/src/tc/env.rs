@@ -149,6 +149,7 @@ pub struct InstInfo {
 pub struct Instances {
     entries: Vec<InstInfo>,
     by_class: HashMap<String, Vec<usize>>,
+    by_dict: HashMap<String, usize>,
 }
 
 impl Instances {
@@ -160,17 +161,34 @@ impl Instances {
         self.by_class.get(class).into_iter().flatten().map(|&i| &self.entries[i])
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &InstInfo> {
+        self.entries.iter()
+    }
+
+    pub fn has_dict(&self, dict: &str) -> bool {
+        self.by_dict.contains_key(dict)
+    }
+
     pub fn since(&self, start: usize) -> &[InstInfo] {
         &self.entries[start..]
     }
 
     pub fn push(&mut self, inst: InstInfo) {
+        // A full cached interface replaces the declaration supplied by its boot file.
+        if let Some(&i) = self.by_dict.get(&inst.dict) {
+            self.remove(i);
+        }
+        self.by_dict.insert(inst.dict.clone(), self.entries.len());
         self.by_class.entry(inst.class.clone()).or_default().push(self.entries.len());
         self.entries.push(inst);
     }
 
     pub fn remove(&mut self, index: usize) -> InstInfo {
         let inst = self.entries.remove(index);
+        self.by_dict.remove(&inst.dict);
+        for i in self.by_dict.values_mut() {
+            if *i > index { *i -= 1; }
+        }
         // Removal is rare (a boot-file instance is replaced by its implementation). Preserve
         // the order of every class, including those whose entries follow the removed one.
         for indices in self.by_class.values_mut() {

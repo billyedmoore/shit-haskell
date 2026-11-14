@@ -952,7 +952,7 @@ impl Checker {
 
     /// The runtime representation of a zonked type's kind, as an annotation names it (`Int#` is
     /// "IntRep", a data type "BoxedRep Lifted"); None when not known here.
-    fn rep_of_type(&self, t: &Ty) -> Option<String> {
+    pub(super) fn rep_of_type(&self, t: &Ty) -> Option<String> {
         let Ty::Con(c) = t.split_apps().0 else { return None };
         if let Some(prim) = c.strip_prefix("GHC.Prim.") {
             let rep = match prim {

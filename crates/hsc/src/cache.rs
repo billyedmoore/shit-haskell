@@ -362,6 +362,9 @@ pub struct Snapshot {
     instances: usize,
     keys: [usize; 9],
     family_eqns: HashMap<String, usize>,
+    /// A boot interface already declared some of this module's names and instances.
+    owner: Option<String>,
+    instance_dicts: Option<std::collections::HashSet<String>>,
 }
 
 /// The additions a module made to the environment.
@@ -392,19 +395,54 @@ pub fn snapshot(env: &Env, kinds: &EnvMap<Kind>) -> Snapshot {
             env.values.mark(), env.fields.mark(), kinds.mark(),
         ],
         family_eqns: env.families.iter().map(|(n, f)| (n.clone(), f.equations.len())).collect(),
+        owner: None,
+        instance_dicts: None,
     }
+}
+
+/// Completing a boot interface replaces declarations as well as adding names. Instance
+/// identities are remembered because replacement shifts their registration indices.
+pub fn snapshot_boot(env: &Env, kinds: &EnvMap<Kind>, module: &str) -> Option<Snapshot> {
+    if !boot_cacheable(env, module) { return None; }
+    let mut s = snapshot(env, kinds);
+    s.owner = Some(module.to_string());
+    s.instance_dicts = Some(env.instances.iter().map(|i| i.dict.clone()).collect());
+    Some(s)
+}
+
+/// Module components begin with an uppercase identifier. Operators may contain dots, so
+/// splitting at the last dot would misclassify a global such as `A..+.`.
+fn owned_by(module: &str, global: &str) -> bool {
+    let Some(rest) = global.strip_prefix(module).and_then(|r| r.strip_prefix('.')) else { return false };
+    !rest.split_once('.').is_some_and(|(component, _)| {
+        component.chars().next().is_some_and(char::is_uppercase)
+            && component.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'')
+    })
+}
+
+/// Equations from a SOURCE consumer are contextual state, not part of the declaring
+/// module's interface. Keep that case uncached until equation ownership is tracked.
+pub fn boot_cacheable(env: &Env, module: &str) -> bool {
+    !env.families.iter().any(|(name, f)| owned_by(module, name) && !f.closed && !f.equations.is_empty())
 }
 
 /// The additions since the snapshot. Kinds are taken resolved (`resolve` prunes their metas).
 pub fn delta(env: &Env, kinds: &EnvMap<Kind>, snap: &Snapshot, resolve: impl Fn(&Kind) -> Kind) -> EnvDelta {
-    fn new<V: Clone>(m: &EnvMap<V>, since: usize) -> Vec<(String, V)> {
+    fn new<V: Clone>(m: &EnvMap<V>, since: usize, owner: Option<&str>) -> Vec<(String, V)> {
         let mut v: Vec<(String, V)> = m.added_since(since).map(|(k, v)| (k.clone(), v.clone())).collect();
+        if let Some(module) = owner {
+            v.extend(m.iter().filter(|(k, _)| owned_by(module, k)).map(|(k, v)| (k.clone(), v.clone())));
+        }
         v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.dedup_by(|a, b| a.0 == b.0);
         v
     }
     let k = &snap.keys;
+    let owner = snap.owner.as_deref();
     let mut family_eqns = Vec::new();
     for (name, f) in &env.families {
+        // An owned family is replaced whole below, so its equations must not also append.
+        if owner.is_some_and(|m| owned_by(m, name)) { continue; }
         if let Some(&before) = snap.family_eqns.get(name) {
             if f.equations.len() > before {
                 family_eqns.push((name.clone(), f.equations[before..].to_vec()));
@@ -413,17 +451,20 @@ pub fn delta(env: &Env, kinds: &EnvMap<Kind>, snap: &Snapshot, resolve: impl Fn(
     }
     family_eqns.sort_by(|a, b| a.0.cmp(&b.0));
     EnvDelta {
-        data_decls: new(&env.data_decls, k[0]),
-        families: new(&env.families, k[1]),
+        data_decls: new(&env.data_decls, k[0], owner),
+        families: new(&env.families, k[1], owner),
         family_eqns,
-        tycons: new(&env.tycons, k[2]),
-        synonyms: new(&env.synonyms, k[3]),
-        datacons: new(&env.datacons, k[4]),
-        classes: new(&env.classes, k[5]),
-        instances: env.instances.since(snap.instances.min(env.instances.len())).to_vec(),
-        values: new(&env.values, k[6]),
-        fields: new(&env.fields, k[7]),
-        kinds: new(kinds, k[8]).into_iter().map(|(n, kd)| (n, resolve(&kd))).collect(),
+        tycons: new(&env.tycons, k[2], owner),
+        synonyms: new(&env.synonyms, k[3], owner),
+        datacons: new(&env.datacons, k[4], owner),
+        classes: new(&env.classes, k[5], owner),
+        instances: match &snap.instance_dicts {
+            Some(old) => env.instances.iter().filter(|i| owner.is_some_and(|m| owned_by(m, &i.dict)) || !old.contains(&i.dict)).cloned().collect(),
+            None => env.instances.since(snap.instances.min(env.instances.len())).to_vec(),
+        },
+        values: new(&env.values, k[6], owner),
+        fields: new(&env.fields, k[7], owner),
+        kinds: new(kinds, k[8], owner).into_iter().map(|(n, kd)| (n, resolve(&kd))).collect(),
     }
 }
 
@@ -448,11 +489,13 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 1";
+const MAGIC: &str = "hsc-module-cache 2";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.
 pub struct Entry {
+    /// The SOURCE interface present before completing this module, if any.
+    pub boot_key: Option<String>,
     pub deps: Vec<(String, String)>,
     pub iface: Iface,
     pub binds: Vec<TopBind>,
@@ -460,7 +503,22 @@ pub struct Entry {
     pub explicit_sigs: Vec<String>,
 }
 
-bin_struct!(Entry { deps, iface, binds, env, explicit_sigs });
+bin_struct!(Entry { boot_key, deps, iface, binds, env, explicit_sigs });
+
+/// Dictionary names are part of the interface consumed by SOURCE importers. Their
+/// numbering can differ between a boot interface and its implementation. Include
+/// the actual mapping, rather than assuming the source text fixes that numbering.
+pub fn instance_key(env: &Env, module: &str, zonk: impl Fn(&Ty) -> Ty) -> String {
+    let mut instances: Vec<_> = env.instances.iter().filter(|i| owned_by(module, &i.dict)).cloned().collect();
+    instances.sort_by(|a, b| a.dict.cmp(&b.dict));
+    for i in &mut instances {
+        i.head = i.head.iter().map(&zonk).collect();
+        for p in &mut i.ctx { p.args = p.args.iter().map(&zonk).collect(); }
+    }
+    let mut w = W { out: Vec::new(), ok: true };
+    instances.put(&mut w);
+    crate::driver::md5_hex(&w.out)
+}
 
 /// The directory of this compiler build's entries (created; other builds' directories removed
 /// the first time).
@@ -661,5 +719,91 @@ mod tests {
         assert_eq!(next.family_eqns.len(), 1);
         assert_eq!(next.family_eqns[0].1.len(), 1);
         assert_eq!(next.family_eqns[0].1[0].rhs, Ty::con("Next"));
+    }
+
+    fn boot_env() -> (Env, EnvMap<Kind>) {
+        let (mut env, mut kinds) = base_env();
+        env.values.insert("M.value".into(), Scheme::mono(Ty::con("Boot")));
+        env.tycons.insert("M.T".into(), TyConInfo { arity: 0, cons: Vec::new() });
+        env.families.insert("M.F".into(), FamilyInfo {
+            arity: 1, closed: true, equations: Vec::new(), injective: Vec::new(),
+        });
+        env.families.insert("M.Sub.F".into(), FamilyInfo {
+            arity: 1, closed: false, equations: vec![equation("SubOld")], injective: Vec::new(),
+        });
+        kinds.insert("M.T".into(), Kind::Star);
+        for dict in ["Other.a", "M.dict", "Other.b"] {
+            env.instances.push(InstInfo {
+                class: "C".into(), nvars: 0, ctx: Vec::new(),
+                head: vec![Ty::con(dict)], dict: dict.into(), kinds: Vec::new(),
+            });
+        }
+        (env, kinds)
+    }
+
+    #[test]
+    fn completed_boot_interface_replaces_declarations_and_instances() {
+        let (mut env, mut kinds) = boot_env();
+        let s = snapshot_boot(&env, &kinds, "M").unwrap();
+        env.values.insert("M.value".into(), Scheme::mono(Ty::con("Implementation")));
+        env.tycons.insert("M.T".into(), TyConInfo { arity: 0, cons: vec!["M.Con".into()] });
+        env.families.get_mut("M.F").unwrap().equations.push(equation("Own"));
+        env.families.get_mut("Boot.F").unwrap().equations.push(equation("Foreign"));
+        env.families.get_mut("M.Sub.F").unwrap().equations.push(equation("SubFromM"));
+        kinds.insert("M.T".into(), Kind::Arr(Box::new(Kind::Star), Box::new(Kind::Star)));
+        let old = env.instances.position("C", |i| i.dict == "M.dict").unwrap();
+        let mut actual = env.instances.remove(old);
+        actual.ctx.push(Pred { class: "Implementation".into(), args: Vec::new() });
+        env.instances.push(actual);
+        env.instances.push(InstInfo {
+            class: "C".into(), nvars: 0, ctx: Vec::new(), head: vec![Ty::con("New")],
+            dict: "Shared.new".into(), kinds: Vec::new(),
+        });
+        let d = delta(&env, &kinds, &s, Clone::clone);
+        assert_eq!(d.values.len(), 1);
+        assert_eq!(d.values[0].1.ty, Ty::con("Implementation"));
+        assert_eq!(d.families.len(), 1);
+        assert_eq!(d.families[0].0, "M.F");
+        assert_eq!(d.family_eqns.len(), 2);
+        assert_eq!(d.family_eqns[0].0, "Boot.F");
+        assert_eq!(d.family_eqns[1].0, "M.Sub.F");
+        assert_eq!(d.family_eqns[1].1.len(), 1);
+        assert_eq!(d.instances.iter().map(|i| i.dict.as_str()).collect::<Vec<_>>(), ["M.dict", "Shared.new"]);
+        let mut w = W { out: Vec::new(), ok: true };
+        d.put(&mut w);
+        assert!(w.ok);
+        let mut r = R { bytes: &w.out, pos: 0 };
+        let decoded = EnvDelta::get(&mut r).unwrap();
+        let (mut loaded, mut loaded_kinds) = boot_env();
+        loaded.families.get_mut("M.Sub.F").unwrap().equations.push(equation("ThirdParty"));
+        apply(&mut loaded, &mut loaded_kinds, decoded);
+        assert_eq!(loaded.values["M.value"].ty, Ty::con("Implementation"));
+        assert_eq!(loaded.tycons["M.T"].cons, ["M.Con"]);
+        assert_eq!(loaded.families["M.F"].equations.len(), 1);
+        assert_eq!(loaded.families["Boot.F"].equations.len(), 2);
+        assert_eq!(loaded.families["M.Sub.F"].equations.iter().map(|e| e.rhs.clone()).collect::<Vec<_>>(),
+            [Ty::con("SubOld"), Ty::con("ThirdParty"), Ty::con("SubFromM")]);
+        assert!(matches!(loaded_kinds["M.T"], Kind::Arr(..)));
+        let all: Vec<_> = loaded.instances.iter().collect();
+        assert_eq!(all.iter().map(|i| i.dict.as_str()).collect::<Vec<_>>(), ["Other.a", "Other.b", "M.dict", "Shared.new"]);
+        assert_eq!(all[2].ctx[0].class, "Implementation");
+        assert_eq!(loaded.instances.position("C", |i| i.dict == "M.dict"), Some(2));
+    }
+
+    #[test]
+    fn boot_family_context_is_not_cached_as_a_declaration() {
+        let (mut env, kinds) = boot_env();
+        env.families.insert("M.Open".into(), FamilyInfo {
+            arity: 1, closed: false, equations: Vec::new(), injective: Vec::new(),
+        });
+        assert!(boot_cacheable(&env, "M"));
+        env.families.get_mut("M.Open").unwrap().equations.push(equation("Consumer"));
+        assert!(!boot_cacheable(&env, "M"));
+        assert!(snapshot_boot(&env, &kinds, "M").is_none());
+        assert!(owned_by("A", "A.value"));
+        assert!(owned_by("A", "A..+."));
+        assert!(owned_by("A", "A.$fClass_with_dots"));
+        assert!(!owned_by("A", "A.B.value"));
+        assert!(!owned_by("A", "A.B.F"));
     }
 }
