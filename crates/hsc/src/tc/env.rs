@@ -77,6 +77,105 @@ pub struct InstInfo {
     pub kinds: Vec<Option<String>>,
 }
 
+/// Instances in registration order, indexed by class. Keeping the index here ensures that
+/// cached modules, derived instances and boot-file replacements all update it together.
+#[derive(Default)]
+pub struct Instances {
+    entries: Vec<InstInfo>,
+    by_class: HashMap<String, Vec<usize>>,
+}
+
+impl Instances {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn for_class(&self, class: &str) -> impl DoubleEndedIterator<Item = &InstInfo> {
+        self.by_class.get(class).into_iter().flatten().map(|&i| &self.entries[i])
+    }
+
+    pub fn since(&self, start: usize) -> &[InstInfo] {
+        &self.entries[start..]
+    }
+
+    pub fn push(&mut self, inst: InstInfo) {
+        self.by_class.entry(inst.class.clone()).or_default().push(self.entries.len());
+        self.entries.push(inst);
+    }
+
+    pub fn remove(&mut self, index: usize) -> InstInfo {
+        let inst = self.entries.remove(index);
+        // Removal is rare (a boot-file instance is replaced by its implementation). Preserve
+        // the order of every class, including those whose entries follow the removed one.
+        for indices in self.by_class.values_mut() {
+            indices.retain(|&i| i != index);
+            for i in indices {
+                if *i > index {
+                    *i -= 1;
+                }
+            }
+        }
+        inst
+    }
+
+    pub fn set_context(&mut self, index: usize, ctx: Vec<Pred>) {
+        self.entries[index].ctx = ctx;
+    }
+
+    pub fn position(&self, class: &str, matches: impl Fn(&InstInfo) -> bool) -> Option<usize> {
+        self.by_class.get(class)?.iter().copied().find(|&i| matches(&self.entries[i]))
+    }
+}
+
+impl std::ops::Index<usize> for Instances {
+    type Output = InstInfo;
+
+    fn index(&self, index: usize) -> &InstInfo {
+        &self.entries[index]
+    }
+}
+
+impl Extend<InstInfo> for Instances {
+    fn extend<T: IntoIterator<Item = InstInfo>>(&mut self, iter: T) {
+        for inst in iter {
+            self.push(inst);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instance(class: &str, dict: &str) -> InstInfo {
+        InstInfo {
+            class: class.into(),
+            nvars: 0,
+            ctx: Vec::new(),
+            head: vec![Ty::con(dict)],
+            dict: dict.into(),
+            kinds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn instance_index_survives_boot_replacement_and_cache_extension() {
+        let mut insts = Instances::default();
+        insts.extend([instance("C", "c0"), instance("D", "d0"), instance("C", "c1"), instance("D", "d1")]);
+        // Replacing a boot-file entry shifts entries of every class, and registers the
+        // replacement last. Cached additions use the same extension path.
+        let old = insts.position("D", |i| i.dict == "d0").unwrap();
+        assert_eq!(insts.remove(old).dict, "d0");
+        insts.extend([instance("D", "d0"), instance("C", "c2")]);
+        let names = |class| insts.for_class(class).map(|i| i.dict.as_str()).collect::<Vec<_>>();
+        assert_eq!(names("C"), ["c0", "c1", "c2"]);
+        assert_eq!(names("D"), ["d1", "d0"]);
+        assert!(names("Missing").is_empty());
+        assert_eq!(insts.position("D", |i| i.dict == "d0"), Some(3));
+        assert_eq!(insts.since(3).iter().map(|i| i.dict.as_str()).collect::<Vec<_>>(), ["d0", "c2"]);
+    }
+}
+
 /// One equation of a type family: patterns over `Gen(0..nvars)`, and the right-hand side.
 #[derive(Clone, Debug)]
 pub struct FamEqn {
@@ -109,7 +208,7 @@ pub struct Env {
     pub synonyms: HashMap<String, Synonym>,
     pub datacons: HashMap<String, DataCon>,
     pub classes: HashMap<String, ClassInfo>,
-    pub instances: Vec<InstInfo>,
+    pub instances: Instances,
     /// Types of all top-level values, including constructors, selectors and methods.
     pub values: HashMap<String, Scheme>,
     /// Record field name to (constructor, position) pairs.

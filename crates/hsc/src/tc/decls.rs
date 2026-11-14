@@ -838,8 +838,7 @@ impl Checker {
         let earlier = self
             .env
             .instances
-            .iter()
-            .position(|i| i.class == class && i.head == head && i.kinds == kinds && i.dict.starts_with(&format!("{}.$f", self.module)));
+            .position(&class, |i| i.head == head && i.kinds == kinds && i.dict.starts_with(&format!("{}.$f", self.module)));
         let dict = match earlier {
             Some(i) => self.env.instances.remove(i).dict,
             None => {
@@ -880,7 +879,7 @@ impl Checker {
                 }
                 let Some(ctx) = self.derived_context(&inst, dd) else { continue };
                 if ctx != inst.ctx {
-                    self.env.instances[*idx].ctx = ctx;
+                    self.env.instances.set_context(*idx, ctx);
                     changed = true;
                 }
             }
@@ -1000,9 +999,9 @@ impl Checker {
         let inst = self
             .env
             .instances
-            .iter()
+            .for_class(&class)
             .rev()
-            .find(|i| i.class == class && i.head == head_check && (i.kinds.is_empty() || i.kinds == kinds))
+            .find(|i| i.head == head_check && (i.kinds.is_empty() || i.kinds == kinds))
             .cloned()
             .expect("instance registered");
         let info = self.class(&class).cloned().expect("class registered");
