@@ -13,7 +13,7 @@ use crate::core::{Alt, Core, Lit as CLit, TopBind};
 use crate::rename::iface::{EntKind, Entity, GName, Iface, PatSynDef};
 use crate::syntax::ast::*;
 use crate::syntax::token::PrimLit;
-use crate::tc::env::{ClassInfo, DataCon, Env, FamEqn, FamilyInfo, InstInfo, Synonym, TyConInfo};
+use crate::tc::env::{ClassInfo, DataCon, Env, EnvMap, FamEqn, FamilyInfo, InstInfo, Synonym, TyConInfo};
 use crate::tc::kinds::Kind;
 use crate::tc::types::{Pred, Scheme, Ty};
 
@@ -359,7 +359,8 @@ bin_struct!(TopBind { name, body });
 
 /// What the environment had before a module was checked: enough to tell its additions.
 pub struct Snapshot {
-    sizes: [usize; 9],
+    instances: usize,
+    keys: [usize; 9],
     family_eqns: HashMap<String, usize>,
 }
 
@@ -382,37 +383,26 @@ pub struct EnvDelta {
 
 bin_struct!(EnvDelta { data_decls, families, family_eqns, tycons, synonyms, datacons, classes, instances, values, fields, kinds });
 
-/// The keys of a map before a module, to find the new ones after it.
-pub struct Keys(Vec<std::collections::HashSet<String>>);
-
-pub fn snapshot(env: &Env, kinds: &HashMap<String, Kind>) -> (Snapshot, Keys) {
-    let keys = |m: Vec<&String>| m.into_iter().cloned().collect::<std::collections::HashSet<String>>();
-    let k = Keys(vec![
-        keys(env.data_decls.keys().collect()),
-        keys(env.families.keys().collect()),
-        keys(env.tycons.keys().collect()),
-        keys(env.synonyms.keys().collect()),
-        keys(env.datacons.keys().collect()),
-        keys(env.classes.keys().collect()),
-        keys(env.values.keys().collect()),
-        keys(env.fields.keys().collect()),
-        keys(kinds.keys().collect()),
-    ]);
-    let s = Snapshot {
-        sizes: [env.instances.len(), 0, 0, 0, 0, 0, 0, 0, 0],
+pub fn snapshot(env: &Env, kinds: &EnvMap<Kind>) -> Snapshot {
+    Snapshot {
+        instances: env.instances.len(),
+        keys: [
+            env.data_decls.mark(), env.families.mark(), env.tycons.mark(),
+            env.synonyms.mark(), env.datacons.mark(), env.classes.mark(),
+            env.values.mark(), env.fields.mark(), kinds.mark(),
+        ],
         family_eqns: env.families.iter().map(|(n, f)| (n.clone(), f.equations.len())).collect(),
-    };
-    (s, k)
+    }
 }
 
 /// The additions since the snapshot. Kinds are taken resolved (`resolve` prunes their metas).
-pub fn delta(env: &Env, kinds: &HashMap<String, Kind>, snap: &Snapshot, keys: &Keys, resolve: impl Fn(&Kind) -> Kind) -> EnvDelta {
-    fn new<V: Clone>(m: &HashMap<String, V>, old: &std::collections::HashSet<String>) -> Vec<(String, V)> {
-        let mut v: Vec<(String, V)> = m.iter().filter(|(k, _)| !old.contains(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+pub fn delta(env: &Env, kinds: &EnvMap<Kind>, snap: &Snapshot, resolve: impl Fn(&Kind) -> Kind) -> EnvDelta {
+    fn new<V: Clone>(m: &EnvMap<V>, since: usize) -> Vec<(String, V)> {
+        let mut v: Vec<(String, V)> = m.added_since(since).map(|(k, v)| (k.clone(), v.clone())).collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v
     }
-    let k = &keys.0;
+    let k = &snap.keys;
     let mut family_eqns = Vec::new();
     for (name, f) in &env.families {
         if let Some(&before) = snap.family_eqns.get(name) {
@@ -423,22 +413,22 @@ pub fn delta(env: &Env, kinds: &HashMap<String, Kind>, snap: &Snapshot, keys: &K
     }
     family_eqns.sort_by(|a, b| a.0.cmp(&b.0));
     EnvDelta {
-        data_decls: new(&env.data_decls, &k[0]),
-        families: new(&env.families, &k[1]),
+        data_decls: new(&env.data_decls, k[0]),
+        families: new(&env.families, k[1]),
         family_eqns,
-        tycons: new(&env.tycons, &k[2]),
-        synonyms: new(&env.synonyms, &k[3]),
-        datacons: new(&env.datacons, &k[4]),
-        classes: new(&env.classes, &k[5]),
-        instances: env.instances.since(snap.sizes[0].min(env.instances.len())).to_vec(),
-        values: new(&env.values, &k[6]),
-        fields: new(&env.fields, &k[7]),
-        kinds: new(kinds, &k[8]).into_iter().map(|(n, kd)| (n, resolve(&kd))).collect(),
+        tycons: new(&env.tycons, k[2]),
+        synonyms: new(&env.synonyms, k[3]),
+        datacons: new(&env.datacons, k[4]),
+        classes: new(&env.classes, k[5]),
+        instances: env.instances.since(snap.instances.min(env.instances.len())).to_vec(),
+        values: new(&env.values, k[6]),
+        fields: new(&env.fields, k[7]),
+        kinds: new(kinds, k[8]).into_iter().map(|(n, kd)| (n, resolve(&kd))).collect(),
     }
 }
 
 /// Puts a module's additions into the environment.
-pub fn apply(env: &mut Env, kinds: &mut HashMap<String, Kind>, d: EnvDelta) {
+pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
     env.data_decls.extend(d.data_decls);
     env.families.extend(d.families);
     for (name, eqns) in d.family_eqns {
@@ -587,5 +577,89 @@ fn has_meta(t: &Ty) -> bool {
         Ty::App(f, a) => has_meta(f) || has_meta(a),
         Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => ps.iter().any(|p| p.args.iter().any(has_meta)) || has_meta(b),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn equation(name: &str) -> FamEqn {
+        FamEqn { nvars: 0, args: vec![Ty::con(name)], rhs: Ty::con(name), kinds: Vec::new() }
+    }
+
+    fn base_env() -> (Env, EnvMap<Kind>) {
+        let mut env = Env::default();
+        let mut kinds = EnvMap::default();
+        env.values.insert("Boot.old".into(), Scheme::mono(Ty::con("Old")));
+        env.families.insert("Boot.F".into(), FamilyInfo {
+            arity: 1, closed: false, equations: vec![equation("Old")], injective: Vec::new(),
+        });
+        kinds.insert("Boot.T".into(), Kind::Star);
+        (env, kinds)
+    }
+
+    #[test]
+    fn module_delta_roundtrips_and_resumes_after_cached_additions() {
+        let (mut env, mut kinds) = base_env();
+        let before = snapshot(&env, &kinds);
+
+        // Replacing an existing value does not introduce a key; repeated definitions of a
+        // new key contribute its final value once (as boot-file completion can do).
+        env.values.insert("Boot.old".into(), Scheme::mono(Ty::con("Replaced")));
+        env.values.insert("M.new".into(), Scheme::mono(Ty::con("First")));
+        env.values.extend([("M.new".into(), Scheme::mono(Ty::con("Final")))]);
+        env.fields.get_or_insert_default("M.field".into()).push(("M.Con".into(), 0));
+        env.fields.get_or_insert_default("M.field".into()).push(("M.Other".into(), 1));
+        env.families.get_mut("Boot.F").unwrap().equations.push(equation("New"));
+        kinds.insert("M.T".into(), Kind::Star);
+        env.instances.push(InstInfo {
+            class: "M.C".into(), nvars: 0, ctx: Vec::new(), head: vec![Ty::con("M.T")],
+            dict: "M.dict".into(), kinds: Vec::new(),
+        });
+
+        let d = delta(&env, &kinds, &before, Clone::clone);
+        assert_eq!(d.values.len(), 1);
+        assert_eq!(d.values[0].0, "M.new");
+        assert_eq!(d.values[0].1.ty, Ty::con("Final"));
+        assert_eq!(d.fields.len(), 1);
+        assert_eq!(d.fields[0].1.len(), 2);
+        assert_eq!(d.kinds.len(), 1);
+        assert_eq!(d.kinds[0].0, "M.T");
+        assert_eq!(d.family_eqns.len(), 1);
+        assert_eq!(d.family_eqns[0].1.len(), 1);
+        assert_eq!(d.family_eqns[0].1[0].rhs, Ty::con("New"));
+
+        let mut w = W { out: Vec::new(), ok: true };
+        d.put(&mut w);
+        assert!(w.ok);
+        let mut r = R { bytes: &w.out, pos: 0 };
+        let decoded = EnvDelta::get(&mut r).unwrap();
+        assert_eq!(r.pos, w.out.len());
+        // Loading a cache entry journals its additions too: the next module starts after
+        // those entries, and can extend a loaded family's equations.
+        let (mut env, mut kinds) = base_env();
+        apply(&mut env, &mut kinds, decoded);
+        assert_eq!(env.values["M.new"].ty, Ty::con("Final"));
+        assert_eq!(env.values["Boot.old"].ty, Ty::con("Old"));
+        assert_eq!(env.fields["M.field"].len(), 2);
+        assert_eq!(env.families["Boot.F"].equations.len(), 2);
+        assert_eq!(env.instances.for_class("M.C").count(), 1);
+        let loaded = snapshot(&env, &kinds);
+        env.values.insert("Next.value".into(), Scheme::mono(Ty::con("Next")));
+        env.fields.get_or_insert_default("Next.field".into()).push(("Next.Con".into(), 0));
+        kinds.insert("Next.T".into(), Kind::Star);
+        env.families.get_mut("Boot.F").unwrap().equations.push(equation("Next"));
+        let next = delta(&env, &kinds, &loaded, Clone::clone);
+        assert_eq!(next.values.len(), 1);
+        assert_eq!(next.values[0].0, "Next.value");
+        assert_eq!(next.fields.len(), 1);
+        assert_eq!(next.fields[0].0, "Next.field");
+        assert_eq!(next.kinds.len(), 1);
+        assert_eq!(next.kinds[0].0, "Next.T");
+        assert!(next.instances.is_empty());
+        assert_eq!(next.family_eqns.len(), 1);
+        assert_eq!(next.family_eqns[0].1.len(), 1);
+        assert_eq!(next.family_eqns[0].1[0].rhs, Ty::con("Next"));
     }
 }

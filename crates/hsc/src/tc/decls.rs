@@ -358,7 +358,7 @@ impl Checker {
             self.add_con(name, &tycon, tag, scheme.clone(), occs.clone(), dd.newtype, strict);
             for (pos, f) in occs.iter().enumerate() {
                 let key = format!("{}.{f}", self.module);
-                self.env.fields.entry(key).or_default().push((name.clone(), pos));
+                self.env.fields.get_or_insert_default(key).push((name.clone(), pos));
             }
         }
 
