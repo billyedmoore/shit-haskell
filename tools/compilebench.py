@@ -9,6 +9,8 @@ NoImplicitPrelude isolates instance lookup from boot-library startup.
 one untimed warmup to create hsc's placeholder objects before measuring the front end.
 --workload boot-cache measures warm dependency checking of 50 SOURCE cycles. Both
 compilers get an untimed build; GHC keeps its native objects, hsc its checked modules.
+--workload application-equalities checks nested applications under recursive
+superclass equalities, as used by ghc-lib-parser's annotation constraints.
 Run without other compiler/test jobs competing for CPU.
 """
 
@@ -40,6 +42,30 @@ def source():
     lines += ["type Deep = " + "D0 (" * 128 + "Result" + ")" * 128]
     for i in range(1000):
         lines += [f"f{i} :: Result", f"f{i} = tag (Proxy :: Proxy (D99 Deep))"]
+    return "\n".join(lines) + "\n"
+
+
+def application_equalities_source():
+    lines = [
+        "{-# LANGUAGE NoImplicitPrelude, AllowAmbiguousTypes, FlexibleInstances,",
+        "    MultiParamTypeClasses, ScopedTypeVariables, TypeFamilies, UndecidableSuperClasses #-}",
+        "module ApplicationEqualities where",
+        "data Result = Result",
+        "data Proxy a = Proxy",
+        "data Parsed",
+        "data Renamed",
+        "type family Body b p where",
+        "  Body b Parsed = b",
+        "  Body b Renamed = [b]",
+        "class (b ~ Body b p) => HasBody b p",
+        "class Tag a where tag :: Proxy a -> Result",
+    ]
+    nested = "b"
+    for _ in range(16):
+        nested = f"Body ({nested}) p"
+    for i in range(500):
+        lines += [f"probe{i} :: forall b p. (HasBody b p, Tag b) => Proxy ({nested}) -> Result",
+                  f"probe{i} = tag"]
     return "\n".join(lines) + "\n"
 
 
@@ -96,7 +122,7 @@ def main():
     parser.add_argument("--after", required=True)
     parser.add_argument("--ghc", default="ghc")
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--workload", choices=("instance-lookup", "module-cache", "boot-cache"), default="instance-lookup")
+    parser.add_argument("--workload", choices=("instance-lookup", "module-cache", "boot-cache", "application-equalities"), default="instance-lookup")
     parser.add_argument("--work", type=Path, default=Path("target/compilebench"))
     args = parser.parse_args()
     if args.runs < 1:
@@ -112,6 +138,11 @@ def main():
         hs = module_sources(work)
         mode = ["--make", "-no-link"]
         title = "Module cache bookkeeping front end (seconds)"
+    elif args.workload == "application-equalities":
+        hs = work / "ApplicationEqualities.hs"
+        hs.write_text(application_equalities_source())
+        mode = ["-c"]
+        title = "Nested application equalities front end (seconds)"
     else:
         hs = work / "InstanceLookup.hs"
         hs.write_text(source())
