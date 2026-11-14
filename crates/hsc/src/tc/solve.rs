@@ -608,7 +608,7 @@ impl Checker {
                 }
                 continue;
             }
-            let insts: Vec<InstInfo> = self.env.instances.iter().filter(|i| i.class == p.class).cloned().collect();
+            let insts: Vec<InstInfo> = self.env.instances.for_class(&p.class).cloned().collect();
             for inst in insts {
                 if inst.head.len() != p.args.len() {
                     continue;
@@ -950,12 +950,9 @@ impl Checker {
             .collect()
     }
 
-    /// Finds an instance for a predicate. Returns the dictionary function name and the
-    /// instance context instantiated for this predicate.
-    /// The runtime representation of a type's kind, as a kind annotation names it (`Int#` is
+    /// The runtime representation of a zonked type's kind, as an annotation names it (`Int#` is
     /// "IntRep", a data type "BoxedRep Lifted"); None when not known here.
     fn rep_of_type(&self, t: &Ty) -> Option<String> {
-        let t = self.metas.zonk(t);
         let Ty::Con(c) = t.split_apps().0 else { return None };
         if let Some(prim) = c.strip_prefix("GHC.Prim.") {
             let rep = match prim {
@@ -987,20 +984,25 @@ impl Checker {
         known.then(|| "BoxedRep Lifted".to_string())
     }
 
+    /// Finds an instance for a predicate, returning its dictionary name and instantiated context.
     pub fn find_instance(&self, want: &Pred) -> Option<(String, Vec<Pred>)> {
+        // Matching never changes the substitution. Resolve the wanted once, rather than
+        // traversing its types again for every candidate (large derived Generic types in
+        // particular). Kind annotations inspect these same resolved arguments.
+        let zonked: Vec<Ty> = want.args.iter().map(|t| self.metas.zonk(t)).collect();
         // Every matching instance; the most specific is chosen (an instance whose head another one's
         // head matches is more specific), as GHC chooses among overlapping instances. Kinds are not
         // tracked, so this also tells apart instances GHC separates by kind (`HasResolution E12` and
         // `KnownNat n => HasResolution n`).
         let mut matches: Vec<(&InstInfo, Vec<Option<Ty>>)> = Vec::new();
-        for inst in &self.env.instances {
-            if inst.class != want.class || inst.head.len() != want.args.len() {
+        for inst in self.env.instances.for_class(&want.class) {
+            if inst.head.len() != want.args.len() {
                 continue;
             }
             // An instance for a kind (`(a :: TYPE 'IntRep)`) is for types of that representation.
-            let kind_ok = inst.kinds.iter().zip(&want.args).all(|(k, t)| match (k, self.rep_of_type(t)) {
-                (Some(want_rep), Some(have)) => *want_rep == have,
-                _ => true,
+            let kind_ok = inst.kinds.iter().zip(&zonked).all(|(k, t)| match k {
+                Some(want_rep) => self.rep_of_type(t).is_none_or(|have| *want_rep == have),
+                None => true,
             });
             if !kind_ok {
                 continue;
@@ -1009,8 +1011,8 @@ impl Checker {
             let ok = inst
                 .head
                 .iter()
-                .zip(&want.args)
-                .all(|(pat, t)| self.match_ty(pat, &self.metas.zonk(t), &mut sub));
+                .zip(&zonked)
+                .all(|(pat, t)| self.match_ty(pat, t, &mut sub));
             if ok {
                 matches.push((inst, sub));
             }
@@ -1018,7 +1020,7 @@ impl Checker {
         // A data instance's representation (`R:Vector136_1`, what `Vector Bit` reduces to) also
         // has the instances of its family application (`instance Eq (Vector a)`).
         if matches.is_empty() {
-            let args: Vec<Ty> = want.args.iter().map(|t| self.family_form(&self.metas.zonk(t))).collect();
+            let args: Vec<Ty> = zonked.iter().map(|t| self.family_form(t)).collect();
             if args != want.args {
                 return self.find_instance(&Pred { class: want.class.clone(), args });
             }

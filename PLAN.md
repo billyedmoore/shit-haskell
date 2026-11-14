@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 203 of 203 programs agree with GHC on both back ends.
+- **Corpus:** 204 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -31,7 +31,8 @@ the GitHub issues.
   - hlint's dependencies build up to and including ghc-lib-parser and mono-traversable.
 - **Weakness: speed.** Generated code is 10–500× slower than `ghc -O0` (baseline below), and
   large packages compile slowly, which limits how fast the rest of the work can go. A cold
-  compile of ghc-lib-parser takes 53 s, down from 171 s now that types share their parts.
+  compile of all 425 exposed ghc-lib-parser modules takes a median 63.1 s, down from 72.8 s
+  before class-indexed instance lookup (paired runs; measurements below).
 
 ## Working rules
 
@@ -44,9 +45,12 @@ the GitHub issues.
   `./target/debug/difftest --hsc <hsc> tests/`, and the same with a `--native` wrapper. CI runs
   both on each pull request.
 - Work goes through pull requests: CI green, a review, then a rebase merge.
+- Commit trailers name the specific model and variant (`Co-Authored-By: GPT-6.1 Sol
+  <noreply@openai.com>`). Pull request descriptions also claim authorship by that model.
 - A package's own test suite is run under cabal against hsc's build (`tools/pkgtest.sh`), and
   a project counts as done when its tests and output match the GHC build's.
-- Speed work shows its results in each pull request as charts of before, after, and GHC.
+- Every speed pull request includes graphs of before, after, and GHC, with the measurement
+  commands and conditions; run-time graphs show both `-O0` and `-O1` and the 0.9× target.
 - This file is kept up to date as work lands.
 
 ## Roadmap, in order
@@ -61,6 +65,12 @@ the GitHub issues.
 **Compile time first**, since it limits every iteration:
 - Types share their parts, so copying, zonking and normalising a large type are cheap (done:
   a derived `Generic` of 200 constructors checks in 2.2 s against GHC's 3.8 s).
+- Instance lookup indexes by class and resolves each wanted's types once, skipping kind checks
+  without annotations (done). With the module cache disabled, median of three alternating
+  before/after runs: ghc-lib-parser's full import set compiles in 72.8 → 63.1 s (type checking
+  47.5 → 39.1 s). The focused `tools/compilebench.py` front-end benchmark takes 0.371 → 0.129 s;
+  GHC 9.12.2 with `-fno-code` takes 1.070 s at `-O0` and 1.067 s at `-O1`. These are compile-time
+  measurements, including process startup; the native run-time baseline below is unchanged.
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and

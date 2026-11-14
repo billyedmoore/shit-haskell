@@ -430,7 +430,7 @@ pub fn delta(env: &Env, kinds: &HashMap<String, Kind>, snap: &Snapshot, keys: &K
         synonyms: new(&env.synonyms, &k[3]),
         datacons: new(&env.datacons, &k[4]),
         classes: new(&env.classes, &k[5]),
-        instances: env.instances[snap.sizes[0].min(env.instances.len())..].to_vec(),
+        instances: env.instances.since(snap.sizes[0].min(env.instances.len())).to_vec(),
         values: new(&env.values, &k[6]),
         fields: new(&env.fields, &k[7]),
         kinds: new(kinds, &k[8]).into_iter().map(|(n, kd)| (n, resolve(&kd))).collect(),

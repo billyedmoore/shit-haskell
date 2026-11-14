@@ -35,6 +35,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build hsc
         run: cargo build --release -p hsc
+      - name: Rust unit tests
+        run: cargo test -p hsc --lib
       - name: Smoke test (interpreter and native)
         run: |
           mkdir -p smoke
