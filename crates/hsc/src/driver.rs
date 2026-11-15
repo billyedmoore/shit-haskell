@@ -1276,6 +1276,10 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
     crate::core::opt::inline_prim_wrappers(&mut binds);
     crate::core::opt::specialise_literals(&mut binds);
     crate::core::opt::resolve_known_methods(&mut binds);
+    crate::core::opt::eliminate_alias_thunks(&mut binds);
+    if flags.iter().any(|f| f == "-dcore-lint") {
+        crate::core::lint::lint_program(&binds).map_err(|e| format!("Core lint after optimization: {e}"))?;
+    }
     Ok(binds)
 }
 
