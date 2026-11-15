@@ -10,11 +10,9 @@ use super::{Alt, Core, Lit, TopBind};
 pub fn specialise_literals(binds: &mut [TopBind]) {
     let mut known: HashMap<String, String> = HashMap::new();
     for b in binds.iter() {
-        collect_dict_aliases(&b.body, &mut known);
+        collect_aliases(&b.body, &mut known);
         if let Core::Var(g) = &b.body {
-            if g.contains(".$f") {
-                known.insert(b.name.clone(), g.clone());
-            }
+            known.insert(b.name.clone(), g.clone());
         }
     }
     for b in binds.iter_mut() {
@@ -22,50 +20,32 @@ pub fn specialise_literals(binds: &mut [TopBind]) {
     }
 }
 
-fn dict_class(global: &str) -> Option<&str> {
-    let rest = global.split_once(".$f")?.1;
-    if rest.starts_with("NumInt_") {
-        Some("Int")
-    } else if rest.starts_with("NumInteger_") {
-        Some("Integer")
-    } else if rest.starts_with("NumDouble_") {
-        Some("Double")
-    } else if rest.starts_with("FractionalDouble_") {
-        Some("FractionalDouble")
-    } else {
-        None
+fn dict_class(name: &str, aliases: &HashMap<String, String>) -> Option<&'static str> {
+    let mut name = name;
+    for _ in 0..16 {
+        match aliases.get(name) {
+            Some(next) => name = next,
+            None => return builtin_dict_class(name),
+        }
     }
+    None
 }
 
-fn collect_dict_aliases(c: &Core, known: &mut HashMap<String, String>) {
-    match c {
-        Core::Let(binds, body) => {
-            for (n, b) in binds {
-                if let Core::Var(g) = b {
-                    if g.contains(".$f") {
-                        known.insert(n.clone(), g.clone());
-                    }
-                }
-                collect_dict_aliases(b, known);
-            }
-            collect_dict_aliases(body, known);
-        }
-        Core::App(f, a) => {
-            collect_dict_aliases(f, known);
-            collect_dict_aliases(a, known);
-        }
-        Core::Lam(_, b) => collect_dict_aliases(b, known),
-        Core::Case(s, _, alts) => {
-            collect_dict_aliases(s, known);
-            for a in alts {
-                match a {
-                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => collect_dict_aliases(b, known),
-                }
+fn builtin_dict_class(global: &str) -> Option<&'static str> {
+    let (module, rest) = global.split_once(".$f")?;
+    let classes: &[(&str, &str)] = match module {
+        "GHC.Internal.Num" => &[("NumInt_", "Int"), ("NumInteger_", "Integer")],
+        "GHC.Internal.Float" => &[("NumDouble_", "Double"), ("FractionalDouble_", "FractionalDouble")],
+        _ => return None,
+    };
+    for (prefix, class) in classes {
+        if let Some(index) = rest.strip_prefix(prefix) {
+            if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(class);
             }
         }
-        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| collect_dict_aliases(a, known)),
-        _ => {}
     }
+    None
 }
 
 fn rewrite(c: &mut Core, known: &HashMap<String, String>) {
@@ -73,8 +53,8 @@ fn rewrite(c: &mut Core, known: &HashMap<String, String>) {
     if let Core::App(f, arg) = c {
         if let Core::App(g, dict) = f.as_ref() {
             if let (Core::Var(fname), Core::Var(ev)) = (g.as_ref(), dict.as_ref()) {
-                if fname == "Base.fromInteger" {
-                    if let (Some(cls), Core::Lit(Lit::Integer(s))) = (known.get(ev).and_then(|d| dict_class(d)), arg.as_ref()) {
+                if fname == "GHC.Internal.Num.fromInteger" {
+                    if let (Some(cls), Core::Lit(Lit::Integer(s))) = (dict_class(ev, known), arg.as_ref()) {
                         match cls {
                             "Int" => {
                                 if let Ok(v) = s.parse::<i64>() {
@@ -87,20 +67,24 @@ fn rewrite(c: &mut Core, known: &HashMap<String, String>) {
                                 return;
                             }
                             "Double" => {
-                                *c = Core::Lit(Lit::Double(s.parse::<f64>().unwrap_or(0.0)));
-                                return;
+                                if let Ok(value) = s.parse::<f64>() {
+                                    *c = Core::Lit(Lit::Double(value));
+                                    return;
+                                }
                             }
                             _ => {}
                         }
                     }
                 }
-                if fname == "Base.fromRational" {
+                if fname == "GHC.Internal.Real.fromRational" {
                     if let (Some("FractionalDouble"), Core::Prim(p, pargs)) =
-                        (known.get(ev).and_then(|d| dict_class(d)), arg.as_ref())
+                        (dict_class(ev, known), arg.as_ref())
                     {
                         if let ("ratioLit", [Core::Lit(Lit::Frac(s))]) = (p.as_str(), pargs.as_slice()) {
-                            *c = Core::Lit(Lit::Double(s.parse::<f64>().unwrap_or(0.0)));
-                            return;
+                            if let Ok(value) = s.parse::<f64>() {
+                                *c = Core::Lit(Lit::Double(value));
+                                return;
+                            }
                         }
                     }
                 }
@@ -327,4 +311,79 @@ fn inline_calls(c: &mut Core, wrappers: &HashMap<String, (usize, String)>) {
     }
     args.reverse();
     *c = Core::Prim(prim.clone(), args);
+}
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+
+    fn integer(function: &str, dictionary: &str, text: &str) -> Core {
+        Core::App(Box::new(Core::App(Box::new(Core::Var(function.into())), Box::new(Core::Var(dictionary.into())))),
+                  Box::new(Core::Lit(Lit::Integer(text.into()))))
+    }
+
+    fn fractional(dictionary: &str, text: &str) -> Core {
+        Core::App(Box::new(Core::App(Box::new(Core::Var("GHC.Internal.Real.fromRational".into())), Box::new(Core::Var(dictionary.into())))),
+                  Box::new(Core::Prim("ratioLit".into(), vec![Core::Lit(Lit::Frac(text.into()))])))
+    }
+
+    fn optimise(body: Core, aliases: &[(&str, &str)]) -> Core {
+        let mut binds: Vec<_> = aliases.iter().map(|(name, target)| TopBind { name: (*name).into(), body: Core::Var((*target).into()) }).collect();
+        binds.push(TopBind { name: "Main.value".into(), body });
+        specialise_literals(&mut binds);
+        binds.pop().unwrap().body
+    }
+
+    #[test]
+    fn standard_literals_specialise_through_dictionary_alias_chains() {
+        let body = Core::Let(vec![("d0".into(), Core::Var("GHC.Internal.Num.$fNumInt_1".into())),
+                                  ("d1".into(), Core::Var("d0".into())), ("d2".into(), Core::Var("d1".into()))],
+                             Box::new(integer("GHC.Internal.Num.fromInteger", "d2", "7")));
+        let Core::Let(_, body) = optimise(body, &[]) else { panic!() };
+        assert_eq!(*body, Core::Lit(Lit::Int(7)));
+        assert_eq!(optimise(integer("GHC.Internal.Num.fromInteger", "GHC.Internal.Num.$fNumInt_1", "-9"), &[]), Core::Lit(Lit::Int(-9)));
+        assert_eq!(optimise(integer("GHC.Internal.Num.fromInteger", "GHC.Internal.Num.$fNumInteger_2", "123456789012345678901234567890"), &[]),
+                   Core::Lit(Lit::Integer("123456789012345678901234567890".into())));
+        assert_eq!(optimise(integer("GHC.Internal.Num.fromInteger", "GHC.Internal.Float.$fNumDouble_8", "9007199254740993"), &[]),
+                   Core::Lit(Lit::Double(9007199254740992.0)));
+        assert_eq!(optimise(integer("GHC.Internal.Num.fromInteger", "GHC.Internal.Float.$fNumDouble_8", "36893488147419107329"), &[]),
+                   Core::Lit(Lit::Double(36893488147419111424.0)));
+        assert_eq!(optimise(fractional("d", "0.125"), &[("d", "GHC.Internal.Float.$fFractionalDouble_9")]), Core::Lit(Lit::Double(0.125)));
+    }
+
+    #[test]
+    fn custom_dictionaries_functions_and_cycles_keep_their_calls() {
+        for dictionary in ["Custom.$fNumInt_1", "Base.$fNumInt_1", "GHC.Internal.Real.$fNumInt_1",
+                           "GHC.Internal.Num.$fNumInt_", "GHC.Internal.Num.$fNumInt_1%mi%2", "GHC.Internal.Num.$fNumInt_١"] {
+            let call = integer("GHC.Internal.Num.fromInteger", dictionary, "7");
+            assert_eq!(optimise(call.clone(), &[]), call, "{dictionary}");
+        }
+        let custom = integer("Custom.fromInteger", "GHC.Internal.Num.$fNumInt_1", "7");
+        assert_eq!(optimise(custom.clone(), &[]), custom);
+        let base = integer("Base.fromInteger", "GHC.Internal.Num.$fNumInt_1", "7");
+        assert_eq!(optimise(base.clone(), &[]), base);
+        let base_fraction = Core::App(Box::new(Core::App(Box::new(Core::Var("Base.fromRational".into())),
+                                                        Box::new(Core::Var("GHC.Internal.Float.$fFractionalDouble_9".into())))),
+                                      Box::new(Core::Prim("ratioLit".into(), vec![Core::Lit(Lit::Frac("0.5".into()))])));
+        assert_eq!(optimise(base_fraction.clone(), &[]), base_fraction);
+        let cycle = integer("GHC.Internal.Num.fromInteger", "GHC.Internal.Num.$fNumInt_1", "7");
+        assert_eq!(optimise(cycle.clone(), &[("GHC.Internal.Num.$fNumInt_1", "d"), ("d", "GHC.Internal.Num.$fNumInt_1")]), cycle);
+        assert_eq!(optimise(cycle.clone(), &[("GHC.Internal.Num.$fNumInt_1", "GHC.Internal.Err.undefined")]), cycle);
+    }
+
+    #[test]
+    fn integer_overflow_failed_parses_and_double_edge_values_are_preserved() {
+        for text in ["9223372036854775808", "-9223372036854775809", "not-an-integer"] {
+            let call = integer("GHC.Internal.Num.fromInteger", "GHC.Internal.Num.$fNumInt_1", text);
+            assert_eq!(optimise(call.clone(), &[]), call);
+        }
+        for call in [integer("GHC.Internal.Num.fromInteger", "GHC.Internal.Float.$fNumDouble_8", "bad"),
+                     fractional("GHC.Internal.Float.$fFractionalDouble_9", "bad")] {
+            assert_eq!(optimise(call.clone(), &[]), call);
+        }
+        let Core::Lit(Lit::Double(zero)) = optimise(fractional("GHC.Internal.Float.$fFractionalDouble_9", "-0.0"), &[]) else { panic!() };
+        assert_eq!(zero.to_bits(), (-0.0f64).to_bits());
+        let Core::Lit(Lit::Double(tiny)) = optimise(fractional("GHC.Internal.Float.$fFractionalDouble_9", "5e-324"), &[]) else { panic!() };
+        assert_eq!(tiny.to_bits(), 1);
+    }
 }
