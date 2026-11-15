@@ -113,6 +113,8 @@ pub struct Gen {
     con_names: Vec<String>,
     prim_ids: HashMap<String, u32>,
     prim_names: Vec<String>,
+    /// Entry labels and fixed arities in program-global index order.
+    known_globals: Vec<(u32, String)>,
     /// Closure bodies still to generate: (label, closure, name for debugging).
     pending: Vec<(String, SClosure, String)>,
     /// The bodies in the order they are emitted (their addresses increase): (label, name).
@@ -149,6 +151,7 @@ impl Gen {
             con_names: Vec::new(),
             prim_ids: HashMap::new(),
             prim_names: Vec::new(),
+            known_globals: Vec::new(),
             pending: Vec::new(),
             body_names: Vec::new(),
             current_name: String::new(),
@@ -204,6 +207,9 @@ impl Gen {
         for gl in &prog.globals {
             let l = g.label("g");
             global_labels.push(l.clone());
+            // Register every entry before emitting bodies, including forward/mutual calls.
+            let arity = if gl.closure.captures.is_empty() { gl.closure.arity } else { 0 };
+            g.known_globals.push((arity, l.clone()));
             g.pending.push((l, gl.closure.clone(), gl.name.clone()));
         }
         g.out.push_str("    .text\n");
@@ -313,6 +319,12 @@ impl Gen {
         self.emit("jmp hsc_eval");
     }
 
+    fn known_global_entry(&self, func: &Atom, nargs: usize) -> Option<&str> {
+        let Atom::Global(index) = func else { return None };
+        let (arity, entry) = self.known_globals.get(*index as usize)?;
+        (*arity > 0 && *arity as usize == nargs).then_some(entry.as_str())
+    }
+
     fn expr(&mut self, e: &SExpr, p: Pos) {
         match e {
             SExpr::Atom(a) => {
@@ -320,6 +332,7 @@ impl Gen {
                 self.eval_result(p);
             }
             SExpr::App(func, args) => {
+                let direct = self.known_global_entry(func, args.len()).map(str::to_owned);
                 // The function is loaded first (into R1, which nothing below clobbers). The arguments
                 // are then copied one at a time, through a scratch register, into a new argument area
                 // below the frame; a tail call moves that area up over the frame it replaces.
@@ -341,7 +354,11 @@ impl Gen {
                     self.emit(&format!("addq ${}, %rbp", 8 * s));
                 }
                 self.emit(&format!("movl ${}, %ecx", n));
-                self.emit("jmp hsc_apply");
+                if let Some(entry) = direct {
+                    self.emit(&format!("jmp {entry}"));
+                } else {
+                    self.emit("jmp hsc_apply");
+                }
             }
             SExpr::Con(name, args) => {
                 let id = self.con_id(name);
@@ -966,5 +983,55 @@ mod nullary_constructor_tests {
         assert!(gen.nullary_cons.is_empty());
         assert!(gen.out.contains("hsc_gc"));
         assert!(gen.out.contains("movq %rcx, 8(%rax)"));
+    }
+}
+
+#[cfg(test)]
+mod known_global_call_tests {
+    use super::*;
+    use crate::native::stg::SGlobal;
+
+    fn position(mode: Mode) -> Pos {
+        Pos { f: Frame { s: 3, a: 2 }, mode, pushed: if mode == Mode::Scrut { 1 } else { 0 } }
+    }
+
+    #[test]
+    fn exact_global_calls_bypass_apply_in_both_return_modes() {
+        for mode in [Mode::Tail, Mode::Scrut] {
+            let mut gen = Gen::new();
+            gen.known_globals.push((2, ".Lknown_entry".into()));
+            gen.expr(&SExpr::App(Atom::Global(0), vec![Atom::Slot(1), Atom::Slot(2)]), position(mode));
+            assert!(gen.out.ends_with("    jmp .Lknown_entry\n"));
+            assert!(!gen.out.contains("jmp hsc_apply"));
+        }
+    }
+
+    #[test]
+    fn partial_overapplied_caf_and_local_calls_keep_generic_dispatch() {
+        for (func, arity, nargs) in [
+            (Atom::Global(0), 2, 1), (Atom::Global(0), 2, 3),
+            (Atom::Global(0), 0, 1), (Atom::Slot(0), 2, 2), (Atom::Free(0), 2, 2),
+        ] {
+            let mut gen = Gen::new();
+            gen.known_globals.push((arity, ".Lknown_entry".into()));
+            let args = vec![Atom::Lit(SLit::Int(7)); nargs];
+            gen.expr(&SExpr::App(func, args), position(Mode::Tail));
+            assert!(gen.out.ends_with("    jmp hsc_apply\n"));
+        }
+    }
+
+    #[test]
+    fn forward_and_mutual_entries_are_registered_before_body_generation() {
+        let globals = vec![
+            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) } },
+            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) } },
+        ];
+        let index = [("Main.main".to_string(), 0), ("Test.other".to_string(), 1)].into_iter().collect();
+        let asm = Gen::program(&SProgram { globals, index });
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        for row in table.lines().take(2) {
+            let label = row.rsplit_once(',').unwrap().1.trim();
+            assert!(asm.contains(&format!("jmp {label}\n")));
+        }
     }
 }
