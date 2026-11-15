@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 228 differential tests for both back ends, compared with GHC.
+- **Corpus:** 229 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -174,19 +174,19 @@ and on build tools hsc builds (happy, alex). `difftest --bench` also checks the 
 Representative paired results use Rust 1.92.0 release hsc, GHC 9.12.2 and CPU 0,
 one untimed correctness warmup and three alternating timed samples per build.
 Builds are excluded; startup is included. Every stdout/stderr/exit result matches.
-The table is the alias-thunk comparison on a hosted AMD EPYC 7763 runner.
+The table is the small-integer cache verification on a hosted AMD EPYC 9V74 runner.
 The target remains **0.9× GHC `-O1` on every program**.
 
 | program | before ms | hsc ms | GHC -O0 ms | GHC -O1 ms | 0.9×O1 target ms |
 |---------|----------:|-------:|-----------:|-----------:|----------------:|
-| fib | 225.211 | 169.073 | 28.944 | 4.811 | 4.330 |
-| integer | 123.492 | 116.416 | 8.690 | 8.169 | 7.352 |
-| ioref | 2865.224 | 1804.312 | 80.040 | 7.670 | 6.903 |
-| mapops | 850.951 | 532.875 | 92.902 | 54.231 | 48.808 |
-| mvar | 262.330 | 216.720 | 18.280 | 8.487 | 7.638 |
-| nqueens | 384.994 | 315.725 | 32.721 | 4.997 | 4.497 |
-| strings | 8027.980 | 6111.663 | 112.681 | 142.335 | 128.101 |
-| sumloop | 18864.813 | 14778.604 | 337.084 | 16.463 | 14.817 |
+| fib | 133.751 | 125.612 | 18.233 | 3.768 | 3.391 |
+| integer | 80.111 | 79.558 | 6.818 | 5.982 | 5.384 |
+| ioref | 1383.175 | 1374.626 | 55.885 | 6.130 | 5.517 |
+| mapops | 419.739 | 409.390 | 71.379 | 45.181 | 40.663 |
+| mvar | 190.813 | 188.590 | 13.427 | 6.649 | 5.984 |
+| nqueens | 229.090 | 223.906 | 22.122 | 4.390 | 3.951 |
+| strings | 4924.212 | 4758.718 | 81.924 | 108.686 | 97.818 |
+| sumloop | 12299.421 | 10751.014 | 195.268 | 13.892 | 12.503 |
 
 Canonical standard numeric literals fold through dictionary aliases, eliminating repeated
 conversion workers. Custom instances, noncanonical `Base` names, overflowing `Int` literals
@@ -230,15 +230,23 @@ different hosted CPU models; their absolute times are not chained together.
 Pure local variable aliases no longer allocate forwarding thunks. Resolution preserves
 sharing and strict Case nodes, and conservatively retains recursive or unresolved aliases
 and bodies with shadowed/reused binders. Post-optimization Core lint checks scope when
-requested. Both backends passed 227 tests and all 51 unit tests. The table above is this
-paired comparison: geometric-mean speedup 1.314×, with all eight medians improved;
+requested. Both backends passed 227 tests and all 51 unit tests. That paired
+comparison measured a geometric-mean speedup of 1.314×, with all eight medians improved;
 ioref 2.865 → 1.804 s and sumloop 18.865 → 14.779 s.
 [Raw samples, conditions and graphs](bench/results/runtime-alias-thunks.md).
 
-Next: measure static native INT cells for -16 through 255, matching GHC's small boxed-Int
-range. Cached immutable cells use the existing static-object GC behavior; uncached values
-retain ordinary allocation. Boundary, Word/Integer payload and direct/indirect GC-root
-coverage is being validated. No speedup is claimed for this candidate yet.
+Native INT cells for -16 through 255 are immutable static values, matching GHC's small
+boxed-Int range. Uncached values retain normal allocation. Both backends passed 228 tests
+and all 53 unit tests, including direct/indirect static GC roots and numeric boundaries.
+Two independent hosted comparisons measured geometric-mean speedups of 1.037× and 1.039×;
+sumloop took 12.656 → 11.030 s and 12.299 → 10.751 s. IORef was 4.2% slower initially and
+0.6% faster on verification, so no consistent IORef change is claimed. The table above is
+the verification comparison. [Both complete runs and graphs](bench/results/runtime-small-integers.md).
+
+Next: measure shared static cells for native constructors without fields. Only zero-field
+construction takes the new path; fieldful constructors keep ordinary allocation. Tag
+separation, both return modes and retention of mixed values across GC are being validated.
+No speedup is claimed for this candidate yet.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.

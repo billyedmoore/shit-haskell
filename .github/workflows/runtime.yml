@@ -74,6 +74,7 @@ jobs:
           work.mkdir(parents=True, exist_ok=True)
           (work / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
           PY
+          cat "$RUNNER_TEMP/runtimebench/metadata.json"
           cpu=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
           python3 after/tools/runtimebench.py \
             --before "$GITHUB_WORKSPACE/before/target/release/hsc" \
