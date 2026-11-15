@@ -1,0 +1,836 @@
+{
+  "runs": 3,
+  "warmups": 1,
+  "cpu": 0,
+  "programs": {
+    "fib": {
+      "source": "$REPO/bench/progs/fib.hs",
+      "source_sha256": "08002aa1da74b1339ab86a6b30639778c2c832990517f362963fec789c0164fc",
+      "builds": {
+        "Before": [
+          "$REPO/target/runtime-literals-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/fib.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/fib/Before",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/fib/Before/program"
+        ],
+        "After": [
+          "$REPO/target/primitive-dispatch-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/fib.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/fib/After",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/fib/After/program"
+        ],
+        "GHC -O0": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$REPO/bench/progs/fib.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/fib/GHC--O0",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/fib/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$REPO/bench/progs/fib.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/fib/GHC--O1",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/fib/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "$REPO/target/speed-runtime/dispatch/full/fib/Before/program"
+        ],
+        "After": [
+          "$REPO/target/speed-runtime/dispatch/full/fib/After/program"
+        ],
+        "GHC -O0": [
+          "$REPO/target/speed-runtime/dispatch/full/fib/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "$REPO/target/speed-runtime/dispatch/full/fib/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.2279378290004388,
+          0.23070113900030265,
+          0.23292711900012364
+        ],
+        "After": [
+          0.2070504269995581,
+          0.1854133830001956,
+          0.18837924499985093
+        ],
+        "GHC -O0": [
+          0.021976218999952835,
+          0.01729063600032532,
+          0.016469246000269777
+        ],
+        "GHC -O1": [
+          0.003779570999540738,
+          0.0033188180004799506,
+          0.0038118410002425662
+        ]
+      },
+      "medians": {
+        "Before": 0.23070113900030265,
+        "After": 0.18837924499985093,
+        "GHC -O0": 0.01729063600032532,
+        "GHC -O1": 0.003779570999540738
+      },
+      "best": {
+        "Before": 0.2279378290004388,
+        "After": 0.1854133830001956,
+        "GHC -O0": 0.016469246000269777,
+        "GHC -O1": 0.0033188180004799506
+      },
+      "target": 0.0034016138995866642
+    },
+    "integer": {
+      "source": "$REPO/bench/progs/integer.hs",
+      "source_sha256": "cf3dbfdb8ecb586373c975be8a524b23b2db321f001d8160938d718df871a261",
+      "builds": {
+        "Before": [
+          "$REPO/target/runtime-literals-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/integer.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/integer/Before",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/integer/Before/program"
+        ],
+        "After": [
+          "$REPO/target/primitive-dispatch-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/integer.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/integer/After",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/integer/After/program"
+        ],
+        "GHC -O0": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$REPO/bench/progs/integer.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/integer/GHC--O0",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/integer/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$REPO/bench/progs/integer.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/integer/GHC--O1",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/integer/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "$REPO/target/speed-runtime/dispatch/full/integer/Before/program"
+        ],
+        "After": [
+          "$REPO/target/speed-runtime/dispatch/full/integer/After/program"
+        ],
+        "GHC -O0": [
+          "$REPO/target/speed-runtime/dispatch/full/integer/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "$REPO/target/speed-runtime/dispatch/full/integer/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.10274403499988694,
+          0.10777851900002133,
+          0.10699993599973823
+        ],
+        "After": [
+          0.10367672499978653,
+          0.1032356659998186,
+          0.10107939499994245
+        ],
+        "GHC -O0": [
+          0.005609611000181758,
+          0.005538863000765559,
+          0.0054483740004798165
+        ],
+        "GHC -O1": [
+          0.00528025399944454,
+          0.00541979799982073,
+          0.004677665000599518
+        ]
+      },
+      "medians": {
+        "Before": 0.10699993599973823,
+        "After": 0.1032356659998186,
+        "GHC -O0": 0.005538863000765559,
+        "GHC -O1": 0.00528025399944454
+      },
+      "best": {
+        "Before": 0.10274403499988694,
+        "After": 0.10107939499994245,
+        "GHC -O0": 0.0054483740004798165,
+        "GHC -O1": 0.004677665000599518
+      },
+      "target": 0.004752228599500086
+    },
+    "ioref": {
+      "source": "$REPO/bench/progs/ioref.hs",
+      "source_sha256": "53021d094730b853b550abeb88844f0052a4a5ebfb703314a1987a681d4f27e3",
+      "builds": {
+        "Before": [
+          "$REPO/target/runtime-literals-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/ioref.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/ioref/Before",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/ioref/Before/program"
+        ],
+        "After": [
+          "$REPO/target/primitive-dispatch-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/ioref.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/ioref/After",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/ioref/After/program"
+        ],
+        "GHC -O0": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$REPO/bench/progs/ioref.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/ioref/GHC--O0",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/ioref/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$REPO/bench/progs/ioref.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/ioref/GHC--O1",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/ioref/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "$REPO/target/speed-runtime/dispatch/full/ioref/Before/program"
+        ],
+        "After": [
+          "$REPO/target/speed-runtime/dispatch/full/ioref/After/program"
+        ],
+        "GHC -O0": [
+          "$REPO/target/speed-runtime/dispatch/full/ioref/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "$REPO/target/speed-runtime/dispatch/full/ioref/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          2.521492751000551,
+          2.4562195789994803,
+          2.640430304999427
+        ],
+        "After": [
+          2.2112434389991904,
+          2.380727246999413,
+          2.169541739000124
+        ],
+        "GHC -O0": [
+          0.054354456999135436,
+          0.05533626099986577,
+          0.052724585999385454
+        ],
+        "GHC -O1": [
+          0.005868086000191397,
+          0.005349166999621957,
+          0.005330605000381183
+        ]
+      },
+      "medians": {
+        "Before": 2.521492751000551,
+        "After": 2.2112434389991904,
+        "GHC -O0": 0.054354456999135436,
+        "GHC -O1": 0.005349166999621957
+      },
+      "best": {
+        "Before": 2.4562195789994803,
+        "After": 2.169541739000124,
+        "GHC -O0": 0.052724585999385454,
+        "GHC -O1": 0.005330605000381183
+      },
+      "target": 0.004814250299659761
+    },
+    "mapops": {
+      "source": "$REPO/bench/progs/mapops.hs",
+      "source_sha256": "28cad5d704b9bb3dba3b25dc1643620ee816573c5a707e1a39fe82551a2c75fb",
+      "builds": {
+        "Before": [
+          "$REPO/target/runtime-literals-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/mapops.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/mapops/Before",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/mapops/Before/program"
+        ],
+        "After": [
+          "$REPO/target/primitive-dispatch-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/mapops.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/mapops/After",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/mapops/After/program"
+        ],
+        "GHC -O0": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$REPO/bench/progs/mapops.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/mapops/GHC--O0",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/mapops/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$REPO/bench/progs/mapops.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/mapops/GHC--O1",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/mapops/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "$REPO/target/speed-runtime/dispatch/full/mapops/Before/program"
+        ],
+        "After": [
+          "$REPO/target/speed-runtime/dispatch/full/mapops/After/program"
+        ],
+        "GHC -O0": [
+          "$REPO/target/speed-runtime/dispatch/full/mapops/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "$REPO/target/speed-runtime/dispatch/full/mapops/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.9117969130002166,
+          0.9320772090004539,
+          0.9301930150004409
+        ],
+        "After": [
+          0.918143374000465,
+          0.8361422620000667,
+          0.8489914490000956
+        ],
+        "GHC -O0": [
+          0.09563706700009789,
+          0.08046638000087114,
+          0.07566278399917792
+        ],
+        "GHC -O1": [
+          0.058149479999883624,
+          0.05033197700049641,
+          0.0456949560002613
+        ]
+      },
+      "medians": {
+        "Before": 0.9301930150004409,
+        "After": 0.8489914490000956,
+        "GHC -O0": 0.08046638000087114,
+        "GHC -O1": 0.05033197700049641
+      },
+      "best": {
+        "Before": 0.9117969130002166,
+        "After": 0.8361422620000667,
+        "GHC -O0": 0.07566278399917792,
+        "GHC -O1": 0.0456949560002613
+      },
+      "target": 0.04529877930044677
+    },
+    "mvar": {
+      "source": "$REPO/bench/progs/mvar.hs",
+      "source_sha256": "962c02cb54d3c696a395a5c6ad14b2aae8ae0288eff8a82a7c5610ed23e12476",
+      "builds": {
+        "Before": [
+          "$REPO/target/runtime-literals-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/mvar.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/mvar/Before",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/mvar/Before/program"
+        ],
+        "After": [
+          "$REPO/target/primitive-dispatch-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/mvar.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/mvar/After",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/mvar/After/program"
+        ],
+        "GHC -O0": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$REPO/bench/progs/mvar.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/mvar/GHC--O0",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/mvar/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$REPO/bench/progs/mvar.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/mvar/GHC--O1",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/mvar/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "$REPO/target/speed-runtime/dispatch/full/mvar/Before/program"
+        ],
+        "After": [
+          "$REPO/target/speed-runtime/dispatch/full/mvar/After/program"
+        ],
+        "GHC -O0": [
+          "$REPO/target/speed-runtime/dispatch/full/mvar/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "$REPO/target/speed-runtime/dispatch/full/mvar/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.1613442859998031,
+          0.16455987799963623,
+          0.16396735799935414
+        ],
+        "After": [
+          0.16346915600024658,
+          0.16635716000018874,
+          0.17189502499968512
+        ],
+        "GHC -O0": [
+          0.014111549000517698,
+          0.011962368999775208,
+          0.012199950000649551
+        ],
+        "GHC -O1": [
+          0.005500735000168788,
+          0.0053304379998735385,
+          0.0057987219997812645
+        ]
+      },
+      "medians": {
+        "Before": 0.16396735799935414,
+        "After": 0.16635716000018874,
+        "GHC -O0": 0.012199950000649551,
+        "GHC -O1": 0.005500735000168788
+      },
+      "best": {
+        "Before": 0.1613442859998031,
+        "After": 0.16346915600024658,
+        "GHC -O0": 0.011962368999775208,
+        "GHC -O1": 0.0053304379998735385
+      },
+      "target": 0.00495066150015191
+    },
+    "nqueens": {
+      "source": "$REPO/bench/progs/nqueens.hs",
+      "source_sha256": "edabd75358c3459032449238e04ea0300bf11c4e0e88214cb5a0abd47ce3d8dc",
+      "builds": {
+        "Before": [
+          "$REPO/target/runtime-literals-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/nqueens.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/Before",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/Before/program"
+        ],
+        "After": [
+          "$REPO/target/primitive-dispatch-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/nqueens.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/After",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/After/program"
+        ],
+        "GHC -O0": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$REPO/bench/progs/nqueens.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/GHC--O0",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$REPO/bench/progs/nqueens.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/GHC--O1",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/Before/program"
+        ],
+        "After": [
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/After/program"
+        ],
+        "GHC -O0": [
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "$REPO/target/speed-runtime/dispatch/full/nqueens/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.32967704800012143,
+          0.34187617899988254,
+          0.33536066899978323
+        ],
+        "After": [
+          0.3161476479999692,
+          0.307606147000115,
+          0.2915944149999632
+        ],
+        "GHC -O0": [
+          0.017919206999977177,
+          0.019963529000051494,
+          0.01979211999969266
+        ],
+        "GHC -O1": [
+          0.0029611470008603646,
+          0.0039252200003829785,
+          0.004353786999672593
+        ]
+      },
+      "medians": {
+        "Before": 0.33536066899978323,
+        "After": 0.307606147000115,
+        "GHC -O0": 0.01979211999969266,
+        "GHC -O1": 0.0039252200003829785
+      },
+      "best": {
+        "Before": 0.32967704800012143,
+        "After": 0.2915944149999632,
+        "GHC -O0": 0.017919206999977177,
+        "GHC -O1": 0.0029611470008603646
+      },
+      "target": 0.003532698000344681
+    },
+    "strings": {
+      "source": "$REPO/bench/progs/strings.hs",
+      "source_sha256": "647fe482371f314f4d08c8ab29c97e865356d90cbd550f937c656779fd657617",
+      "builds": {
+        "Before": [
+          "$REPO/target/runtime-literals-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/strings.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/strings/Before",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/strings/Before/program"
+        ],
+        "After": [
+          "$REPO/target/primitive-dispatch-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/strings.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/strings/After",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/strings/After/program"
+        ],
+        "GHC -O0": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$REPO/bench/progs/strings.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/strings/GHC--O0",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/strings/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$REPO/bench/progs/strings.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/strings/GHC--O1",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/strings/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "$REPO/target/speed-runtime/dispatch/full/strings/Before/program"
+        ],
+        "After": [
+          "$REPO/target/speed-runtime/dispatch/full/strings/After/program"
+        ],
+        "GHC -O0": [
+          "$REPO/target/speed-runtime/dispatch/full/strings/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "$REPO/target/speed-runtime/dispatch/full/strings/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          6.9483414840005935,
+          7.400411992000045,
+          10.310674051000206
+        ],
+        "After": [
+          6.238657998000235,
+          6.458715546000349,
+          6.871776476000377
+        ],
+        "GHC -O0": [
+          0.07672288100002334,
+          0.0754303109997636,
+          0.09009314599916252
+        ],
+        "GHC -O1": [
+          0.10019554500013328,
+          0.09605931800069811,
+          0.10332650500004092
+        ]
+      },
+      "medians": {
+        "Before": 7.400411992000045,
+        "After": 6.458715546000349,
+        "GHC -O0": 0.07672288100002334,
+        "GHC -O1": 0.10019554500013328
+      },
+      "best": {
+        "Before": 6.9483414840005935,
+        "After": 6.238657998000235,
+        "GHC -O0": 0.0754303109997636,
+        "GHC -O1": 0.09605931800069811
+      },
+      "target": 0.09017599050011996
+    },
+    "sumloop": {
+      "source": "$REPO/bench/progs/sumloop.hs",
+      "source_sha256": "29196ab96b01fada51cade9573a660be0677e2d509ad238ecde747dd09979712",
+      "builds": {
+        "Before": [
+          "$REPO/target/runtime-literals-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/sumloop.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/Before",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/Before/program"
+        ],
+        "After": [
+          "$REPO/target/primitive-dispatch-after/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$REPO/bench/progs/sumloop.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/After",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/After/program"
+        ],
+        "GHC -O0": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$REPO/bench/progs/sumloop.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/GHC--O0",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/billy/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$REPO/bench/progs/sumloop.hs",
+          "-outputdir",
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/GHC--O1",
+          "-o",
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/Before/program"
+        ],
+        "After": [
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/After/program"
+        ],
+        "GHC -O0": [
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "$REPO/target/speed-runtime/dispatch/full/sumloop/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          21.574776515999474,
+          23.506638830000156,
+          26.617687288000525
+        ],
+        "After": [
+          20.941388784999617,
+          21.666137610999613,
+          20.70896970099966
+        ],
+        "GHC -O0": [
+          0.22801184700074373,
+          0.20108645399977831,
+          0.19786911200026225
+        ],
+        "GHC -O1": [
+          0.017627125999752025,
+          0.01504551400012133,
+          0.018017379000411893
+        ]
+      },
+      "medians": {
+        "Before": 23.506638830000156,
+        "After": 20.941388784999617,
+        "GHC -O0": 0.20108645399977831,
+        "GHC -O1": 0.017627125999752025
+      },
+      "best": {
+        "Before": 21.574776515999474,
+        "After": 20.70896970099966,
+        "GHC -O0": 0.19786911200026225,
+        "GHC -O1": 0.01504551400012133
+      },
+      "target": 0.015864413399776824
+    }
+  },
+  "follow_up": {
+    "mvar": {
+      "results": {
+        "Before": [
+          0.16543706399988878,
+          0.16542171000037342,
+          0.2044402360006643,
+          0.22210505699968053,
+          0.20573276599952806,
+          0.19089418799921987,
+          0.1678004269997473
+        ],
+        "After": [
+          0.1712761610006055,
+          0.1751168390001112,
+          0.173387673000434,
+          0.19541871900037222,
+          0.1887867630002802,
+          0.1875676330000715,
+          0.17512648699994315
+        ]
+      },
+      "medians": {
+        "Before": 0.19089418799921987,
+        "After": 0.17512648699994315
+      }
+    }
+  },
+  "before_commit": "e8c23a1a71ce0ef9491d19d54df50025e83fe996",
+  "conditions": {
+    "hsc_libdir": "$REPO/libs",
+    "release": true,
+    "builds_timed": false,
+    "startup_timed": true,
+    "ghc_version": "9.12.2",
+    "follow_up": "Same binaries, CPU 0, one untimed correctness warmup followed by seven alternating pairs; stdout/stderr/exit checked."
+  }
+}
