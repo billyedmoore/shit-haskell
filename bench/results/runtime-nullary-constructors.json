@@ -1,0 +1,815 @@
+{
+  "runs": 3,
+  "warmups": 1,
+  "cpu": 0,
+  "programs": {
+    "fib": {
+      "source": "$WORKSPACE/after/bench/progs/fib.hs",
+      "source_sha256": "08002aa1da74b1339ab86a6b30639778c2c832990517f362963fec789c0164fc",
+      "builds": {
+        "Before": [
+          "$WORKSPACE/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/fib.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/fib/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/fib/Before/program"
+        ],
+        "After": [
+          "$WORKSPACE/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/fib.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/fib/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/fib/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$WORKSPACE/after/bench/progs/fib.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$WORKSPACE/after/bench/progs/fib.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/fib/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/fib/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.09333874999992986,
+          0.10770972300008452,
+          0.12651283500008503
+        ],
+        "After": [
+          0.08939691000000494,
+          0.09575332700001127,
+          0.09260490299993762
+        ],
+        "GHC -O0": [
+          0.01501287099995352,
+          0.019163574999993216,
+          0.014911707999999635
+        ],
+        "GHC -O1": [
+          0.00322619099995336,
+          0.003176876999987144,
+          0.003387283999927604
+        ]
+      },
+      "medians": {
+        "Before": 0.10770972300008452,
+        "After": 0.09260490299993762,
+        "GHC -O0": 0.01501287099995352,
+        "GHC -O1": 0.00322619099995336
+      },
+      "best": {
+        "Before": 0.09333874999992986,
+        "After": 0.08939691000000494,
+        "GHC -O0": 0.014911707999999635,
+        "GHC -O1": 0.003176876999987144
+      },
+      "target": 0.002903571899958024
+    },
+    "integer": {
+      "source": "$WORKSPACE/after/bench/progs/integer.hs",
+      "source_sha256": "cf3dbfdb8ecb586373c975be8a524b23b2db321f001d8160938d718df871a261",
+      "builds": {
+        "Before": [
+          "$WORKSPACE/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/integer.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/integer/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/integer/Before/program"
+        ],
+        "After": [
+          "$WORKSPACE/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/integer.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/integer/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/integer/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$WORKSPACE/after/bench/progs/integer.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$WORKSPACE/after/bench/progs/integer.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/integer/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/integer/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.061657666000087374,
+          0.059821291000048404,
+          0.06744736400003148
+        ],
+        "After": [
+          0.06024236700000074,
+          0.05932869599996593,
+          0.06024237700000867
+        ],
+        "GHC -O0": [
+          0.005324696000002405,
+          0.005889549000016814,
+          0.0051798270000062985
+        ],
+        "GHC -O1": [
+          0.005759253000064746,
+          0.005274128999985805,
+          0.005246618000001035
+        ]
+      },
+      "medians": {
+        "Before": 0.061657666000087374,
+        "After": 0.06024236700000074,
+        "GHC -O0": 0.005324696000002405,
+        "GHC -O1": 0.005274128999985805
+      },
+      "best": {
+        "Before": 0.059821291000048404,
+        "After": 0.05932869599996593,
+        "GHC -O0": 0.0051798270000062985,
+        "GHC -O1": 0.005246618000001035
+      },
+      "target": 0.004746716099987225
+    },
+    "ioref": {
+      "source": "$WORKSPACE/after/bench/progs/ioref.hs",
+      "source_sha256": "53021d094730b853b550abeb88844f0052a4a5ebfb703314a1987a681d4f27e3",
+      "builds": {
+        "Before": [
+          "$WORKSPACE/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/ioref.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/ioref/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/ioref/Before/program"
+        ],
+        "After": [
+          "$WORKSPACE/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/ioref.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/ioref/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/ioref/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$WORKSPACE/after/bench/progs/ioref.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$WORKSPACE/after/bench/progs/ioref.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/ioref/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/ioref/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          1.167949951999958,
+          1.119687769000052,
+          1.1340773609999815
+        ],
+        "After": [
+          1.0958071779999727,
+          1.0965817979999883,
+          1.1321924840000293
+        ],
+        "GHC -O0": [
+          0.0375829850000855,
+          0.03693961400006174,
+          0.03521375600007559
+        ],
+        "GHC -O1": [
+          0.0049744059999738965,
+          0.005397804999915934,
+          0.006103582000037022
+        ]
+      },
+      "medians": {
+        "Before": 1.1340773609999815,
+        "After": 1.0965817979999883,
+        "GHC -O0": 0.03693961400006174,
+        "GHC -O1": 0.005397804999915934
+      },
+      "best": {
+        "Before": 1.119687769000052,
+        "After": 1.0958071779999727,
+        "GHC -O0": 0.03521375600007559,
+        "GHC -O1": 0.0049744059999738965
+      },
+      "target": 0.0048580244999243405
+    },
+    "mapops": {
+      "source": "$WORKSPACE/after/bench/progs/mapops.hs",
+      "source_sha256": "28cad5d704b9bb3dba3b25dc1643620ee816573c5a707e1a39fe82551a2c75fb",
+      "builds": {
+        "Before": [
+          "$WORKSPACE/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/mapops.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mapops/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mapops/Before/program"
+        ],
+        "After": [
+          "$WORKSPACE/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/mapops.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mapops/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mapops/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$WORKSPACE/after/bench/progs/mapops.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$WORKSPACE/after/bench/progs/mapops.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/mapops/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/mapops/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.3016421849999915,
+          0.30287148200000047,
+          0.310430561999965
+        ],
+        "After": [
+          0.30405591199996707,
+          0.30534849499997563,
+          0.3118026050000253
+        ],
+        "GHC -O0": [
+          0.05338390500003243,
+          0.050689834999957384,
+          0.053823018000002776
+        ],
+        "GHC -O1": [
+          0.03045247400007156,
+          0.030552304000025288,
+          0.03418010400002913
+        ]
+      },
+      "medians": {
+        "Before": 0.30287148200000047,
+        "After": 0.30534849499997563,
+        "GHC -O0": 0.05338390500003243,
+        "GHC -O1": 0.030552304000025288
+      },
+      "best": {
+        "Before": 0.3016421849999915,
+        "After": 0.30405591199996707,
+        "GHC -O0": 0.050689834999957384,
+        "GHC -O1": 0.03045247400007156
+      },
+      "target": 0.02749707360002276
+    },
+    "mvar": {
+      "source": "$WORKSPACE/after/bench/progs/mvar.hs",
+      "source_sha256": "962c02cb54d3c696a395a5c6ad14b2aae8ae0288eff8a82a7c5610ed23e12476",
+      "builds": {
+        "Before": [
+          "$WORKSPACE/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/mvar.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mvar/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mvar/Before/program"
+        ],
+        "After": [
+          "$WORKSPACE/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/mvar.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mvar/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mvar/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$WORKSPACE/after/bench/progs/mvar.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$WORKSPACE/after/bench/progs/mvar.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/mvar/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/mvar/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.16838942299989412,
+          0.1674405700000534,
+          0.17113335800002005
+        ],
+        "After": [
+          0.16681882000000314,
+          0.16767636600002334,
+          0.16751945900000464
+        ],
+        "GHC -O0": [
+          0.01044422500001474,
+          0.010480350000079852,
+          0.01120900100011113
+        ],
+        "GHC -O1": [
+          0.006185122000033516,
+          0.0062066550000281495,
+          0.005069347000016933
+        ]
+      },
+      "medians": {
+        "Before": 0.16838942299989412,
+        "After": 0.16751945900000464,
+        "GHC -O0": 0.010480350000079852,
+        "GHC -O1": 0.006185122000033516
+      },
+      "best": {
+        "Before": 0.1674405700000534,
+        "After": 0.16681882000000314,
+        "GHC -O0": 0.01044422500001474,
+        "GHC -O1": 0.005069347000016933
+      },
+      "target": 0.005566609800030165
+    },
+    "nqueens": {
+      "source": "$WORKSPACE/after/bench/progs/nqueens.hs",
+      "source_sha256": "edabd75358c3459032449238e04ea0300bf11c4e0e88214cb5a0abd47ce3d8dc",
+      "builds": {
+        "Before": [
+          "$WORKSPACE/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/nqueens.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/nqueens/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/nqueens/Before/program"
+        ],
+        "After": [
+          "$WORKSPACE/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/nqueens.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/nqueens/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/nqueens/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$WORKSPACE/after/bench/progs/nqueens.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$WORKSPACE/after/bench/progs/nqueens.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/nqueens/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/nqueens/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.17889747399999578,
+          0.17073645600009968,
+          0.1715414000000237
+        ],
+        "After": [
+          0.17971960200009107,
+          0.16921427199997652,
+          0.1726812860000564
+        ],
+        "GHC -O0": [
+          0.017309502999978577,
+          0.016991243999996186,
+          0.020767223000007107
+        ],
+        "GHC -O1": [
+          0.0041768440000851115,
+          0.004294071000003896,
+          0.004380571000069722
+        ]
+      },
+      "medians": {
+        "Before": 0.1715414000000237,
+        "After": 0.1726812860000564,
+        "GHC -O0": 0.017309502999978577,
+        "GHC -O1": 0.004294071000003896
+      },
+      "best": {
+        "Before": 0.17073645600009968,
+        "After": 0.16921427199997652,
+        "GHC -O0": 0.016991243999996186,
+        "GHC -O1": 0.0041768440000851115
+      },
+      "target": 0.0038646639000035066
+    },
+    "strings": {
+      "source": "$WORKSPACE/after/bench/progs/strings.hs",
+      "source_sha256": "647fe482371f314f4d08c8ab29c97e865356d90cbd550f937c656779fd657617",
+      "builds": {
+        "Before": [
+          "$WORKSPACE/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/strings.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/strings/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/strings/Before/program"
+        ],
+        "After": [
+          "$WORKSPACE/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/strings.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/strings/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/strings/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$WORKSPACE/after/bench/progs/strings.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$WORKSPACE/after/bench/progs/strings.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/strings/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/strings/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          3.773721851000005,
+          3.903331791000028,
+          3.9250807310000937
+        ],
+        "After": [
+          3.7741985499999373,
+          3.8669845470000155,
+          3.860742635000065
+        ],
+        "GHC -O0": [
+          0.06374921199994787,
+          0.06034158500006015,
+          0.06334534000006897
+        ],
+        "GHC -O1": [
+          0.08574915999997756,
+          0.08273975600002359,
+          0.0853178109999817
+        ]
+      },
+      "medians": {
+        "Before": 3.903331791000028,
+        "After": 3.860742635000065,
+        "GHC -O0": 0.06334534000006897,
+        "GHC -O1": 0.0853178109999817
+      },
+      "best": {
+        "Before": 3.773721851000005,
+        "After": 3.7741985499999373,
+        "GHC -O0": 0.06034158500006015,
+        "GHC -O1": 0.08273975600002359
+      },
+      "target": 0.07678602989998354
+    },
+    "sumloop": {
+      "source": "$WORKSPACE/after/bench/progs/sumloop.hs",
+      "source_sha256": "29196ab96b01fada51cade9573a660be0677e2d509ad238ecde747dd09979712",
+      "builds": {
+        "Before": [
+          "$WORKSPACE/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/sumloop.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/sumloop/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/sumloop/Before/program"
+        ],
+        "After": [
+          "$WORKSPACE/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "$WORKSPACE/after/bench/progs/sumloop.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/sumloop/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/sumloop/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "$WORKSPACE/after/bench/progs/sumloop.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "$WORKSPACE/after/bench/progs/sumloop.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/sumloop/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/sumloop/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          8.22591653699999,
+          8.026726965999956,
+          8.124657186000036
+        ],
+        "After": [
+          7.853504391999991,
+          8.034380525000074,
+          7.749294496000061
+        ],
+        "GHC -O0": [
+          0.13595606800004134,
+          0.13822945299989442,
+          0.1270175790000394
+        ],
+        "GHC -O1": [
+          0.01465672300003007,
+          0.01414457000009861,
+          0.013854895999998007
+        ]
+      },
+      "medians": {
+        "Before": 8.124657186000036,
+        "After": 7.853504391999991,
+        "GHC -O0": 0.13595606800004134,
+        "GHC -O1": 0.01414457000009861
+      },
+      "best": {
+        "Before": 8.026726965999956,
+        "After": 7.749294496000061,
+        "GHC -O0": 0.1270175790000394,
+        "GHC -O1": 0.013854895999998007
+      },
+      "target": 0.01273011300008875
+    }
+  },
+  "hosted_metadata": {
+    "before_commit": "d17bc87fa0cd7d01a5515becad2ffac344b7d5a6",
+    "after_commit": "4ebe76029dd6bda85477758d4f9bdc43b086e722",
+    "run_url": "https://github.com/billyedmoore/shit-haskell/actions/runs/43746474090",
+    "platform": "Linux-7.0.0-1019-azure-x86_64-with-glibc2.43",
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "cpu_model": "AMD EPYC 9V45 96-Core Processor",
+    "ghc": "9.12.2",
+    "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+    "hsc_libdir": "$WORKSPACE/after/libs"
+  }
+}
