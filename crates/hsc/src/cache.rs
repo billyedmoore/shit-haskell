@@ -353,16 +353,52 @@ bin_enum!(Pat {
 });
 bin_enum!(PatOpItem { 0 => Operand(a), 1 => Op(a, b) });
 
-/// Expressions are not kept (only a view pattern of a pattern synonym has one): a module whose
-/// interface needs one is not cached.
+/// View patterns of exported pattern synonyms keep their renamed view expression.
+/// Forms needing local declarations/statements or TH remain uncacheable.
 impl Bin for Expr {
     fn put(&self, w: &mut W) {
-        w.ok = false;
+        match self {
+            Expr::Var(a, b) => { w.u8(0); a.put(w); b.put(w); }
+            Expr::Con(a, b) => { w.u8(1); a.put(w); b.put(w); }
+            Expr::Lit(a, b) => { w.u8(2); a.put(w); b.put(w); }
+            Expr::App(a, b) => { w.u8(3); a.put(w); b.put(w); }
+            Expr::TyApp(a, b, c) => { w.u8(4); a.put(w); b.put(w); c.put(w); }
+            Expr::OpChain(a, b) => { w.u8(5); a.put(w); b.put(w); }
+            Expr::Lam(a, b, c) => { w.u8(6); a.put(w); b.put(w); c.put(w); }
+            Expr::If(a, b, c, d) => { w.u8(7); a.put(w); b.put(w); c.put(w); d.put(w); }
+            Expr::Tuple(a, b) => { w.u8(8); a.put(w); b.put(w); }
+            Expr::List(a, b) => { w.u8(9); a.put(w); b.put(w); }
+            Expr::LeftSection(a, b, c) => { w.u8(10); a.put(w); b.put(w); c.put(w); }
+            Expr::RightSection(a, b, c) => { w.u8(11); a.put(w); b.put(w); c.put(w); }
+            Expr::Sig(a, b, c) => { w.u8(12); a.put(w); b.put(w); c.put(w); }
+            Expr::RecCon { con, fields, dotdot, loc } => { w.u8(13); con.put(w); fields.put(w); dotdot.put(w); loc.put(w); }
+            Expr::RecUpd(a, b, c) => { w.u8(14); a.put(w); b.put(w); c.put(w); }
+            _ => w.ok = false,
+        }
     }
-    fn get(_: &mut R) -> Option<Self> {
-        None
+    fn get(r: &mut R) -> Option<Self> {
+        Some(match r.u8()? {
+            0 => Expr::Var(Bin::get(r)?, Bin::get(r)?),
+            1 => Expr::Con(Bin::get(r)?, Bin::get(r)?),
+            2 => Expr::Lit(Bin::get(r)?, Bin::get(r)?),
+            3 => Expr::App(Bin::get(r)?, Bin::get(r)?),
+            4 => Expr::TyApp(Bin::get(r)?, Bin::get(r)?, Bin::get(r)?),
+            5 => Expr::OpChain(Bin::get(r)?, Bin::get(r)?),
+            6 => Expr::Lam(Bin::get(r)?, Bin::get(r)?, Bin::get(r)?),
+            7 => Expr::If(Bin::get(r)?, Bin::get(r)?, Bin::get(r)?, Bin::get(r)?),
+            8 => Expr::Tuple(Bin::get(r)?, Bin::get(r)?),
+            9 => Expr::List(Bin::get(r)?, Bin::get(r)?),
+            10 => Expr::LeftSection(Bin::get(r)?, Bin::get(r)?, Bin::get(r)?),
+            11 => Expr::RightSection(Bin::get(r)?, Bin::get(r)?, Bin::get(r)?),
+            12 => Expr::Sig(Bin::get(r)?, Bin::get(r)?, Bin::get(r)?),
+            13 => Expr::RecCon { con: Bin::get(r)?, fields: Bin::get(r)?, dotdot: Bin::get(r)?, loc: Bin::get(r)? },
+            14 => Expr::RecUpd(Bin::get(r)?, Bin::get(r)?, Bin::get(r)?),
+            _ => return None,
+        })
     }
 }
+
+bin_enum!(OpItem { 0 => Operand(a), 1 => Op(a, b), 2 => Neg(a) });
 
 bin_struct!(Field { ty, strict });
 bin_enum!(ConFields { 0 => Positional(a), 1 => Record(a) });
@@ -533,7 +569,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 3";
+const MAGIC: &str = "hsc-module-cache 4";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.
@@ -699,6 +735,72 @@ mod tests {
         });
         kinds.insert("Boot.T".into(), Kind::Star);
         (env, kinds)
+    }
+
+    #[test]
+    fn view_expressions_roundtrip_names_locations_and_nested_forms() {
+        let l = Loc { line: 7, col: 13 };
+        let q = QName { qual: Some("Views".into()), name: "view".into() };
+        let var = Expr::Var(q.clone(), l);
+        let con = Expr::Con(QName::unqual("Just"), l);
+        let lit = Expr::Lit(Lit::Int("3".into()), l);
+        let ty = Type::Con(QName::unqual("Int"), l);
+        let forms = vec![var.clone(), con.clone(), lit.clone(),
+            Expr::App(Box::new(var.clone()), Box::new(lit.clone())),
+            Expr::TyApp(Box::new(var.clone()), ty.clone(), l),
+            Expr::OpChain(vec![OpItem::Neg(l), OpItem::Operand(var.clone()), OpItem::Op(q.clone(), l), OpItem::Operand(lit.clone())], l),
+            Expr::Lam(vec![Pat::Var("x".into(), l)], Box::new(var.clone()), l),
+            Expr::If(Box::new(var.clone()), Box::new(lit.clone()), Box::new(con), l),
+            Expr::Tuple(vec![Some(lit.clone()), None], l), Expr::List(vec![var.clone(), lit.clone()], l),
+            Expr::LeftSection(Box::new(var.clone()), q.clone(), l),
+            Expr::RightSection(q.clone(), Box::new(lit.clone()), l),
+            Expr::Sig(Box::new(var.clone()), ty, l),
+            Expr::RecCon { con: q.clone(), fields: vec![(q.clone(), Some(lit.clone())), (QName::unqual("pun"), None)], dotdot: true, loc: l },
+            Expr::RecUpd(Box::new(var), vec![(q, Some(lit))], l)];
+        let mut w = W::new(Vec::new(), true);
+        forms.put(&mut w);
+        assert!(w.ok);
+        let mut r = R::new(&w.out);
+        assert_eq!(Vec::<Expr>::get(&mut r).unwrap(), forms);
+        assert_eq!(r.pos, w.out.len());
+    }
+
+    #[test]
+    fn unsupported_or_truncated_view_expressions_fail_closed() {
+        let l = Loc::default();
+        let var = Expr::Var(QName::unqual("view"), l);
+        let unsupported = Expr::Let(Vec::new(), Box::new(var.clone()), l);
+        let mut w = W::new(Vec::new(), true);
+        Expr::App(Box::new(var), Box::new(unsupported)).put(&mut w);
+        assert!(!w.ok);
+        for bytes in [vec![255], vec![3], vec![0, 0], vec![8, 1, 0, 0, 0]] {
+            assert!(Expr::get(&mut R::new(&bytes)).is_none());
+        }
+    }
+
+    #[test]
+    fn cached_pattern_synonym_replays_and_unsupported_views_do_not_overwrite() {
+        let l = Loc::default();
+        let view = Expr::Var(QName { qual: Some("Views".into()), name: "view".into() }, l);
+        let pattern = PatSynDef {
+            params: vec!["p".into()], names: vec!["source".into()],
+            pat: Pat::View(Box::new(view.clone()), Box::new(Pat::Var("p".into(), l)), l),
+            builder: true, arg_types: vec![Some(Type::Con(QName::unqual("Int"), l))],
+        };
+        let name = GName { module: "Views".into(), name: "P".into() };
+        let mut iface = Iface { module: "Views".into(), ..Iface::default() };
+        iface.patsyns.insert(name.clone(), pattern.clone());
+        let mut entry = Entry { boot_key: None, deps: Vec::new(), iface, binds: Vec::new(), env: EnvDelta::default(), explicit_sigs: Vec::new() };
+        let path = std::env::temp_dir().join(format!("hsc-view-cache-{}.bin", std::process::id()));
+        save(&path, &entry);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.iface.patsyns[&name], pattern);
+        let before = std::fs::read(&path).unwrap();
+        entry.iface.patsyns.get_mut(&name).unwrap().pat = Pat::View(
+            Box::new(Expr::Let(Vec::new(), Box::new(view), l)), Box::new(Pat::Wild(l)), l);
+        save(&path, &entry);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
