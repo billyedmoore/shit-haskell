@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 221 differential tests for both back ends, compared with GHC.
+- **Corpus:** 222 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -30,12 +30,11 @@ the GitHub issues.
     and its output on real scripts.
   - hlint's dependencies build up to and including ghc-lib-parser and mono-traversable.
 - **Weakness: speed.** Generated code is 10–500× slower than `ghc -O0` (baseline below), and
-  large packages compile slowly, which limits how fast the rest of the work can go. In the latest
-  paired comparison on CPU 0, a cold compile of all 425 exposed ghc-lib-parser modules with a
-  fresh module cache takes 27.8 s versus 28.1 s; run variation exceeds this small difference.
-  Warm builds take 1.39 s versus 1.67 s after exported view-pattern expressions could be cached
-  (seven alternating pairs). The earlier completed-boot cache change reduced warm builds
-  from 11.16 s to 1.94 s.
+  large packages have also been slow to compile. In the latest paired comparison on CPU 0,
+  a cold compile of all 425 exposed ghc-lib-parser modules with a fresh module cache takes
+  27.9 s versus 28.3 s; run variation exceeds this small difference. Warm builds take
+  1.34 s versus 1.41 s after kind arrows began sharing their branches (seven alternating pairs).
+  The earlier completed-boot cache change reduced warm builds from 11.16 s to 1.94 s.
 
 ## Working rules
 
@@ -68,7 +67,10 @@ the GitHub issues.
   projects' test suites, and at least as fast as `ghc -O0`.
 - Compile times are comparable to GHC's for the same packages.
 
-**Compile time first**, since it limits every iteration:
+**Current focus: generated program run time**, following the shared-kind change below.
+Remaining compile-time work waits unless it blocks runtime iteration.
+
+**Compile-time work so far and remaining items:**
 - Types share their parts, so copying, zonking and normalising a large type are cheap (done:
   a derived `Generic` of 200 constructors checks in 2.2 s against GHC's 3.8 s).
 - Instance lookup indexes by class and resolves each wanted's types once, skipping kind checks
@@ -151,13 +153,20 @@ the GitHub issues.
   one untimed build each, CPU 0, common hsc library directory). hsc retains checked Core while
   GHC retains native objects/interfaces. Full parser warm builds take 1.674 → 1.391 s
   (seven pairs); cold builds take 28.10 → 27.83 s (three pairs, within variation).
+- Kind arrows share immutable branches. Pruning clones their parts shallowly, and zonking
+  retains unchanged tails while observing new solutions and keeping generic instantiations
+  independent. The structural cache encoding is unchanged. `tools/compilebench.py --workload
+  wide-kinds` checks 500 functions using a 128-argument constructor: 0.080 → 0.050 s, versus
+  GHC's 0.177/0.174 s at `-O0`/`-O1` (seven alternating runs, CPU 0, hsc cache disabled).
+  Full parser warm builds take 1.407 → 1.341 s (seven pairs); cold builds take
+  28.28 → 27.86 s (three pairs, within variation).
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and
   remove passes that grow faster than the code they check.
 - Compile a package's modules in parallel.
 
-**Then run time**, measured with `difftest --bench` against `ghc -O0` and `-O1`, and on the
+**Run time now**, measured with `difftest --bench` against `ghc -O0` and `-O1`, and on the
 build tools hsc builds (happy, alex). The baseline (native, best of 3, against `ghc -O0`;
 `difftest --bench 3 bench/`):
 
