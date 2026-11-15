@@ -245,6 +245,109 @@ fn rewrite_selection(
     }
 }
 
+/// Remove local bindings that only forward to another variable. The target computation remains
+/// shared, and recursive alias cycles retain their original thunks.
+pub fn eliminate_alias_thunks(binds: &mut [TopBind]) {
+    use std::collections::HashSet;
+    let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
+    for bind in binds {
+        let mut names = HashSet::new();
+        let mut aliases = HashMap::new();
+        // Some matcher alternatives clone binders. Skip those bodies rather than risk capture
+        // when a name is reused in another scope (including a shadowed global).
+        if !local_aliases(&bind.body, &globals, &mut names, &mut aliases) || aliases.is_empty() {
+            continue;
+        }
+        let mut resolved = HashMap::new();
+        for name in aliases.keys() {
+            let mut target = name.as_str();
+            for _ in 0..=16 {
+                match aliases.get(target) {
+                    Some(next) => target = next,
+                    None => {
+                        resolved.insert(name.clone(), target.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        drop_aliases(&mut bind.body, &resolved);
+    }
+}
+
+fn local_aliases(
+    c: &Core,
+    globals: &std::collections::HashSet<String>,
+    names: &mut std::collections::HashSet<String>,
+    aliases: &mut HashMap<String, String>,
+) -> bool {
+    let bind = |name: &String, names: &mut std::collections::HashSet<String>| {
+        !globals.contains(name) && names.insert(name.clone())
+    };
+    match c {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => true,
+        Core::App(f, a) => local_aliases(f, globals, names, aliases) && local_aliases(a, globals, names, aliases),
+        Core::Lam(name, body) => bind(name, names) && local_aliases(body, globals, names, aliases),
+        Core::Let(bindings, body) => {
+            for (name, rhs) in bindings {
+                if !bind(name, names) {
+                    return false;
+                }
+                if let Core::Var(target) = rhs {
+                    aliases.insert(name.clone(), target.clone());
+                }
+            }
+            bindings.iter().all(|(_, rhs)| local_aliases(rhs, globals, names, aliases))
+                && local_aliases(body, globals, names, aliases)
+        }
+        Core::Case(scrut, binder, alts) => {
+            local_aliases(scrut, globals, names, aliases) && bind(binder, names)
+                && alts.iter().all(|alt| match alt {
+                    Alt::Con(_, vars, body) => vars.iter().all(|name| bind(name, names))
+                        && local_aliases(body, globals, names, aliases),
+                    Alt::Lit(_, body) | Alt::Default(body) => local_aliases(body, globals, names, aliases),
+                })
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| local_aliases(a, globals, names, aliases)),
+    }
+}
+
+fn drop_aliases(c: &mut Core, resolved: &HashMap<String, String>) {
+    match c {
+        Core::Var(name) => {
+            if let Some(target) = resolved.get(name) {
+                *name = target.clone();
+            }
+        }
+        Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            drop_aliases(f, resolved);
+            drop_aliases(a, resolved);
+        }
+        Core::Lam(_, body) => drop_aliases(body, resolved),
+        Core::Let(bindings, body) => {
+            bindings.retain(|(name, _)| !resolved.contains_key(name));
+            for (_, rhs) in bindings.iter_mut() {
+                drop_aliases(rhs, resolved);
+            }
+            drop_aliases(body, resolved);
+            if bindings.is_empty() {
+                let Core::Let(_, body) = std::mem::replace(c, Core::Fail(String::new())) else { unreachable!() };
+                *c = *body;
+            }
+        }
+        Core::Case(scrut, _, alts) => {
+            drop_aliases(scrut, resolved);
+            for alt in alts {
+                match alt {
+                    Alt::Con(_, _, body) | Alt::Lit(_, body) | Alt::Default(body) => drop_aliases(body, resolved),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| drop_aliases(a, resolved)),
+    }
+}
+
 /// A foreign primitive is a global `\p1 .. pn -> Prim(name, [p1 .. pn])`. A saturated call
 /// becomes the primitive applied directly to its argument expressions, so that `seq a b`
 /// keeps `b` in tail position instead of returning it through a parameter variable.
@@ -456,5 +559,71 @@ mod method_selection_tests {
             resolve_known_methods(&mut binds);
             assert_eq!(binds[2].body, original);
         }
+    }
+}
+
+#[cfg(test)]
+mod alias_thunk_tests {
+    use super::*;
+
+    fn var(name: &str) -> Core { Core::Var(name.into()) }
+    fn program(body: Core) -> Vec<TopBind> {
+        vec![TopBind { name: "Test.value".into(), body: Core::Lit(crate::core::Lit::Int(42)) },
+             TopBind { name: "Test.use".into(), body }]
+    }
+
+    #[test]
+    fn aliases_redirect_uses_without_duplicating_the_shared_computation() {
+        let computation = Core::Prim("+#".into(), vec![var("Test.value"), var("Test.value")]);
+        let mut binds = program(Core::Let(vec![
+            ("shared%1".into(), computation.clone()),
+            ("alias%2".into(), var("shared%1")),
+            ("alias%3".into(), var("alias%2")),
+            ("result%4".into(), Core::Prim("*#".into(), vec![var("alias%3"), var("alias%2")])),
+        ], Box::new(Core::Lam("arg%5".into(), Box::new(var("result%4"))))));
+        eliminate_alias_thunks(&mut binds);
+        crate::core::lint::lint_program(&binds).unwrap();
+        let Core::Let(kept, _) = &binds[1].body else { panic!("shared computation must remain") };
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].1, computation);
+        assert_eq!(kept[1].1, Core::Prim("*#".into(), vec![var("shared%1"), var("shared%1")]));
+    }
+
+    #[test]
+    fn alias_substitution_keeps_case_forcing_and_lambda_capture() {
+        let mut binds = program(Core::Lam("outer%1".into(), Box::new(Core::Let(
+            vec![("alias%2".into(), var("outer%1"))],
+            Box::new(Core::Case(Box::new(var("alias%2")), "case%3".into(),
+                vec![Alt::Default(Core::Lam("inner%4".into(), Box::new(var("alias%2"))))])),
+        ))));
+        eliminate_alias_thunks(&mut binds);
+        crate::core::lint::lint_program(&binds).unwrap();
+        let Core::Lam(_, body) = &binds[1].body else { panic!("lambda") };
+        let Core::Case(scrut, _, alts) = body.as_ref() else { panic!("case must remain strict") };
+        assert_eq!(scrut.as_ref(), &var("outer%1"));
+        assert_eq!(alts.as_slice(), &[Alt::Default(Core::Lam("inner%4".into(), Box::new(var("outer%1"))))]);
+    }
+
+    #[test]
+    fn recursive_cycles_and_shadowed_names_are_preserved() {
+        for body in [
+            Core::Let(vec![("x%1".into(), var("y%2")), ("y%2".into(), var("x%1"))], Box::new(var("x%1"))),
+            Core::Lam("x%1".into(), Box::new(Core::Let(vec![("alias%2".into(), var("x%1"))], Box::new(Core::Lam("x%1".into(), Box::new(var("alias%2"))))))),
+            Core::Let(vec![("alias%1".into(), var("Test.value"))], Box::new(Core::Lam("Test.value".into(), Box::new(var("alias%1"))))),
+        ] {
+            let mut binds = program(body.clone());
+            eliminate_alias_thunks(&mut binds);
+            assert_eq!(binds[1].body, body);
+            crate::core::lint::lint_program(&binds).unwrap();
+        }
+    }
+
+    #[test]
+    fn bounded_resolution_never_leaves_a_dangling_alias_in_long_chains() {
+        let mut aliases: Vec<(String, Core)> = (0..40).map(|i| (format!("alias%{i}"), var(&format!("alias%{}", i + 1)))).collect();
+        aliases.push(("alias%40".into(), var("Test.value")));
+        let mut binds = program(Core::Let(aliases, Box::new(var("alias%0"))));
+        eliminate_alias_thunks(&mut binds);
+        crate::core::lint::lint_program(&binds).unwrap();
     }
 }

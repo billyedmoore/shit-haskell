@@ -3,9 +3,7 @@ name: Native runtime
 on:
   pull_request:
     paths:
-      - 'crates/hsc/src/machine/**'
-      - 'crates/hsc/src/native/**'
-      - 'crates/hsc/src/core/**'
+      - 'crates/hsc/src/**'
       - 'bench/progs/**'
       - 'tools/runtimebench.py'
       - '.github/workflows/runtime.yml'

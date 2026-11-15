@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 226 differential tests for both back ends, compared with GHC.
+- **Corpus:** 227 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -171,20 +171,22 @@ Remaining compile-time work waits unless it blocks runtime iteration.
 
 **Run time now**, measured against GHC `-O0` and `-O1` with `tools/runtimebench.py`,
 and on build tools hsc builds (happy, alex). `difftest --bench` also checks the native baseline.
-The latest results use release hsc builds, GHC 9.12.2, CPU 0, one untimed correctness warmup
-and three alternating timed samples per build. Builds are excluded; startup is included.
-Every stdout/stderr/exit result matches. The target remains **0.9× GHC `-O1` on every program**.
+Representative paired results use Rust 1.92.0 release hsc, GHC 9.12.2 and CPU 0,
+one untimed correctness warmup and three alternating timed samples per build.
+Builds are excluded; startup is included. Every stdout/stderr/exit result matches.
+The table is the partial-dictionary comparison on a hosted AMD EPYC 9V74 runner.
+The target remains **0.9× GHC `-O1` on every program**.
 
 | program | before ms | hsc ms | GHC -O0 ms | GHC -O1 ms | 0.9×O1 target ms |
 |---------|----------:|-------:|-----------:|-----------:|----------------:|
-| fib | 230.701 | 188.379 | 17.291 | 3.780 | 3.402 |
-| integer | 107.000 | 103.236 | 5.539 | 5.280 | 4.752 |
-| ioref | 2521.493 | 2211.243 | 54.354 | 5.349 | 4.814 |
-| mapops | 930.193 | 848.991 | 80.466 | 50.332 | 45.299 |
-| mvar | 163.967 | 166.357 | 12.200 | 5.501 | 4.951 |
-| nqueens | 335.361 | 307.606 | 19.792 | 3.925 | 3.533 |
-| strings | 7400.412 | 6458.716 | 76.723 | 100.196 | 90.176 |
-| sumloop | 23506.639 | 20941.389 | 201.086 | 17.627 | 15.864 |
+| fib | 179.939 | 173.647 | 19.419 | 3.849 | 3.464 |
+| integer | 91.660 | 93.787 | 7.189 | 6.594 | 5.934 |
+| ioref | 2485.037 | 2496.150 | 58.018 | 6.616 | 5.954 |
+| mapops | 765.572 | 721.913 | 73.502 | 42.684 | 38.415 |
+| mvar | 235.171 | 239.541 | 17.821 | 8.928 | 8.035 |
+| nqueens | 280.713 | 292.761 | 27.653 | 4.995 | 4.495 |
+| strings | 6749.721 | 6471.050 | 83.345 | 107.812 | 97.030 |
+| sumloop | 16189.803 | 15862.293 | 197.906 | 14.075 | 12.668 |
 
 Canonical standard numeric literals fold through dictionary aliases, eliminating repeated
 conversion workers. Custom instances, noncanonical `Base` names, overflowing `Int` literals
@@ -194,7 +196,7 @@ and failed parses keep their original calls. That change gave a 1.22× geometric
 Common ordinary primitives are classified once at startup under the existing program-local
 IDs. Their calls reuse static names and skip foreign-signature parsing, while general calls
 retain their original dispatch. Scheduler points, argument roots, reservation, exception
-handling and final forcing are shared. The table above is a new paired comparison:
+handling and final forcing are shared. That paired comparison measured
 fib 0.231 → 0.188 s, ioref 2.521 → 2.211 s, sumloop 23.507 → 20.941 s;
 eight-program geometric-mean speedup 1.103×. MVar results are mixed (1.5% slower in three
 pairs, 8.3% faster in a seven-pair same-binary recheck); no consistent MVar gain is claimed.
@@ -204,20 +206,30 @@ All runtime targets remain unmet.
 The inline evaluated-argument experiment is held out: it removed only 0.4% of instructions
 on a scaled sumloop and made fib 2.3% slower over seven alternating pairs.
 
-Next: measure lazy native diagnostic-name decoding. The draft preserves the static table's
-address lookup and lossy UTF-8 behavior, and passes 44 unit tests plus a Unicode-body corpus
-case on both backends (native with a small heap), including a real GC-census lookup.
-Performance measurements and full CI are pending; Windows disk pressure stopped local
-benchmark runs. Runtime PRs now have a GitHub-hosted paired benchmark workflow, retaining
-raw samples, compiler revisions and graphs without archiving generated executables.
-No speedup is claimed for this candidate.
+Native diagnostic body names are decoded on demand from the executable's static table.
+Address lookup, empty names and lossy Unicode behavior are preserved. This avoids eagerly
+allocating thousands of Strings during startup: 1.130× geometric-mean speedup across eight
+programs on a hosted Intel Xeon 6973P-C; integer 108.5 → 71.2 ms and fib 173.7 → 141.9 ms.
+Strings measured 1.5% slower; no universal gain is claimed.
+[Raw samples, runner metadata and graphs](bench/results/runtime-lazy-names.md) record this
+independent paired comparison. Both backends passed 225 tests and all 44 unit tests.
 
-A second pending runtime candidate resolves an individual known method when other dictionary
-fields are lazy default applications. The emitted `Ord Int` dictionary has global comparison
-workers beside applied max/min defaults; the previous all-fields-global check excluded it.
-Selectors retain constructor identity, and only selected plain global fields are folded.
-Custom defaults, unused bottom fields, superclass offsets and aliases have regression
-coverage; hosted correctness and paired performance results are pending.
+Known global methods can be selected even beside lazy default-method applications.
+Constructor identity is checked, while selected non-global fields retain their calls.
+The `Ord Int` dictionary has global comparisons beside applied max/min defaults; the old
+all-fields-global check excluded it. Custom defaults, unused bottom fields, superclass
+offsets and aliases have regression coverage. Both backends passed 226 tests and all
+47 unit tests. The table above is its paired comparison: geometric-mean speedup 1.009×,
+within variation, so no consistent overall speedup is claimed.
+[Samples, runner metadata and graphs](bench/results/runtime-partial-dictionaries.md).
+
+Runtime PRs run paired Before/After/GHC benchmarks on hosted CI, saving raw samples,
+compiler revisions and graphs without generated executables. Independent runs can use
+different hosted CPU models; their absolute times are not chained together.
+
+Next: eliminate pure local variable-alias thunks without duplicating computations or
+changing Case forcing. Recursive aliases, shadowed binders and unresolved chains stay
+conservative. Unit, differential and post-optimizer lint coverage is being validated.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
