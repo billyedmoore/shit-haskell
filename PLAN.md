@@ -255,6 +255,12 @@ paired comparison: geometric-mean speedup 1.031×; fib 107.7 → 92.6 ms and sum
 do not continue automatically after limits reset. The direct-known-global-call draft
 remains unsubmitted and unmeasured in its worktree.
 
+Next candidate: direct native calls to known global functions with exact positive arity.
+Argument and tail-frame setup stay unchanged; partial, overapplied, local and CAF calls
+retain generic dispatch. Regression coverage includes mutual recursion, argument rotation,
+laziness and exceptions. Paired runtime measurements and both corpus gates are pending;
+no speedup is claimed yet.
+
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
 - Code: known standard numeric literals bypass run-time conversion (done). Next, resolve
@@ -266,10 +272,12 @@ The work:
 
 ### 2. Large projects
 
-Each built with cabal and compared with its GHC build:
+Each built with its supported build system and compared with its GHC-built counterpart:
 - hlint: its remaining dependencies, then its test suite and its output on real code.
 - cabal-install.
 - pandoc.
+- GHC: build the compiler with hsc, then validate its test suite and the behaviour of
+  programs it compiles against the reference GHC build.
 
 The remaining boot-library suites go alongside:
 - text: needs tasty-inspection-testing, a GHC plugin.
