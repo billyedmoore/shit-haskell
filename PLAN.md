@@ -54,6 +54,8 @@ the GitHub issues.
 - Every speed pull request includes graphs of before, after, and GHC, with the measurement
   commands and conditions; run-time graphs show both `-O0` and `-O1` and the 0.9× target.
 - Keep PR descriptions concise, with key results, graphs and validation.
+- Remove old generated corpus executables after preserving reports and raw measurements;
+  reuse build directories and retain the compiler baselines needed for current comparisons.
 - This file is kept up to date as work lands.
 - Use goal mode and keep iterating until the roadmap is complete. If execution or usage limits interrupt work,
   checkpoint the current state and resume work when execution becomes available
@@ -199,8 +201,16 @@ pairs, 8.3% faster in a seven-pair same-binary recheck); no consistent MVar gain
 [Raw samples, conditions and graphs](bench/results/runtime-dispatch.md) retain both runs.
 All runtime targets remain unmet.
 
-Next: measure a small inline path for already evaluated primitive arguments, keeping thunk
-entry, indirections, saved GC roots and exception recovery unchanged.
+The inline evaluated-argument experiment is held out: it removed only 0.4% of instructions
+on a scaled sumloop and made fib 2.3% slower over seven alternating pairs.
+
+Next: measure lazy native diagnostic-name decoding. The draft preserves the static table's
+address lookup and lossy UTF-8 behavior, and passes 44 unit tests plus a Unicode-body corpus
+case on both backends (native with a small heap), including a real GC-census lookup.
+Performance measurements and full CI are pending; Windows disk pressure stopped local
+benchmark runs. Runtime PRs now have a GitHub-hosted paired benchmark workflow, retaining
+raw samples, compiler revisions and graphs without archiving generated executables.
+No speedup is claimed for this candidate.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
