@@ -120,9 +120,10 @@ fn rewrite(c: &mut Core, known: &HashMap<String, String>) {
 /// instance dictionary becomes a direct reference to that instance's method.
 pub fn resolve_known_methods(binds: &mut [TopBind]) {
     // Method selectors: `\d -> case d of C .. x .. -> x` gives the field index.
-    let mut selectors: HashMap<String, usize> = HashMap::new();
-    // Constant dictionaries: their fields, when all are plain globals.
-    let mut dicts: HashMap<String, Vec<Core>> = HashMap::new();
+    let mut selectors: HashMap<String, (String, usize)> = HashMap::new();
+    // A constant dictionary can mix global methods with lazy default applications.
+    // Record each global field independently; selecting it does not force the other fields.
+    let mut dicts: HashMap<String, (String, Vec<Option<String>>)> = HashMap::new();
     // Aliases of globals (evidence bound to a dictionary, or a dictionary bound to another).
     let mut aliases: HashMap<String, String> = HashMap::new();
     for b in binds.iter() {
@@ -133,9 +134,13 @@ pub fn resolve_known_methods(binds: &mut [TopBind]) {
         if let Some(index) = selector_index(&b.body) {
             selectors.insert(b.name.clone(), index);
         }
-        if let Core::Con(_, fields) = &b.body {
-            if fields.iter().all(|f| matches!(f, Core::Var(_))) && b.name.contains(".$f") {
-                dicts.insert(b.name.clone(), fields.clone());
+        if let Core::Con(con, fields) = &b.body {
+            if b.name.contains(".$f") {
+                let globals = fields.iter().map(|field| match field {
+                    Core::Var(name) => Some(name.clone()),
+                    _ => None,
+                }).collect();
+                dicts.insert(b.name.clone(), (con.clone(), globals));
             }
         }
     }
@@ -154,12 +159,12 @@ pub fn resolve_known_methods(binds: &mut [TopBind]) {
     }
 }
 
-fn selector_index(c: &Core) -> Option<usize> {
+fn selector_index(c: &Core) -> Option<(String, usize)> {
     if let Core::Lam(d, body) = c {
         if let Core::Case(scrut, _, alts) = body.as_ref() {
             if matches!(scrut.as_ref(), Core::Var(v) if v == d) {
-                if let [Alt::Con(_, vars, Core::Var(field))] = alts.as_slice() {
-                    return vars.iter().position(|v| v == field);
+                if let [Alt::Con(con, vars, Core::Var(field))] = alts.as_slice() {
+                    return vars.iter().position(|v| v == field).map(|index| (con.clone(), index));
                 }
             }
         }
@@ -198,8 +203,8 @@ fn collect_aliases(c: &Core, aliases: &mut HashMap<String, String>) {
 
 fn rewrite_selection(
     c: &mut Core,
-    selectors: &HashMap<String, usize>,
-    dicts: &HashMap<String, Vec<Core>>,
+    selectors: &HashMap<String, (String, usize)>,
+    dicts: &HashMap<String, (String, Vec<Option<String>>)>,
     resolve: &dyn Fn(&str) -> Option<String>,
 ) {
     match c {
@@ -207,10 +212,12 @@ fn rewrite_selection(
             rewrite_selection(f, selectors, dicts, resolve);
             rewrite_selection(a, selectors, dicts, resolve);
             if let (Core::Var(sel), Core::Var(d)) = (f.as_ref(), a.as_ref()) {
-                if let (Some(index), Some(dict)) = (selectors.get(sel), resolve(d)) {
-                    if let Some(fields) = dicts.get(&dict) {
-                        if let Some(Core::Var(method)) = fields.get(*index) {
-                            *c = Core::Var(method.clone());
+                if let (Some((expected_con, index)), Some(dict)) = (selectors.get(sel), resolve(d)) {
+                    if let Some((actual_con, fields)) = dicts.get(&dict) {
+                        if expected_con == actual_con {
+                            if let Some(Some(method)) = fields.get(*index) {
+                                *c = Core::Var(method.clone());
+                            }
                         }
                     }
                 }
@@ -385,5 +392,69 @@ mod literal_tests {
         assert_eq!(zero.to_bits(), (-0.0f64).to_bits());
         let Core::Lit(Lit::Double(tiny)) = optimise(fractional("GHC.Internal.Float.$fFractionalDouble_9", "5e-324"), &[]) else { panic!() };
         assert_eq!(tiny.to_bits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod method_selection_tests {
+    use super::*;
+
+    fn selector(con: &str, index: usize) -> Core {
+        let fields = vec!["first%1".to_string(), "second%2".to_string()];
+        Core::Lam("dict%3".into(), Box::new(Core::Case(
+            Box::new(Core::Var("dict%3".into())), "case%4".into(),
+            vec![Alt::Con(con.into(), fields.clone(), Core::Var(fields[index].clone()))],
+        )))
+    }
+
+    fn call(method: &str, dict: &str) -> Core {
+        Core::App(Box::new(Core::Var(method.into())), Box::new(Core::Var(dict.into())))
+    }
+
+    #[test]
+    fn global_field_resolves_beside_lazy_default_and_bottom_fields() {
+        for other in [call("Test.default", "Test.$fMixed_1"), Core::Fail("unused".into())] {
+            let original_default = call("Test.second", "Test.$fMixed_1");
+            let mut binds = vec![
+                TopBind { name: "Test.first".into(), body: selector("Test.D:Mixed", 0) },
+                TopBind { name: "Test.second".into(), body: selector("Test.D:Mixed", 1) },
+                TopBind { name: "Test.$fMixed_1".into(), body: Core::Con("Test.D:Mixed".into(), vec![Core::Var("Test.fast".into()), other]) },
+                TopBind { name: "Test.alias".into(), body: Core::Var("Test.$fMixed_1".into()) },
+                TopBind { name: "Test.use".into(), body: call("Test.first", "Test.alias") },
+                TopBind { name: "Test.useDefault".into(), body: original_default.clone() },
+            ];
+            resolve_known_methods(&mut binds);
+            assert!(matches!(&binds[4].body, Core::Var(name) if name == "Test.fast"));
+            assert_eq!(binds[5].body, original_default);
+        }
+    }
+
+    #[test]
+    fn nonzero_field_after_a_superclass_resolves_without_forcing_other_fields() {
+        let mut binds = vec![
+            TopBind { name: "Test.second".into(), body: selector("Test.D:Mixed", 1) },
+            TopBind { name: "Test.$fMixed_1".into(), body: Core::Con("Test.D:Mixed".into(), vec![Core::Fail("superclass is unused".into()), Core::Var("Test.fast".into())]) },
+            TopBind { name: "Test.use".into(), body: call("Test.second", "Test.$fMixed_1") },
+        ];
+        resolve_known_methods(&mut binds);
+        assert_eq!(binds[2].body, Core::Var("Test.fast".into()));
+    }
+
+    #[test]
+    fn constructor_mismatches_cycles_and_noninstance_values_stay_unresolved() {
+        for (dict_name, body) in [
+            ("Test.$fWrong", Core::Con("Other.D:Mixed".into(), vec![Core::Var("wrong".into())])),
+            ("Test.$fCycle", Core::Var("Test.$fCycle".into())),
+            ("Test.value", Core::Con("Test.D:Mixed".into(), vec![Core::Var("ordinary".into())])),
+        ] {
+            let original = call("Test.first", dict_name);
+            let mut binds = vec![
+                TopBind { name: "Test.first".into(), body: selector("Test.D:Mixed", 0) },
+                TopBind { name: dict_name.into(), body },
+                TopBind { name: "Test.use".into(), body: original.clone() },
+            ];
+            resolve_known_methods(&mut binds);
+            assert_eq!(binds[2].body, original);
+        }
     }
 }
