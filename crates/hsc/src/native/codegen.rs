@@ -121,6 +121,8 @@ pub struct Gen {
     current_name: String,
     /// Static objects (label, header, payload).
     statics: Vec<(String, u64, u64)>,
+    /// Shared static cells for constructors without fields, indexed by constructor ID.
+    nullary_cons: HashMap<u32, String>,
     /// Byte strings (label, bytes).
     strings: Vec<(String, Vec<u8>)>,
 }
@@ -151,6 +153,7 @@ impl Gen {
             body_names: Vec::new(),
             current_name: String::new(),
             statics: Vec::new(),
+            nullary_cons: HashMap::new(),
             strings: Vec::new(),
         }
     }
@@ -342,14 +345,19 @@ impl Gen {
             }
             SExpr::Con(name, args) => {
                 let id = self.con_id(name);
-                self.alloc(1 + args.len(), p);
-                self.emit(&format!("movabsq ${}, %rcx", header(CON, args.len() as u64, id as u64)));
-                self.emit("movq %rcx, (%rax)");
-                for (i, a) in args.iter().enumerate() {
-                    self.load(a, p, "%rcx");
-                    self.emit(&format!("movq %rcx, {}(%rax)", 8 * (i + 1)));
+                if args.is_empty() {
+                    let label = self.nullary_con(id);
+                    self.emit(&format!("leaq {label}(%rip), %r14"));
+                } else {
+                    self.alloc(1 + args.len(), p);
+                    self.emit(&format!("movabsq ${}, %rcx", header(CON, args.len() as u64, id as u64)));
+                    self.emit("movq %rcx, (%rax)");
+                    for (i, a) in args.iter().enumerate() {
+                        self.load(a, p, "%rcx");
+                        self.emit(&format!("movq %rcx, {}(%rax)", 8 * (i + 1)));
+                    }
+                    self.emit("movq %rax, %r14");
                 }
-                self.emit("movq %rax, %r14");
                 self.ret(p);
             }
             SExpr::Prim(name, args) => self.prim(name, args, p),
@@ -540,6 +548,17 @@ impl Gen {
         };
         self.emit(&format!("leaq {lbl}(%rip), {reg}"));
         let _ = p;
+    }
+
+    fn nullary_con(&mut self, id: u32) -> String {
+        if let Some(label) = self.nullary_cons.get(&id) {
+            return label.clone();
+        }
+        let label = self.label("con");
+        // A zero-field object still occupies two words, like every other native object.
+        self.statics.push((label.clone(), header(CON, 0, id as u64), 0));
+        self.nullary_cons.insert(id, label.clone());
+        label
     }
 
     fn string_label(&mut self, bytes: &[u8]) -> String {
@@ -913,3 +932,39 @@ hsc_raise_pending:
     jmp hsc_apply
 
 "#;
+
+#[cfg(test)]
+mod nullary_constructor_tests {
+    use super::*;
+
+    fn position(mode: Mode) -> Pos {
+        Pos { f: Frame { s: 1, a: 0 }, mode, pushed: 0 }
+    }
+
+    #[test]
+    fn empty_constructors_share_static_cells_and_preserve_tags_in_both_modes() {
+        let mut gen = Gen::new();
+        gen.expr(&SExpr::Con("Test.A".into(), Vec::new()), position(Mode::Tail));
+        gen.expr(&SExpr::Con("Test.B".into(), Vec::new()), position(Mode::Scrut));
+        gen.expr(&SExpr::Con("Test.A".into(), Vec::new()), position(Mode::Scrut));
+        assert_eq!(gen.statics.len(), 2);
+        for name in ["Test.A", "Test.B"] {
+            let id = gen.con_ids[name];
+            let label = &gen.nullary_cons[&id];
+            let cell = gen.statics.iter().find(|(l, _, _)| l == label).unwrap();
+            assert_eq!((cell.1, cell.2), (header(CON, 0, id as u64), 0));
+            assert!(gen.out.contains(&format!("leaq {label}(%rip), %r14")));
+        }
+        assert!(!gen.out.contains("hsc_gc"));
+        assert!(!gen.out.contains("%r12"));
+    }
+
+    #[test]
+    fn constructors_with_fields_keep_heap_allocation() {
+        let mut gen = Gen::new();
+        gen.expr(&SExpr::Con("Test.Box".into(), vec![Atom::Lit(SLit::Int(42))]), position(Mode::Tail));
+        assert!(gen.nullary_cons.is_empty());
+        assert!(gen.out.contains("hsc_gc"));
+        assert!(gen.out.contains("movq %rcx, 8(%rax)"));
+    }
+}
