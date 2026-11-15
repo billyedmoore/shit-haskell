@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 222 differential tests for both back ends, compared with GHC.
+- **Corpus:** 223 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -29,7 +29,7 @@ the GitHub issues.
   - ShellCheck 0.11 and its ~45 dependencies build and match the GHC build: the whole test suite,
     and its output on real scripts.
   - hlint's dependencies build up to and including ghc-lib-parser and mono-traversable.
-- **Weakness: speed.** Generated code is 10–500× slower than `ghc -O0` (baseline below), and
+- **Weakness: speed.** Generated programs remain much slower than GHC (measurements below), and
   large packages have also been slow to compile. In the latest paired comparison on CPU 0,
   a cold compile of all 425 exposed ghc-lib-parser modules with a fresh module cache takes
   27.9 s versus 28.3 s; run variation exceeds this small difference. Warm builds take
@@ -53,6 +53,7 @@ the GitHub issues.
   a project counts as done when its tests and output match the GHC build's.
 - Every speed pull request includes graphs of before, after, and GHC, with the measurement
   commands and conditions; run-time graphs show both `-O0` and `-O1` and the 0.9× target.
+- Keep PR descriptions concise, with key results, graphs and validation.
 - This file is kept up to date as work lands.
 - Use goal mode and keep iterating until the roadmap is complete. If execution or usage limits interrupt work,
   checkpoint the current state and resume work when execution becomes available
@@ -166,25 +167,38 @@ Remaining compile-time work waits unless it blocks runtime iteration.
   remove passes that grow faster than the code they check.
 - Compile a package's modules in parallel.
 
-**Run time now**, measured with `difftest --bench` against `ghc -O0` and `-O1`, and on the
-build tools hsc builds (happy, alex). The baseline (native, best of 3, against `ghc -O0`;
-`difftest --bench 3 bench/`):
+**Run time now**, measured against GHC `-O0` and `-O1` with `tools/runtimebench.py`,
+and on build tools hsc builds (happy, alex). `difftest --bench` also checks the native baseline.
+The latest results use release hsc builds, GHC 9.12.2, CPU 0, one untimed correctness warmup
+and three alternating timed samples per build. Builds are excluded; startup is included.
+Every stdout/stderr/exit result matches. The target remains **0.9× GHC `-O1` on every program**.
 
-| program | ghc -O0 ms | hsc ms | ratio |
-|---------|-----------:|-------:|------:|
-| fib (27) | 16.5 | 592 | 36× |
-| integer (3000!) | 6.3 | 129 | 20× |
-| ioref (10^6 modifyIORef') | 61 | 3031 | 50× |
-| mapops (search tree, 5·10^4) | 145 | 1635 | 11× |
-| mvar (2·10^4 round trips) | 12 | 1004 | 84× |
-| nqueens (9) | 38 | 583 | 15× |
-| strings (words, map) | 188 | 10077 | 54× |
-| sumloop (5·10^6 strict Int loop) | 212 | 111100 | 524× |
+| program | before ms | hsc ms | GHC -O0 ms | GHC -O1 ms | 0.9×O1 target ms |
+|---------|----------:|-------:|-----------:|-----------:|----------------:|
+| fib | 541.072 | 247.086 | 16.560 | 3.471 | 3.124 |
+| integer | 119.116 | 102.735 | 5.429 | 5.246 | 4.722 |
+| ioref | 2139.022 | 2279.883 | 50.576 | 5.464 | 4.918 |
+| mapops | 1029.347 | 959.790 | 74.079 | 46.954 | 42.258 |
+| mvar | 163.243 | 168.658 | 10.682 | 5.462 | 4.916 |
+| nqueens | 383.228 | 331.353 | 18.948 | 4.252 | 3.827 |
+| strings | 7535.894 | 7128.742 | 82.763 | 100.507 | 90.456 |
+| sumloop | 33254.132 | 20223.921 | 251.093 | 16.620 | 14.958 |
+
+Canonical standard numeric literals now fold through dictionary aliases, eliminating repeated
+conversion workers. Custom instances, noncanonical `Base` names, overflowing `Int` literals
+and failed parses keep their original calls. The eight-program geometric-mean speedup is
+1.22×, with large gains in fib and sumloop; the `-O1` target remains unmet. The initial three
+samples put ioref/mvar 6.6%/3.3% slower; seven-pair follow-ups put both about 1% slower.
+[Raw samples, conditions and graphs](bench/results/runtime-literals.md) retain both runs.
+
+Next: profile primitive dispatch after literal specialization. Native calls already use
+program-local IDs; repeated name cloning and foreign-signature parsing remain candidates.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
-- Code: Int literals without a run-time `fromInteger`, primops by index, unboxed Int and
-  Double paths, a direct calling convention.
+- Code: known standard numeric literals bypass run-time conversion (done). Next, resolve
+  program-local primitive IDs without repeated name decoding/foreign parsing, then unboxed
+  Int and Double paths and a direct calling convention.
 - Optimiser: inlining, specialisation at known dictionaries, case-of-case, strictness analysis
   with worker/wrapper, rewrite rules (for `-O1`'s list fusion).
 - Runtime: a generational GC, cheaper thunk allocation.
