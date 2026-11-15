@@ -57,7 +57,8 @@ the GitHub issues.
 - Remove old generated corpus executables after preserving reports and raw measurements;
   reuse build directories and retain the compiler baselines needed for current comparisons.
 - This file is kept up to date as work lands.
-- Use goal mode and keep iterating until the roadmap is complete. If execution or usage limits interrupt work,
+- User stop/pause instructions take precedence; work stops after PR #39 until a new instruction.
+- Use goal mode and keep iterating until the roadmap is complete when continuation is authorized. If execution or usage limits interrupt work,
   checkpoint the current state and resume work when execution becomes available
   after the reset, without waiting for another instruction to continue.
 
@@ -174,19 +175,19 @@ and on build tools hsc builds (happy, alex). `difftest --bench` also checks the 
 Representative paired results use Rust 1.92.0 release hsc, GHC 9.12.2 and CPU 0,
 one untimed correctness warmup and three alternating timed samples per build.
 Builds are excluded; startup is included. Every stdout/stderr/exit result matches.
-The table is the small-integer cache verification on a hosted AMD EPYC 9V74 runner.
+The table is the static zero-field constructor comparison on a hosted AMD EPYC 9V45 runner.
 The target remains **0.9× GHC `-O1` on every program**.
 
 | program | before ms | hsc ms | GHC -O0 ms | GHC -O1 ms | 0.9×O1 target ms |
 |---------|----------:|-------:|-----------:|-----------:|----------------:|
-| fib | 133.751 | 125.612 | 18.233 | 3.768 | 3.391 |
-| integer | 80.111 | 79.558 | 6.818 | 5.982 | 5.384 |
-| ioref | 1383.175 | 1374.626 | 55.885 | 6.130 | 5.517 |
-| mapops | 419.739 | 409.390 | 71.379 | 45.181 | 40.663 |
-| mvar | 190.813 | 188.590 | 13.427 | 6.649 | 5.984 |
-| nqueens | 229.090 | 223.906 | 22.122 | 4.390 | 3.951 |
-| strings | 4924.212 | 4758.718 | 81.924 | 108.686 | 97.818 |
-| sumloop | 12299.421 | 10751.014 | 195.268 | 13.892 | 12.503 |
+| fib | 107.710 | 92.605 | 15.013 | 3.226 | 2.904 |
+| integer | 61.658 | 60.242 | 5.325 | 5.274 | 4.747 |
+| ioref | 1134.077 | 1096.582 | 36.940 | 5.398 | 4.858 |
+| mapops | 302.871 | 305.348 | 53.384 | 30.552 | 27.497 |
+| mvar | 168.389 | 167.519 | 10.480 | 6.185 | 5.567 |
+| nqueens | 171.541 | 172.681 | 17.310 | 4.294 | 3.865 |
+| strings | 3903.332 | 3860.743 | 63.345 | 85.318 | 76.786 |
+| sumloop | 8124.657 | 7853.504 | 135.956 | 14.145 | 12.730 |
 
 Canonical standard numeric literals fold through dictionary aliases, eliminating repeated
 conversion workers. Custom instances, noncanonical `Base` names, overflowing `Int` literals
@@ -240,13 +241,19 @@ boxed-Int range. Uncached values retain normal allocation. Both backends passed 
 and all 53 unit tests, including direct/indirect static GC roots and numeric boundaries.
 Two independent hosted comparisons measured geometric-mean speedups of 1.037× and 1.039×;
 sumloop took 12.656 → 11.030 s and 12.299 → 10.751 s. IORef was 4.2% slower initially and
-0.6% faster on verification, so no consistent IORef change is claimed. The table above is
-the verification comparison. [Both complete runs and graphs](bench/results/runtime-small-integers.md).
+0.6% faster on verification, so no consistent IORef change is claimed. [Both complete runs and graphs](bench/results/runtime-small-integers.md).
 
-Next: measure shared static cells for native constructors without fields. Only zero-field
-construction takes the new path; fieldful constructors keep ordinary allocation. Tag
-separation, both return modes and retention of mixed values across GC are being validated.
-No speedup is claimed for this candidate yet.
+Native constructors without fields share per-program static cells. Their constructor tags,
+two-word object layout and return convention are preserved; fieldful constructors retain
+ordinary allocation. Both backends passed 229 tests and all 55 unit tests, including tag
+separation, both return modes and mixed values retained across GC. The table above is this
+paired comparison: geometric-mean speedup 1.031×; fib 107.7 → 92.6 ms and sumloop
+8.125 → 7.854 s. Mapops and nqueens measured less than 1% slower.
+[Raw samples, conditions and graphs](bench/results/runtime-nullary-constructors.md).
+
+**Stop after PR #39**, as requested on 2026-11-15. Resume only on a new user instruction;
+do not continue automatically after limits reset. The direct-known-global-call draft
+remains unsubmitted and unmeasured in its worktree.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
