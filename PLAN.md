@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 224 differential tests for both back ends, compared with GHC.
+- **Corpus:** 226 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -211,6 +211,13 @@ Performance measurements and full CI are pending; Windows disk pressure stopped 
 benchmark runs. Runtime PRs now have a GitHub-hosted paired benchmark workflow, retaining
 raw samples, compiler revisions and graphs without archiving generated executables.
 No speedup is claimed for this candidate.
+
+A second pending runtime candidate resolves an individual known method when other dictionary
+fields are lazy default applications. The emitted `Ord Int` dictionary has global comparison
+workers beside applied max/min defaults; the previous all-fields-global check excluded it.
+Selectors retain constructor identity, and only selected plain global fields are folded.
+Custom defaults, unused bottom fields, superclass offsets and aliases have regression
+coverage; hosted correctness and paired performance results are pending.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
