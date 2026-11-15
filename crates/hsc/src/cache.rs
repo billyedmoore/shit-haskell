@@ -8,6 +8,7 @@
 //! compiler builds are removed, so the cache holds the entries of the latest builds only.
 
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use crate::core::{Alt, Core, Lit as CLit, TopBind};
 use crate::rename::iface::{EntKind, Entity, GName, Iface, PatSynDef};
@@ -24,14 +25,23 @@ use crate::tc::types::{Pred, Scheme, Ty};
 pub struct W {
     pub out: Vec<u8>,
     pub ok: bool,
+    shared_types: bool,
+    type_ids: HashMap<*const Ty, u32>,
+    // Keep registered allocations alive: a later value must not reuse an old address.
+    types: Vec<Rc<Ty>>,
 }
 
 pub struct R<'a> {
     bytes: &'a [u8],
     pos: usize,
+    types: Vec<Rc<Ty>>,
 }
 
 impl W {
+    fn new(out: Vec<u8>, shared_types: bool) -> Self {
+        Self { out, ok: true, shared_types, type_ids: HashMap::new(), types: Vec::new() }
+    }
+
     fn u8(&mut self, b: u8) {
         self.out.push(b);
     }
@@ -48,6 +58,12 @@ impl R<'_> {
         let s = self.bytes.get(self.pos..self.pos + n)?;
         self.pos += n;
         Some(s)
+    }
+}
+
+impl<'a> R<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0, types: Vec::new() }
     }
 }
 
@@ -175,12 +191,40 @@ impl<T: Bin> Bin for Option<T> {
     }
 }
 
-impl<T: Bin> Bin for std::rc::Rc<T> {
+impl Bin for Rc<Ty> {
     fn put(&self, w: &mut W) {
+        // ABI fingerprints describe the type, independently of allocation/sharing.
+        if !w.shared_types {
+            (**self).put(w);
+            return;
+        }
+        let pointer = Rc::as_ptr(self);
+        if let Some(&id) = w.type_ids.get(&pointer) {
+            w.u8(1);
+            id.put(w);
+            return;
+        }
+        w.u8(0);
         (**self).put(w);
+        // IDs are postorder on both sides. Only completed nodes may be referenced.
+        let Ok(id) = u32::try_from(w.types.len()) else { w.ok = false; return };
+        w.type_ids.insert(pointer, id);
+        w.types.push(self.clone());
     }
     fn get(r: &mut R) -> Option<Self> {
-        Some(std::rc::Rc::new(T::get(r)?))
+        match r.u8()? {
+            0 => {
+                let ty = Rc::new(Ty::get(r)?);
+                u32::try_from(r.types.len()).ok()?;
+                r.types.push(ty.clone());
+                Some(ty)
+            }
+            1 => {
+                let id = u32::get(r)?;
+                r.types.get(id as usize).cloned()
+            }
+            _ => None,
+        }
     }
 }
 
@@ -489,7 +533,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 2";
+const MAGIC: &str = "hsc-module-cache 3";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.
@@ -515,7 +559,7 @@ pub fn instance_key(env: &Env, module: &str, zonk: impl Fn(&Ty) -> Ty) -> String
         i.head = i.head.iter().map(&zonk).collect();
         for p in &mut i.ctx { p.args = p.args.iter().map(&zonk).collect(); }
     }
-    let mut w = W { out: Vec::new(), ok: true };
+    let mut w = W::new(Vec::new(), false);
     instances.put(&mut w);
     crate::driver::md5_hex(&w.out)
 }
@@ -561,13 +605,13 @@ fn compiler_id() -> Option<String> {
 pub fn load(path: &std::path::Path) -> Option<Entry> {
     let bytes = std::fs::read(path).ok()?;
     let rest = bytes.strip_prefix(MAGIC.as_bytes())?;
-    let mut r = R { bytes: rest, pos: 0 };
+    let mut r = R::new(rest);
     let e = Entry::get(&mut r)?;
     (r.pos == rest.len()).then_some(e)
 }
 
 pub fn save(path: &std::path::Path, e: &Entry) {
-    let mut w = W { out: MAGIC.as_bytes().to_vec(), ok: true };
+    let mut w = W::new(MAGIC.as_bytes().to_vec(), true);
     e.put(&mut w);
     if !w.ok {
         return;
@@ -658,6 +702,68 @@ mod tests {
     }
 
     #[test]
+    fn type_codec_retains_nested_sharing_across_schemes() {
+        let leaf = Rc::new(Ty::con("M.T"));
+        let pair = Rc::new(Ty::App(leaf.clone(), leaf.clone()));
+        let body = Rc::new(Ty::Forall(vec![7], vec![Pred { class: "M.C".into(), args: vec![Ty::Bound(7)] }], pair.clone()));
+        let input = vec![Scheme::mono(Ty::App(body.clone(), pair.clone())),
+                         Scheme::mono(Ty::Qual(Vec::new(), body.clone()))];
+        let weak = Rc::downgrade(&leaf);
+        let mut w = W::new(Vec::new(), true);
+        input.put(&mut w);
+        assert!(w.ok);
+        drop(input); drop(body); drop(pair); drop(leaf);
+        assert!(weak.upgrade().is_some(), "registered addresses must remain live");
+        let mut r = R::new(&w.out);
+        let decoded = Vec::<Scheme>::get(&mut r).unwrap();
+        assert_eq!(r.pos, w.out.len());
+        let Ty::App(body, pair) = &decoded[0].ty else { panic!() };
+        let Ty::Qual(_, other_body) = &decoded[1].ty else { panic!() };
+        assert!(Rc::ptr_eq(body, other_body));
+        let Ty::Forall(_, preds, inner) = body.as_ref() else { panic!() };
+        assert_eq!(preds[0].args, [Ty::Bound(7)]);
+        assert!(Rc::ptr_eq(pair, inner));
+        let Ty::App(a, b) = pair.as_ref() else { panic!() };
+        assert!(Rc::ptr_eq(a, b));
+        assert_eq!(a.as_ref(), &Ty::con("M.T"));
+    }
+
+    #[test]
+    fn type_codec_rejects_unavailable_references_and_truncated_nodes() {
+        for bytes in [vec![1, 0, 0, 0, 0], vec![1, 255, 255, 255, 255], vec![2],
+                      vec![0], vec![0, 0, 9, 0, 0, 0, b'x'],
+                      vec![0, 1, 1, 0, 0, 0, 0]] {
+            assert!(Rc::<Ty>::get(&mut R::new(&bytes)).is_none(), "{bytes:?}");
+        }
+        let node = Rc::new(Ty::con("T"));
+        let mut w = W::new(Vec::new(), true);
+        node.put(&mut w);
+        w.u8(1); 1u32.put(&mut w); // Only ID 0 exists.
+        let mut r = R::new(&w.out);
+        assert_eq!(Rc::<Ty>::get(&mut r).unwrap().as_ref(), node.as_ref());
+        assert!(Rc::<Ty>::get(&mut r).is_none());
+    }
+
+    #[test]
+    fn instance_fingerprint_is_independent_of_type_sharing() {
+        let leaf = Rc::new(Ty::con("M.T"));
+        let shared = Ty::App(leaf.clone(), leaf);
+        let separate = Ty::app(Ty::con("M.T"), Ty::con("M.T"));
+        let env = |head| {
+            let mut env = Env::default();
+            env.instances.push(InstInfo {
+                class: "M.C".into(), nvars: 0, ctx: Vec::new(), head: vec![head],
+                dict: "M.dict".into(), kinds: Vec::new(),
+            });
+            env
+        };
+        assert_eq!(instance_key(&env(shared), "M", Clone::clone),
+                   instance_key(&env(separate), "M", Clone::clone));
+        assert_ne!(instance_key(&env(Ty::con("Other")), "M", Clone::clone),
+                   instance_key(&env(Ty::con("M.T")), "M", Clone::clone));
+    }
+
+    #[test]
     fn module_delta_roundtrips_and_resumes_after_cached_additions() {
         let (mut env, mut kinds) = base_env();
         let before = snapshot(&env, &kinds);
@@ -688,10 +794,10 @@ mod tests {
         assert_eq!(d.family_eqns[0].1.len(), 1);
         assert_eq!(d.family_eqns[0].1[0].rhs, Ty::con("New"));
 
-        let mut w = W { out: Vec::new(), ok: true };
+        let mut w = W::new(Vec::new(), true);
         d.put(&mut w);
         assert!(w.ok);
-        let mut r = R { bytes: &w.out, pos: 0 };
+        let mut r = R::new(&w.out);
         let decoded = EnvDelta::get(&mut r).unwrap();
         assert_eq!(r.pos, w.out.len());
         // Loading a cache entry journals its additions too: the next module starts after
@@ -769,10 +875,10 @@ mod tests {
         assert_eq!(d.family_eqns[1].0, "M.Sub.F");
         assert_eq!(d.family_eqns[1].1.len(), 1);
         assert_eq!(d.instances.iter().map(|i| i.dict.as_str()).collect::<Vec<_>>(), ["M.dict", "Shared.new"]);
-        let mut w = W { out: Vec::new(), ok: true };
+        let mut w = W::new(Vec::new(), true);
         d.put(&mut w);
         assert!(w.ok);
-        let mut r = R { bytes: &w.out, pos: 0 };
+        let mut r = R::new(&w.out);
         let decoded = EnvDelta::get(&mut r).unwrap();
         let (mut loaded, mut loaded_kinds) = boot_env();
         loaded.families.get_mut("M.Sub.F").unwrap().equations.push(equation("ThirdParty"));

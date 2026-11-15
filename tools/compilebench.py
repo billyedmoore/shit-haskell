@@ -13,6 +13,8 @@ compilers get an untimed build; GHC keeps its native objects, hsc its checked mo
 superclass equalities, as used by ghc-lib-parser's annotation constraints.
 --workload type-substitution repeatedly instantiates monomorphic functions with
 a large closed type, isolating copying of unchanged type application branches.
+--workload typed-cache measures warm loading of 50 modules with 64 signatures
+each at a closed 64-layer type; hsc retains shared types in its checked cache.
 Run without other compiler/test jobs competing for CPU.
 """
 
@@ -131,21 +133,45 @@ def boot_sources(work):
     return root
 
 
+def typed_sources(work):
+    prefix = "{-# LANGUAGE NoImplicitPrelude #-}\n"
+    closed = "Box (" * 64 + "Result" + ")" * 64
+    (work / "Seed.hs").write_text(prefix + "module Seed where\ndata Result = Result\n"
+                                   + "data Box a = Box a\n" + f"type Closed = {closed}\n")
+    previous = None
+    for i in range(50):
+        name = f"Typed{i:03}"
+        lines = [prefix, f"module {name} where", "import Seed"]
+        if previous:
+            lines.append(f"import {previous} ()")
+        for j in range(64):
+            lines += [f"value{j} :: Closed -> Closed", f"value{j} x = x"]
+        (work / f"{name}.hs").write_text("\n".join(lines) + "\n")
+        previous = name
+    root = work / "CompileTyped.hs"
+    root.write_text(prefix + f"module CompileTyped where\nimport {previous} ()\n")
+    return root
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--before", required=True)
     parser.add_argument("--after", required=True)
     parser.add_argument("--ghc", default="ghc")
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--workload", choices=("instance-lookup", "module-cache", "boot-cache", "application-equalities", "type-substitution"), default="instance-lookup")
+    parser.add_argument("--workload", choices=("instance-lookup", "module-cache", "boot-cache", "application-equalities", "type-substitution", "typed-cache"), default="instance-lookup")
     parser.add_argument("--work", type=Path, default=Path("target/compilebench"))
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
-    warm = args.workload == "boot-cache"
-    if warm:
+    warm = args.workload in ("boot-cache", "typed-cache")
+    if args.workload == "typed-cache":
+        hs = typed_sources(work)
+        mode = ["--make", "-no-link"]
+        title = "Warm shared type cache (seconds)"
+    elif args.workload == "boot-cache":
         hs = boot_sources(work)
         mode = ["--make", "-no-link"]
         title = "Warm SOURCE dependency build (seconds)"
@@ -180,7 +206,7 @@ def main():
         ("GHC -O1", args.ghc, ["-O1", *([] if warm else ["-fno-code"])]),
     ]
     results = {name: [] for name, _, _ in compilers}
-    warmups = 1 if args.workload in ("module-cache", "boot-cache") else 0
+    warmups = 1 if args.workload in ("module-cache", "boot-cache", "typed-cache") else 0
     for run in range(-warmups, args.runs):
         # Alternate order to reduce systematic bias from warming or clock changes.
         for name, compiler, flags in compilers[::1 if run < 0 or run % 2 == 0 else -1]:
