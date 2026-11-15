@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 229 differential tests for both back ends, compared with GHC.
+- **Corpus:** 230 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -255,11 +255,11 @@ paired comparison: geometric-mean speedup 1.031×; fib 107.7 → 92.6 ms and sum
 do not continue automatically after limits reset. The direct-known-global-call draft
 remains unsubmitted and unmeasured in its worktree.
 
-Next candidate: direct native calls to known global functions with exact positive arity.
-Argument and tail-frame setup stay unchanged; partial, overapplied, local and CAF calls
-retain generic dispatch. Regression coverage includes mutual recursion, argument rotation,
-laziness and exceptions. Paired runtime measurements and both corpus gates are pending;
-no speedup is claimed yet.
+Direct native calls to known global functions with exact positive arity bypass generic
+dispatch. Argument and tail-frame setup stay unchanged; other calls retain generic dispatch.
+Both corpora pass 230/230 and all 58 unit tests pass. The paired comparison measures
+a 1.026× geometric-mean speedup, led by fib; other differences are small. All runtime
+targets remain unmet. [Raw samples, conditions and graphs](bench/results/runtime-direct-calls.md).
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
