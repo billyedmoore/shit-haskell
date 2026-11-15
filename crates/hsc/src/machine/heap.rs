@@ -31,7 +31,7 @@ pub mod kind {
 pub type Word = u64;
 
 /// Packs a header.
-pub fn header(kind: u8, size: u32, aux: u32) -> Word {
+pub const fn header(kind: u8, size: u32, aux: u32) -> Word {
     debug_assert!(size < (1 << 24), "object too large");
     kind as u64 | ((size as u64) << 8) | ((aux as u64) << 32)
 }

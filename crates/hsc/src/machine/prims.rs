@@ -7,8 +7,36 @@ use super::Machine;
 use crate::interp::bigint::{limb64, limb64_count, BigInt};
 use crate::native::codegen::{CHAR, INT};
 
-/// A new `Int#` object.
+// Immutable machine integers, matching GHC's small boxed-Int range. Like native literal
+// cells, these have no pointer fields and live outside the collector's semispaces.
+const SMALL_INT_MIN: i64 = -16;
+const SMALL_INT_MAX: i64 = 255;
+const SMALL_INT_COUNT: usize = (SMALL_INT_MAX - SMALL_INT_MIN + 1) as usize;
+static SMALL_INTS: [[Word; 2]; SMALL_INT_COUNT] = {
+    let mut cells = [[0; 2]; SMALL_INT_COUNT];
+    let mut i = 0;
+    while i < SMALL_INT_COUNT {
+        cells[i] = [heap::header(INT_KIND, 1, 0), (SMALL_INT_MIN + i as i64) as Word];
+        i += 1;
+    }
+    cells
+};
+
+#[inline]
+fn cached_int(n: i64) -> Option<Word> {
+    if (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&n) {
+        Some(SMALL_INTS[(n - SMALL_INT_MIN) as usize].as_ptr() as Word)
+    } else {
+        None
+    }
+}
+
+/// An immutable `Int#` object, reusing a static cell for a small value.
+#[inline]
 pub fn int_value(m: &mut Machine, n: i64) -> Word {
+    if let Some(p) = cached_int(n) {
+        return p;
+    }
     let p = m.alloc(2);
     m.heap_set(p, heap::header(INT_KIND, 1, 0));
     m.heap_set(p + 8, n as Word);
@@ -298,5 +326,43 @@ mod dispatch_tests {
                      "ccall:+#", "unknown#", "plusWord8#"] {
             assert_eq!(ordinary_name(name), None, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod small_int_tests {
+    use super::{cached_int, SMALL_INTS, SMALL_INT_MAX, SMALL_INT_MIN};
+    use crate::machine::{gc, heap::{self, kind, Heap, Word}};
+
+    #[test]
+    fn cached_cells_have_exact_headers_payloads_and_stable_addresses() {
+        for n in SMALL_INT_MIN..=SMALL_INT_MAX {
+            let p = cached_int(n).unwrap();
+            assert_eq!(Some(p), cached_int(n));
+            assert_eq!(p % std::mem::align_of::<Word>() as Word, 0);
+            // SAFETY: cached_int returns a process-lived static cell of two aligned words.
+            let cell = unsafe { std::slice::from_raw_parts(p as *const Word, 2) };
+            assert_eq!(cell[0], heap::header(kind::INT, 1, 0));
+            assert_eq!(cell[1], n as Word);
+        }
+        for n in [i64::MIN, SMALL_INT_MIN - 1, SMALL_INT_MAX + 1, i64::MAX] {
+            assert_eq!(cached_int(n), None);
+        }
+    }
+
+    #[test]
+    fn cached_cells_survive_direct_and_indirect_gc_roots() {
+        let mut heap = Heap::new(64);
+        let cached = cached_int(7).unwrap();
+        let before = SMALL_INTS[(7 - SMALL_INT_MIN) as usize];
+        let object = heap.try_alloc(2, heap::header(kind::CON, 1, 0)).unwrap();
+        heap.set_word(object, 1, cached);
+        let mut roots = [cached, object];
+        gc::collect(&mut heap, &mut roots, 0);
+        assert_eq!(roots[0], cached);
+        assert_ne!(roots[1], object);
+        assert_eq!(heap.word(roots[1], 1), cached);
+        assert!(!heap.contains(cached));
+        assert_eq!(SMALL_INTS[(7 - SMALL_INT_MIN) as usize], before);
     }
 }
