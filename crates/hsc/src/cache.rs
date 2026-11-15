@@ -228,6 +228,16 @@ impl Bin for Rc<Ty> {
     }
 }
 
+// Kinds retain the same structural encoding as boxed arrows; type-node IDs are separate.
+impl Bin for Rc<Kind> {
+    fn put(&self, w: &mut W) {
+        (**self).put(w);
+    }
+    fn get(r: &mut R) -> Option<Self> {
+        Some(Rc::new(Kind::get(r)?))
+    }
+}
+
 impl<T: Bin> Bin for Box<T> {
     fn put(&self, w: &mut W) {
         (**self).put(w);
@@ -738,6 +748,17 @@ mod tests {
     }
 
     #[test]
+    fn shared_kind_arrows_keep_the_structural_cache_encoding() {
+        let kind = Kind::Arr(Rc::new(Kind::Star), Rc::new(Kind::Arr(Rc::new(Kind::Gen(0)), Rc::new(Kind::Star))));
+        let mut w = W::new(Vec::new(), true);
+        kind.put(&mut w);
+        assert_eq!(w.out, [1, 0, 1, 3, 0, 0, 0, 0, 0]);
+        let mut r = R::new(&w.out);
+        assert_eq!(Kind::get(&mut r).unwrap(), kind);
+        assert_eq!(r.pos, w.out.len());
+    }
+
+    #[test]
     fn view_expressions_roundtrip_names_locations_and_nested_forms() {
         let l = Loc { line: 7, col: 13 };
         let q = QName { qual: Some("Views".into()), name: "view".into() };
@@ -958,7 +979,7 @@ mod tests {
         env.families.get_mut("M.F").unwrap().equations.push(equation("Own"));
         env.families.get_mut("Boot.F").unwrap().equations.push(equation("Foreign"));
         env.families.get_mut("M.Sub.F").unwrap().equations.push(equation("SubFromM"));
-        kinds.insert("M.T".into(), Kind::Arr(Box::new(Kind::Star), Box::new(Kind::Star)));
+        kinds.insert("M.T".into(), Kind::Arr(Rc::new(Kind::Star), Rc::new(Kind::Star)));
         let old = env.instances.position("C", |i| i.dict == "M.dict").unwrap();
         let mut actual = env.instances.remove(old);
         actual.ctx.push(Pred { class: "Implementation".into(), args: Vec::new() });

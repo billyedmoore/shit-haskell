@@ -3,6 +3,7 @@
 //! (GHC2021 enables PolyKinds). Signatures must have kind `Type`.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::convert::global_tycon_name;
 use super::{Checker, TcError, TR};
@@ -11,14 +12,14 @@ use crate::syntax::ast::{ClassDecl, DataDecl, Decl, Loc, Type};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Star,
-    Arr(Box<Kind>, Box<Kind>),
+    Arr(Rc<Kind>, Rc<Kind>),
     Meta(u32),
     /// A generalised kind variable of a declaration's kind.
     Gen(u32),
 }
 
 fn arr(a: Kind, b: Kind) -> Kind {
-    Kind::Arr(Box::new(a), Box::new(b))
+    Kind::Arr(Rc::new(a), Rc::new(b))
 }
 
 fn show(k: &Kind) -> String {
@@ -50,7 +51,7 @@ impl KindEnv {
     /// for a module in the module cache.
     pub fn resolve(&self, k: &Kind) -> Kind {
         match self.prune(k) {
-            Kind::Arr(a, b) => Kind::Arr(Box::new(self.resolve(&a)), Box::new(self.resolve(&b))),
+            Kind::Arr(a, b) => Kind::Arr(Rc::new(self.resolve(&a)), Rc::new(self.resolve(&b))),
             Kind::Meta(_) => Kind::Star,
             other => other,
         }
@@ -91,8 +92,25 @@ impl KindEnv {
 
     fn zonk(&self, k: &Kind) -> Kind {
         match self.prune(k) {
-            Kind::Arr(a, b) => arr(self.zonk(&a), self.zonk(&b)),
+            Kind::Arr(a, b) => Kind::Arr(self.zonk_rc(&a), self.zonk_rc(&b)),
             other => other,
+        }
+    }
+
+    /// Keep closed arrow tails shared; solved metas are observed anew on every walk.
+    fn zonk_rc(&self, k: &Rc<Kind>) -> Rc<Kind> {
+        match &**k {
+            Kind::Star | Kind::Gen(_) => k.clone(),
+            Kind::Meta(m) if self.metas[*m as usize].is_none() => k.clone(),
+            Kind::Arr(a, b) => {
+                let (a2, b2) = (self.zonk_rc(a), self.zonk_rc(b));
+                if Rc::ptr_eq(a, &a2) && Rc::ptr_eq(b, &b2) {
+                    k.clone()
+                } else {
+                    Rc::new(Kind::Arr(a2, b2))
+                }
+            }
+            _ => Rc::new(self.zonk(k)),
         }
     }
 
@@ -141,6 +159,64 @@ fn occurs(k: &Kind, m: u32) -> bool {
         Kind::Meta(x) => *x == m,
         Kind::Arr(a, b) => occurs(a, m) || occurs(b, m),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+
+    #[test]
+    fn zonking_shares_unchanged_tails_and_observes_later_solutions() {
+        let mut env = KindEnv::default();
+        let meta = env.fresh();
+        let left = Rc::new(meta.clone());
+        let tail = Rc::new(arr(Kind::Star, Kind::Star));
+        let kind = Kind::Arr(left.clone(), tail.clone());
+        let Kind::Arr(before, before_tail) = env.zonk(&kind) else { panic!() };
+        assert!(Rc::ptr_eq(&before, &left));
+        assert!(Rc::ptr_eq(&before_tail, &tail));
+        env.unify(&meta, &Kind::Star).unwrap();
+        let Kind::Arr(after, after_tail) = env.zonk(&kind) else { panic!() };
+        assert_eq!(*after, Kind::Star);
+        assert!(Rc::ptr_eq(&after_tail, &tail));
+        assert_eq!(*before, meta, "solving does not mutate shared kind nodes");
+        let unsolved = env.fresh();
+        assert_eq!(env.resolve(&unsolved), Kind::Star);
+        assert_eq!(env.zonk(&unsolved), unsolved);
+    }
+
+    #[test]
+    fn generic_kind_instantiations_remain_independent_and_ordered() {
+        let mut env = KindEnv::default();
+        let generic = Rc::new(Kind::Gen(0));
+        let scheme = Kind::Arr(generic.clone(), generic);
+        let first = env.instantiate(&scheme, &mut Vec::new());
+        let second = env.instantiate(&scheme, &mut Vec::new());
+        let (Kind::Arr(a, b), Kind::Arr(c, d)) = (first, second) else { panic!() };
+        assert_eq!(a, b);
+        assert_eq!(c, d);
+        assert_ne!(a, c);
+        env.unify(&a, &Kind::Star).unwrap();
+        assert!(matches!(env.prune(&c), Kind::Meta(_)));
+        env.unify(&c, &arr(Kind::Star, Kind::Star)).unwrap();
+        assert_eq!(env.prune(&b), Kind::Star);
+        assert_eq!(env.prune(&d), arr(Kind::Star, Kind::Star));
+        let (x, y) = (env.fresh(), env.fresh());
+        let mut names = Vec::new();
+        assert_eq!(env.generalise(&arr(y.clone(), x.clone()), &mut names), arr(Kind::Gen(0), Kind::Gen(1)));
+        let (Kind::Meta(x), Kind::Meta(y)) = (x, y) else { panic!() };
+        assert_eq!(names, [y, x]);
+    }
+
+    #[test]
+    fn shared_arrows_retain_occurs_checks_and_kind_mismatches() {
+        let mut env = KindEnv::default();
+        let variable = env.fresh();
+        assert!(env.unify(&variable, &arr(variable.clone(), Kind::Star)).is_err());
+        assert_eq!(env.prune(&variable), variable);
+        assert!(env.unify(&Kind::Star, &arr(Kind::Star, Kind::Star)).is_err());
+        assert!(env.unify(&variable, &variable).is_ok());
     }
 }
 
@@ -307,8 +383,8 @@ impl Checker {
                     for tv in &dd.tyvars {
                         let from_sig = match rest.take() {
                             Some(Kind::Arr(a, r)) => {
-                                rest = Some(*r);
-                                Some(*a)
+                                rest = Some((*r).clone());
+                                Some((*a).clone())
                             }
                             _ => None,
                         };

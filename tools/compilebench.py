@@ -17,6 +17,8 @@ a large closed type, isolating copying of unchanged type application branches.
 each at a closed 64-layer type; hsc retains shared types in its checked cache.
 --workload view-cache measures warm loading of 50 modules exporting view-pattern
 synonyms, which otherwise prevents hsc from saving their checked interfaces.
+--workload wide-kinds checks many uses of a constructor with 128 kind arguments,
+exposing copying of curried arrow kinds during pruning and substitution.
 Run without other compiler/test jobs competing for CPU.
 """
 
@@ -85,6 +87,16 @@ def type_substitution_source():
     for i in range(500):
         lines += [f"probe{i} :: Closed -> Closed",
                   f"probe{i} x = callee (callee (callee (callee x)))"]
+    return "\n".join(lines) + "\n"
+
+
+def wide_kinds_source():
+    lines = ["{-# LANGUAGE NoImplicitPrelude #-}", "module WideKinds where", "data Result = Result",
+             "data Wide " + " ".join(f"a{i}" for i in range(128)) + " = Wide",
+             "type Closed = Wide " + " ".join(["Result"] * 128),
+             "callee :: Closed -> Closed", "callee x = x"]
+    for i in range(500):
+        lines += [f"probe{i} :: Closed -> Closed", f"probe{i} x = callee (callee (callee (callee x)))"]
     return "\n".join(lines) + "\n"
 
 
@@ -181,7 +193,7 @@ def main():
     parser.add_argument("--after", required=True)
     parser.add_argument("--ghc", default="ghc")
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--workload", choices=("instance-lookup", "module-cache", "boot-cache", "application-equalities", "type-substitution", "typed-cache", "view-cache"), default="instance-lookup")
+    parser.add_argument("--workload", choices=("instance-lookup", "module-cache", "boot-cache", "application-equalities", "type-substitution", "typed-cache", "view-cache", "wide-kinds"), default="instance-lookup")
     parser.add_argument("--work", type=Path, default=Path("target/compilebench"))
     args = parser.parse_args()
     if args.runs < 1:
@@ -215,6 +227,11 @@ def main():
         hs.write_text(type_substitution_source())
         mode = ["-c"]
         title = "Closed type substitution front end (seconds)"
+    elif args.workload == "wide-kinds":
+        hs = work / "WideKinds.hs"
+        hs.write_text(wide_kinds_source())
+        mode = ["-c"]
+        title = "Wide constructor kind checking (seconds)"
     else:
         hs = work / "InstanceLookup.hs"
         hs.write_text(source())

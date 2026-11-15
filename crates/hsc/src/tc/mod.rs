@@ -647,7 +647,7 @@ impl Checker {
     fn install_builtin_kinds(&mut self) {
         use kinds::Kind;
         let star = Kind::Star;
-        let arr = |a: Kind, b: Kind| Kind::Arr(Box::new(a), Box::new(b));
+        let arr = |a: Kind, b: Kind| Kind::Arr(std::rc::Rc::new(a), std::rc::Rc::new(b));
         self.kinds.tycons.insert("Builtin.()".into(), star.clone());
         self.kinds.tycons.insert(LIST.into(), arr(star.clone(), star.clone()));
         self.kinds
