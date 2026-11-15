@@ -80,7 +80,7 @@ pub struct Machine {
     /// The program's name, as the runtime reports errors.
     pub prog_name: String,
     /// The bodies of the program in address order, with their names (for diagnostics).
-    pub bodies: Vec<(Word, String)>,
+    pub bodies: entry::DiagnosticBodies,
     /// The argument slots of the primitive operations that are waiting on a nested evaluation.
     pub saved_args: Vec<[Word; ARG_SLOTS]>,
     /// Set when a nested evaluation a primitive made raised: the primitive answers the exception.
@@ -142,7 +142,7 @@ impl Machine {
             saved_args: Vec::new(),
             prim_failed: false,
             ordinary_prims,
-            bodies: Vec::new(),
+            bodies: entry::DiagnosticBodies::default(),
         });
         m.stack = stack;
         m.sp = m.stack.as_mut_ptr() as Word + (STACK_WORDS as Word) * 8;
