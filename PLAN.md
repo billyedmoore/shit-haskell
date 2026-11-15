@@ -258,7 +258,8 @@ remains unsubmitted and unmeasured in its worktree.
 Direct native calls to known global functions with exact positive arity bypass generic
 dispatch. Argument and tail-frame setup stay unchanged; other calls retain generic dispatch.
 Both corpora pass 230/230 and all 58 unit tests pass. The paired comparison measures
-a 1.026× geometric-mean speedup, led by fib; other differences are small. All runtime
+a 1.026× geometric-mean speedup, but a second run measures 0.993× and Integer regresses.
+No consistent overall speedup is established; fib improves in both runs. All runtime
 targets remain unmet. [Raw samples, conditions and graphs](bench/results/runtime-direct-calls.md).
 
 The work:
