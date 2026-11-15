@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 223 differential tests for both back ends, compared with GHC.
+- **Corpus:** 224 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -175,29 +175,37 @@ Every stdout/stderr/exit result matches. The target remains **0.9× GHC `-O1` on
 
 | program | before ms | hsc ms | GHC -O0 ms | GHC -O1 ms | 0.9×O1 target ms |
 |---------|----------:|-------:|-----------:|-----------:|----------------:|
-| fib | 541.072 | 247.086 | 16.560 | 3.471 | 3.124 |
-| integer | 119.116 | 102.735 | 5.429 | 5.246 | 4.722 |
-| ioref | 2139.022 | 2279.883 | 50.576 | 5.464 | 4.918 |
-| mapops | 1029.347 | 959.790 | 74.079 | 46.954 | 42.258 |
-| mvar | 163.243 | 168.658 | 10.682 | 5.462 | 4.916 |
-| nqueens | 383.228 | 331.353 | 18.948 | 4.252 | 3.827 |
-| strings | 7535.894 | 7128.742 | 82.763 | 100.507 | 90.456 |
-| sumloop | 33254.132 | 20223.921 | 251.093 | 16.620 | 14.958 |
+| fib | 230.701 | 188.379 | 17.291 | 3.780 | 3.402 |
+| integer | 107.000 | 103.236 | 5.539 | 5.280 | 4.752 |
+| ioref | 2521.493 | 2211.243 | 54.354 | 5.349 | 4.814 |
+| mapops | 930.193 | 848.991 | 80.466 | 50.332 | 45.299 |
+| mvar | 163.967 | 166.357 | 12.200 | 5.501 | 4.951 |
+| nqueens | 335.361 | 307.606 | 19.792 | 3.925 | 3.533 |
+| strings | 7400.412 | 6458.716 | 76.723 | 100.196 | 90.176 |
+| sumloop | 23506.639 | 20941.389 | 201.086 | 17.627 | 15.864 |
 
-Canonical standard numeric literals now fold through dictionary aliases, eliminating repeated
+Canonical standard numeric literals fold through dictionary aliases, eliminating repeated
 conversion workers. Custom instances, noncanonical `Base` names, overflowing `Int` literals
-and failed parses keep their original calls. The eight-program geometric-mean speedup is
-1.22×, with large gains in fib and sumloop; the `-O1` target remains unmet. The initial three
-samples put ioref/mvar 6.6%/3.3% slower; seven-pair follow-ups put both about 1% slower.
-[Raw samples, conditions and graphs](bench/results/runtime-literals.md) retain both runs.
+and failed parses keep their original calls. That change gave a 1.22× geometric-mean speedup;
+[its measurements](bench/results/runtime-literals.md) retain the paired baseline and IO rechecks.
 
-Next: profile primitive dispatch after literal specialization. Native calls already use
-program-local IDs; repeated name cloning and foreign-signature parsing remain candidates.
+Common ordinary primitives are classified once at startup under the existing program-local
+IDs. Their calls reuse static names and skip foreign-signature parsing, while general calls
+retain their original dispatch. Scheduler points, argument roots, reservation, exception
+handling and final forcing are shared. The table above is a new paired comparison:
+fib 0.231 → 0.188 s, ioref 2.521 → 2.211 s, sumloop 23.507 → 20.941 s;
+eight-program geometric-mean speedup 1.103×. MVar results are mixed (1.5% slower in three
+pairs, 8.3% faster in a seven-pair same-binary recheck); no consistent MVar gain is claimed.
+[Raw samples, conditions and graphs](bench/results/runtime-dispatch.md) retain both runs.
+All runtime targets remain unmet.
+
+Next: measure a small inline path for already evaluated primitive arguments, keeping thunk
+entry, indirections, saved GC roots and exception recovery unchanged.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
 - Code: known standard numeric literals bypass run-time conversion (done). Next, resolve
-  program-local primitive IDs without repeated name decoding/foreign parsing, then unboxed
+  program-local primitive IDs without repeated name cloning/foreign parsing (common operations done), then unboxed
   Int and Double paths and a direct calling convention.
 - Optimiser: inlining, specialisation at known dictionaries, case-of-case, strictness analysis
   with worker/wrapper, rewrite rules (for `-O1`'s list fusion).

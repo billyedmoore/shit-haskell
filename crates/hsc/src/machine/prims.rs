@@ -36,6 +36,35 @@ fn int_arg(m: &mut Machine, i: usize) -> Option<i64> {
     Some(int_of(m, v))
 }
 
+/// Common ordinary primitives, classified once when the program starts. Names outside this
+/// bounded set retain the general dispatcher (including all encoded foreign calls).
+const ORDINARY_NAMES: &[&str] = &[
+    "ratioLit", "+#", "-#", "*#", "quotInt#", "remInt#", "==#", "/=#", "<#", "<=#", ">#", ">=#",
+    "andI#", "orI#", "xorI#", "notI#", "negateInt#", "uncheckedIShiftL#", "uncheckedIShiftRA#",
+    "plusWord#", "minusWord#", "timesWord#", "quotWord#", "remWord#", "and#", "or#", "xor#",
+    "eqWord#", "neWord#", "ltWord#", "leWord#", "gtWord#", "geWord#", "uncheckedShiftL#",
+    "uncheckedShiftRL#", "int2Word#", "word2Int#", "ord#", "chr#", "eqChar#", "neChar#",
+    "ltChar#", "leChar#", "gtChar#", "geChar#", "int2Double#", "double2Int#", "word2Double#",
+    "+##", "-##", "*##", "/##", "==##", "/=##", "<##", "<=##", ">##", ">=##", "tagToEnum#",
+    "newMutVar#", "readMutVar#", "writeMutVar#", "atomicModifyMutVar2#", "casMutVar#",
+    "newMVar#", "takeMVar#", "readMVar#", "putMVar#", "tryTakeMVar#", "tryReadMVar#",
+    "tryPutMVar#", "isEmptyMVar#",
+];
+
+pub(super) fn ordinary_name(name: &str) -> Option<&'static str> {
+    ORDINARY_NAMES.iter().copied().find(|&candidate| candidate == name)
+}
+
+/// Entry for a name already classified as ordinary. Keep the literal's early return and the
+/// failure flag's lifetime identical to `run`.
+pub(super) fn run_ordinary(m: &mut Machine, name: &'static str, nargs: usize) -> Word {
+    if name == "ratioLit" {
+        return force_arg(m, 0).unwrap_or(0);
+    }
+    m.prim_failed = false;
+    dispatch_ordinary(m, name, nargs)
+}
+
 /// Runs a primitive operation on the arguments in the record. Answers the result object, or 0 with
 /// the exception raised.
 pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
@@ -71,6 +100,10 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
         }
         return run(m, &sym, nargs);
     }
+    dispatch_ordinary(m, name, nargs)
+}
+
+fn dispatch_ordinary(m: &mut Machine, name: &str, nargs: usize) -> Word {
     let result = super::prims_num::run(m, name)
         .or_else(|| super::prims_mem::run(m, name))
         .or_else(|| super::prims_ffi::run(m, name, nargs))
@@ -248,4 +281,22 @@ pub fn integer_of(m: &mut Machine, p: Word) -> Option<BigInt> {
     let words = heap::size_of(m.heap_get(bp, 0)) as usize;
     let limbs: Vec<u64> = (0..words).map(|i| m.heap_get(bp, 1 + i)).collect();
     Some(BigInt::from_u64_limbs(name == "GHC.Num.Integer.IN", &limbs))
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::{ordinary_name, ORDINARY_NAMES};
+
+    #[test]
+    fn classified_names_cannot_be_foreign_calls() {
+        for name in ORDINARY_NAMES {
+            assert!(crate::ccall::parse(name).is_none(), "{name}");
+        }
+        assert_eq!(ordinary_name("+#"), Some("+#"));
+        assert_eq!(ordinary_name("readMutVar#"), Some("readMutVar#"));
+        for name in ["ccall:II>I:abs", "!ccall:II>I:abs", "capi:I>I:abs:stdlib.h:",
+                     "ccall:+#", "unknown#", "plusWord8#"] {
+            assert_eq!(ordinary_name(name), None, "{name}");
+        }
+    }
 }

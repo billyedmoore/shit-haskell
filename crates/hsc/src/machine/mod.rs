@@ -85,6 +85,8 @@ pub struct Machine {
     pub saved_args: Vec<[Word; ARG_SLOTS]>,
     /// Set when a nested evaluation a primitive made raised: the primitive answers the exception.
     pub prim_failed: bool,
+    /// Ordinary names indexed by the unchanged program-local primitive IDs.
+    pub ordinary_prims: Vec<Option<&'static str>>,
 }
 
 /// The tables the generated program provides (see `native::codegen`).
@@ -110,6 +112,7 @@ impl Machine {
         let base = heap.addr(0);
         let limit = base + (words as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
+        let ordinary_prims = prog.prim_names.iter().map(|name| prims::ordinary_name(name)).collect();
         let mut m = Box::new(Machine {
             hp: base,
             hplim: limit,
@@ -138,6 +141,7 @@ impl Machine {
             prog_name: std::env::args().next().and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "main".into()),
             saved_args: Vec::new(),
             prim_failed: false,
+            ordinary_prims,
             bodies: Vec::new(),
         });
         m.stack = stack;
