@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 220 differential tests for both back ends, compared with GHC.
+- **Corpus:** 221 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -30,11 +30,12 @@ the GitHub issues.
     and its output on real scripts.
   - hlint's dependencies build up to and including ghc-lib-parser and mono-traversable.
 - **Weakness: speed.** Generated code is 10–500× slower than `ghc -O0` (baseline below), and
-  large packages compile slowly, which limits how fast the rest of the work can go. A cold
-  compile of all 425 exposed ghc-lib-parser modules with a fresh module cache takes a median
-  29.8 s versus 30.3 s before shared types were retained in cache entries; run variation exceeds
-  this small difference. Warm builds take 1.77 s versus 1.93 s (seven alternating pairs).
-  The earlier completed-boot cache change reduced warm builds from 11.16 s to 1.94 s.
+  large packages compile slowly, which limits how fast the rest of the work can go. In the latest
+  paired comparison on CPU 0, a cold compile of all 425 exposed ghc-lib-parser modules with a
+  fresh module cache takes 27.8 s versus 28.1 s; run variation exceeds this small difference.
+  Warm builds take 1.39 s versus 1.67 s after exported view-pattern expressions could be cached
+  (seven alternating pairs). The earlier completed-boot cache change reduced warm builds
+  from 11.16 s to 1.94 s.
 
 ## Working rules
 
@@ -141,6 +142,15 @@ the GitHub issues.
   falls from 6,528,438 to 813,592 bytes on this workload. The full parser's warm build takes
   1.931 → 1.772 s (seven alternating pairs); cold builds take 30.34 → 29.84 s
   (three pairs, within run variation). Its median cache payload falls from 108.6 to 106.6 MB.
+- Exported view-pattern synonyms can use the checked-module cache. Their renamed ordinary
+  expressions retain qualified names, binders, locations, tuple holes, signatures and records;
+  unsupported declaration/statement/TH forms still leave the module uncached. Replay and private
+  helper edits have regression coverage. `tools/compilebench.py --workload view-cache` builds
+  50 modules with 64 values and one view-pattern synonym each: warm dependency checks take
+  0.034 → 0.009 s, versus GHC's 0.107/0.128 s at `-O0`/`-O1` (seven alternating runs,
+  one untimed build each, CPU 0, common hsc library directory). hsc retains checked Core while
+  GHC retains native objects/interfaces. Full parser warm builds take 1.674 → 1.391 s
+  (seven pairs); cold builds take 28.10 → 27.83 s (three pairs, within variation).
 - Real interface files, so that base and a package's modules are not re-checked for every
   program and every downstream package.
 - Profile the driver and the type checker on ghc-lib-parser and the corpus (`HSC_TIME`), and
