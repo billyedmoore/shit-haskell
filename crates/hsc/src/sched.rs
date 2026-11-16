@@ -44,6 +44,28 @@ pub fn fd_ready(fd: i32, write: bool) -> bool {
 /// A thread's number: 1 for the main thread, increasing with every fork.
 pub type Tid = u64;
 
+/// A hasher for small integer keys (thread numbers, `MVar` keys): one multiply instead of
+/// SipHash, which dominated each thread switch. The keys are not chosen by an adversary.
+#[derive(Default, Clone, Copy)]
+pub struct IntHash(u64);
+
+impl std::hash::Hasher for IntHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+/// A map keyed by small integers.
+pub type IntMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<IntHash>>;
+
 /// Set at the end of every time slice once a second thread exists: the running thread gives way
 /// at its next safe point. Generated code reads it (as `hsc_preempt`) on its inline fast paths.
 #[export_name = "hsc_preempt"]
@@ -152,12 +174,12 @@ struct Thread<V> {
 pub struct Sched<V> {
     cur: Tid,
     next_id: Tid,
-    threads: HashMap<Tid, Thread<V>>,
+    threads: IntMap<Tid, Thread<V>>,
     runq: VecDeque<Tid>,
     /// Sleeping threads with the instants they wake at.
     sleepers: Vec<(Instant, Tid)>,
     /// The queues of the `MVar`s that have waiters, by key.
-    waits: HashMap<u64, VecDeque<Waiter<V>>>,
+    waits: IntMap<u64, VecDeque<Waiter<V>>>,
     /// The threads whose transactions retried.
     stm_waiters: VecDeque<Tid>,
     next_key: u64,
@@ -207,7 +229,7 @@ impl<V> Sched<V> {
     /// A scheduler with the main thread running; `slice_ms` is the time slice.
     pub fn new(slice_ms: u64) -> Sched<V> {
         crate::signals::init();
-        let mut threads = HashMap::new();
+        let mut threads = IntMap::default();
         threads.insert(1, Self::thread(0));
         Sched {
             cur: 1,
@@ -215,7 +237,7 @@ impl<V> Sched<V> {
             threads,
             runq: VecDeque::new(),
             sleepers: Vec::new(),
-            waits: HashMap::new(),
+            waits: IntMap::default(),
             stm_waiters: VecDeque::new(),
             next_key: 1,
             baton: Arc::new(Baton { turn: Mutex::new(1) }),
