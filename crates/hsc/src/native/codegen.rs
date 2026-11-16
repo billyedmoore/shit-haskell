@@ -455,13 +455,22 @@ impl Gen {
                     SExpr::Atom(a @ (Atom::Slot(_) | Atom::Free(_) | Atom::Global(_))) => {
                         let ready = self.label("ready");
                         let eval = self.label("eval");
+                        let value = self.label("value");
                         self.load(a, p, "%r14");
                         self.emit("testq %r14, %r14");
-                        self.emit(&format!("je {ready}"));
+                        self.emit(&format!("je {value}"));
                         self.emit(&format!("cmpb ${THUNK}, (%r14)"));
                         self.emit(&format!("je {eval}"));
                         self.emit(&format!("cmpb ${IND}, (%r14)"));
-                        self.emit(&format!("jne {ready}"));
+                        self.emit(&format!("je {eval}"));
+                        // A value: as on the slow path, its slot is cleared when nothing uses it
+                        // after (only here: the slow path loads the slot again).
+                        self.put_label(&value);
+                        let live = self.case_live(alts, p);
+                        self.live.push(live);
+                        self.clear_dead(std::slice::from_ref(a), Pos { mode: Mode::Scrut, ..p });
+                        self.live.pop();
+                        self.emit(&format!("jmp {ready}"));
                         self.put_label(&eval);
                         Some(ready)
                     }
@@ -473,17 +482,7 @@ impl Gen {
                 self.emit("movq %rax, (%rbp)");
                 let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
                 // What the alternatives (and, for a nested case, what follows it) still use.
-                let mut live = std::collections::HashSet::new();
-                for a in alts {
-                    match a {
-                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => self.slot_uses(b, &mut live),
-                    }
-                }
-                if p.mode == Mode::Scrut {
-                    if let Some(outer) = self.live.last() {
-                        live.extend(outer.iter().copied());
-                    }
-                }
+                let live = self.case_live(alts, p);
                 self.live.push(live);
                 self.expr(scrut, sp);
                 self.live.pop();
@@ -917,6 +916,23 @@ impl Gen {
         self.emit("movq %rax, %r14");
         self.ret(p);
         true
+    }
+
+    /// The slots used after a case's scrutinee: by its alternatives and, for a case in a
+    /// scrutinee, by what follows the enclosing one.
+    fn case_live(&self, alts: &[SAlt], p: Pos) -> std::collections::HashSet<u32> {
+        let mut live = std::collections::HashSet::new();
+        for a in alts {
+            match a {
+                SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => self.slot_uses(b, &mut live),
+            }
+        }
+        if p.mode == Mode::Scrut {
+            if let Some(outer) = self.live.last() {
+                live.extend(outer.iter().copied());
+            }
+        }
+        live
     }
 
     /// In a scrutinee (the frame stays while the callee runs), clears the frame slots among
