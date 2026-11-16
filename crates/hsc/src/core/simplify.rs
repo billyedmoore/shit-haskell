@@ -1209,12 +1209,21 @@ fn call_by_value(binds: &mut [TopBind]) {
 
 /// The variables an expression certainly evaluates when its value is demanded.
 fn forced(e: &Core, strict: &HashMap<String, Vec<bool>>) -> HashSet<String> {
+    forced_d(e, strict).0
+}
+
+/// What `forced` answers, and whether the expression certainly fails (a pattern-match failure
+/// is bottom, as GHC takes it: a failing alternative constrains nothing). Calls of functions that
+/// raise are not counted as failing.
+fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>) -> (HashSet<String>, bool) {
     let mut out = HashSet::new();
+    let mut fails = false;
     match e {
         Core::Var(v) => {
             out.insert(v.clone());
         }
-        Core::Lit(_) | Core::Fail(_) | Core::Lam(..) | Core::Con(..) => {}
+        Core::Fail(_) => fails = true,
+        Core::Lit(_) | Core::Lam(..) | Core::Con(..) => {}
         Core::App(..) => {
             let mut args = Vec::new();
             let mut head = e;
@@ -1237,7 +1246,7 @@ fn forced(e: &Core, strict: &HashMap<String, Vec<bool>>) -> HashSet<String> {
             }
         }
         Core::Let(binds, body) => {
-            out = forced(body, strict);
+            (out, fails) = forced_d(body, strict);
             for (x, _) in binds {
                 out.remove(x);
             }
@@ -1250,7 +1259,7 @@ fn forced(e: &Core, strict: &HashMap<String, Vec<bool>>) -> HashSet<String> {
                 || (matches!(&**s, Core::App(..))
                     && alts.iter().any(|a| matches!(a, Alt::Con(k, _, _) if k == "Builtin.(,)"))) =>
         {
-            out = forced(s, strict);
+            (out, fails) = forced_d(s, strict);
         }
         Core::Case(s, b, alts) => {
             let mut common: Option<HashSet<String>> = None;
@@ -1259,7 +1268,10 @@ fn forced(e: &Core, strict: &HashMap<String, Vec<bool>>) -> HashSet<String> {
                     Alt::Con(_, vars, body) => (vars, body),
                     Alt::Lit(_, body) | Alt::Default(body) => (&[], body),
                 };
-                let mut f = forced(body, strict);
+                let (mut f, alt_fails) = forced_d(body, strict);
+                if alt_fails {
+                    continue;
+                }
                 for v in vars {
                     f.remove(v);
                 }
@@ -1268,22 +1280,31 @@ fn forced(e: &Core, strict: &HashMap<String, Vec<bool>>) -> HashSet<String> {
                     Some(c) => c.intersection(&f).cloned().collect(),
                 });
             }
+            // Every alternative fails: so does the case.
+            fails = common.is_none() && !alts.is_empty();
             out = common.unwrap_or_default();
             out.remove(b);
-            out.extend(forced(s, strict));
+            let (sf, s_fails) = forced_d(s, strict);
+            out.extend(sf);
+            fails |= s_fails;
         }
         Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
-            out = forced(&args[0], strict);
-            out.extend(forced(&args[1], strict));
+            let (a, fa) = forced_d(&args[0], strict);
+            let (b, fb) = forced_d(&args[1], strict);
+            out = a;
+            out.extend(b);
+            fails = fa || fb;
         }
         Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
             for a in args {
-                out.extend(forced(a, strict));
+                let (f, fa) = forced_d(a, strict);
+                out.extend(f);
+                fails |= fa;
             }
         }
         Core::Prim(..) => {}
     }
-    out
+    (out, fails)
 }
 
 fn by_value(c: &mut Core, strict: &HashMap<String, Vec<bool>>, fresh: &mut u64) {
