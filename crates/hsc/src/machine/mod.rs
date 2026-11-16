@@ -407,14 +407,14 @@ impl Machine {
         eprintln!("  stack: {} words", stack_top.saturating_sub(self.sp) / 8);
         // The frames on the stack, by kind and body.
         let mut frames: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut p = self.sp + 8 * self.top;
+        let mut p = self.sp + 8 * crate::native::codegen::frame::words(self.top);
         loop {
             let ret = unsafe { *(p as *const Word) };
             if ret == 0 {
                 break;
             }
             let fkind = unsafe { *((ret - 16) as *const Word) };
-            let size = unsafe { *((ret - 8) as *const Word) };
+            let size = crate::native::codegen::frame::words(unsafe { *((ret - 8) as *const Word) });
             p += 8;
             use crate::native::codegen::frame;
             let what = match fkind {
@@ -457,7 +457,7 @@ impl Machine {
     /// The bodies of the frames on the stack, innermost first (for diagnostics).
     pub fn stack_bodies(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let mut p = self.sp + 8 * self.top;
+        let mut p = self.sp + 8 * crate::native::codegen::frame::words(self.top);
         for _ in 0..64 {
             let ret = unsafe { *(p as *const Word) };
             if ret == 0 {
@@ -465,7 +465,7 @@ impl Machine {
             }
             out.push(self.body_name(ret));
             let fkind = unsafe { *((ret - 16) as *const Word) };
-            let size = unsafe { *((ret - 8) as *const Word) };
+            let size = crate::native::codegen::frame::words(unsafe { *((ret - 8) as *const Word) });
             p += 8;
             match fkind {
                 crate::native::codegen::frame::BODY => p += 8 * size,
@@ -495,8 +495,11 @@ pub fn stack_roots(sp: Word, top: Word, out: &mut Vec<*mut Word>) {
     let mut walked = 0usize;
     let first_top = top;
     loop {
-        for _ in 0..top {
-            out.push(p as *mut Word);
+        // The raw words at the low end of the top region are not pointers.
+        for i in 0..frame::words(top) {
+            if i >= frame::raw(top) {
+                out.push(p as *mut Word);
+            }
             p += 8;
         }
         let ret = unsafe { *(p as *const Word) };
@@ -527,10 +530,10 @@ pub fn stack_roots(sp: Word, top: Word, out: &mut Vec<*mut Word>) {
                 top = outer_top;
             }
             frame::BODY => {
-                for i in 0..size {
+                for i in frame::raw(size)..frame::words(size) {
                     out.push((p + 8 * i) as *mut Word);
                 }
-                p += 8 * size;
+                p += 8 * frame::words(size);
             }
             frame::UPDATE => {
                 out.push(p as *mut Word);

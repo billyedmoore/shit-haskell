@@ -281,7 +281,7 @@ pub extern "C" fn hsc_apply_slow(m: *mut Machine) -> i32 {
 pub extern "C" fn hsc_unwind(m: *mut Machine) -> i32 {
     // SAFETY: generated code passes the machine record.
     let m = unsafe { &mut *m };
-    let mut p = m.sp + 8 * m.top;
+    let mut p = m.sp + 8 * crate::native::codegen::frame::words(m.top);
     loop {
         let ret = m.stack_load(p);
         let fkind = m.stack_load(ret - 16);
@@ -292,7 +292,7 @@ pub extern "C" fn hsc_unwind(m: *mut Machine) -> i32 {
                 return 0;
             }
             frame::BODY => {
-                let size = m.stack_load(ret - 8);
+                let size = crate::native::codegen::frame::words(m.stack_load(ret - 8));
                 p += 8 * size;
             }
             frame::UPDATE => {
