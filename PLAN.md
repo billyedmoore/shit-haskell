@@ -279,7 +279,10 @@ strict cases in dependency order. A strictness analysis (to a fixpoint, error pa
 nothing) evaluates strict arguments before the call instead of allocating thunks. Code generation
 computes `Int#` arithmetic and comparisons inline on evaluated INT cells, and compares number and
 character literal alternatives inline. Banged `where` bindings are now forced as GHC forces them.
-Locally sumloop takes 3.77 → 0.27 s (GHC -O0 0.20 s); hosted measurements are in the PR.
+All eight medians improve (geometric mean 2.36×): sumloop 2.451 → 0.160 s (GHC -O0 0.146 s),
+fib 91.8 → 17.7 ms, mapops 274 → 112 ms, strings 3.72 → 2.38 s. Both corpora pass 234/234.
+[Raw samples, conditions and graphs](bench/results/runtime-simplifier.md). All runtime targets
+remain unmet; sumloop and fib are now within 1.15× of GHC -O0.
 `HSC_TRACE_SIMPLIFY=<global>` prints a binding after each simplifier round.
 
 The work:
