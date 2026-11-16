@@ -292,6 +292,10 @@ The work:
   registers (worker/wrapper) and a direct calling convention.
 - Optimiser: inlining, case-of-case, strictness and call by value (done, first versions); next
   specialisation at known dictionaries, worker/wrapper, rewrite rules (for `-O1`'s list fusion).
+- Strictness: the analysis's effect boundary (GHC's IO hack) recognises effectful primitives
+  and applications matched against a pair; a helper answering only `State#` under a default
+  alternative is not recognised, so a later demand could be evaluated before its effect. No
+  program showing it is known; typed Core would let this test the `State#` type instead.
 - Space: `forM_` over a list keeps its whole chain of IO actions alive (ioref holds ~15M
   words), also on the version before the simplifier.
 - Runtime: a generational GC, cheaper thunk allocation.
