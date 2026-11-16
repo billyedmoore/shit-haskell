@@ -121,12 +121,14 @@ pub struct Gen {
     body_names: Vec<(String, String)>,
     /// The name of the body being generated.
     current_name: String,
-    /// Static objects (label, header, payload).
-    statics: Vec<(String, u64, u64)>,
+    /// Static objects (label, header, payload: a number or a label).
+    statics: Vec<(String, u64, String)>,
     /// Shared static cells for constructors without fields, indexed by constructor ID.
     nullary_cons: HashMap<u32, String>,
     /// Byte strings (label, bytes).
     strings: Vec<(String, Vec<u8>)>,
+    /// The static INT cells 0 and 1 (made when first used).
+    bool_cells: Option<(String, String)>,
     /// The code labels and parameter slots of the join points generated so far.
     joins: HashMap<u32, (String, Vec<u32>)>,
 }
@@ -161,6 +163,7 @@ impl Gen {
             nullary_cons: HashMap::new(),
             strings: Vec::new(),
             joins: HashMap::new(),
+            bool_cells: None,
         }
     }
 
@@ -569,13 +572,21 @@ impl Gen {
     fn literal(&mut self, l: &SLit, p: Pos, reg: &str) {
         let stat = |g: &mut Gen, kind: u8, payload: u64| {
             let lbl = g.label("lit");
-            g.statics.push((lbl.clone(), header(kind, 1, 0), payload));
+            g.statics.push((lbl.clone(), header(kind, 1, 0), payload.to_string()));
             lbl
         };
         let lbl = match l {
             SLit::Int(i) => stat(self, INT, *i as u64),
             SLit::Char(c) => stat(self, CHAR, crate::syntax::lexer::char_code(*c) as u64),
             SLit::Double(d) => stat(self, DOUBLE, d.to_bits()),
+            // An `Integer` that fits in an `Int` is `IS` of it: a static cell for both.
+            SLit::Integer(s) if s.parse::<i64>().is_ok() => {
+                let small = stat(self, INT, s.parse::<i64>().unwrap_or(0) as u64);
+                let id = self.con_id("GHC.Num.Integer.IS");
+                let lbl = self.label("lit");
+                self.statics.push((lbl.clone(), header(CON, 1, id as u64), small));
+                lbl
+            }
             other => {
                 // Strings, big integers, fractions and addresses: the runtime builds the object (the
                 // call allocates, so the atom is loaded last).
@@ -610,7 +621,7 @@ impl Gen {
         }
         let label = self.label("con");
         // A zero-field object still occupies two words, like every other native object.
-        self.statics.push((label.clone(), header(CON, 0, id as u64), 0));
+        self.statics.push((label.clone(), header(CON, 0, id as u64), "0".into()));
         self.nullary_cons.insert(id, label.clone());
         label
     }
@@ -706,7 +717,7 @@ impl Gen {
     /// runtime's primitive. Answers whether the fast path was emitted.
     fn int_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
         #[derive(PartialEq)]
-        enum K { Bin(&'static str), Cmp(&'static str), Shift(&'static str), Div(bool), Un(&'static str) }
+        enum K { Bin(&'static str), Cmp(&'static str), Shift(&'static str), Div(bool), Un(&'static str), CharCmp(&'static str), Ord, Chr, TagToEnum }
         let k = match name {
             "+#" => K::Bin("addq"), "-#" => K::Bin("subq"), "*#" => K::Bin("imulq"),
             "andI#" => K::Bin("andq"), "orI#" => K::Bin("orq"), "xorI#" => K::Bin("xorq"),
@@ -716,15 +727,34 @@ impl Gen {
             "uncheckedIShiftRL#" => K::Shift("shrq"),
             "quotInt#" => K::Div(true), "remInt#" => K::Div(false),
             "negateInt#" => K::Un("negq"), "notI#" => K::Un("notq"),
+            // Char# comparisons are on the (unsigned) code points.
+            "eqChar#" => K::CharCmp("sete"), "neChar#" => K::CharCmp("setne"), "ltChar#" => K::CharCmp("setb"),
+            "leChar#" => K::CharCmp("setbe"), "gtChar#" => K::CharCmp("seta"), "geChar#" => K::CharCmp("setae"),
+            "ord#" => K::Ord, "chr#" => K::Chr,
+            // Bool, as the runtime's primitive takes it.
+            "tagToEnum#" => K::TagToEnum,
+            // Word# shares Int#'s cells; its comparisons are unsigned.
+            "plusWord#" => K::Bin("addq"), "minusWord#" => K::Bin("subq"), "timesWord#" => K::Bin("imulq"),
+            "and#" => K::Bin("andq"), "or#" => K::Bin("orq"), "xor#" => K::Bin("xorq"),
+            "eqWord#" => K::Cmp("sete"), "neWord#" => K::Cmp("setne"), "ltWord#" => K::Cmp("setb"),
+            "leWord#" => K::Cmp("setbe"), "gtWord#" => K::Cmp("seta"), "geWord#" => K::Cmp("setae"),
+            "uncheckedShiftL#" => K::Shift("shlq"), "uncheckedShiftRL#" => K::Shift("shrq"),
             _ => return false,
         };
-        let arity = if matches!(k, K::Un(_)) { 1 } else { 2 };
-        if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !matches!(l, SLit::Int(_)))) {
+        let arity = if matches!(k, K::Un(_) | K::Ord | K::Chr | K::TagToEnum) { 1 } else { 2 };
+        let (in_kind, out_kind) = match k {
+            K::CharCmp(_) => (CHAR, INT),
+            K::Ord => (CHAR, INT),
+            K::Chr => (INT, CHAR),
+            _ => (INT, INT),
+        };
+        let lit_ok = |l: &SLit| matches!((l, in_kind), (SLit::Int(_), INT) | (SLit::Char(_), CHAR));
+        if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
             return false;
         }
         for a in args {
             self.load(a, p, "%rax");
-            self.emit(&format!("cmpb ${INT}, (%rax)"));
+            self.emit(&format!("cmpb ${in_kind}, (%rax)"));
             self.emit(&format!("jne {slow}"));
         }
         self.emit("cmpb $0, hsc_preempt(%rip)");
@@ -736,6 +766,38 @@ impl Gen {
             self.emit("cmpq $1, %rcx");
             self.emit(&format!("jbe {slow}"));
         }
+        if k == K::TagToEnum {
+            let t = self.con_id("GHC.Types.True");
+            let f = self.con_id("GHC.Types.False");
+            let (t, f) = (self.nullary_con(t), self.nullary_con(f));
+            self.load(&args[0], p, "%rcx");
+            self.emit("cmpq $0, 8(%rcx)");
+            self.emit(&format!("leaq {f}(%rip), %r14"));
+            self.emit(&format!("leaq {t}(%rip), %rax"));
+            self.emit("cmovneq %rax, %r14");
+            self.ret(p);
+            return true;
+        }
+        if matches!(k, K::Cmp(_) | K::CharCmp(_)) {
+            // A comparison answers one of two shared static cells: nothing is allocated.
+            let (zero, one) = self.bool_cells();
+            self.load(&args[0], p, "%rcx");
+            self.emit("movq 8(%rcx), %rcx");
+            self.load(&args[1], p, "%rdx");
+            self.emit("movq 8(%rdx), %rdx");
+            let (cmp, set) = match k {
+                K::Cmp(set) => ("cmpq %rdx, %rcx", set),
+                K::CharCmp(set) => ("cmpl %edx, %ecx", set),
+                _ => unreachable!(),
+            };
+            self.emit(cmp);
+            self.emit(&format!("leaq {zero}(%rip), %r14"));
+            self.emit(&format!("leaq {one}(%rip), %rax"));
+            let cmov = set.replacen("set", "cmov", 1);
+            self.emit(&format!("{cmov}q %rax, %r14"));
+            self.ret(p);
+            return true;
+        }
         // The cell is allocated first: a collection moves the arguments, so they are loaded after.
         self.alloc(2, p);
         self.load(&args[0], p, "%rcx");
@@ -746,11 +808,6 @@ impl Gen {
         }
         match k {
             K::Bin(op) => self.emit(&format!("{op} %rdx, %rcx")),
-            K::Cmp(set) => {
-                self.emit("cmpq %rdx, %rcx");
-                self.emit(&format!("{set} %cl"));
-                self.emit("movzbl %cl, %ecx");
-            }
             K::Shift(op) => {
                 self.emit("xchgq %rdx, %rcx");
                 self.emit(&format!("{op} %cl, %rdx"));
@@ -766,12 +823,29 @@ impl Gen {
                 self.emit("movq %r8, %rax");
             }
             K::Un(op) => self.emit(&format!("{op} %rcx")),
+            K::Ord => {}
+            // The code point is the low 32 bits (as the runtime takes it).
+            K::Chr => self.emit("movl %ecx, %ecx"),
+            K::Cmp(_) | K::CharCmp(_) | K::TagToEnum => unreachable!("answered without allocating"),
         }
-        self.emit(&format!("movq ${}, (%rax)", header(INT, 1, 0)));
+        self.emit(&format!("movq ${}, (%rax)", header(out_kind, 1, 0)));
         self.emit("movq %rcx, 8(%rax)");
         self.emit("movq %rax, %r14");
         self.ret(p);
         true
+    }
+
+    /// The static INT cells 0 and 1, shared by the inline comparisons.
+    fn bool_cells(&mut self) -> (String, String) {
+        if let Some(c) = &self.bool_cells {
+            return c.clone();
+        }
+        let zero = self.label("int0");
+        let one = self.label("int1");
+        self.statics.push((zero.clone(), header(INT, 1, 0), "0".into()));
+        self.statics.push((one.clone(), header(INT, 1, 0), "1".into()));
+        self.bool_cells = Some((zero.clone(), one.clone()));
+        (zero, one)
     }
 
     /// Calls the runtime with the machine record in rdi, after recording the heap and stack state
@@ -1084,7 +1158,7 @@ mod nullary_constructor_tests {
             let id = gen.con_ids[name];
             let label = &gen.nullary_cons[&id];
             let cell = gen.statics.iter().find(|(l, _, _)| l == label).unwrap();
-            assert_eq!((cell.1, cell.2), (header(CON, 0, id as u64), 0));
+            assert_eq!((cell.1, cell.2.as_str()), (header(CON, 0, id as u64), "0"));
             assert!(gen.out.contains(&format!("leaq {label}(%rip), %r14")));
         }
         assert!(!gen.out.contains("hsc_gc"));

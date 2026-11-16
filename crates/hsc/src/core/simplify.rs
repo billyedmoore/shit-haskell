@@ -26,7 +26,10 @@ const ROUNDS: usize = 8;
 const STRICT_PRIMS: &[&str] = &[
     "+#", "-#", "*#", "quotInt#", "remInt#", "andI#", "orI#", "xorI#", "notI#", "negateInt#",
     "==#", "/=#", "<#", "<=#", ">#", ">=#", "uncheckedIShiftL#", "uncheckedIShiftRA#",
-    "uncheckedIShiftRL#", "tagToEnum#",
+    "uncheckedIShiftRL#", "tagToEnum#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#",
+    "geChar#", "ord#", "chr#", "plusWord#", "minusWord#", "timesWord#", "and#", "or#", "xor#",
+    "eqWord#", "neWord#", "ltWord#", "leWord#", "gtWord#", "geWord#", "uncheckedShiftL#",
+    "uncheckedShiftRL#",
 ];
 /// The calls inlined into one binding in one round.
 const INLINE_BUDGET: usize = 64;
@@ -285,6 +288,22 @@ impl Simp<'_> {
                     }
                 }
             }
+            // Representation identities (Int# and Word# share it), and Integer conversions of
+            // small literals and of `IS`.
+            Core::Prim(p, args) if args.len() == 1 && matches!(p.as_str(), "int2Word#" | "word2Int#" | "integerToInt" | "integerToWord") => {
+                self.expr(&mut args[0]);
+                let integer = p.starts_with("integer");
+                let folded = match &mut args[0] {
+                    _ if !integer => Some(take(&mut args[0])),
+                    Core::Lit(Lit::Integer(t)) => t.parse::<i64>().ok().map(|i| Core::Lit(Lit::Int(i))),
+                    Core::Con(k, fields) if k == "GHC.Num.Integer.IS" && fields.len() == 1 => fields.pop(),
+                    _ => None,
+                };
+                if let Some(f) = folded {
+                    *c = f;
+                    self.changed = true;
+                }
+            }
             Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
                 args.iter_mut().for_each(|a| self.expr(a));
                 // Each argument that is not an atom is evaluated first, into a fresh variable.
@@ -317,8 +336,19 @@ impl Simp<'_> {
     fn strict_let(&mut self, c: &mut Core) {
         let Core::Let(bs, body) = c else { return };
         let [(x, e)] = &bs[..] else { return };
-        let Core::Case(s, _, _) = &**body else { return };
-        if !matches!(&**s, Core::Var(v) if v == x) || mentions(e, x) {
+        if mentions(e, x) || matches!(e, Core::Lam(..)) {
+            return;
+        }
+        let direct = matches!(&**body, Core::Case(s, _, _) if matches!(&**s, Core::Var(v) if v == x));
+        if !direct {
+            // The body certainly evaluates x: x is evaluated first instead of allocated.
+            if !forced(body, &HashMap::new()).contains(x.as_str()) {
+                return;
+            }
+            let Core::Let(mut bs, body) = take(c) else { unreachable!() };
+            let (x, e) = bs.pop().expect("one binding");
+            *c = Core::Case(Box::new(e), x, vec![Alt::Default(*body)]);
+            self.changed = true;
             return;
         }
         let Core::Let(mut bs, body) = take(c) else { unreachable!() };
@@ -618,6 +648,18 @@ fn fold(p: &str, args: &[Core]) -> Option<i64> {
         "==#" => (a == b) as i64,
         "/=#" => (a != b) as i64,
         "<#" => (a < b) as i64,
+        "plusWord#" => (a as u64).wrapping_add(b as u64) as i64,
+        "minusWord#" => (a as u64).wrapping_sub(b as u64) as i64,
+        "timesWord#" => (a as u64).wrapping_mul(b as u64) as i64,
+        "and#" => a & b,
+        "or#" => a | b,
+        "xor#" => a ^ b,
+        "eqWord#" => (a == b) as i64,
+        "neWord#" => (a != b) as i64,
+        "ltWord#" => ((a as u64) < (b as u64)) as i64,
+        "leWord#" => ((a as u64) <= (b as u64)) as i64,
+        "gtWord#" => ((a as u64) > (b as u64)) as i64,
+        "geWord#" => ((a as u64) >= (b as u64)) as i64,
         "<=#" => (a <= b) as i64,
         ">#" => (a > b) as i64,
         ">=#" => (a >= b) as i64,

@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 234 differential tests for both back ends, compared with GHC.
+- **Corpus:** 235 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -287,7 +287,8 @@ remain unmet; sumloop and fib are now within 1.15× of GHC -O0.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
-- Code: inline `Int#` operations (done); next Double and Char, then unboxed values in
+- Code: inline `Int#`, `Word#`, `Char#` and `tagToEnum#` operations, static small `Integer`
+  literals, and folds of Int/Word/Integer conversions (done); next Double, then unboxed values in
   registers (worker/wrapper) and a direct calling convention.
 - Optimiser: inlining, case-of-case, strictness and call by value (done, first versions); next
   specialisation at known dictionaries, worker/wrapper, rewrite rules (for `-O1`'s list fusion).
