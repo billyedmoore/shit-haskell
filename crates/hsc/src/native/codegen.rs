@@ -228,7 +228,26 @@ impl Gen {
             g.pending.push((l, gl.closure.clone(), gl.name.clone()));
         }
         g.out.push_str("    .text\n");
-        g.out.push_str(RUNTIME_ASM);
+        if std::env::var_os("HSC_DEBUG").is_some() {
+            // Each runtime routine (a `hsc_` label) gets a type and size, for profilers.
+            let mut current: Option<&str> = None;
+            for line in RUNTIME_ASM.lines() {
+                if let Some(name) = line.strip_suffix(':').filter(|n| n.starts_with("hsc_") && !n.contains(' ')) {
+                    if let Some(prev) = current {
+                        let _ = writeln!(g.out, "    .size {prev}, .-{prev}");
+                    }
+                    let _ = writeln!(g.out, "    .type {name}, @function");
+                    current = Some(name);
+                }
+                g.out.push_str(line);
+                g.out.push('\n');
+            }
+            if let Some(prev) = current {
+                let _ = writeln!(g.out, "    .size {prev}, .-{prev}");
+            }
+        } else {
+            g.out.push_str(RUNTIME_ASM);
+        }
         // HSC_DEBUG: every body also gets a symbol named after its binding, for profilers.
         let symbols = std::env::var_os("HSC_DEBUG").is_some();
         let mut n = 0usize;
@@ -430,6 +449,24 @@ impl Gen {
             }
             SExpr::Case(scrut, bslot, alts) => {
                 let cont = self.label("k");
+                // A variable that is already a value (not a thunk or an indirection) goes straight
+                // to the alternatives, without the return address and `hsc_eval`.
+                let ready = match scrut.as_ref() {
+                    SExpr::Atom(a @ (Atom::Slot(_) | Atom::Free(_) | Atom::Global(_))) => {
+                        let ready = self.label("ready");
+                        let eval = self.label("eval");
+                        self.load(a, p, "%r14");
+                        self.emit("testq %r14, %r14");
+                        self.emit(&format!("je {ready}"));
+                        self.emit(&format!("cmpb ${THUNK}, (%r14)"));
+                        self.emit(&format!("je {eval}"));
+                        self.emit(&format!("cmpb ${IND}, (%r14)"));
+                        self.emit(&format!("jne {ready}"));
+                        self.put_label(&eval);
+                        Some(ready)
+                    }
+                    _ => None,
+                };
                 // Push the return address (its frame is this body's, above it).
                 self.emit("subq $8, %rbp");
                 self.emit(&format!("leaq {cont}(%rip), %rax"));
@@ -458,6 +495,9 @@ impl Gen {
                 let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
                 self.put_label(&cont);
                 self.emit("addq $8, %rbp");
+                if let Some(ready) = ready {
+                    self.put_label(&ready);
+                }
                 self.emit(&format!("movq %r14, {}", p.slot(*bslot)));
                 self.alts(alts, *bslot, p);
             }
@@ -1169,14 +1209,55 @@ hsc_apply:
     je .Lap_ind
     cmpb $8, %dl
     je .Lap_eval
+    cmpb $7, %dl
+    je .Lap_pap
     cmpb $6, %dl
     jne .Lap_slow
     movq %rax, %rdx
     shrq $32, %rdx
     cmpq %rcx, %rdx
-    jne .Lap_slow
+    jne .Lap_arity
     movq 8(%r14), %rdx
     jmp *%rdx
+.Lap_arity:
+    ja .Lap_slow
+    # Over-application (arity rdx < rcx): the first rdx arguments move down two words, and an
+    # apply frame [hsc_apply_ret][count] holds the rest, which stay where they are.
+    subq $16, %rbp
+    xorl %r8d, %r8d
+.Lap_over_copy:
+    cmpq %rdx, %r8
+    jae .Lap_over_done
+    movq 16(%rbp,%r8,8), %r9
+    movq %r9, (%rbp,%r8,8)
+    incq %r8
+    jmp .Lap_over_copy
+.Lap_over_done:
+    leaq hsc_apply_ret(%rip), %r9
+    movq %r9, (%rbp,%rdx,8)
+    subq %rdx, %rcx
+    movq %rcx, 8(%rbp,%rdx,8)
+    movq 8(%r14), %rdx
+    jmp *%rdx
+.Lap_pap:
+    # A partial application: its held arguments go below the new ones, and its function is
+    # applied to all of them.
+    movq %rax, %rdx
+    shrq $32, %rdx
+    leaq (,%rdx,8), %r8
+    subq %r8, %rbp
+    xorl %r8d, %r8d
+.Lap_pap_copy:
+    cmpq %rdx, %r8
+    jae .Lap_pap_done
+    movq 16(%r14,%r8,8), %r9
+    movq %r9, (%rbp,%r8,8)
+    incq %r8
+    jmp .Lap_pap_copy
+.Lap_pap_done:
+    addq %rdx, %rcx
+    movq 8(%r14), %r14
+    jmp hsc_apply
 .Lap_ind:
     movq 8(%r14), %r14
     jmp hsc_apply

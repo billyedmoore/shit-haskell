@@ -308,11 +308,19 @@ keeps 2,434 live words (PR #46). Hosted, ioref takes 633 → 166 ms; the others 
 A local function generalised over class constraints but called with the same global
 dictionaries everywhere (recursive calls may pass the parameter itself) is specialised: the
 dictionaries are substituted and the parameters dropped, so its methods resolve and inline.
-nqueens' `safe` compared through three dictionaries; locally nqueens takes 93 → 56 ms
-(instructions 831 → 434 M). `HSC_DEBUG` builds give every generated body a sized symbol, so
+nqueens' `safe` compared through three dictionaries (PR #47): hosted, nqueens takes
+133 → 100 ms (instructions 831 → 434 M). fib measured 19.1 → 23.9 ms on that noisy runner,
+but its Core is identical and local runs show no change. [Raw samples, conditions and graphs](bench/results/runtime-local-specialisation.md). `HSC_DEBUG` builds give every generated body a sized symbol, so
 cachegrind attributes time to Haskell bindings. The nqueens profile now shows ~32% in the
 generic eval/apply/update runtime: unknown calls and laziness, the target of worker/wrapper and
 wider specialisation.
+
+A case of a variable that is already a value goes straight to its alternatives (no return
+address or `hsc_eval`), and applying a partial application or over-applying a function stay in
+the assembly apply path instead of calling into Rust. `HSC_DEBUG` builds also size the runtime's
+own routines for profilers. Instructions: nqueens 434 → 422 M, mapops 603 → 560 M, others flat.
+The nqueens profile is now `hsc_eval` 18%, `hsc_apply` 10%, updates 5%: lazy intermediate
+structure that GHC's `-O1` fuses away, which fusion and worker/wrapper would address.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
