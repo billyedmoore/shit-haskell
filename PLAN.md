@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 231 differential tests for both back ends, compared with GHC.
+- **Corpus:** 232 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -263,6 +263,13 @@ existing paths. Both corpora pass 231/231 and all 59 unit tests pass. A three-pa
 comparison measures 1.034× geometric-mean speedup; all eight medians improve, though
 small differences may be noise. All runtime targets remain unmet.
 [Raw samples, conditions and graphs](bench/results/runtime-int-operations.md).
+
+A guard's fall-through was let-bound as a thunk entered in tail position, so guarded loops
+pushed an update frame per iteration and retained every thunk (sumloop reached 2 GB). Single-use
+lets now move to their use, `case otherwise` folds, and tail-only lets compile as join points
+in the enclosing frame (a jump, no allocation). Both corpora pass 232/232. The paired
+comparison: sumloop 10.70 → 3.77 s; the other seven are within 10% (ioref 1.41 → 1.26 s).
+[Raw samples, conditions and graphs](bench/results/runtime-join-points.md).
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
