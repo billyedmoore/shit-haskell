@@ -318,11 +318,13 @@ impl Checker {
         }
         self.reduce_derived_contexts(&derived_insts);
         // 6. Top-level values.
+        let is_rule = |d: &Decl| matches!(d, Decl::Fun { name, .. } if name.starts_with(crate::rename::RULE_PREFIX));
         let value_decls: Vec<Decl> = decls
             .iter()
-            .filter(|d| matches!(d, Decl::Fun { .. } | Decl::PatBind { .. } | Decl::Sig { .. }))
+            .filter(|d| matches!(d, Decl::Fun { .. } | Decl::PatBind { .. } | Decl::Sig { .. }) && !is_rule(d))
             .cloned()
             .collect();
+        let rule_decls: Vec<Decl> = decls.iter().filter(|d| is_rule(d)).cloned().collect();
         if self.boot {
             // A boot file declares types only: each signature is the value's scheme.
             for d in &value_decls {
@@ -337,6 +339,25 @@ impl Checker {
         } else {
             let t_binds = std::time::Instant::now();
             let mut binds = self.infer_binds(&value_decls, true)?;
+            // Rewrite rules, each on its own: one that does not check (or leaves constraints to
+            // the module's) is left out, as GHC would reject it but no result depends on it.
+            for d in &rule_decls {
+                let wanted = self.wanted.clone();
+                let loc = self.loc;
+                match self.infer_binds(std::slice::from_ref(d), true) {
+                    Ok(b) if self.wanted.len() == wanted.len() => binds.extend(b),
+                    other => {
+                        if std::env::var_os("HSC_DEBUG_RULES").is_some() {
+                            let why = match &other { Err(e) => e.msg.clone(), Ok(_) => "constraints left".into() };
+                            if let Decl::Fun { name, .. } = d {
+                                eprintln!("rule {} in {} not checked: {why}", name, self.module);
+                            }
+                        }
+                        self.wanted = wanted;
+                        self.loc = loc;
+                    }
+                }
+            }
             if std::env::var_os("HSC_TIME_TC").is_some() && t_binds.elapsed().as_millis() >= 200 {
                 eprintln!("tc {}: top-level values: {} ms", self.module, t_binds.elapsed().as_millis());
             }

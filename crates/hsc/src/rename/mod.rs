@@ -97,6 +97,39 @@ pub struct Renamer<'a> {
 }
 
 /// Renames a module against the interfaces of its imports.
+/// The prefix of a rewrite rule's binding name: `$rule%<index>%<activation>`, the activation
+/// being `A` (always), `F<n>` (from phase n), `B<n>` (before phase n) or `N` (never).
+pub const RULE_PREFIX: &str = "$rule%";
+
+/// A rewrite rule as a top-level binding: its binders are the parameters (with their
+/// signatures), its body the list of its two sides.
+fn rule_binding(i: usize, r: crate::syntax::ast::Rule) -> Decl {
+    use crate::syntax::ast::{Activation, Body, Clause, Expr, Pat, Rhs};
+    let act = match r.activation {
+        Activation::Always => "A".to_string(),
+        Activation::From(n) => format!("F{n}"),
+        Activation::Before(n) => format!("B{n}"),
+        Activation::Never => "N".to_string(),
+    };
+    let pats = r
+        .binders
+        .into_iter()
+        .map(|(v, ty)| {
+            let var = Pat::Var(v, r.loc);
+            match ty {
+                Some(t) => Pat::Sig(Box::new(var), t, r.loc),
+                None => var,
+            }
+        })
+        .collect();
+    let body = Expr::List(vec![r.lhs, r.rhs], r.loc);
+    Decl::Fun {
+        name: format!("{RULE_PREFIX}{i}%{act}"),
+        clauses: vec![Clause { pats, rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() }, loc: r.loc, end: r.loc }],
+        loc: r.loc,
+    }
+}
+
 pub fn rename_module(
     mut m: Module,
     ifaces: &BTreeMap<String, Iface>,
@@ -253,6 +286,29 @@ impl<'a> Renamer<'a> {
         for d in builders {
             decls.push(self.top_decl(d)?);
         }
+        // Rewrite rules, as bindings `$rule%i%act binders = [lhs, rhs]` (the list makes the two
+        // sides one type; see `tc::check_module`). A rule that does not rename is left out:
+        // rules only make programs faster.
+        if std::env::var_os("HSC_DEBUG_RULES").is_some() && !m.rules.is_empty() {
+            eprintln!("rules: {} has {}", self.module, m.rules.len());
+        }
+        for (i, r) in m.rules.into_iter().enumerate() {
+            // A binder of a polymorphic (rank-2) type, as "fold/build"'s `g`, cannot be checked
+            // as a parameter here: those rules are built into the simplifier instead.
+            if r.binders.iter().any(|(_, t)| t.as_ref().is_some_and(|t| matches!(t, crate::syntax::ast::Type::Forall(..)))) {
+                continue;
+            }
+            let mark = self.locals.len();
+            match self.top_decl(rule_binding(i, r)) {
+                Ok(d) => decls.push(d),
+                Err(e) => {
+                    self.locals.truncate(mark);
+                    if std::env::var_os("HSC_DEBUG_RULES").is_some() {
+                        eprintln!("rule in {} not renamed: {}", self.module, e.msg);
+                    }
+                }
+            }
+        }
 
         // Exports.
         let exports = self.compute_exports(&m.exports, m.loc)?;
@@ -280,7 +336,7 @@ impl<'a> Renamer<'a> {
             imports,
             decls,
             loc: m.loc,
-            // Rules are not renamed yet: they are not used past the parser.
+            // Rules are among the declarations now (`rule_binding`).
             rules: Vec::new(),
         };
         Ok((module, iface))
