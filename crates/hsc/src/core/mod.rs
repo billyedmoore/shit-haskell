@@ -10,6 +10,7 @@ pub mod matcher;
 pub mod opt;
 pub mod pretty;
 pub mod serial;
+pub mod simplify;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lit {

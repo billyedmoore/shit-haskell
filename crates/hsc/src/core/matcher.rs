@@ -83,7 +83,7 @@ fn row_code(scruts: &[String], row: &Row, fail: Core, fresh: Fresh) -> Core {
 pub fn compile_body(body: &CBody, fail: Core, fresh: Fresh) -> Core {
     match body {
         CBody::Expr(c) => c.clone(),
-        CBody::Where(binds, inner) => Core::Let(binds.clone(), Box::new(compile_body(inner, fail, fresh))),
+        CBody::Where(binds, inner) => crate::tc::expr::wrap_let(binds.clone(), compile_body(inner, fail, fresh)),
         CBody::Guards(alts) => guard_alts(alts, fail, fresh),
     }
 }
