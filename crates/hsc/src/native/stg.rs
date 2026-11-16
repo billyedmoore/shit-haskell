@@ -74,6 +74,8 @@ pub struct SClosure {
     pub nslots: u32,
     /// The raw (unboxed) slots, numbered `RAW | i` (see `RAW`), apart from those.
     pub nraw: u32,
+    /// A worker's raw parameters: the argument slot each arrives in, and its raw slot.
+    pub raw_args: Vec<(u32, u32)>,
     pub body: SExpr,
 }
 
@@ -96,31 +98,161 @@ fn raw_operand_prim(p: &str) -> bool {
     p == "tagToEnum#" || RAW_RESULT_PRIMS.contains(&p)
 }
 
-/// Whether every use of `x` in `e` can take it raw: as an operand of an inline primitive, or as
-/// the scrutinee of a case on literals whose binder is unused.
-fn raw_uses(e: &Core, x: &str) -> bool {
+/// A raw slot holding a `Char#` (its boxed form is a CHAR cell); others hold `Int#`/`Word#`.
+pub const RAW_CHAR: u32 = 1 << 30;
+
+/// The functions with a worker taking some parameters raw: by name, which parameters.
+pub type Workers = HashMap<String, Vec<bool>>;
+
+/// Whether every use of `x` in `e` can take it raw: as an operand of an inline primitive, as the
+/// scrutinee of a case on literals whose binder is unused, as a raw argument of a worker call,
+/// or as the body's result (boxed once, when returned).
+fn raw_uses(e: &Core, x: &str, w: &Workers) -> bool {
+    raw_uses_in(e, x, w, true)
+}
+
+/// `raw_uses`; `result` says whether `e` is in a result position of the body. Elsewhere (inside a
+/// scrutinee, whose own results become a join point's arguments, or an operand) `x` itself must
+/// not be the value.
+fn raw_uses_in(e: &Core, x: &str, w: &Workers, result: bool) -> bool {
     match e {
-        Core::Var(v) => v != x,
+        Core::Var(v) => v != x || result,
         Core::Lit(_) | Core::Fail(_) => true,
-        Core::Prim(p, args) if raw_operand_prim(p) => args.iter().all(|a| matches!(a, Core::Var(v) if v == x) || raw_uses(a, x)),
+        Core::Prim(p, args) if raw_operand_prim(p) => {
+            args.iter().all(|a| matches!(a, Core::Var(v) if v == x) || raw_uses_in(a, x, w, false))
+        }
+        Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+            raw_uses_in(&args[0], x, w, result)
+        }
         Core::Case(s, b, alts) if matches!(&**s, Core::Var(v) if v == x) => {
             alts.iter().all(|a| match a {
-                Alt::Lit(Lit::Int(_) | Lit::Char(_), body) | Alt::Default(body) => !mentions(body, b) && raw_uses(body, x),
+                Alt::Lit(Lit::Int(_) | Lit::Char(_), body) | Alt::Default(body) => {
+                    !mentions(body, b) && raw_uses_in(body, x, w, result)
+                }
                 _ => false,
             })
         }
-        // A call's function and arguments are passed or captured (a non-atomic argument becomes
-        // a thunk), never evaluated in place: they must not mention the raw value.
-        Core::App(..) => !mentions(e, x),
+        Core::App(..) => {
+            let (f, args) = spine(e);
+            if let Core::Var(g) = f {
+                if let Some(raw) = w.get(g.as_str()).filter(|r| r.len() == args.len()) {
+                    // A raw parameter's argument is evaluated in place (see `worker_call`); the others
+                    // are passed or captured.
+                    return g != x
+                        && args.iter().zip(raw).all(|(a, r)| match a {
+                            Core::Var(v) if v == x => *r,
+                            a if *r => raw_uses_in(a, x, w, false),
+                            a => !mentions(a, x),
+                        });
+                }
+            }
+            // Otherwise the function and arguments are passed or captured (a non-atomic argument
+            // becomes a thunk), never evaluated in place: they must not mention the raw value.
+            !mentions(e, x)
+        }
         Core::Lam(_, b) => !mentions(b, x),
-        Core::Let(binds, body) => binds.iter().all(|(_, r)| !mentions(r, x)) && raw_uses(body, x),
+        Core::Let(binds, body) => binds.iter().all(|(_, r)| !mentions(r, x)) && raw_uses_in(body, x, w, result),
         Core::Case(s, _, alts) => {
-            raw_uses(s, x)
+            raw_uses_in(s, x, w, false)
                 && alts.iter().all(|a| match a {
-                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => raw_uses(b, x),
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => raw_uses_in(b, x, w, result),
                 })
         }
         Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, x)),
+    }
+}
+
+/// Whether `e` uses `x` as a number: an operand of an inline primitive, or the scrutinee of a
+/// case with number or character literal alternatives.
+fn numeric_use(e: &Core, x: &str) -> bool {
+    match e {
+        Core::Prim(p, args) if raw_operand_prim(p) && args.iter().any(|a| matches!(a, Core::Var(v) if v == x)) => true,
+        Core::Case(s, _, alts)
+            if matches!(&**s, Core::Var(v) if v == x)
+                && alts.iter().any(|a| matches!(a, Alt::Lit(Lit::Int(_) | Lit::Char(_), _))) =>
+        {
+            true
+        }
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => false,
+        Core::App(f, a) => numeric_use(f, x) || numeric_use(a, x),
+        Core::Lam(_, b) => numeric_use(b, x),
+        Core::Let(binds, body) => binds.iter().any(|(_, r)| numeric_use(r, x)) || numeric_use(body, x),
+        Core::Case(s, _, alts) => {
+            numeric_use(s, x)
+                || alts.iter().any(|a| match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => numeric_use(b, x),
+                })
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| numeric_use(a, x)),
+    }
+}
+
+/// Whether `x` is an operand of a `Char#` primitive in `e` (its raw slot then holds a `Char#`).
+fn char_operand(e: &Core, x: &str) -> bool {
+    match e {
+        Core::Prim(p, args) if p.ends_with("Char#") || p == "ord#" => {
+            args.iter().any(|a| matches!(a, Core::Var(v) if v == x) || char_operand(a, x))
+        }
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => false,
+        Core::App(f, a) => char_operand(f, x) || char_operand(a, x),
+        Core::Lam(_, b) => char_operand(b, x),
+        Core::Let(binds, body) => binds.iter().any(|(_, r)| char_operand(r, x)) || char_operand(body, x),
+        Core::Case(s, _, alts) => {
+            char_operand(s, x)
+                || alts.iter().any(|a| match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => char_operand(b, x),
+                })
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| char_operand(a, x)),
+    }
+}
+
+/// The global functions given workers: a parameter is passed raw when the body certainly
+/// evaluates it and every use takes it raw (with the other workers' raw parameters: a fixpoint
+/// from every candidate, weakened until each claim holds).
+pub fn workers(binds: &[TopBind]) -> Workers {
+    let mut w: Workers = HashMap::new();
+    let mut bodies: HashMap<&str, (Vec<&str>, &Core)> = HashMap::new();
+    for b in binds {
+        let mut params = Vec::new();
+        let mut cur = &b.body;
+        while let Core::Lam(x, inner) = cur {
+            params.push(x.as_str());
+            cur = inner;
+        }
+        if params.is_empty() {
+            continue;
+        }
+        let evaluated = crate::core::simplify::certainly_evaluated(cur);
+        // Core is untyped: a parameter is known to be an Int#/Word#/Char# only when the body
+        // itself uses it as one (an identity like a newtype's constructor must stay boxed).
+        let raw: Vec<bool> = params.iter().map(|p| evaluated.contains(*p) && numeric_use(cur, p)).collect();
+        if raw.iter().any(|r| *r) {
+            w.insert(b.name.clone(), raw);
+            bodies.insert(b.name.as_str(), (params, cur));
+        }
+    }
+    loop {
+        let mut changed = false;
+        let names: Vec<String> = w.keys().cloned().collect();
+        for name in names {
+            let (params, body) = &bodies[name.as_str()];
+            let mut raw = w[&name].clone();
+            for (i, p) in params.iter().enumerate() {
+                if raw[i] && !raw_uses(body, p, &w) {
+                    raw[i] = false;
+                    changed = true;
+                }
+            }
+            if raw.iter().any(|r| *r) {
+                w.insert(name, raw);
+            } else {
+                w.remove(&name);
+            }
+        }
+        if !changed {
+            return w;
+        }
     }
 }
 
@@ -128,6 +260,8 @@ fn raw_uses(e: &Core, x: &str) -> bool {
 pub struct SGlobal {
     pub name: String,
     pub closure: SClosure,
+    /// The same function taking some parameters raw, for exact calls (see `workers`).
+    pub worker: Option<(SClosure, Vec<bool>)>,
 }
 
 pub struct SProgram {
@@ -159,6 +293,8 @@ pub struct Lowering {
     pending: Vec<(u32, SClosure)>,
     /// The next join point id (unique in the program).
     next_join: u32,
+    /// The functions with workers (see `workers`).
+    workers: Workers,
 }
 
 impl Body {
@@ -184,12 +320,14 @@ impl Lowering {
             bodies: Vec::new(),
             pending: Vec::new(),
             next_join: 0,
+            workers: if std::env::var_os("HSC_NO_WORKERS").is_some() { HashMap::new() } else { workers(binds) },
         };
         let globals = binds
             .iter()
             .map(|b| {
                 let closure = lw.closure_of(&b.body);
-                SGlobal { name: b.name.clone(), closure }
+                let worker = lw.workers.get(&b.name).cloned().map(|raw| (lw.closure_with(&b.body, Some(&raw)), raw));
+                SGlobal { name: b.name.clone(), closure, worker }
             })
             .collect();
         SProgram { globals, index }
@@ -197,7 +335,14 @@ impl Lowering {
 
     /// The closure of a top-level or delayed expression: a lambda's parameters, or a thunk.
     fn closure_of(&mut self, e: &Core) -> SClosure {
+        self.closure_with(e, None)
+    }
+
+    /// `closure_of`, with the parameters `raw` marks bound to raw slots (a worker): each still has
+    /// its argument slot, which it arrives in.
+    fn closure_with(&mut self, e: &Core, raw: Option<&[bool]>) -> SClosure {
         self.bodies.push(Body::new());
+        let mut raw_args = Vec::new();
         let (arity, body_expr) = match e {
             Core::Lam(..) => {
                 let mut params = Vec::new();
@@ -207,9 +352,16 @@ impl Lowering {
                     cur = b;
                 }
                 let top = self.bodies.last_mut().expect("body");
-                for p in &params {
+                for (i, p) in params.iter().enumerate() {
                     let s = top.fresh_slot();
                     top.locals.insert(p.clone(), s);
+                    if raw.is_some_and(|r| r[i]) {
+                        let kind = if char_operand(cur, p) { RAW_CHAR } else { 0 };
+                        let r = RAW | kind | top.nraw;
+                        top.nraw += 1;
+                        top.locals.insert(p.clone(), r);
+                        raw_args.push((s, r));
+                    }
                 }
                 (params.len() as u32, cur)
             }
@@ -218,7 +370,7 @@ impl Lowering {
         let body = self.strict(body_expr);
         let b = self.bodies.pop().expect("body");
         let captures = b.captures.iter().map(|(_, a)| a.clone()).collect();
-        SClosure { arity, captures, nslots: b.nslots, nraw: b.nraw, body }
+        SClosure { arity, captures, nslots: b.nslots, nraw: b.nraw, raw_args, body }
     }
 
     /// Resolves a variable in the current body: a slot, a captured variable (captured now from
@@ -267,6 +419,9 @@ impl Lowering {
                 if let Some(id) = match f { Core::Var(v) => self.join(v, args.len()), _ => None } {
                     let aa = args.iter().map(|a| self.atom(a)).collect();
                     return self.allocating(mark, SExpr::Jump(id, aa));
+                }
+                if let Some(call) = self.worker_call(f, &args) {
+                    return call;
                 }
                 let fa = self.atom(f);
                 let aa = args.iter().map(|a| self.atom(a)).collect();
@@ -318,9 +473,10 @@ impl Lowering {
                 }
                 // The result of an inline primitive that is only used raw is kept unboxed.
                 let raw = matches!(scrut.as_ref(), Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str()))
-                    && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder));
+                    && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder, &self.workers));
+                let char = matches!(scrut.as_ref(), Core::Prim(p, _) if p == "chr#");
                 let scrut = self.strict(scrut);
-                let bslot = if raw { self.bind_raw(binder) } else { self.bind_local(binder) };
+                let bslot = if raw { self.bind_raw(binder, char) } else { self.bind_local(binder) };
                 // Only one alternative runs, so their locals share the slots after the binder: the
                 // frame needs the largest alternative's, not their sum.
                 let (base, raw_base) = {
@@ -367,6 +523,50 @@ impl Lowering {
         }
     }
 
+    /// An exact call of a function with a worker: each raw parameter's argument is a raw slot or a
+    /// number literal, evaluated first (into a fresh raw slot) otherwise; the parameter is strict,
+    /// so evaluating it before the call is what the function would do.
+    fn worker_call(&mut self, f: &Core, args: &[&Core]) -> Option<SExpr> {
+        let Core::Var(g) = f else { return None };
+        if self.bodies.last().is_some_and(|b| b.locals.contains_key(g) || b.capture_index.contains_key(g)) {
+            return None;
+        }
+        let raw = self.workers.get(g.as_str()).filter(|r| r.len() == args.len())?.clone();
+        let mut evals: Vec<(u32, SExpr)> = Vec::new();
+        let mut atoms: Vec<Option<Atom>> = vec![None; args.len()];
+        for (i, a) in args.iter().enumerate() {
+            if !raw[i] {
+                continue;
+            }
+            let direct = match a {
+                Core::Var(v) => match self.resolve(v) {
+                    at @ Atom::Slot(k) if k & RAW != 0 => Some(at),
+                    _ => None,
+                },
+                Core::Lit(l @ (Lit::Int(_) | Lit::Char(_))) => Some(Atom::Lit(slit(l))),
+                _ => None,
+            };
+            match direct {
+                Some(at) => atoms[i] = Some(at),
+                None => {
+                    let scrut = self.strict(a);
+                    let slot = self.bind_raw(&format!("w%{}", self.next_join), false);
+                    self.next_join += 1;
+                    evals.push((slot, scrut));
+                    atoms[i] = Some(Atom::Slot(slot));
+                }
+            }
+        }
+        let mark = self.pending.len();
+        let fa = self.atom(f);
+        let aa: Vec<Atom> = args.iter().zip(atoms).map(|(a, at)| at.unwrap_or_else(|| self.atom(a))).collect();
+        let mut e = self.allocating(mark, SExpr::App(fa, aa));
+        for (slot, scrut) in evals.into_iter().rev() {
+            e = SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(e)]);
+        }
+        Some(e)
+    }
+
     /// Wraps an operation with the allocations of the thunks its arguments needed.
     fn allocating(&mut self, mark: usize, op: SExpr) -> SExpr {
         if self.pending.len() == mark {
@@ -383,10 +583,10 @@ impl Lowering {
     }
 
     /// Binds a name to a fresh raw slot.
-    fn bind_raw(&mut self, name: &str) -> u32 {
+    fn bind_raw(&mut self, name: &str, char: bool) -> u32 {
         let b = self.bodies.last_mut().expect("body");
         b.joins.remove(name);
-        let s = RAW | b.nraw;
+        let s = RAW | if char { RAW_CHAR } else { 0 } | b.nraw;
         b.nraw += 1;
         b.locals.insert(name.to_string(), s);
         s
@@ -606,8 +806,12 @@ mod raw_slot_tests {
         Core::Case(Box::new(s), b.into(), vec![Alt::Default(body)])
     }
 
+    /// Lowers `Test.f = \x -> body` beside `Test.k`, a CAF (an unknown function value).
     fn lower(body: Core) -> SClosure {
-        let binds = vec![TopBind { name: "Test.f".into(), body: Core::Lam("x".into(), Box::new(body)) }];
+        let binds = vec![
+            TopBind { name: "Test.f".into(), body: Core::Lam("x".into(), Box::new(body)) },
+            TopBind { name: "Test.k".into(), body: Core::Var("Test.k".into()) },
+        ];
         Lowering::program(&binds).globals.remove(0).closure
     }
 
@@ -621,11 +825,11 @@ mod raw_slot_tests {
     }
 
     #[test]
-    fn a_literal_case_on_the_result_keeps_it_raw() {
+    fn a_literal_case_or_a_result_keeps_it_raw() {
         let lits = Core::Case(
             Box::new(var("y")),
             "z".into(),
-            vec![Alt::Lit(Lit::Int(0), Core::Lit(Lit::Int(1))), Alt::Default(Core::Lit(Lit::Int(2)))],
+            vec![Alt::Lit(Lit::Int(0), Core::Lit(Lit::Int(1))), Alt::Default(var("y"))],
         );
         let c = lower(case(prim("remInt#", vec![var("x"), Core::Lit(Lit::Int(4))]), "y", lits));
         assert_eq!(c.nraw, 1);
@@ -633,19 +837,53 @@ mod raw_slot_tests {
 
     #[test]
     fn results_that_escape_stay_boxed() {
-        // Returned, passed to a call, stored in a constructor, captured, or the case binder used.
+        // Passed to an unknown function, stored in a constructor, captured, the case binder used,
+        // in an argument expression, or a result of a scrutinee (a join point's argument).
         let escapes = vec![
-            var("y"),
-            Core::App(Box::new(var("Test.f")), Box::new(var("y"))),
+            Core::App(Box::new(var("Test.k")), Box::new(var("y"))),
             Core::Con("Test.K".into(), vec![var("y")]),
             Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t"))),
-            // An argument expression becomes a thunk capturing the value.
-            Core::App(Box::new(var("Test.f")), Box::new(prim("+#", vec![var("y"), Core::Lit(Lit::Int(1))]))),
             Core::Case(Box::new(var("y")), "z".into(), vec![Alt::Default(var("z"))]),
+            Core::App(Box::new(var("Test.k")), Box::new(prim("+#", vec![var("y"), Core::Lit(Lit::Int(1))]))),
+            Core::Case(
+                Box::new(Core::Case(Box::new(var("x")), "u".into(), vec![Alt::Default(var("y"))])),
+                "s".into(),
+                vec![Alt::Default(var("s"))],
+            ),
         ];
         for body in escapes {
             let c = lower(case(prim("+#", vec![var("x"), var("x")]), "y", body.clone()));
             assert_eq!(c.nraw, 0, "{body:?}");
         }
+    }
+
+    #[test]
+    fn strict_parameters_used_raw_get_a_worker() {
+        // f x = case x ># 0# of 1# -> x; _ -> f (x +# 1#): x is evaluated and used raw.
+        let body = Core::Case(
+            Box::new(prim(">#", vec![var("x"), Core::Lit(Lit::Int(0))])),
+            "c".into(),
+            vec![Alt::Default(Core::Case(
+                Box::new(var("c")),
+                "d".into(),
+                vec![
+                    Alt::Lit(Lit::Int(1), var("x")),
+                    Alt::Default(Core::App(Box::new(var("Test.f")), Box::new(prim("+#", vec![var("x"), Core::Lit(Lit::Int(1))])))),
+                ],
+            ))],
+        );
+        let binds = vec![TopBind { name: "Test.f".into(), body: Core::Lam("x".into(), Box::new(body)) }];
+        let w = workers(&binds);
+        assert_eq!(w.get("Test.f"), Some(&vec![true]));
+        let g = Lowering::program(&binds).globals.remove(0);
+        let (worker, _) = g.worker.expect("a worker");
+        assert_eq!(worker.raw_args.len(), 1);
+    }
+
+    #[test]
+    fn a_parameter_not_used_as_a_number_gets_no_worker() {
+        // A newtype's constructor (\x -> x) returns its evaluated parameter, of any type.
+        let binds = vec![TopBind { name: "Test.K1".into(), body: Core::Lam("x".into(), Box::new(var("x"))) }];
+        assert!(workers(&binds).is_empty());
     }
 }
