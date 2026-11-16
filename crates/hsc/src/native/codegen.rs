@@ -131,6 +131,10 @@ pub struct Gen {
     live: Vec<std::collections::HashSet<u32>>,
     /// The slots each join point's code uses (a jump to it uses them).
     join_uses: HashMap<u32, std::collections::HashSet<u32>>,
+    /// Where an inline primitive's value goes when it is a case scrutinee computed in place.
+    fast_done: Option<String>,
+    /// The next primitive is a scrutinee whose fast path is already emitted: only the slow path.
+    slow_only: bool,
     /// The static INT cells 0 and 1 (made when first used).
     bool_cells: Option<(String, String)>,
     /// The code labels and parameter slots of the join points generated so far.
@@ -171,6 +175,8 @@ impl Gen {
             strings: Vec::new(),
             joins: HashMap::new(),
             bool_cells: None,
+            fast_done: None,
+            slow_only: false,
             live: Vec::new(),
             join_uses: HashMap::new(),
         }
@@ -473,6 +479,22 @@ impl Gen {
                         self.emit(&format!("jmp {ready}"));
                         self.put_label(&eval);
                         Some(ready)
+                    }
+                    // A primitive with an inline fast path is computed in place (before the return
+                    // address, which only its slow path needs).
+                    SExpr::Prim(name, args) => {
+                        let ready = self.label("ready");
+                        let slow = self.label("slow");
+                        self.fast_done = Some(ready.clone());
+                        let fast = self.int_fast_path(name, args, p, &slow);
+                        self.fast_done = None;
+                        if fast {
+                            self.put_label(&slow);
+                            self.slow_only = true;
+                            Some(ready)
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 };
@@ -777,7 +799,8 @@ impl Gen {
             return;
         }
         let slow = self.label("slow");
-        let fast = self.int_fast_path(name, args, p, &slow);
+        // A case scrutinee whose fast path was already emitted in place has only its slow path.
+        let fast = !std::mem::take(&mut self.slow_only) && self.int_fast_path(name, args, p, &slow);
         if fast {
             self.put_label(&slow);
         }
@@ -858,7 +881,7 @@ impl Gen {
             self.emit(&format!("leaq {f}(%rip), %r14"));
             self.emit(&format!("leaq {t}(%rip), %rax"));
             self.emit("cmovneq %rax, %r14");
-            self.ret(p);
+            self.fast_ret(p);
             return true;
         }
         if matches!(k, K::Cmp(_) | K::CharCmp(_)) {
@@ -878,7 +901,7 @@ impl Gen {
             self.emit(&format!("leaq {one}(%rip), %rax"));
             let cmov = set.replacen("set", "cmov", 1);
             self.emit(&format!("{cmov}q %rax, %r14"));
-            self.ret(p);
+            self.fast_ret(p);
             return true;
         }
         // The cell is allocated first: a collection moves the arguments, so they are loaded after.
@@ -914,7 +937,7 @@ impl Gen {
         self.emit(&format!("movq ${}, (%rax)", header(out_kind, 1, 0)));
         self.emit("movq %rcx, 8(%rax)");
         self.emit("movq %rax, %r14");
-        self.ret(p);
+        self.fast_ret(p);
         true
     }
 
@@ -1026,6 +1049,15 @@ impl Gen {
                     }
                 }
             }
+        }
+    }
+
+    /// The end of an inline primitive: its value (in R1) is returned, or, for a case scrutinee
+    /// computed in place, goes straight to the alternatives.
+    fn fast_ret(&mut self, p: Pos) {
+        match self.fast_done.clone() {
+            Some(l) => self.emit(&format!("jmp {l}")),
+            None => self.ret(p),
         }
     }
 

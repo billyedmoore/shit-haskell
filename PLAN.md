@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 236 differential tests for both back ends, compared with GHC.
+- **Corpus:** 237 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -318,9 +318,17 @@ wider specialisation.
 A case of a variable that is already a value goes straight to its alternatives (no return
 address or `hsc_eval`), and applying a partial application or over-applying a function stay in
 the assembly apply path instead of calling into Rust. `HSC_DEBUG` builds also size the runtime's
-own routines for profilers. Instructions: nqueens 434 → 422 M, mapops 603 → 560 M, others flat.
+own routines for profilers (PR #48). Instructions: nqueens 434 → 422 M, mapops 603 → 560 M,
+others flat; the hosted run shows no wall-clock speedup (all within noise; integer and sumloop
+measured 9% and 5% slower), so none is claimed. [Raw samples, conditions and graphs](bench/results/runtime-eval-apply-paths.md).
 The nqueens profile is now `hsc_eval` 18%, `hsc_apply` 10%, updates 5%: lazy intermediate
 structure that GHC's `-O1` fuses away, which fusion and worker/wrapper would address.
+
+Strictness treats a pattern-match failure as bottom, as GHC does: the matcher's unreachable
+`FAIL` default no longer erased every demand, so `length`'s accumulator (`lenAcc`) is strict and
+`n + 1` is evaluated before the call instead of built as a thunk per element. A case scrutinee
+with an inline fast path is computed in place, and a case's alternatives share frame slots.
+Instructions: strings 49.5 → 38.0 M (500 repetitions), mapops 549 → 534 M, others flat.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.

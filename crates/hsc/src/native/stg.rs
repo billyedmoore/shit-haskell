@@ -267,8 +267,18 @@ impl Lowering {
                 }
                 let scrut = self.strict(scrut);
                 let bslot = self.bind_local(binder);
-                let alts = alts.iter().map(|a| self.alt(a)).collect();
-                SExpr::Case(Box::new(scrut), bslot, alts)
+                // Only one alternative runs, so their locals share the slots after the binder: the
+                // frame needs the largest alternative's, not their sum.
+                let base = self.bodies.last().expect("body").nslots;
+                let mut top = base;
+                let mut lowered = Vec::with_capacity(alts.len());
+                for a in alts {
+                    self.bodies.last_mut().expect("body").nslots = base;
+                    lowered.push(self.alt(a));
+                    top = top.max(self.bodies.last().expect("body").nslots);
+                }
+                self.bodies.last_mut().expect("body").nslots = top;
+                SExpr::Case(Box::new(scrut), bslot, lowered)
             }
             Core::Con(name, args) => {
                 let mark = self.pending.len();
