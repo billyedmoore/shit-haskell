@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 238 differential tests for both back ends, compared with GHC.
+- **Corpus:** 239 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -335,9 +335,19 @@ Frames can hold raw (unboxed) words: a body frame's size word is `words | raw <<
 collector, unwinder and `TOP` skip the raw words at the frame's low end. The result of an inline
 `Int#`/`Word#`/`Char#` primitive whose every use is another inline primitive or a literal case
 is kept raw: no cell is allocated and no kind is checked. Raw operands are boxed only for the
-runtime's slow path. Instructions: sumloop 2,338 → 1,539 M, fib 64.6 → 56.6 M, mapops
-534 → 510 M, strings 38.0 → 35.9 M (500 repetitions), nqueens 419 → 409 M. Next: raw values
+runtime's slow path (PR #50). Hosted: sumloop 184 → 122 ms, fib 20.1 → 14.5 ms, nqueens
+79 → 67 ms, strings 584 → 536 ms. integer measured 23.1 → 30.1 ms, though its instructions fell
+(181.1 → 179.9 M): taken as noise on a 23 ms run, to be rechecked by the next paired run.
+[Raw samples, conditions and graphs](bench/results/runtime-raw-slots.md). Next: raw values
 across calls (worker/wrapper), so loop arguments are not boxed.
+
+Workers take unboxed arguments: a global function whose parameter is certainly evaluated, used
+as a number in its own body (Core is untyped: an identity such as a newtype's constructor stays
+boxed), and only ever used raw (operand, literal case, a worker's raw argument, or its result,
+boxed once) gets a second entry taking it raw. Every exact call uses the worker, evaluating a
+raw parameter's argument first; partial applications and the function as a value use the boxed
+entry. The worker's prologue moves raw arguments into raw slots before anything can collect.
+Instructions: sumloop 1,539 → 1,023 M, fib 56.6 → 39.7 M, strings 2,779 → 2,659 M; others flat.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.

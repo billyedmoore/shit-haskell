@@ -1213,6 +1213,13 @@ fn forced(e: &Core, strict: &HashMap<String, Vec<bool>>) -> HashSet<String> {
     forced_d(e, strict, true).0
 }
 
+/// The variables an expression certainly evaluates when its value is demanded (failures are
+/// bottom, calls of unknown functions evaluate only the function): for the native back end's
+/// choice of parameters to pass unboxed.
+pub fn certainly_evaluated(e: &Core) -> HashSet<String> {
+    forced(e, &HashMap::new())
+}
+
 /// What `forced` answers when a failing alternative counts as evaluating nothing: used where
 /// an earlier evaluation should not even precede a pattern failure (`strict_let`).
 fn forced_total(e: &Core) -> HashSet<String> {
