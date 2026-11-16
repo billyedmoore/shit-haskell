@@ -43,9 +43,8 @@ const FALSE: &str = "GHC.Types.False";
 pub fn simplify(binds: &mut [TopBind]) {
     // The rewrite rules, taken before any pass changes their sides, and the functions they
     // mention, which are not inlined while rules may still need to see them (phases 2 and 1).
-    // Off unless HSC_RULES is set, until fused code is also inlined into loops (the rules alone
-    // leave calls of unknown functions per element, slower than the lists they replace).
-    let enabled = std::env::var_os("HSC_RULES").is_some();
+    // HSC_NO_RULES: without them (to compare, or to rule them out).
+    let enabled = std::env::var_os("HSC_NO_RULES").is_none();
     let rules = if enabled { Rules::new(extract_rules(binds)) } else { Rules { by_head: HashMap::new(), protected: HashSet::new() } };
     // The passes are GHC's phases 2, 1 and 0: the second inlines the bodies the first
     // simplified; the last cleans up after the calls by value.
@@ -121,10 +120,13 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
             occurrences(&bind.body, 0, &mut depth, &mut occ);
             let mut once = HashSet::new();
             let mut dead = HashSet::new();
+            let values = let_values(&bind.body);
             for (n, o) in occ {
                 if o.count == 0 {
                     dead.insert(n);
-                } else if o.count == 1 && !o.under_lambda && !o.recursive {
+                } else if o.count == 1 && !o.recursive && (!o.under_lambda || values.contains(&n)) {
+                    // A value (a lambda, or a global applied to atoms) moves even under a
+                    // lambda: no work is repeated, and its call site can then reduce it.
                     once.insert(n);
                 }
             }
@@ -430,7 +432,9 @@ impl Simp<'_> {
             let mut lets = Vec::new();
             for v in &rule.vars {
                 let e = sub.remove(v).expect("matched");
-                if is_atom(&e) {
+                // An atom, or an expression the right side uses once (its lambdas are those of
+                // `build`'s argument, called once): in place, so later rules see it.
+                if is_atom(&e) || occurrences_of(&rhs, v) == 1 {
                     subst(&mut rhs, v, &e);
                 } else {
                     let name = format!("{v}{tag}");
@@ -906,6 +910,79 @@ fn drop_args(c: &mut Core, f: &str, constant: &[Option<String>]) {
             }
         }
         Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| drop_args(a, f, constant)),
+    }
+}
+
+/// The let-bound locals of an expression whose right sides are values: lambdas, or globals
+/// applied to atoms (partial applications), whose copies cost no repeated work.
+fn let_values(e: &Core) -> HashSet<String> {
+    fn is_value(e: &Core) -> bool {
+        match e {
+            Core::Lam(..) => true,
+            Core::App(..) => {
+                let mut h = e;
+                while let Core::App(f, a) = h {
+                    if !is_atom(a) && !matches!(**a, Core::Lam(..)) {
+                        return false;
+                    }
+                    h = f;
+                }
+                matches!(h, Core::Var(v) if v.contains('.'))
+            }
+            _ => false,
+        }
+    }
+    fn go(e: &Core, out: &mut HashSet<String>) {
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(f, a) => {
+                go(f, out);
+                go(a, out);
+            }
+            Core::Lam(_, b) => go(b, out),
+            Core::Let(binds, body) => {
+                for (x, r) in binds {
+                    if is_value(r) {
+                        out.insert(x.clone());
+                    }
+                    go(r, out);
+                }
+                go(body, out);
+            }
+            Core::Case(s, _, alts) => {
+                go(s, out);
+                for a in alts {
+                    match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => go(b, out),
+                    }
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| go(a, out)),
+        }
+    }
+    let mut out = HashSet::new();
+    go(e, &mut out);
+    out
+}
+
+/// The occurrences of a variable in an expression.
+fn occurrences_of(e: &Core, x: &str) -> usize {
+    match e {
+        Core::Var(v) => (v == x) as usize,
+        Core::Lit(_) | Core::Fail(_) => 0,
+        Core::App(f, a) => occurrences_of(f, x) + occurrences_of(a, x),
+        Core::Lam(_, b) => occurrences_of(b, x),
+        Core::Let(binds, body) => binds.iter().map(|(_, r)| occurrences_of(r, x)).sum::<usize>() + occurrences_of(body, x),
+        Core::Case(s, _, alts) => {
+            occurrences_of(s, x)
+                + alts
+                    .iter()
+                    .map(|a| match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => occurrences_of(b, x),
+                    })
+                    .sum::<usize>()
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().map(|a| occurrences_of(a, x)).sum(),
     }
 }
 
