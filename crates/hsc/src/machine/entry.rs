@@ -192,7 +192,7 @@ pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
     let r = if let Some(op) = m.int_prims[id as usize] {
         op.run(m)
     } else { match ordinary {
-        Some(name) => super::prims::run_ordinary(m, name, nargs),
+        Some(name) => super::prims::run_ordinary(m, id as usize, name, nargs),
         None => super::prims::run(m, name.as_deref().unwrap(), nargs),
     }};
     // Generated code takes a primitive's result as a value: a thunk (a result that is a variable of

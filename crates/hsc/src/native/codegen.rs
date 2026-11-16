@@ -27,6 +27,7 @@ pub const FUN: u8 = 6;
 pub const PAP: u8 = 7;
 pub const THUNK: u8 = 8;
 pub const IND: u8 = 9;
+pub const REF: u8 = 11;
 
 /// Frame kinds, as the collector reads them from the info of a return address.
 pub mod frame {
@@ -962,6 +963,9 @@ impl Gen {
     /// when a thread switch is due, or a division could fault) control goes to `slow`, the
     /// runtime's primitive. Answers whether the fast path was emitted.
     fn int_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
+        if self.raw_dest.is_none() && self.mutvar_fast_path(name, args, p, slow) {
+            return true;
+        }
         #[derive(PartialEq)]
         enum K { Bin(&'static str), Cmp(&'static str), Shift(&'static str), Div(bool), Un(&'static str), CharCmp(&'static str), Ord, Chr, TagToEnum }
         let k = match name {
@@ -1161,6 +1165,45 @@ impl Gen {
             SExpr::Case(_, k, alts) if k & RAW != 0 => matches!(&alts[..], [SAlt::Default(b)] if self.returns_raw(b)),
             _ => false,
         }
+    }
+
+    /// `readMutVar#` and `writeMutVar#` on an evaluated `MutVar#` (a REF cell), inline: the read
+    /// answers the state pair `(,) [state, contents]`, the write stores the contents and answers
+    /// `()`. Otherwise (or when a thread switch is due) control goes to `slow`.
+    fn mutvar_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
+        let read = match (name, args.len()) {
+            ("readMutVar#", 2) => true,
+            ("writeMutVar#", 3) => false,
+            _ => return false,
+        };
+        if args.iter().any(is_raw) || matches!(args[0], Atom::Lit(_)) {
+            return false;
+        }
+        self.load(&args[0], p, "%rax");
+        self.emit(&format!("cmpb ${REF}, (%rax)"));
+        self.emit(&format!("jne {slow}"));
+        self.emit("cmpb $0, hsc_preempt(%rip)");
+        self.emit(&format!("jne {slow}"));
+        if read {
+            let pair = self.con_id("Builtin.(,)");
+            self.alloc(3, p);
+            self.emit(&format!("movabsq ${}, %rcx", header(CON, 2, pair as u64)));
+            self.emit("movq %rcx, (%rax)");
+            self.emit("movq $0, 8(%rax)");
+            // The variable is loaded after the allocation, which may have moved it.
+            self.load(&args[0], p, "%rcx");
+            self.emit("movq 8(%rcx), %rcx");
+            self.emit("movq %rcx, 16(%rax)");
+            self.emit("movq %rax, %r14");
+        } else {
+            self.load(&args[1], p, "%rcx");
+            self.emit("movq %rcx, 8(%rax)");
+            let unit = self.con_id("Builtin.()");
+            let cell = self.nullary_con(unit);
+            self.emit(&format!("leaq {cell}(%rip), %r14"));
+        }
+        self.fast_ret(p);
+        true
     }
 
     /// The number an operand of an inline primitive holds: a raw slot's, or a boxed cell's.
