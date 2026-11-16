@@ -262,6 +262,10 @@ a 1.026× geometric-mean speedup, but a second run measures 0.993× and Integer 
 No consistent overall speedup is established; fib improves in both runs. All runtime
 targets remain unmet. [Raw samples, conditions and graphs](bench/results/runtime-direct-calls.md).
 
+Next candidate: classify common binary Int arithmetic and comparisons once at startup,
+avoiding repeated string dispatch. Forcing, scheduling, reservation and result handling
+retain their existing paths. Corpus validation and paired runtime measurements are pending.
+
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
 - Code: known standard numeric literals bypass run-time conversion (done). Next, resolve
