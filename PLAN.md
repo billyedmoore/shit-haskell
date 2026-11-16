@@ -57,10 +57,9 @@ the GitHub issues.
 - Remove old generated corpus executables after preserving reports and raw measurements;
   reuse build directories and retain the compiler baselines needed for current comparisons.
 - This file is kept up to date as work lands.
-- User stop/pause instructions take precedence; work stops after PR #39 until a new instruction.
-- Use goal mode and keep iterating until the roadmap is complete when continuation is authorized. If execution or usage limits interrupt work,
-  checkpoint the current state and resume work when execution becomes available
-  after the reset, without waiting for another instruction to continue.
+- Keep iterating until the roadmap is complete (asked for on 2026-11-16): each merged pull
+  request leads straight into the next item. If execution or usage limits interrupt work,
+  checkpoint the current state and resume after the reset without waiting for an instruction.
 
 ## Roadmap, in order
 
@@ -250,10 +249,6 @@ separation, both return modes and mixed values retained across GC. The table abo
 paired comparison: geometric-mean speedup 1.031×; fib 107.7 → 92.6 ms and sumloop
 8.125 → 7.854 s. Mapops and nqueens measured less than 1% slower.
 [Raw samples, conditions and graphs](bench/results/runtime-nullary-constructors.md).
-
-**Stop after PR #39**, as requested on 2026-11-15. Resume only on a new user instruction;
-do not continue automatically after limits reset. The direct-known-global-call draft
-remains unsubmitted and unmeasured in its worktree.
 
 Direct native calls to known global functions with exact positive arity bypass generic
 dispatch. Argument and tail-frame setup stay unchanged; other calls retain generic dispatch.
