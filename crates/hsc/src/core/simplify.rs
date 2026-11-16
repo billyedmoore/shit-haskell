@@ -693,7 +693,9 @@ fn specialise_let(binds: &mut [(String, Core)], body: &mut Core, globals: &HashS
             constant[i] = g.map(str::to_string);
         }
     }
-    if constant.iter().all(|c| c.is_none()) {
+    // At least one parameter must remain: dropping them all would make `f` a shared thunk
+    // where each call recomputed it (and could keep a large result alive).
+    if constant.iter().all(|c| c.is_none()) || constant.iter().all(|c| c.is_some()) {
         return;
     }
     let f = f.clone();
