@@ -293,9 +293,16 @@ its run-to-run variation. [Raw samples, conditions and graphs](bench/results/run
 
 `Integer` division uses Knuth's algorithm D instead of bit-at-a-time long division (`show` of a
 large Integer divides repeatedly), and the scheduler's maps keyed by thread number or `MVar` key
-use an integer hasher instead of SipHash. Locally integer takes 63.9 → 20.8 ms; mvar's
-instructions fall 328 → 257 M. mvar's remaining cost is mostly OS thread switches (a Haskell
-thread is an OS thread): green threads are the item that closes it.
+use an integer hasher instead of SipHash (PR #45). Hosted, integer takes 81.7 → 31.6 ms; mvar's
+instructions fall 328 → 257 M but its time barely moves (198.6 → 196.5 ms): its cost is OS
+thread switches (a Haskell thread is an OS thread), which green threads would remove.
+[Raw samples, conditions and graphs](bench/results/runtime-bigint-division.md).
+
+A body's frame kept every slot alive until the body returned, so during `case m s of ..` the
+slot holding `m` kept the chain of actions `forM_` builds reachable (ioref held ~19M words). A
+call or evaluation in a scrutinee now clears the slots it mentions that nothing uses after it
+(the alternatives, enclosing continuations and the code of join points they jump to). ioref
+keeps 2,434 live words; locally it takes 682 → 237 ms and strings 998 → 769 ms.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
@@ -308,8 +315,6 @@ The work:
   and applications matched against a pair; a helper answering only `State#` under a default
   alternative is not recognised, so a later demand could be evaluated before its effect. No
   program showing it is known; typed Core would let this test the `State#` type instead.
-- Space: `forM_` over a list keeps its whole chain of IO actions alive (ioref holds ~15M
-  words), also on the version before the simplifier.
 - Runtime: a generational GC, cheaper thunk allocation.
 
 ### 2. Large projects
