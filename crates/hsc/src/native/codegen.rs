@@ -154,8 +154,10 @@ pub struct Gen {
     live: Vec<std::collections::HashSet<u32>>,
     /// The slots each join point's code uses (a jump to it uses them).
     join_uses: HashMap<u32, std::collections::HashSet<u32>>,
-    /// The worker entries (label, raw parameters) in program-global index order.
-    workers: Vec<Option<(String, Vec<bool>)>>,
+    /// The worker entries (label, raw parameters, returns raw) in program-global index order.
+    workers: Vec<Option<(String, Vec<bool>, bool)>>,
+    /// The body being generated returns its result raw (see `stg::raw_returns`).
+    ret_raw: bool,
     /// The raw slot an inline primitive's number goes to (a case binder kept unboxed).
     raw_dest: Option<u32>,
     /// Where an inline primitive's value goes when it is a case scrutinee computed in place.
@@ -220,6 +222,7 @@ impl Gen {
             slow_only: false,
             raw_dest: None,
             workers: Vec::new(),
+            ret_raw: false,
             live: Vec::new(),
             join_uses: HashMap::new(),
         }
@@ -278,7 +281,7 @@ impl Gen {
             let worker = gl.worker.as_ref().map(|(c, raw)| {
                 let wl = g.label("w");
                 g.pending.push((wl.clone(), c.clone(), format!("{}/worker", gl.name)));
-                (wl, raw.clone())
+                (wl, raw.clone(), c.ret_raw)
             });
             g.workers.push(worker);
         }
@@ -392,6 +395,7 @@ impl Gen {
     fn closure_code(&mut self, label: &str, c: &SClosure, name: &str) {
         self.current_name = name.to_string();
         let f = Frame { s: c.nslots + c.nraw, a: c.arity, r: c.nraw };
+        self.ret_raw = c.ret_raw;
         self.put_label(label);
         // R1 is the closure; the arguments are above the new frame (they were pushed by the caller).
         self.emit(&format!("subq ${}, %rbp", 8 * (f.s - f.a) as i64));
@@ -437,6 +441,20 @@ impl Gen {
 
     fn expr(&mut self, e: &SExpr, p: Pos) {
         match e {
+            // A worker returning raw: its result's number goes back in R1.
+            SExpr::Atom(Atom::Slot(k)) if *k & RAW != 0 && p.mode == Mode::Tail && self.ret_raw => {
+                self.emit(&format!("movq {}, %r14", p.slot(*k)));
+                self.ret(p);
+            }
+            SExpr::Atom(Atom::Lit(l @ (SLit::Int(_) | SLit::Char(_)))) if p.mode == Mode::Tail && self.ret_raw => {
+                let v = match l {
+                    SLit::Int(i) => *i as u64,
+                    SLit::Char(c) => crate::syntax::lexer::char_code(*c) as u64,
+                    _ => unreachable!(),
+                };
+                self.emit(&format!("movabsq ${v}, %r14"));
+                self.ret(p);
+            }
             SExpr::Atom(a) if is_raw(a) => {
                 // A raw number as a result: boxed once.
                 let Atom::Slot(k) = a else { unreachable!() };
@@ -456,14 +474,14 @@ impl Gen {
             SExpr::App(func, args) => {
                 // An exact call of a function with a worker passes its raw parameters as numbers.
                 let worker = match func {
-                    Atom::Global(g) => self.workers.get(*g as usize).cloned().flatten().filter(|(_, r)| r.len() == args.len()),
+                    Atom::Global(g) => self.workers.get(*g as usize).cloned().flatten().filter(|(_, r, _)| r.len() == args.len()),
                     _ => None,
                 };
                 let direct = match &worker {
-                    Some((l, _)) => Some(l.clone()),
+                    Some((l, _, _)) => Some(l.clone()),
                     None => self.known_global_entry(func, args.len()).map(str::to_owned),
                 };
-                let raw_pos = worker.map(|(_, r)| r).unwrap_or_default();
+                let raw_pos = worker.map(|(_, r, _)| r).unwrap_or_default();
                 // The function is loaded first (into R1, which nothing below clobbers). The arguments
                 // are then copied one at a time, through a scratch register, into a new argument area
                 // below the frame; a tail call moves that area up over the frame it replaces.
@@ -655,8 +673,13 @@ impl Gen {
                             self.put_label(ready);
                         }
                     }
-                    self.emit("movq 8(%r14), %rcx");
-                    self.emit(&format!("movq %rcx, {}", p.slot(*bslot)));
+                    if self.returns_raw(scrut) {
+                        // A worker returning raw answered the number itself.
+                        self.emit(&format!("movq %r14, {}", p.slot(*bslot)));
+                    } else {
+                        self.emit("movq 8(%r14), %rcx");
+                        self.emit(&format!("movq %rcx, {}", p.slot(*bslot)));
+                    }
                     if stored {
                         if let Some(ready) = ready {
                             self.put_label(&ready);
@@ -1121,6 +1144,20 @@ impl Gen {
         }
         self.fast_ret(p);
         true
+    }
+
+    /// Whether an expression's result is a raw number: an exact call of a worker returning raw,
+    /// under the lets and argument evaluations that lowering wraps it in.
+    fn returns_raw(&self, e: &SExpr) -> bool {
+        match e {
+            SExpr::App(Atom::Global(g), args) => {
+                matches!(self.workers.get(*g as usize), Some(Some((_, r, true))) if r.len() == args.len())
+            }
+            // The thunks of the call's arguments, and the evaluation of its raw arguments.
+            SExpr::Let(_, body) => self.returns_raw(body),
+            SExpr::Case(_, k, alts) if k & RAW != 0 => matches!(&alts[..], [SAlt::Default(b)] if self.returns_raw(b)),
+            _ => false,
+        }
     }
 
     /// The number an operand of an inline primitive holds: a raw slot's, or a boxed cell's.
@@ -1688,8 +1725,8 @@ mod known_global_call_tests {
     #[test]
     fn forward_and_mutual_entries_are_registered_before_body_generation() {
         let globals = vec![
-            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, nraw: 0, raw_args: Vec::new(), body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) }, worker: None },
-            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, nraw: 0, raw_args: Vec::new(), body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) }, worker: None },
+            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, nraw: 0, raw_args: Vec::new(), ret_raw: false, body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) }, worker: None },
+            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, nraw: 0, raw_args: Vec::new(), ret_raw: false, body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) }, worker: None },
         ];
         let index = [("Main.main".to_string(), 0), ("Test.other".to_string(), 1)].into_iter().collect();
         let asm = Gen::program(&SProgram { globals, index });

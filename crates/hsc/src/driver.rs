@@ -1753,7 +1753,7 @@ pub fn numeric_params(values: &crate::tc::env::EnvMap<crate::tc::types::Scheme>)
         },
         _ => 0,
     };
-    let mut out = crate::native::stg::NumericParams::new();
+    let mut out = crate::native::stg::NumericParams::default();
     for (name, scheme) in values {
         let mut params = vec![0u8; scheme.preds.len()];
         let mut t = &scheme.ty;
@@ -1767,8 +1767,11 @@ pub fn numeric_params(values: &crate::tc::env::EnvMap<crate::tc::types::Scheme>)
                 _ => break,
             }
         }
+        if kind(t) != 0 && params.len() > scheme.preds.len() {
+            out.results.insert(name.clone(), (params.len(), kind(t)));
+        }
         if params.iter().any(|k| *k != 0) {
-            out.insert(name.clone(), params);
+            out.params.insert(name.clone(), params);
         }
     }
     out
