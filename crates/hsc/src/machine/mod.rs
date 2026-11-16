@@ -64,7 +64,7 @@ pub struct Machine {
     /// The scheduler of the Haskell threads; the values it holds are roots.
     pub sched: crate::sched::Sched<Word>,
     /// The registers of the threads waiting for their turn (their roots), by thread.
-    pub suspended: std::collections::HashMap<crate::sched::Tid, conc::Ctx>,
+    pub suspended: crate::sched::IntMap<crate::sched::Tid, conc::Ctx>,
     /// The writes of the running transaction: each variable with its contents before.
     pub stm_log: Vec<(Word, Word)>,
     /// The transactions the running thread is in.
@@ -133,7 +133,7 @@ impl Machine {
             stable: vec![0],
             tid: 1,
             sched: crate::sched::Sched::new(conc::SLICE_MS),
-            suspended: std::collections::HashMap::new(),
+            suspended: crate::sched::IntMap::default(),
             stm_log: Vec::new(),
             stm_depth: 0,
             stm_retry: false,

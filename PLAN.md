@@ -285,6 +285,18 @@ fib 91.8 → 17.7 ms, mapops 274 → 112 ms, strings 3.72 → 2.38 s. Both corpo
 remain unmet; sumloop and fib are now within 1.15× of GHC -O0.
 `HSC_TRACE_SIMPLIFY=<global>` prints a binding after each simplifier round.
 
+Inline `Char#`, `Word#` and `tagToEnum#` code, shared static 0/1 and True/False results,
+static small `Integer` literals and Int/Word/Integer conversion folds (PR #44): geometric mean
+1.27×; strings 2.384 → 0.799 s, nqueens 110 → 81 ms, mapops 112 → 89 ms. fib (11.5 ms) and
+sumloop (156 ms) now run faster than GHC -O0 (16.6 / 204 ms). ioref measured 4% slower, within
+its run-to-run variation. [Raw samples, conditions and graphs](bench/results/runtime-char-word-integer.md).
+
+`Integer` division uses Knuth's algorithm D instead of bit-at-a-time long division (`show` of a
+large Integer divides repeatedly), and the scheduler's maps keyed by thread number or `MVar` key
+use an integer hasher instead of SipHash. Locally integer takes 63.9 → 20.8 ms; mvar's
+instructions fall 328 → 257 M. mvar's remaining cost is mostly OS thread switches (a Haskell
+thread is an OS thread): green threads are the item that closes it.
+
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
 - Code: inline `Int#`, `Word#`, `Char#` and `tagToEnum#` operations, static small `Integer`
