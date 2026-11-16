@@ -87,6 +87,7 @@ pub struct Machine {
     pub prim_failed: bool,
     /// Ordinary names indexed by the unchanged program-local primitive IDs.
     pub ordinary_prims: Vec<Option<&'static str>>,
+    pub(super) int_prims: Vec<Option<prims_num::IntOp>>,
 }
 
 /// The tables the generated program provides (see `native::codegen`).
@@ -112,6 +113,7 @@ impl Machine {
         let base = heap.addr(0);
         let limit = base + (words as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
+        let int_prims = prog.prim_names.iter().map(|name| prims_num::IntOp::classify(name)).collect();
         let ordinary_prims = prog.prim_names.iter().map(|name| prims::ordinary_name(name)).collect();
         let mut m = Box::new(Machine {
             hp: base,
@@ -142,6 +144,7 @@ impl Machine {
             saved_args: Vec::new(),
             prim_failed: false,
             ordinary_prims,
+            int_prims,
             bodies: entry::DiagnosticBodies::default(),
         });
         m.stack = stack;

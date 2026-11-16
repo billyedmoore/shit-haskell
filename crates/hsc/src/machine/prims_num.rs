@@ -46,6 +46,38 @@ fn bool_int(m: &mut Machine, b: bool) -> Word {
     int_value(m, b as i64)
 }
 
+/// Common binary Int operations, classified once under program-local primitive IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IntOp { Add, Sub, Mul, Eq, Ne, Lt, Le, Gt, Ge }
+
+impl IntOp {
+    pub(super) fn classify(name: &str) -> Option<Self> {
+        Some(match name {
+            "+#" => Self::Add, "-#" => Self::Sub, "*#" => Self::Mul,
+            "==#" => Self::Eq, "/=#" => Self::Ne, "<#" => Self::Lt,
+            "<=#" => Self::Le, ">#" => Self::Gt, ">=#" => Self::Ge,
+            _ => return None,
+        })
+    }
+
+    fn eval(self, a: i64, b: i64) -> i64 {
+        match self {
+            Self::Add => a.wrapping_add(b), Self::Sub => a.wrapping_sub(b),
+            Self::Mul => a.wrapping_mul(b), Self::Eq => (a == b) as i64,
+            Self::Ne => (a != b) as i64, Self::Lt => (a < b) as i64,
+            Self::Le => (a <= b) as i64, Self::Gt => (a > b) as i64,
+            Self::Ge => (a >= b) as i64,
+        }
+    }
+
+    pub(super) fn run(self, m: &mut Machine) -> Word {
+        m.prim_failed = false;
+        // Preserve the ordinary path's evaluation order, including forcing both arguments.
+        let (Some(a), Some(b)) = (i(m, 0), i(m, 1)) else { return 0 };
+        int_value(m, self.eval(a, b))
+    }
+}
+
 /// Runs a numeric primitive, if `name` is one. The arguments are in the record.
 pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
     let r = match name {
@@ -405,4 +437,22 @@ pub fn con_pair(m: &mut Machine, a: Word, b: Word) -> Word {
 #[allow(dead_code)]
 fn unused_kind() -> u8 {
     kind::INT
+}
+
+#[cfg(test)]
+mod int_op_tests {
+    use super::IntOp;
+    #[test]
+    fn classification_is_exact_and_arithmetic_wraps() {
+        assert_eq!(IntOp::classify("+#"), Some(IntOp::Add));
+        for name in ["plusWord#", "plusInt64#", "ccall +#", "Test.+#", "quotInt#"] {
+            assert_eq!(IntOp::classify(name), None);
+        }
+        assert_eq!(IntOp::Add.eval(i64::MAX, 1), i64::MIN);
+        assert_eq!(IntOp::Sub.eval(i64::MIN, 1), i64::MAX);
+        assert_eq!(IntOp::Mul.eval(i64::MAX, 2), -2);
+        for (name, expected) in [("==#", 0), ("/=#", 1), ("<#", 1), ("<=#", 1), (">#", 0), (">=#", 0)] {
+            assert_eq!(IntOp::classify(name).unwrap().eval(i64::MIN, i64::MAX), expected);
+        }
+    }
 }
