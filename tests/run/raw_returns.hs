@@ -34,8 +34,18 @@ pick b n xs = case b of
   True -> fib n + 1
   False -> head xs
 
+-- A tail-call cycle through a worker and a function without one stays a loop of jumps.
+cycleF :: Int -> Int
+cycleF 0 = 0
+cycleF n = cycleG [n - 1]
+
+cycleG :: [Int] -> Int
+cycleG [m] = cycleF m
+cycleG _ = 0
+
 main :: IO ()
 main = do
+  print (cycleF 300000)
   print (fib 20, [fib k | k <- [0 .. 10]])
   print (map (collatz 0) [1, 7, 27, 97])
   putStrLn (map rot "hello, zebra")
