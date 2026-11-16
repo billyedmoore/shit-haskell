@@ -365,8 +365,9 @@ their instructions are within 1%. [Raw samples, conditions and graphs](bench/res
 `readMutVar#`/`writeMutVar#` on an evaluated `MutVar#` are inline (the write answers the static
 `()`); the runtime's own constructors' ids come from their position instead of hashing their
 names; and each ordinary primitive remembers which runtime module ran it, instead of trying
-the numeric module's string matches first every time. Instructions: ioref 2,874 → 1,135 M,
-mvar 250 → 195 M, integer 180 → 175 M; others flat. Locally ioref takes 207 → 95 ms.
+the numeric module's string matches first every time (PR #53). Hosted: ioref 216 → 108 ms,
+mvar 174 → 157 ms, integer 24.5 → 22.0 ms; fib measured 5.7 → 6.5 ms with its code unchanged
+(a 6 ms run's noise). [Raw samples, conditions and graphs](bench/results/runtime-mutvar-dispatch.md).
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
@@ -374,13 +375,28 @@ The work:
   literals, and folds of Int/Word/Integer conversions (done); next Double, then unboxed values in
   registers (worker/wrapper) and a direct calling convention.
 - Optimiser: inlining, case-of-case, strictness and call by value, specialisation of local
-  functions at constant dictionaries (done, first versions); next specialisation of global
-  functions at known dictionaries, worker/wrapper, rewrite rules (for `-O1`'s list fusion).
+  functions at constant dictionaries, unboxed workers and returns (done, first versions); next
+  `RULES` (below), specialisation of global functions at known dictionaries, rewrite rules (for `-O1`'s list fusion).
 - Strictness: the analysis's effect boundary (GHC's IO hack) recognises effectful primitives
   and applications matched against a pair; a helper answering only `State#` under a default
   alternative is not recognised, so a later demand could be evaluated before its effect. No
   program showing it is known; typed Core would let this test the `State#` type instead.
-- Runtime: a generational GC, cheaper thunk allocation.
+- Runtime: a generational GC, cheaper thunk allocation; green threads (mvar's cost is OS
+  thread switches: each Haskell thread is an OS thread).
+- `RULES` (next): the lexer drops `{-# RULES #-}`, so base's `foldr`/`build` fusion never
+  happens, and lazy intermediate lists dominate nqueens, strings and ioref (generic eval/apply
+  is 30-40% of their instructions). Plan, in steps:
+  1. Parse rule pragmas (name, activation `[n]`/`[~n]`, `forall` binders with optional
+     signatures, LHS = RHS) into the module's declarations.
+  2. Type-check each side with the binders in scope (the LHS's type is the RHS's), desugar both
+     to Core; the LHS's dictionary arguments become pattern variables. Rules travel in
+     interfaces and the module cache like the bindings they mention.
+  3. Rewrite in the simplifier: match a LHS (a global applied to argument patterns, binders
+     matching any expression, repeated binders compared) at each call, substitute the RHS
+     (fresh binders), with GHC's phases: run phases 2, 1, 0 in order, a rule active per its
+     annotation, so "map" (`[~1]`) builds and "mapList" (`[1]`) restores unfused leftovers.
+  4. Measure, then add `INLINE [n]` phase control where base relies on it (`build`, `augment`,
+     `mapFB`).
 
 ### 2. Large projects
 
