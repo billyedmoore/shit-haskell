@@ -41,6 +41,32 @@ pub struct Module {
     pub imports: Vec<Import>,
     pub decls: Vec<Decl>,
     pub loc: Loc,
+    /// The module's rewrite rules (`{-# RULES #-}`): optimisations only, never needed for meaning.
+    pub rules: Vec<Rule>,
+}
+
+/// A rewrite rule: `"name" [activation] forall binders . lhs = rhs`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rule {
+    pub name: String,
+    pub activation: Activation,
+    /// The rule's variables, with their signatures when given (`(g :: forall b. ..)`).
+    pub binders: Vec<(String, Option<Type>)>,
+    pub lhs: Expr,
+    pub rhs: Expr,
+    pub loc: Loc,
+}
+
+/// When a rule (or an INLINE pragma) is active, in GHC's simplifier phases (2, then 1, then 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    Always,
+    /// `[n]`: from phase n on.
+    From(u32),
+    /// `[~n]`: before phase n only.
+    Before(u32),
+    /// `[~]`: never (as a rule written only to be disabled).
+    Never,
 }
 
 #[derive(Clone, Debug, PartialEq)]
