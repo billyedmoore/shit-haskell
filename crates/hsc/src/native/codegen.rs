@@ -471,59 +471,13 @@ impl Gen {
                 self.clear_dead(std::slice::from_ref(a), p);
                 self.eval_result(p);
             }
-            SExpr::App(func, args) => {
-                // An exact call of a function with a worker passes its raw parameters as numbers.
-                let worker = match func {
-                    Atom::Global(g) => self.workers.get(*g as usize).cloned().flatten().filter(|(_, r, _)| r.len() == args.len()),
-                    _ => None,
-                };
-                let direct = match &worker {
-                    Some((l, _, _)) => Some(l.clone()),
-                    None => self.known_global_entry(func, args.len()).map(str::to_owned),
-                };
-                let raw_pos = worker.map(|(_, r, _)| r).unwrap_or_default();
-                // The function is loaded first (into R1, which nothing below clobbers). The arguments
-                // are then copied one at a time, through a scratch register, into a new argument area
-                // below the frame; a tail call moves that area up over the frame it replaces.
-                let n = args.len() as i64;
-                self.load(func, p, "%r14");
-                self.emit(&format!("subq ${}, %rbp", 8 * n));
-                let inner = Pos { pushed: p.pushed + n, ..p };
-                for (i, a) in args.iter().enumerate() {
-                    if raw_pos.get(i).copied().unwrap_or(false) {
-                        match a {
-                            Atom::Slot(k) if k & RAW != 0 => self.emit(&format!("movq {}, %rcx", inner.slot(*k))),
-                            Atom::Lit(SLit::Int(v)) => self.emit(&format!("movabsq ${v}, %rcx")),
-                            Atom::Lit(SLit::Char(c)) => {
-                                self.emit(&format!("movq ${}, %rcx", crate::syntax::lexer::char_code(*c)))
-                            }
-                            other => panic!("internal: worker argument {other:?} is not raw"),
-                        }
-                    } else {
-                        self.load(a, inner, "%rcx");
-                    }
-                    self.emit(&format!("movq %rcx, {}(%rbp)", 8 * i as i64));
-                }
-                if p.mode == Mode::Tail {
-                    let s = p.f.s as i64;
-                    // Highest first: the destination of an argument may be the source of a later one.
-                    for i in (0..n).rev() {
-                        self.emit(&format!("movq {}(%rbp), %rcx", 8 * i));
-                        self.emit(&format!("movq %rcx, {}(%rbp)", 8 * (i + s)));
-                    }
-                    self.emit(&format!("addq ${}, %rbp", 8 * s));
-                } else {
-                    let mut used = vec![func.clone()];
-                    used.extend(args.iter().cloned());
-                    self.clear_dead(&used, inner);
-                }
-                self.emit(&format!("movl ${}, %ecx", n));
-                if let Some(entry) = direct {
-                    self.emit(&format!("jmp {entry}"));
-                } else {
-                    self.emit("jmp hsc_apply");
-                }
+            SExpr::CallWorker(g, args) => {
+                let func = Atom::Global(*g);
+                let worker = self.workers.get(*g as usize).cloned().flatten();
+                assert!(worker.as_ref().is_some_and(|(_, r, _)| r.len() == args.len()), "internal: no worker for call");
+                self.call(&func, args, worker, p);
             }
+            SExpr::App(func, args) => self.call(func, args, None, p),
             SExpr::Con(name, args) => {
                 let id = self.con_id(name);
                 if args.is_empty() {
@@ -1146,13 +1100,62 @@ impl Gen {
         true
     }
 
+    /// A call: the ordinary entry of `func`, or (an exact call) a global's worker, which takes its
+    /// raw parameters as numbers.
+    fn call(&mut self, func: &Atom, args: &[Atom], worker: Option<(String, Vec<bool>, bool)>, p: Pos) {
+        let direct = match &worker {
+            Some((l, _, _)) => Some(l.clone()),
+            None => self.known_global_entry(func, args.len()).map(str::to_owned),
+        };
+        let raw_pos = worker.map(|(_, r, _)| r).unwrap_or_default();
+        // The function is loaded first (into R1, which nothing below clobbers). The arguments
+        // are then copied one at a time, through a scratch register, into a new argument area
+        // below the frame; a tail call moves that area up over the frame it replaces.
+        let n = args.len() as i64;
+        self.load(func, p, "%r14");
+        self.emit(&format!("subq ${}, %rbp", 8 * n));
+        let inner = Pos { pushed: p.pushed + n, ..p };
+        for (i, a) in args.iter().enumerate() {
+            if raw_pos.get(i).copied().unwrap_or(false) {
+                match a {
+                    Atom::Slot(k) if k & RAW != 0 => self.emit(&format!("movq {}, %rcx", inner.slot(*k))),
+                    Atom::Lit(SLit::Int(v)) => self.emit(&format!("movabsq ${v}, %rcx")),
+                    Atom::Lit(SLit::Char(c)) => {
+                        self.emit(&format!("movq ${}, %rcx", crate::syntax::lexer::char_code(*c)))
+                    }
+                    other => panic!("internal: worker argument {other:?} is not raw"),
+                }
+            } else {
+                self.load(a, inner, "%rcx");
+            }
+            self.emit(&format!("movq %rcx, {}(%rbp)", 8 * i as i64));
+        }
+        if p.mode == Mode::Tail {
+            let s = p.f.s as i64;
+            // Highest first: the destination of an argument may be the source of a later one.
+            for i in (0..n).rev() {
+                self.emit(&format!("movq {}(%rbp), %rcx", 8 * i));
+                self.emit(&format!("movq %rcx, {}(%rbp)", 8 * (i + s)));
+            }
+            self.emit(&format!("addq ${}, %rbp", 8 * s));
+        } else {
+            let mut used = vec![func.clone()];
+            used.extend(args.iter().cloned());
+            self.clear_dead(&used, inner);
+        }
+        self.emit(&format!("movl ${}, %ecx", n));
+        if let Some(entry) = direct {
+            self.emit(&format!("jmp {entry}"));
+        } else {
+            self.emit("jmp hsc_apply");
+        }
+    }
+
     /// Whether an expression's result is a raw number: an exact call of a worker returning raw,
     /// under the lets and argument evaluations that lowering wraps it in.
     fn returns_raw(&self, e: &SExpr) -> bool {
         match e {
-            SExpr::App(Atom::Global(g), args) => {
-                matches!(self.workers.get(*g as usize), Some(Some((_, r, true))) if r.len() == args.len())
-            }
+            SExpr::CallWorker(g, _) => matches!(self.workers.get(*g as usize), Some(Some((_, _, true)))),
             // The thunks of the call's arguments, and the evaluation of its raw arguments.
             SExpr::Let(_, body) => self.returns_raw(body),
             SExpr::Case(_, k, alts) if k & RAW != 0 => matches!(&alts[..], [SAlt::Default(b)] if self.returns_raw(b)),
@@ -1253,6 +1256,7 @@ impl Gen {
                 atom(f, out);
                 args.iter().for_each(|a| atom(a, out));
             }
+            SExpr::CallWorker(_, args) => args.iter().for_each(|a| atom(a, out)),
             SExpr::Con(_, args) | SExpr::Prim(_, args) => args.iter().for_each(|a| atom(a, out)),
             SExpr::Let(binds, body) => {
                 for (_, c) in binds {

@@ -36,8 +36,11 @@ pub enum SLit {
 pub enum SExpr {
     /// Evaluate an atom to weak head normal form and return it.
     Atom(Atom),
-    /// Apply a function to atoms (evaluated when the function is).
+    /// Apply a function to atoms (evaluated when the function is), at its ordinary entry.
     App(Atom, Vec<Atom>),
+    /// An exact call of a global's worker (see `workers`): its raw parameters' atoms are raw slots
+    /// or number literals.
+    CallWorker(u32, Vec<Atom>),
     /// Allocate a constructor and return it.
     Con(String, Vec<Atom>),
     /// A primitive operation on (lazy) atoms.
@@ -206,34 +209,55 @@ fn numeric_use(e: &Core, x: &str) -> bool {
 /// is a number, the body has exactly that many parameters, and no result is a constructor or a
 /// function (each result is then a number to pass back as it is).
 fn raw_returns(binds: &[TopBind], w: &Workers, numeric: &NumericParams) -> HashMap<String, u8> {
-    fn numeric_results(e: &Core) -> bool {
+    // A result that is a call must be an exact call of another worker returning raw (so that a
+    // tail call stays a jump: a call answering a boxed result would have to return here first).
+    fn numeric_results(e: &Core, out: &HashMap<String, u8>, w: &Workers) -> bool {
         match e {
             Core::Con(..) | Core::Lam(..) => false,
             Core::Lit(l) => matches!(l, Lit::Int(_) | Lit::Char(_)),
-            Core::Var(_) | Core::App(..) | Core::Fail(_) => true,
-            Core::Prim(p, args) if p == "seq" && args.len() == 2 => numeric_results(&args[1]),
-            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => numeric_results(&args[0]),
+            Core::Var(_) | Core::Fail(_) => true,
+            Core::App(..) => {
+                let (f, args) = spine(e);
+                matches!(f, Core::Var(g) if out.contains_key(g.as_str()) && w.get(g.as_str()).is_some_and(|r| r.len() == args.len()))
+            }
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => numeric_results(&args[1], out, w),
+            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => numeric_results(&args[0], out, w),
             Core::Prim(..) => true,
             Core::Let(binds, body) => {
-                (!is_join(binds, body) || numeric_results(lambdas(&binds[0].1).1)) && numeric_results(body)
+                (!is_join(binds, body) || numeric_results(lambdas(&binds[0].1).1, out, w)) && numeric_results(body, out, w)
             }
             Core::Case(_, _, alts) => alts.iter().all(|a| match a {
-                Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => numeric_results(b),
+                Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => numeric_results(b, out, w),
             }),
         }
     }
     let mut out = HashMap::new();
+    let mut bodies = Vec::new();
     for b in binds {
         if !w.contains_key(&b.name) {
             continue;
         }
         let Some((n, kind)) = numeric.results.get(&b.name) else { continue };
         let (arity, inner) = lambdas(&b.body);
-        if arity == *n && numeric_results(inner) {
+        if arity == *n {
             out.insert(b.name.clone(), *kind);
+            bodies.push((b.name.as_str(), inner));
         }
     }
-    out
+    // From every candidate, weakened until each claim holds.
+    loop {
+        let failing: Vec<&str> = bodies
+            .iter()
+            .filter(|(name, inner)| out.contains_key(*name) && !numeric_results(inner, &out, w))
+            .map(|(name, _)| *name)
+            .collect();
+        if failing.is_empty() {
+            return out;
+        }
+        for name in failing {
+            out.remove(name);
+        }
+    }
 }
 
 /// The global functions given workers: a parameter is passed raw when the body certainly
@@ -558,7 +582,9 @@ impl Lowering {
                 match (callee_raw, self.raw_result()) {
                     // A raw result where a raw one is taken: passed on as it is.
                     (Some(_), _) if raw_here => call,
-                    // A raw result where a boxed one is expected: boxed after the return.
+                    // A raw result where a boxed one is expected: boxed after the return. (No tail
+                    // cycle passes through here: a worker returning raw tail-calls only others that
+                    // do, see `raw_returns`.)
                     (Some(kind), _) => self.through_raw(call, kind),
                     // A boxed result returned raw: unboxed after the return.
                     (None, Some(kind)) => self.through_raw(call, kind),
@@ -703,9 +729,9 @@ impl Lowering {
             }
         }
         let mark = self.pending.len();
-        let fa = self.atom(f);
+        let Atom::Global(gi) = self.atom(f) else { return None };
         let aa: Vec<Atom> = args.iter().zip(atoms).map(|(a, at)| at.unwrap_or_else(|| self.atom(a))).collect();
-        let mut e = self.allocating(mark, SExpr::App(fa, aa));
+        let mut e = self.allocating(mark, SExpr::CallWorker(gi, aa));
         for (slot, scrut) in evals.into_iter().rev() {
             e = SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(e)]);
         }
