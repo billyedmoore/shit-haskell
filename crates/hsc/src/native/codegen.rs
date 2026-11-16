@@ -229,9 +229,22 @@ impl Gen {
         }
         g.out.push_str("    .text\n");
         g.out.push_str(RUNTIME_ASM);
+        // HSC_DEBUG: every body also gets a symbol named after its binding, for profilers.
+        let symbols = std::env::var_os("HSC_DEBUG").is_some();
+        let mut n = 0usize;
         while let Some((label, c, name)) = g.pending.pop() {
+            let symbol = symbols.then(|| {
+                n += 1;
+                let clean: String = name.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }).collect();
+                let sym = format!("hs_{clean}_{n}");
+                let _ = writeln!(g.out, "    .type {sym}, @function\n{sym}:");
+                sym
+            });
             g.body_names.push((label.clone(), name.clone()));
             g.closure_code(&label, &c, &name);
+            if let Some(sym) = symbol {
+                let _ = writeln!(g.out, "    .size {sym}, .-{sym}");
+            }
         }
         g.out.push_str("    .data\n    .p2align 3\n");
         g.out.push_str("hsc_globals:\n");

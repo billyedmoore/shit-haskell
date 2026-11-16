@@ -98,6 +98,7 @@ fn pass(binds: &mut [TopBind]) {
             }
         }
         // HSC_TRACE_SIMPLIFY=<global>: that binding before simplification and after each round.
+        constant_args(&mut bind.body, &globals);
         let trace = std::env::var("HSC_TRACE_SIMPLIFY").ok().filter(|t| *t == bind.name);
         if trace.is_some() {
             eprintln!("== start\n{}", super::pretty::show(&bind.body));
@@ -616,6 +617,204 @@ fn bang_lets(c: &mut Core) -> bool {
     }
     *c = e;
     true
+}
+
+/// Specialises local functions on arguments that are the same global at every call (the
+/// dictionaries of a local polymorphic function used at one type): `let f = \d x -> e in .. f
+/// D a ..` becomes `let f = \x -> e[d := D] in .. f a ..`. Recursive calls may pass the
+/// parameter itself. Every use of `f` must be a call with the parameter's argument.
+fn constant_args(c: &mut Core, globals: &HashSet<String>) {
+    match c {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            constant_args(f, globals);
+            constant_args(a, globals);
+        }
+        Core::Lam(_, b) => constant_args(b, globals),
+        Core::Let(binds, body) => {
+            for (_, r) in binds.iter_mut() {
+                constant_args(r, globals);
+            }
+            constant_args(body, globals);
+            if binds.len() == 1 {
+                specialise_let(binds, body, globals);
+            }
+        }
+        Core::Case(s, _, alts) => {
+            constant_args(s, globals);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => constant_args(b, globals),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| constant_args(a, globals)),
+    }
+}
+
+fn specialise_let(binds: &mut [(String, Core)], body: &mut Core, globals: &HashSet<String>) {
+    let (f, rhs) = &binds[0];
+    let params: Vec<String> = {
+        let mut ps = Vec::new();
+        let mut cur = rhs;
+        while let Core::Lam(x, b) = cur {
+            ps.push(x.clone());
+            cur = b;
+        }
+        ps
+    };
+    if params.is_empty() {
+        return;
+    }
+    // Every use: the variable names of its arguments (None for a non-variable), or None when
+    // the use is not the head of a call.
+    let mut calls: Vec<Option<Vec<Option<String>>>> = Vec::new();
+    calls_of(rhs, f, &mut calls);
+    calls_of(body, f, &mut calls);
+    if calls.is_empty() || calls.iter().any(|c| c.is_none()) {
+        return;
+    }
+    let calls: Vec<Vec<Option<String>>> = calls.into_iter().flatten().collect();
+    let mut constant: Vec<Option<String>> = vec![None; params.len()];
+    for (i, p) in params.iter().enumerate() {
+        let mut g: Option<&str> = None;
+        let mut ok = true;
+        for call in &calls {
+            match call.get(i) {
+                Some(Some(v)) if v == p => {}
+                Some(Some(v)) if globals.contains(v) && g.is_none_or(|g| g == v) => g = Some(v),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            constant[i] = g.map(str::to_string);
+        }
+    }
+    if constant.iter().all(|c| c.is_none()) {
+        return;
+    }
+    let f = f.clone();
+    // The function without those parameters, the global in their place.
+    let rhs = &mut binds[0].1;
+    let mut lams = Vec::new();
+    let mut cur = take(rhs);
+    while let Core::Lam(x, b) = cur {
+        lams.push(x);
+        cur = *b;
+    }
+    let mut inner = cur;
+    for (x, k) in lams.iter().zip(&constant) {
+        if let Some(g) = k {
+            subst(&mut inner, x, &Core::Var(g.clone()));
+        }
+    }
+    for (x, k) in lams.into_iter().zip(&constant).rev() {
+        if k.is_none() {
+            inner = Core::Lam(x, Box::new(inner));
+        }
+    }
+    *rhs = inner;
+    drop_args(rhs, &f, &constant);
+    drop_args(body, &f, &constant);
+}
+
+/// The uses of `f` in `e` (see `specialise_let`).
+fn calls_of(e: &Core, f: &str, out: &mut Vec<Option<Vec<Option<String>>>>) {
+    match e {
+        Core::Var(v) => {
+            if v == f {
+                out.push(None);
+            }
+        }
+        Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(..) => {
+            let mut args = Vec::new();
+            let mut head = e;
+            while let Core::App(g, a) = head {
+                args.push(&**a);
+                head = g;
+            }
+            args.reverse();
+            match head {
+                Core::Var(v) if v == f => {
+                    out.push(Some(args.iter().map(|a| match a { Core::Var(x) => Some(x.clone()), _ => None }).collect()));
+                }
+                other => calls_of(other, f, out),
+            }
+            for a in args {
+                calls_of(a, f, out);
+            }
+        }
+        Core::Lam(_, b) => calls_of(b, f, out),
+        Core::Let(binds, body) => {
+            binds.iter().for_each(|(_, r)| calls_of(r, f, out));
+            calls_of(body, f, out);
+        }
+        Core::Case(s, _, alts) => {
+            calls_of(s, f, out);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => calls_of(b, f, out),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| calls_of(a, f, out)),
+    }
+}
+
+/// Removes, from every call of `f`, the arguments at the positions `constant` marks. A spine
+/// whose head is `f` is one call: only its arguments are walked, not its partial applications.
+fn drop_args(c: &mut Core, f: &str, constant: &[Option<String>]) {
+    let is_call = {
+        let mut head = &*c;
+        while let Core::App(g, _) = head {
+            head = g;
+        }
+        matches!(c, Core::App(..)) && matches!(head, Core::Var(v) if v == f)
+    };
+    if is_call {
+        let mut args = Vec::new();
+        let mut cur = take(c);
+        while let Core::App(g, a) = cur {
+            args.push(*a);
+            cur = *g;
+        }
+        args.reverse();
+        let mut e = cur;
+        for (i, mut a) in args.into_iter().enumerate() {
+            if constant.get(i).is_some_and(|k| k.is_some()) {
+                continue;
+            }
+            drop_args(&mut a, f, constant);
+            e = Core::App(Box::new(e), Box::new(a));
+        }
+        *c = e;
+        return;
+    }
+    match c {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(g, a) => {
+            drop_args(g, f, constant);
+            drop_args(a, f, constant);
+        }
+        Core::Lam(_, b) => drop_args(b, f, constant),
+        Core::Let(binds, body) => {
+            binds.iter_mut().for_each(|(_, r)| drop_args(r, f, constant));
+            drop_args(body, f, constant);
+        }
+        Core::Case(s, _, alts) => {
+            drop_args(s, f, constant);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => drop_args(b, f, constant),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| drop_args(a, f, constant)),
+    }
 }
 
 /// The value of an `Int#` primitive applied to literals (as the runtime computes it).
