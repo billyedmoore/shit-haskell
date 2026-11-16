@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 241 differential tests for both back ends, compared with GHC.
+- **Corpus:** 242 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -356,8 +356,17 @@ Workers whose type gives a numeric result for a full application, with exactly t
 parameters and no constructor or function among their results, return the number raw in R1.
 A raw result is taken as it is only by a raw case binder whose scrutinee is the call itself,
 or by another such worker's tail call; elsewhere it is boxed after the return, and inside such
-a worker every other result is evaluated and unboxed. Instructions: fib 39.7 → 30.8 M,
-sumloop 1,023 → 962 M, others within 1%.
+a worker every other result is evaluated and unboxed; a result that is a call must be another
+raw-returning worker's exact call, so tail calls stay jumps. Hosted (PR #52): fib 16.5 → 8.9 ms,
+sumloop 113.7 → 79.0 ms, nqueens 82.8 → 71.9 ms; ioref, mvar and strings measured 3-12% slower
+on that run (its baselines were well above the previous run's: ioref 243 vs 155 ms), while
+their instructions are within 1%. [Raw samples, conditions and graphs](bench/results/runtime-raw-returns.md).
+
+`readMutVar#`/`writeMutVar#` on an evaluated `MutVar#` are inline (the write answers the static
+`()`); the runtime's own constructors' ids come from their position instead of hashing their
+names; and each ordinary primitive remembers which runtime module ran it, instead of trying
+the numeric module's string matches first every time. Instructions: ioref 2,874 → 1,135 M,
+mvar 250 → 195 M, integer 180 → 175 M; others flat. Locally ioref takes 207 → 95 ms.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.

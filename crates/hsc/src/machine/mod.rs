@@ -87,6 +87,8 @@ pub struct Machine {
     pub prim_failed: bool,
     /// Ordinary names indexed by the unchanged program-local primitive IDs.
     pub ordinary_prims: Vec<Option<&'static str>>,
+    /// The module that ran each ordinary primitive (0 not yet; see `prims::run_ordinary`).
+    pub ordinary_module: Vec<u8>,
     pub(super) int_prims: Vec<Option<prims_num::IntOp>>,
 }
 
@@ -114,7 +116,8 @@ impl Machine {
         let limit = base + (words as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
         let int_prims = prog.prim_names.iter().map(|name| prims_num::IntOp::classify(name)).collect();
-        let ordinary_prims = prog.prim_names.iter().map(|name| prims::ordinary_name(name)).collect();
+        let ordinary_prims: Vec<Option<&'static str>> = prog.prim_names.iter().map(|name| prims::ordinary_name(name)).collect();
+        let ordinary_count = ordinary_prims.len();
         let mut m = Box::new(Machine {
             hp: base,
             hplim: limit,
@@ -143,6 +146,7 @@ impl Machine {
             prog_name: std::env::args().next().and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "main".into()),
             saved_args: Vec::new(),
             prim_failed: false,
+            ordinary_module: vec![0; ordinary_count],
             ordinary_prims,
             int_prims,
             bodies: entry::DiagnosticBodies::default(),
@@ -151,6 +155,10 @@ impl Machine {
         m.sp = m.stack.as_mut_ptr() as Word + (STACK_WORDS as Word) * 8;
         for (i, n) in m.prog.con_names.iter().enumerate() {
             m.con_ids.insert(n.clone(), i as u32);
+        }
+        // `prims::con_value` takes the runtime's constructors' ids from their position.
+        for (i, c) in crate::native::RTS_CONS.iter().enumerate() {
+            assert_eq!(m.con_ids.get(*c), Some(&(i as u32)), "internal: runtime constructor {c} out of place");
         }
         set_current(&mut *m);
         m

@@ -85,12 +85,47 @@ pub(super) fn ordinary_name(name: &str) -> Option<&'static str> {
 
 /// Entry for a name already classified as ordinary. Keep the literal's early return and the
 /// failure flag's lifetime identical to `run`.
-pub(super) fn run_ordinary(m: &mut Machine, name: &'static str, nargs: usize) -> Word {
+pub(super) fn run_ordinary(m: &mut Machine, id: usize, name: &'static str, nargs: usize) -> Word {
     if name == "ratioLit" {
         return force_arg(m, 0).unwrap_or(0);
     }
     m.prim_failed = false;
-    dispatch_ordinary(m, name, nargs)
+    // The module that ran this primitive before runs it again, without the others' name matches.
+    let known = m.ordinary_module.get(id).copied().unwrap_or(0);
+    if known != 0 {
+        if let Some(r) = run_module(m, known, name, nargs) {
+            return r;
+        }
+        if std::mem::take(&mut m.prim_failed) {
+            return 0;
+        }
+    }
+    for module in 1..=MODULES {
+        if let Some(r) = run_module(m, module, name, nargs) {
+            if let Some(slot) = m.ordinary_module.get_mut(id) {
+                *slot = module;
+            }
+            return r;
+        }
+        if m.prim_failed {
+            break;
+        }
+    }
+    finish_ordinary(m, name, nargs)
+}
+
+/// The primitive modules, in the order `dispatch_ordinary` tries them.
+const MODULES: u8 = 6;
+
+fn run_module(m: &mut Machine, module: u8, name: &str, nargs: usize) -> Option<Word> {
+    match module {
+        1 => super::prims_num::run(m, name),
+        2 => super::prims_mem::run(m, name),
+        3 => super::prims_ffi::run(m, name, nargs),
+        4 => super::prims_misc::run(m, name, nargs),
+        5 => super::conc::run(m, name),
+        _ => super::prims_integer::run(m, name),
+    }
 }
 
 /// Runs a primitive operation on the arguments in the record. Answers the result object, or 0 with
@@ -140,8 +175,15 @@ fn dispatch_ordinary(m: &mut Machine, name: &str, nargs: usize) -> Word {
         .or_else(|| super::prims_integer::run(m, name));
     match result {
         Some(r) => r,
-        None if std::mem::take(&mut m.prim_failed) => 0,
-        None => match crate::interp::prims_ghc::sized_alias(name) {
+        None => finish_ordinary(m, name, nargs),
+    }
+}
+
+/// An ordinary primitive no module ran: failed, or a sized alias of a base operation.
+fn finish_ordinary(m: &mut Machine, name: &str, nargs: usize) -> Word {
+    match () {
+        _ if std::mem::take(&mut m.prim_failed) => 0,
+        _ => match crate::interp::prims_ghc::sized_alias(name) {
             // Int64#, Word64# and the sized Int/Word operations: the base operation, narrowed.
             Some((base, narrow)) => {
                 let r = run(m, base, nargs);
@@ -253,12 +295,15 @@ pub fn char_code_value(m: &mut Machine, c: u32) -> Word {
 
 /// A constructor object of the named constructor with the fields given (pointers).
 pub fn con_value(m: &mut Machine, name: &str, arity: usize, fields: &[Word]) -> Word {
-    let id = match m.con_ids.get(name) {
-        Some(&i) => i,
-        None => {
+    // The runtime's own constructors (tuples of IO results, lists, Bool) have the first ids, in
+    // `RTS_CONS` order (codegen registers them first): found without hashing the name.
+    let id = match crate::native::RTS_CONS.iter().position(|c| *c == name) {
+        Some(i) => i as u32,
+        None => match m.con_ids.get(name) {
+            Some(&i) => i,
             // A constructor the program does not mention: it matches no alternative.
-            u32::MAX
-        }
+            None => u32::MAX,
+        },
     };
     let p = m.alloc(1 + arity);
     m.heap_set(p, heap::header(kind::CON, arity as u32, id));
