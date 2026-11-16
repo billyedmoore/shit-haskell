@@ -391,8 +391,11 @@ The work:
      that does not is skipped, since rules never change meaning; `HSC_DEBUG_RULES` reports it;
      the renamer drops them until step 2).
   2. Type-check each side with the binders in scope (the LHS's type is the RHS's), desugar both
-     to Core; the LHS's dictionary arguments become pattern variables. Rules travel in
-     interfaces and the module cache like the bindings they mention.
+     to Core; the LHS's dictionary arguments become pattern variables (done: each rule is a
+     private binding `$rule%<i>%<activation> binders = [lhs, rhs]`, renamed and checked on its
+     own, so it travels with the module's Core through the module cache; 232 of base's rules
+     come through, the rest mention instances of later modules or, as "fold/build" and
+     "foldr/augment", bind a rank-2 variable, which the simplifier will build in).
   3. Rewrite in the simplifier: match a LHS (a global applied to argument patterns, binders
      matching any expression, repeated binders compared) at each call, substitute the RHS
      (fresh binders), with GHC's phases: run phases 2, 1, 0 in order, a rule active per its
