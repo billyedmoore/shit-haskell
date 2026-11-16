@@ -109,7 +109,9 @@ fn raw_uses(e: &Core, x: &str) -> bool {
                 _ => false,
             })
         }
-        Core::App(f, a) => raw_uses(f, x) && raw_uses(a, x),
+        // A call's function and arguments are passed or captured (a non-atomic argument becomes
+        // a thunk), never evaluated in place: they must not mention the raw value.
+        Core::App(..) => !mentions(e, x),
         Core::Lam(_, b) => !mentions(b, x),
         Core::Let(binds, body) => binds.iter().all(|(_, r)| !mentions(r, x)) && raw_uses(body, x),
         Core::Case(s, _, alts) => {
@@ -637,6 +639,8 @@ mod raw_slot_tests {
             Core::App(Box::new(var("Test.f")), Box::new(var("y"))),
             Core::Con("Test.K".into(), vec![var("y")]),
             Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t"))),
+            // An argument expression becomes a thunk capturing the value.
+            Core::App(Box::new(var("Test.f")), Box::new(prim("+#", vec![var("y"), Core::Lit(Lit::Int(1))]))),
             Core::Case(Box::new(var("y")), "z".into(), vec![Alt::Default(var("z"))]),
         ];
         for body in escapes {

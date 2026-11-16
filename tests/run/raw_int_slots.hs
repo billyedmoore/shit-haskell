@@ -31,8 +31,23 @@ shout (C# c) = case ord# c of
   n | isTrue# (n ># 96#) && isTrue# (n <# 123#) -> C# (chr# (n -# 32#))
   _ -> C# c
 
+-- A raw-looking value used inside a call's argument expression (which becomes a thunk).
+applyK :: (Int# -> Int) -> Int# -> Int
+applyK k n = case n *# n of
+  m -> case m ># 100# of
+    1# -> k (m +# 1#)
+    _ -> k (m +# 2#)
+
+-- A local recursive loop: its arguments are thunks capturing the intermediate value.
+sumSquares :: Int# -> Int
+sumSquares n = let go i acc = case i ># n of
+                     1# -> I# acc
+                     _ -> case i *# i of sq -> go (i +# 1#) (acc +# sq)
+               in go 0# 0#
+
 main :: IO ()
 main = do
+  print (applyK (\v -> I# v) 5#, applyK (\v -> I# (v *# 2#)) 20#, sumSquares 1000#)
   print (map poly [-3, 0, 5, 100000])
   print (map classify [0, 5, 10, -3])
   print (lazySum 7 (sum [1 .. 10]))
