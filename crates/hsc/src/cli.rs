@@ -844,7 +844,7 @@ fn build_program(
     // definitions, in every program.
     c_sources.push((driver::default_lib_dir().join("rts").join("hsc-rts-shim.c"), Vec::new()));
     let written = if o.native {
-        driver::write_native_with(&out, &binds, &c_sources)
+        driver::write_native_with(&out, &binds, &c_sources, &driver::numeric_params(&d.checker.env.values))
     } else {
         // The interpreter loads the C sources as a shared library named in the program.
         let mut binds = binds;

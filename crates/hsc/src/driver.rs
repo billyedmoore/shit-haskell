@@ -1023,7 +1023,8 @@ impl Driver {
         // As in every program: the RTS functions C code calls, and base's C helpers.
         let mut c_sources = self.c_sources.clone();
         c_sources.push((default_lib_dir().join("rts").join("hsc-rts-shim.c"), Vec::new()));
-        let result = write_native_with(&exe.display().to_string(), &binds, &c_sources).and_then(|()| {
+        let numeric = numeric_params(&self.checker.env.values);
+        let result = write_native_with(&exe.display().to_string(), &binds, &c_sources, &numeric).and_then(|()| {
             let t_run = std::time::Instant::now();
             let out = std::process::Command::new(&exe).output().map_err(|e| format!("{}: {e}", exe.display()))?;
             if std::env::var_os("HSC_TIME_SPLICES").is_some() {
@@ -1735,11 +1736,46 @@ pub fn load_cbits(binds: &[TopBind]) {
 /// Writes a native executable for a program: its code is generated as assembly, assembled, and
 /// linked with the hsc runtime library next to this binary.
 pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), String> {
-    write_native_with(out, binds, &[])
+    write_native_with(out, binds, &[], &Default::default())
+}
+
+/// The parameters of each global function its type says are numbers (for the native back end's
+/// workers; see `native::stg::NumericParams`): the dictionaries of its predicates come first,
+/// then the arguments of its arrows. A rank-N or otherwise qualified inner type says nothing.
+pub fn numeric_params(values: &crate::tc::env::EnvMap<crate::tc::types::Scheme>) -> crate::native::stg::NumericParams {
+    use crate::native::stg::{NUM_CHAR, NUM_INT};
+    use crate::tc::types::{Ty, ARROW};
+    let kind = |t: &Ty| match t {
+        Ty::Con(c) => match c.as_str() {
+            "GHC.Types.Int" | "GHC.Prim.Int#" | "GHC.Types.Word" | "GHC.Prim.Word#" => NUM_INT,
+            "GHC.Types.Char" | "GHC.Prim.Char#" => NUM_CHAR,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    let mut out = crate::native::stg::NumericParams::new();
+    for (name, scheme) in values {
+        let mut params = vec![0u8; scheme.preds.len()];
+        let mut t = &scheme.ty;
+        loop {
+            let (head, args) = t.split_apps();
+            match (head, &args[..]) {
+                (Ty::Con(c), [a, r]) if c == ARROW => {
+                    params.push(kind(a));
+                    t = r;
+                }
+                _ => break,
+            }
+        }
+        if params.iter().any(|k| *k != 0) {
+            out.insert(name.clone(), params);
+        }
+    }
+    out
 }
 
 /// As `write_native`, with the C sources of the program's packages compiled and linked in.
-pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &[(PathBuf, Vec<String>)]) -> Result<(), String> {
+pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &[(PathBuf, Vec<String>)], numeric: &crate::native::stg::NumericParams) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let runtime = exe.parent().map(|d| d.join("libhsc.a")).unwrap_or_default();
     if !runtime.is_file() {
@@ -1770,7 +1806,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     roots.extend_from_slice(crate::native::RTS_GLOBALS);
     let t = std::time::Instant::now();
     let binds = crate::native::reachable(binds, &roots);
-    let prog = crate::native::stg::Lowering::program(&binds);
+    let prog = crate::native::stg::Lowering::program(&binds, numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
     std::fs::write(&asm, text).map_err(|e| e.to_string())?;

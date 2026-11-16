@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 239 differential tests for both back ends, compared with GHC.
+- **Corpus:** 240 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -341,9 +341,10 @@ runtime's slow path (PR #50). Hosted: sumloop 184 → 122 ms, fib 20.1 → 14.5 
 [Raw samples, conditions and graphs](bench/results/runtime-raw-slots.md). Next: raw values
 across calls (worker/wrapper), so loop arguments are not boxed.
 
-Workers take unboxed arguments: a global function whose parameter is certainly evaluated, used
-as a number in its own body (Core is untyped: an identity such as a newtype's constructor stays
-boxed), and only ever used raw (operand, literal case, a worker's raw argument, or its result,
+Workers take unboxed arguments: a global function whose parameter's type is a monomorphic
+`Int`/`Word`/`Char` (boxed or `#`; from its type scheme, dictionaries first), that is certainly
+evaluated, used as a number in its own body (Core is untyped: neither an identity such as a
+newtype's constructor nor a GADT-refined parameter may go raw), and only ever used raw (operand, literal case, a worker's raw argument, or its result,
 boxed once) gets a second entry taking it raw. Every exact call uses the worker, evaluating a
 raw parameter's argument first; partial applications and the function as a value use the boxed
 entry. The worker's prologue moves raw arguments into raw slots before anything can collect.

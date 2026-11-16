@@ -104,6 +104,13 @@ pub const RAW_CHAR: u32 = 1 << 30;
 /// The functions with a worker taking some parameters raw: by name, which parameters.
 pub type Workers = HashMap<String, Vec<bool>>;
 
+/// What the types say of each global function's parameters (in Core order, dictionaries
+/// first): 0 not known to be a number, `NUM_INT` an `Int`/`Int#`/`Word`/`Word#`, `NUM_CHAR` a
+/// `Char`/`Char#`. Core is untyped, so only these may be passed raw.
+pub type NumericParams = HashMap<String, Vec<u8>>;
+pub const NUM_INT: u8 = 1;
+pub const NUM_CHAR: u8 = 2;
+
 /// Whether every use of `x` in `e` can take it raw: as an operand of an inline primitive, as the
 /// scrutinee of a case on literals whose binder is unused, as a raw argument of a worker call,
 /// or as the body's result (boxed once, when returned).
@@ -118,9 +125,8 @@ fn raw_uses_in(e: &Core, x: &str, w: &Workers, result: bool) -> bool {
     match e {
         Core::Var(v) => v != x || result,
         Core::Lit(_) | Core::Fail(_) => true,
-        Core::Prim(p, args) if raw_operand_prim(p) => {
-            args.iter().all(|a| matches!(a, Core::Var(v) if v == x) || raw_uses_in(a, x, w, false))
-        }
+        // An operand that is not an atom becomes a thunk: it must not mention the raw value.
+        Core::Prim(p, args) if raw_operand_prim(p) => args.iter().all(|a| matches!(a, Core::Var(v) if v == x) || !mentions(a, x)),
         Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
             raw_uses_in(&args[0], x, w, result)
         }
@@ -187,30 +193,10 @@ fn numeric_use(e: &Core, x: &str) -> bool {
     }
 }
 
-/// Whether `x` is an operand of a `Char#` primitive in `e` (its raw slot then holds a `Char#`).
-fn char_operand(e: &Core, x: &str) -> bool {
-    match e {
-        Core::Prim(p, args) if p.ends_with("Char#") || p == "ord#" => {
-            args.iter().any(|a| matches!(a, Core::Var(v) if v == x) || char_operand(a, x))
-        }
-        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => false,
-        Core::App(f, a) => char_operand(f, x) || char_operand(a, x),
-        Core::Lam(_, b) => char_operand(b, x),
-        Core::Let(binds, body) => binds.iter().any(|(_, r)| char_operand(r, x)) || char_operand(body, x),
-        Core::Case(s, _, alts) => {
-            char_operand(s, x)
-                || alts.iter().any(|a| match a {
-                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => char_operand(b, x),
-                })
-        }
-        Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| char_operand(a, x)),
-    }
-}
-
 /// The global functions given workers: a parameter is passed raw when the body certainly
 /// evaluates it and every use takes it raw (with the other workers' raw parameters: a fixpoint
 /// from every candidate, weakened until each claim holds).
-pub fn workers(binds: &[TopBind]) -> Workers {
+pub fn workers(binds: &[TopBind], numeric: &NumericParams) -> Workers {
     let mut w: Workers = HashMap::new();
     let mut bodies: HashMap<&str, (Vec<&str>, &Core)> = HashMap::new();
     for b in binds {
@@ -226,7 +212,16 @@ pub fn workers(binds: &[TopBind]) -> Workers {
         let evaluated = crate::core::simplify::certainly_evaluated(cur);
         // Core is untyped: a parameter is known to be an Int#/Word#/Char# only when the body
         // itself uses it as one (an identity like a newtype's constructor must stay boxed).
-        let raw: Vec<bool> = params.iter().map(|p| evaluated.contains(*p) && numeric_use(cur, p)).collect();
+        // Both the types (a GADT match can refine a parameter's type in one alternative only) and
+        // the body say it is a number.
+        let types = numeric.get(&b.name);
+        let raw: Vec<bool> = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                types.and_then(|t| t.get(i)).is_some_and(|k| *k != 0) && evaluated.contains(*p) && numeric_use(cur, p)
+            })
+            .collect();
         if raw.iter().any(|r| *r) {
             w.insert(b.name.clone(), raw);
             bodies.insert(b.name.as_str(), (params, cur));
@@ -295,6 +290,8 @@ pub struct Lowering {
     next_join: u32,
     /// The functions with workers (see `workers`).
     workers: Workers,
+    /// The parameters the types say are numbers (see `NumericParams`).
+    numeric: NumericParams,
 }
 
 impl Body {
@@ -312,7 +309,7 @@ impl Body {
 
 impl Lowering {
     /// Lowers a whole program. Global names are the top-level bindings.
-    pub fn program(binds: &[TopBind]) -> SProgram {
+    pub fn program(binds: &[TopBind], numeric: &NumericParams) -> SProgram {
         let index: HashMap<String, u32> = binds.iter().enumerate().map(|(i, b)| (b.name.clone(), i as u32)).collect();
         let mut lw = Lowering {
             globals: index.keys().cloned().collect(),
@@ -320,13 +317,17 @@ impl Lowering {
             bodies: Vec::new(),
             pending: Vec::new(),
             next_join: 0,
-            workers: if std::env::var_os("HSC_NO_WORKERS").is_some() { HashMap::new() } else { workers(binds) },
+            workers: if std::env::var_os("HSC_NO_WORKERS").is_some() { HashMap::new() } else { workers(binds, numeric) },
+            numeric: numeric.clone(),
         };
         let globals = binds
             .iter()
             .map(|b| {
                 let closure = lw.closure_of(&b.body);
-                let worker = lw.workers.get(&b.name).cloned().map(|raw| (lw.closure_with(&b.body, Some(&raw)), raw));
+                let worker = lw.workers.get(&b.name).cloned().map(|raw| {
+                    let kinds = lw.numeric.get(&b.name).cloned().unwrap_or_default();
+                    (lw.closure_with(&b.body, Some((&raw, &kinds))), raw)
+                });
                 SGlobal { name: b.name.clone(), closure, worker }
             })
             .collect();
@@ -340,7 +341,7 @@ impl Lowering {
 
     /// `closure_of`, with the parameters `raw` marks bound to raw slots (a worker): each still has
     /// its argument slot, which it arrives in.
-    fn closure_with(&mut self, e: &Core, raw: Option<&[bool]>) -> SClosure {
+    fn closure_with(&mut self, e: &Core, raw: Option<(&[bool], &[u8])>) -> SClosure {
         self.bodies.push(Body::new());
         let mut raw_args = Vec::new();
         let (arity, body_expr) = match e {
@@ -355,8 +356,9 @@ impl Lowering {
                 for (i, p) in params.iter().enumerate() {
                     let s = top.fresh_slot();
                     top.locals.insert(p.clone(), s);
-                    if raw.is_some_and(|r| r[i]) {
-                        let kind = if char_operand(cur, p) { RAW_CHAR } else { 0 };
+                    if let Some((r, kinds)) = raw.filter(|(r, _)| r[i]) {
+                        let _ = r;
+                        let kind = if kinds.get(i) == Some(&NUM_CHAR) { RAW_CHAR } else { 0 };
                         let r = RAW | kind | top.nraw;
                         top.nraw += 1;
                         top.locals.insert(p.clone(), r);
@@ -528,7 +530,8 @@ impl Lowering {
     /// so evaluating it before the call is what the function would do.
     fn worker_call(&mut self, f: &Core, args: &[&Core]) -> Option<SExpr> {
         let Core::Var(g) = f else { return None };
-        if self.bodies.last().is_some_and(|b| b.locals.contains_key(g) || b.capture_index.contains_key(g)) {
+        // A local of that name in any enclosing body shadows the global.
+        if self.bodies.iter().any(|b| b.locals.contains_key(g) || b.capture_index.contains_key(g)) {
             return None;
         }
         let raw = self.workers.get(g.as_str()).filter(|r| r.len() == args.len())?.clone();
@@ -802,6 +805,11 @@ mod raw_slot_tests {
         Core::Prim(p.into(), args)
     }
 
+    /// Every parameter typed as an Int (the types themselves are not under test here).
+    fn numeric_all(binds: &[TopBind]) -> NumericParams {
+        binds.iter().map(|b| (b.name.clone(), vec![NUM_INT; 8])).collect()
+    }
+
     fn case(s: Core, b: &str, body: Core) -> Core {
         Core::Case(Box::new(s), b.into(), vec![Alt::Default(body)])
     }
@@ -812,7 +820,7 @@ mod raw_slot_tests {
             TopBind { name: "Test.f".into(), body: Core::Lam("x".into(), Box::new(body)) },
             TopBind { name: "Test.k".into(), body: Core::Var("Test.k".into()) },
         ];
-        Lowering::program(&binds).globals.remove(0).closure
+        Lowering::program(&binds, &numeric_all(&binds)).globals.remove(0).closure
     }
 
     #[test]
@@ -873,17 +881,36 @@ mod raw_slot_tests {
             ))],
         );
         let binds = vec![TopBind { name: "Test.f".into(), body: Core::Lam("x".into(), Box::new(body)) }];
-        let w = workers(&binds);
+        let w = workers(&binds, &numeric_all(&binds));
         assert_eq!(w.get("Test.f"), Some(&vec![true]));
-        let g = Lowering::program(&binds).globals.remove(0);
+        let g = Lowering::program(&binds, &numeric_all(&binds)).globals.remove(0);
         let (worker, _) = g.worker.expect("a worker");
         assert_eq!(worker.raw_args.len(), 1);
+    }
+
+    #[test]
+    fn a_parameter_the_types_do_not_make_a_number_gets_no_worker() {
+        // A GADT match: `x` is a Char in one alternative only (its type is a variable).
+        let body = Core::Case(
+            Box::new(var("t")),
+            "u".into(),
+            vec![
+                Alt::Con("Test.TChr".into(), vec![], case(prim("eqChar#", vec![var("x"), Core::Lit(Lit::Char('a'))]), "e", var("x"))),
+                Alt::Con("Test.TStr".into(), vec![], var("x")),
+            ],
+        );
+        let binds = vec![TopBind {
+            name: "Test.f".into(),
+            body: Core::Lam("t".into(), Box::new(Core::Lam("x".into(), Box::new(body)))),
+        }];
+        let untyped: NumericParams = [("Test.f".to_string(), vec![0, 0])].into_iter().collect();
+        assert!(workers(&binds, &untyped).is_empty());
     }
 
     #[test]
     fn a_parameter_not_used_as_a_number_gets_no_worker() {
         // A newtype's constructor (\x -> x) returns its evaluated parameter, of any type.
         let binds = vec![TopBind { name: "Test.K1".into(), body: Core::Lam("x".into(), Box::new(var("x"))) }];
-        assert!(workers(&binds).is_empty());
+        assert!(workers(&binds, &numeric_all(&binds)).is_empty());
     }
 }
