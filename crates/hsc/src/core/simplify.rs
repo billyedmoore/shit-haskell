@@ -343,7 +343,7 @@ impl Simp<'_> {
         let direct = matches!(&**body, Core::Case(s, _, _) if matches!(&**s, Core::Var(v) if v == x));
         if !direct {
             // The body certainly evaluates x: x is evaluated first instead of allocated.
-            if !forced(body, &HashMap::new()).contains(x.as_str()) {
+            if !forced_total(body).contains(x.as_str()) {
                 return;
             }
             let Core::Let(mut bs, body) = take(c) else { unreachable!() };
@@ -1163,12 +1163,13 @@ fn occurrences(c: &Core, lam: i32, depth: &mut HashMap<String, (i32, bool)>, occ
     }
 }
 
-/// Strictness of global functions, and calls by value: a parameter is strict when the function's
-/// body evaluates it on every path that returns (failures and calls of failing functions count as
-/// evaluating nothing, so no exception changes). The analysis starts with every parameter
-/// strict and weakens to a fixpoint. A saturated call's non-atomic argument for a strict
-/// parameter is then evaluated before the call (`case a as v of _ -> f .. v ..`) instead of
-/// being allocated as a thunk.
+/// Strictness of global functions, and calls by value: a parameter is strict when every
+/// alternative of the function's body that returns evaluates it. A pattern-match failure is
+/// bottom (it constrains nothing, as GHC takes `patError`), so an argument may be evaluated
+/// before a call that would fail; calls of functions that raise count as evaluating nothing.
+/// The analysis starts with every parameter strict and weakens to a fixpoint. A saturated
+/// call's non-atomic argument for a strict parameter is then evaluated before the call
+/// (`case a as v of _ -> f .. v ..`) instead of being allocated as a thunk.
 fn call_by_value(binds: &mut [TopBind]) {
     let mut strict: HashMap<String, Vec<bool>> = HashMap::new();
     for b in binds.iter() {
@@ -1209,20 +1210,26 @@ fn call_by_value(binds: &mut [TopBind]) {
 
 /// The variables an expression certainly evaluates when its value is demanded.
 fn forced(e: &Core, strict: &HashMap<String, Vec<bool>>) -> HashSet<String> {
-    forced_d(e, strict).0
+    forced_d(e, strict, true).0
+}
+
+/// What `forced` answers when a failing alternative counts as evaluating nothing: used where
+/// an earlier evaluation should not even precede a pattern failure (`strict_let`).
+fn forced_total(e: &Core) -> HashSet<String> {
+    forced_d(e, &HashMap::new(), false).0
 }
 
 /// What `forced` answers, and whether the expression certainly fails (a pattern-match failure
 /// is bottom, as GHC takes it: a failing alternative constrains nothing). Calls of functions that
 /// raise are not counted as failing.
-fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>) -> (HashSet<String>, bool) {
+fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>, bottom: bool) -> (HashSet<String>, bool) {
     let mut out = HashSet::new();
     let mut fails = false;
     match e {
         Core::Var(v) => {
             out.insert(v.clone());
         }
-        Core::Fail(_) => fails = true,
+        Core::Fail(_) => fails = bottom,
         Core::Lit(_) | Core::Lam(..) | Core::Con(..) => {}
         Core::App(..) => {
             let mut args = Vec::new();
@@ -1246,7 +1253,7 @@ fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>) -> (HashSet<String>, 
             }
         }
         Core::Let(binds, body) => {
-            (out, fails) = forced_d(body, strict);
+            (out, fails) = forced_d(body, strict, bottom);
             for (x, _) in binds {
                 out.remove(x);
             }
@@ -1259,7 +1266,7 @@ fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>) -> (HashSet<String>, 
                 || (matches!(&**s, Core::App(..))
                     && alts.iter().any(|a| matches!(a, Alt::Con(k, _, _) if k == "Builtin.(,)"))) =>
         {
-            (out, fails) = forced_d(s, strict);
+            (out, fails) = forced_d(s, strict, bottom);
         }
         Core::Case(s, b, alts) => {
             let mut common: Option<HashSet<String>> = None;
@@ -1268,7 +1275,7 @@ fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>) -> (HashSet<String>, 
                     Alt::Con(_, vars, body) => (vars, body),
                     Alt::Lit(_, body) | Alt::Default(body) => (&[], body),
                 };
-                let (mut f, alt_fails) = forced_d(body, strict);
+                let (mut f, alt_fails) = forced_d(body, strict, bottom);
                 if alt_fails {
                     continue;
                 }
@@ -1284,20 +1291,20 @@ fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>) -> (HashSet<String>, 
             fails = common.is_none() && !alts.is_empty();
             out = common.unwrap_or_default();
             out.remove(b);
-            let (sf, s_fails) = forced_d(s, strict);
+            let (sf, s_fails) = forced_d(s, strict, bottom);
             out.extend(sf);
             fails |= s_fails;
         }
         Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
-            let (a, fa) = forced_d(&args[0], strict);
-            let (b, fb) = forced_d(&args[1], strict);
+            let (a, fa) = forced_d(&args[0], strict, bottom);
+            let (b, fb) = forced_d(&args[1], strict, bottom);
             out = a;
             out.extend(b);
             fails = fa || fb;
         }
         Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
             for a in args {
-                let (f, fa) = forced_d(a, strict);
+                let (f, fa) = forced_d(a, strict, bottom);
                 out.extend(f);
                 fails |= fa;
             }
