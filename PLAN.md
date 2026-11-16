@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 232 differential tests for both back ends, compared with GHC.
+- **Corpus:** 234 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -271,13 +271,25 @@ in the enclosing frame (a jump, no allocation). Both corpora pass 232/232. The p
 comparison: sumloop 10.70 → 3.77 s; the other seven are within 10% (ioref 1.41 → 1.26 s).
 [Raw samples, conditions and graphs](bench/results/runtime-join-points.md).
 
+A Core simplifier (`core/simplify.rs`) runs before code generation. Binders are renamed apart
+first. It inlines small non-recursive global functions; beta-reduces; folds `Int#` constants and
+cases of known constructors, literals and dictionaries; flattens single-alternative
+case-of-case; and turns `case tagToEnum# e` on Bool into a literal case. Banged let groups become
+strict cases in dependency order. A strictness analysis (to a fixpoint, error paths forcing
+nothing) evaluates strict arguments before the call instead of allocating thunks. Code generation
+computes `Int#` arithmetic and comparisons inline on evaluated INT cells, and compares number and
+character literal alternatives inline. Banged `where` bindings are now forced as GHC forces them.
+Locally sumloop takes 3.77 → 0.27 s (GHC -O0 0.20 s); hosted measurements are in the PR.
+`HSC_TRACE_SIMPLIFY=<global>` prints a binding after each simplifier round.
+
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
-- Code: known standard numeric literals bypass run-time conversion (done). Next, resolve
-  program-local primitive IDs without repeated name cloning/foreign parsing (common operations done), then unboxed
-  Int and Double paths and a direct calling convention.
-- Optimiser: inlining, specialisation at known dictionaries, case-of-case, strictness analysis
-  with worker/wrapper, rewrite rules (for `-O1`'s list fusion).
+- Code: inline `Int#` operations (done); next Double and Char, then unboxed values in
+  registers (worker/wrapper) and a direct calling convention.
+- Optimiser: inlining, case-of-case, strictness and call by value (done, first versions); next
+  specialisation at known dictionaries, worker/wrapper, rewrite rules (for `-O1`'s list fusion).
+- Space: `forM_` over a list keeps its whole chain of IO actions alive (ioref holds ~15M
+  words), also on the version before the simplifier.
 - Runtime: a generational GC, cheaper thunk allocation.
 
 ### 2. Large projects

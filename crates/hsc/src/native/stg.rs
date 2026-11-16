@@ -382,7 +382,17 @@ fn redirect(e: &Core, j: &str) -> Core {
                 .collect(),
         ),
         Core::Fail(_) => e.clone(),
-        other => Core::App(Box::new(Core::Var(j.to_string())), Box::new(other.clone())),
+        // The join point evaluates its argument at once, so a value that is not an atom is
+        // evaluated here rather than passed as a thunk.
+        other @ (Core::Var(_) | Core::Lit(_)) => Core::App(Box::new(Core::Var(j.to_string())), Box::new(other.clone())),
+        other => {
+            let x = format!("{j}%v");
+            Core::Case(
+                Box::new(other.clone()),
+                x.clone(),
+                vec![Alt::Default(Core::App(Box::new(Core::Var(j.to_string())), Box::new(Core::Var(x))))],
+            )
+        }
     }
 }
 

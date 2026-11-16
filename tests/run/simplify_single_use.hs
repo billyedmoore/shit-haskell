@@ -6,7 +6,7 @@ import Debug.Trace (trace)
 
 loop :: Int -> Int -> Int
 loop !acc i
-  | i > 3000000 = acc
+  | i > 300000 = acc
   | even i, i `mod` 3 == 0 = loop (acc + 2) (i + 1)
   | otherwise = loop (acc + i `mod` 7) (i + 1)
 

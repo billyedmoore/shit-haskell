@@ -45,7 +45,8 @@ pub fn fd_ready(fd: i32, write: bool) -> bool {
 pub type Tid = u64;
 
 /// Set at the end of every time slice once a second thread exists: the running thread gives way
-/// at its next safe point.
+/// at its next safe point. Generated code reads it (as `hsc_preempt`) on its inline fast paths.
+#[export_name = "hsc_preempt"]
 pub static PREEMPT: AtomicBool = AtomicBool::new(false);
 
 static TICKER: Once = Once::new();

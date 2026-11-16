@@ -460,6 +460,22 @@ impl Gen {
                     self.emit(&format!("cmpq ${id}, %rcx"));
                     self.emit(&format!("je {l}"));
                 }
+                SAlt::Lit(lit @ (Lit::Int(_) | Lit::Char(_) | Lit::Double(_)), _) => {
+                    // A number or character: its kind and payload are compared inline.
+                    let next = self.label("lit");
+                    let (kind, payload, cmp) = match lit {
+                        Lit::Int(i) => (INT, *i as u64, "cmpq %rcx, 8(%r14)"),
+                        Lit::Char(c) => (CHAR, crate::syntax::lexer::char_code(*c) as u64, "cmpl %ecx, 8(%r14)"),
+                        Lit::Double(d) => (DOUBLE, d.to_bits(), "cmpq %rcx, 8(%r14)"),
+                        _ => unreachable!(),
+                    };
+                    self.emit(&format!("cmpb ${kind}, (%r14)"));
+                    self.emit(&format!("jne {next}"));
+                    self.emit(&format!("movabsq ${payload}, %rcx"));
+                    self.emit(cmp);
+                    self.emit(&format!("je {l}"));
+                    self.put_label(&next);
+                }
                 SAlt::Lit(lit, _) => {
                     // The runtime compares the scrutinee with the literal's text (no allocation).
                     let (kind, text) = lit_text(lit);
@@ -666,6 +682,11 @@ impl Gen {
             self.catch(args, p);
             return;
         }
+        let slow = self.label("slow");
+        let fast = self.int_fast_path(name, args, p, &slow);
+        if fast {
+            self.put_label(&slow);
+        }
         let id = self.prim_id(name);
         for (i, a) in args.iter().enumerate() {
             self.load(a, p, "%rdx");
@@ -678,6 +699,79 @@ impl Gen {
         self.emit("jz hsc_raise_pending");
         self.emit("movq %rax, %r14");
         self.ret(p);
+    }
+
+    /// An `Int#` operation on arguments that are already INT cells, computed inline; otherwise (or
+    /// when a thread switch is due, or a division could fault) control goes to `slow`, the
+    /// runtime's primitive. Answers whether the fast path was emitted.
+    fn int_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
+        #[derive(PartialEq)]
+        enum K { Bin(&'static str), Cmp(&'static str), Shift(&'static str), Div(bool), Un(&'static str) }
+        let k = match name {
+            "+#" => K::Bin("addq"), "-#" => K::Bin("subq"), "*#" => K::Bin("imulq"),
+            "andI#" => K::Bin("andq"), "orI#" => K::Bin("orq"), "xorI#" => K::Bin("xorq"),
+            "==#" => K::Cmp("sete"), "/=#" => K::Cmp("setne"), "<#" => K::Cmp("setl"),
+            "<=#" => K::Cmp("setle"), ">#" => K::Cmp("setg"), ">=#" => K::Cmp("setge"),
+            "uncheckedIShiftL#" => K::Shift("shlq"), "uncheckedIShiftRA#" => K::Shift("sarq"),
+            "uncheckedIShiftRL#" => K::Shift("shrq"),
+            "quotInt#" => K::Div(true), "remInt#" => K::Div(false),
+            "negateInt#" => K::Un("negq"), "notI#" => K::Un("notq"),
+            _ => return false,
+        };
+        let arity = if matches!(k, K::Un(_)) { 1 } else { 2 };
+        if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !matches!(l, SLit::Int(_)))) {
+            return false;
+        }
+        for a in args {
+            self.load(a, p, "%rax");
+            self.emit(&format!("cmpb ${INT}, (%rax)"));
+            self.emit(&format!("jne {slow}"));
+        }
+        self.emit("cmpb $0, hsc_preempt(%rip)");
+        self.emit(&format!("jne {slow}"));
+        if matches!(k, K::Div(_)) {
+            // A divisor of 0 or -1 takes the runtime's path (x86 faults on minBound / -1).
+            self.emit("movq 8(%rax), %rax");
+            self.emit("leaq 1(%rax), %rcx");
+            self.emit("cmpq $1, %rcx");
+            self.emit(&format!("jbe {slow}"));
+        }
+        // The cell is allocated first: a collection moves the arguments, so they are loaded after.
+        self.alloc(2, p);
+        self.load(&args[0], p, "%rcx");
+        self.emit("movq 8(%rcx), %rcx");
+        if arity == 2 {
+            self.load(&args[1], p, "%rdx");
+            self.emit("movq 8(%rdx), %rdx");
+        }
+        match k {
+            K::Bin(op) => self.emit(&format!("{op} %rdx, %rcx")),
+            K::Cmp(set) => {
+                self.emit("cmpq %rdx, %rcx");
+                self.emit(&format!("{set} %cl"));
+                self.emit("movzbl %cl, %ecx");
+            }
+            K::Shift(op) => {
+                self.emit("xchgq %rdx, %rcx");
+                self.emit(&format!("{op} %cl, %rdx"));
+                self.emit("movq %rdx, %rcx");
+            }
+            K::Div(quot) => {
+                self.emit("movq %rax, %r8");
+                self.emit("movq %rcx, %rax");
+                self.emit("movq %rdx, %rcx");
+                self.emit("cqto");
+                self.emit("idivq %rcx");
+                self.emit(if quot { "movq %rax, %rcx" } else { "movq %rdx, %rcx" });
+                self.emit("movq %r8, %rax");
+            }
+            K::Un(op) => self.emit(&format!("{op} %rcx")),
+        }
+        self.emit(&format!("movq ${}, (%rax)", header(INT, 1, 0)));
+        self.emit("movq %rcx, 8(%rax)");
+        self.emit("movq %rax, %r14");
+        self.ret(p);
+        true
     }
 
     /// Calls the runtime with the machine record in rdi, after recording the heap and stack state
