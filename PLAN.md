@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 240 differential tests for both back ends, compared with GHC.
+- **Corpus:** 241 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -348,7 +348,16 @@ newtype's constructor nor a GADT-refined parameter may go raw), and only ever us
 boxed once) gets a second entry taking it raw. Every exact call uses the worker, evaluating a
 raw parameter's argument first; partial applications and the function as a value use the boxed
 entry. The worker's prologue moves raw arguments into raw slots before anything can collect.
-Instructions: sumloop 1,539 → 1,023 M, fib 56.6 → 39.7 M, strings 2,779 → 2,659 M; others flat.
+Hosted (PR #51): sumloop 92.6 → 71.4 ms (GHC -O0 144 ms), fib 12.8 → 10.3 ms, strings
+466 → 424 ms, the others within noise; integer measured 19.7 → 19.0 ms, so #50's apparent
+integer regression was noise. [Raw samples, conditions and graphs](bench/results/runtime-workers.md).
+
+Workers whose type gives a numeric result for a full application, with exactly that many
+parameters and no constructor or function among their results, return the number raw in R1.
+A raw result is taken as it is only by a raw case binder whose scrutinee is the call itself,
+or by another such worker's tail call; elsewhere it is boxed after the return, and inside such
+a worker every other result is evaluated and unboxed. Instructions: fib 39.7 → 30.8 M,
+sumloop 1,023 → 962 M, others within 1%.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.

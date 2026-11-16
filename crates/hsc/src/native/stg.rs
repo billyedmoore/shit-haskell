@@ -76,6 +76,8 @@ pub struct SClosure {
     pub nraw: u32,
     /// A worker's raw parameters: the argument slot each arrives in, and its raw slot.
     pub raw_args: Vec<(u32, u32)>,
+    /// The body returns its (numeric) result raw in R1, not a pointer (see `raw_returns`).
+    pub ret_raw: bool,
     pub body: SExpr,
 }
 
@@ -107,7 +109,14 @@ pub type Workers = HashMap<String, Vec<bool>>;
 /// What the types say of each global function's parameters (in Core order, dictionaries
 /// first): 0 not known to be a number, `NUM_INT` an `Int`/`Int#`/`Word`/`Word#`, `NUM_CHAR` a
 /// `Char`/`Char#`. Core is untyped, so only these may be passed raw.
-pub type NumericParams = HashMap<String, Vec<u8>>;
+#[derive(Clone, Default, Debug)]
+pub struct NumericParams {
+    /// Each function's parameters' kinds.
+    pub params: HashMap<String, Vec<u8>>,
+    /// Functions whose result is a number when applied to all their parameters: their number of
+    /// parameters (dictionaries included), and the result's kind.
+    pub results: HashMap<String, (usize, u8)>,
+}
 pub const NUM_INT: u8 = 1;
 pub const NUM_CHAR: u8 = 2;
 
@@ -193,6 +202,40 @@ fn numeric_use(e: &Core, x: &str) -> bool {
     }
 }
 
+/// The workers that return their result raw: the type says the result of a full application
+/// is a number, the body has exactly that many parameters, and no result is a constructor or a
+/// function (each result is then a number to pass back as it is).
+fn raw_returns(binds: &[TopBind], w: &Workers, numeric: &NumericParams) -> HashMap<String, u8> {
+    fn numeric_results(e: &Core) -> bool {
+        match e {
+            Core::Con(..) | Core::Lam(..) => false,
+            Core::Lit(l) => matches!(l, Lit::Int(_) | Lit::Char(_)),
+            Core::Var(_) | Core::App(..) | Core::Fail(_) => true,
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => numeric_results(&args[1]),
+            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => numeric_results(&args[0]),
+            Core::Prim(..) => true,
+            Core::Let(binds, body) => {
+                (!is_join(binds, body) || numeric_results(lambdas(&binds[0].1).1)) && numeric_results(body)
+            }
+            Core::Case(_, _, alts) => alts.iter().all(|a| match a {
+                Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => numeric_results(b),
+            }),
+        }
+    }
+    let mut out = HashMap::new();
+    for b in binds {
+        if !w.contains_key(&b.name) {
+            continue;
+        }
+        let Some((n, kind)) = numeric.results.get(&b.name) else { continue };
+        let (arity, inner) = lambdas(&b.body);
+        if arity == *n && numeric_results(inner) {
+            out.insert(b.name.clone(), *kind);
+        }
+    }
+    out
+}
+
 /// The global functions given workers: a parameter is passed raw when the body certainly
 /// evaluates it and every use takes it raw (with the other workers' raw parameters: a fixpoint
 /// from every candidate, weakened until each claim holds).
@@ -214,7 +257,7 @@ pub fn workers(binds: &[TopBind], numeric: &NumericParams) -> Workers {
         // itself uses it as one (an identity like a newtype's constructor must stay boxed).
         // Both the types (a GADT match can refine a parameter's type in one alternative only) and
         // the body say it is a number.
-        let types = numeric.get(&b.name);
+        let types = numeric.params.get(&b.name);
         let raw: Vec<bool> = params
             .iter()
             .enumerate()
@@ -277,6 +320,19 @@ struct Body {
     capture_index: HashMap<String, u32>,
     /// The join points in scope, to their id and arity.
     joins: HashMap<String, (u32, usize)>,
+    /// Where the expression being lowered is (see `Ctx`).
+    ctx: Ctx,
+    /// The kind of the raw result this body returns (a worker returning its number raw).
+    ret_raw: Option<u8>,
+}
+
+/// Where an expression is lowered: its result returned from the body, a case scrutinee, or the
+/// scrutinee of a case whose binder is raw (which takes a raw result as it is).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Ctx {
+    Tail,
+    Scrut,
+    RawScrut,
 }
 
 pub struct Lowering {
@@ -292,12 +348,14 @@ pub struct Lowering {
     workers: Workers,
     /// The parameters the types say are numbers (see `NumericParams`).
     numeric: NumericParams,
+    /// The workers that return their result raw, with its kind (see `raw_returns`).
+    raw_returns: HashMap<String, u8>,
 }
 
 impl Body {
     fn new() -> Body {
         // Slot 0 is the closure itself.
-        Body { locals: HashMap::new(), nslots: 1, nraw: 0, captures: Vec::new(), capture_index: HashMap::new(), joins: HashMap::new() }
+        Body { locals: HashMap::new(), nslots: 1, nraw: 0, captures: Vec::new(), capture_index: HashMap::new(), joins: HashMap::new(), ctx: Ctx::Tail, ret_raw: None }
     }
 
     fn fresh_slot(&mut self) -> u32 {
@@ -319,14 +377,17 @@ impl Lowering {
             next_join: 0,
             workers: if std::env::var_os("HSC_NO_WORKERS").is_some() { HashMap::new() } else { workers(binds, numeric) },
             numeric: numeric.clone(),
+            raw_returns: HashMap::new(),
         };
+        lw.raw_returns = raw_returns(binds, &lw.workers, numeric);
         let globals = binds
             .iter()
             .map(|b| {
                 let closure = lw.closure_of(&b.body);
                 let worker = lw.workers.get(&b.name).cloned().map(|raw| {
-                    let kinds = lw.numeric.get(&b.name).cloned().unwrap_or_default();
-                    (lw.closure_with(&b.body, Some((&raw, &kinds))), raw)
+                    let kinds = lw.numeric.params.get(&b.name).cloned().unwrap_or_default();
+                    let ret = lw.raw_returns.get(&b.name).copied();
+                    (lw.closure_with(&b.body, Some((&raw, &kinds)), ret), raw)
                 });
                 SGlobal { name: b.name.clone(), closure, worker }
             })
@@ -336,13 +397,15 @@ impl Lowering {
 
     /// The closure of a top-level or delayed expression: a lambda's parameters, or a thunk.
     fn closure_of(&mut self, e: &Core) -> SClosure {
-        self.closure_with(e, None)
+        self.closure_with(e, None, None)
     }
 
     /// `closure_of`, with the parameters `raw` marks bound to raw slots (a worker): each still has
     /// its argument slot, which it arrives in.
-    fn closure_with(&mut self, e: &Core, raw: Option<(&[bool], &[u8])>) -> SClosure {
-        self.bodies.push(Body::new());
+    fn closure_with(&mut self, e: &Core, raw: Option<(&[bool], &[u8])>, ret_raw: Option<u8>) -> SClosure {
+        let mut body = Body::new();
+        body.ret_raw = ret_raw;
+        self.bodies.push(body);
         let mut raw_args = Vec::new();
         let (arity, body_expr) = match e {
             Core::Lam(..) => {
@@ -372,7 +435,7 @@ impl Lowering {
         let body = self.strict(body_expr);
         let b = self.bodies.pop().expect("body");
         let captures = b.captures.iter().map(|(_, a)| a.clone()).collect();
-        SClosure { arity, captures, nslots: b.nslots, nraw: b.nraw, raw_args, body }
+        SClosure { arity, captures, nslots: b.nslots, nraw: b.nraw, raw_args, ret_raw: b.ret_raw.is_some(), body }
     }
 
     /// Resolves a variable in the current body: a slot, a captured variable (captured now from
@@ -408,11 +471,71 @@ impl Lowering {
     }
 
     /// An expression evaluated in place (a case scrutinee, a body's result).
+    /// The current body's position context.
+    fn ctx(&self) -> Ctx {
+        self.bodies.last().map_or(Ctx::Tail, |b| b.ctx)
+    }
+
+    fn set_ctx(&mut self, ctx: Ctx) -> Ctx {
+        let b = self.bodies.last_mut().expect("body");
+        std::mem::replace(&mut b.ctx, ctx)
+    }
+
+    /// Lowers `e` where `ctx` says (a scrutinee), restoring the context after.
+    fn strict_in(&mut self, e: &Core, ctx: Ctx) -> SExpr {
+        let prev = self.set_ctx(ctx);
+        let out = self.strict(e);
+        self.set_ctx(prev);
+        out
+    }
+
+    /// The kind of the raw result returned from here, when the body returns raw and this is a
+    /// result position.
+    fn raw_result(&self) -> Option<u8> {
+        let b = self.bodies.last()?;
+        if b.ctx == Ctx::Tail { b.ret_raw } else { None }
+    }
+
+    /// The raw result kind of an exact call of a worker that returns raw.
+    fn raw_call(&self, e: &Core) -> Option<u8> {
+        let (f, args) = spine(e);
+        let Core::Var(g) = f else { return None };
+        if self.bodies.iter().any(|b| b.locals.contains_key(g) || b.capture_index.contains_key(g)) {
+            return None;
+        }
+        let kind = *self.raw_returns.get(g.as_str())?;
+        (self.workers.get(g.as_str())?.len() == args.len()).then_some(kind)
+    }
+
+    /// `case e as r of _ -> r` with a raw binder of the given kind: the number of `e` (unboxed,
+    /// or taken raw from a worker returning raw), as the result of the case.
+    fn through_raw(&mut self, e: SExpr, kind: u8) -> SExpr {
+        let slot = self.bind_raw(&format!("r%{}", self.next_join), kind == NUM_CHAR);
+        self.next_join += 1;
+        SExpr::Case(Box::new(e), slot, vec![SAlt::Default(SExpr::Atom(Atom::Slot(slot)))])
+    }
+
     fn strict(&mut self, e: &Core) -> SExpr {
+        // Only a call directly in a raw binder's scrutinee may answer raw: anything with
+        // alternatives or bindings there is an ordinary scrutinee (no mix of raw and boxed results).
+        let direct = matches!(e, Core::App(..) | Core::Var(_) | Core::Lit(_))
+            || matches!(e, Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1);
+        if self.ctx() == Ctx::RawScrut && !direct {
+            return self.strict_in(e, Ctx::Scrut);
+        }
         match e {
             Core::Var(v) => match self.join(v, 0) {
                 Some(id) => SExpr::Jump(id, Vec::new()),
-                None => SExpr::Atom(self.resolve(v)),
+                None => {
+                    let a = self.resolve(v);
+                    match self.raw_result() {
+                        // A boxed variable as a raw result: evaluated, then its number returned.
+                        Some(kind) if !matches!(a, Atom::Slot(k) if k & RAW != 0) => {
+                            self.through_raw(SExpr::Atom(a), kind)
+                        }
+                        _ => SExpr::Atom(a),
+                    }
+                }
             },
             Core::Lit(l) => SExpr::Atom(Atom::Lit(slit(l))),
             Core::App(..) => {
@@ -422,12 +545,25 @@ impl Lowering {
                     let aa = args.iter().map(|a| self.atom(a)).collect();
                     return self.allocating(mark, SExpr::Jump(id, aa));
                 }
-                if let Some(call) = self.worker_call(f, &args) {
-                    return call;
+                let callee_raw = self.raw_call(e);
+                let call = match self.worker_call(f, &args) {
+                    Some(call) => call,
+                    None => {
+                        let fa = self.atom(f);
+                        let aa = args.iter().map(|a| self.atom(a)).collect();
+                        self.allocating(mark, SExpr::App(fa, aa))
+                    }
+                };
+                let raw_here = self.ctx() == Ctx::RawScrut || self.raw_result().is_some();
+                match (callee_raw, self.raw_result()) {
+                    // A raw result where a raw one is taken: passed on as it is.
+                    (Some(_), _) if raw_here => call,
+                    // A raw result where a boxed one is expected: boxed after the return.
+                    (Some(kind), _) => self.through_raw(call, kind),
+                    // A boxed result returned raw: unboxed after the return.
+                    (None, Some(kind)) => self.through_raw(call, kind),
+                    (None, None) => call,
                 }
-                let fa = self.atom(f);
-                let aa = args.iter().map(|a| self.atom(a)).collect();
-                self.allocating(mark, SExpr::App(fa, aa))
             }
             Core::Lam(..) => SExpr::Closure(Box::new(self.closure_of(e))),
             Core::Let(binds, body) if is_join(binds, body) => {
@@ -474,10 +610,11 @@ impl Lowering {
                     _ => {}
                 }
                 // The result of an inline primitive that is only used raw is kept unboxed.
-                let raw = matches!(scrut.as_ref(), Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str()))
+                let raw_call = self.raw_call(scrut);
+                let raw = (matches!(scrut.as_ref(), Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str())) || raw_call.is_some())
                     && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder, &self.workers));
-                let char = matches!(scrut.as_ref(), Core::Prim(p, _) if p == "chr#");
-                let scrut = self.strict(scrut);
+                let char = matches!(scrut.as_ref(), Core::Prim(p, _) if p == "chr#") || raw_call == Some(NUM_CHAR);
+                let scrut = self.strict_in(scrut, if raw { Ctx::RawScrut } else { Ctx::Scrut });
                 let bslot = if raw { self.bind_raw(binder, char) } else { self.bind_local(binder) };
                 // Only one alternative runs, so their locals share the slots after the binder: the
                 // frame needs the largest alternative's, not their sum.
@@ -509,7 +646,7 @@ impl Lowering {
             // `seq a b` evaluates a, then answers b; the identities answer their argument.
             Core::Prim(name, args) if name == "seq" && args.len() == 2 => {
                 let slot = self.bind_local(&format!("seq%{}", self.bodies.len()));
-                let scrut = self.strict(&args[0]);
+                let scrut = self.strict_in(&args[0], Ctx::Scrut);
                 let body = self.strict(&args[1]);
                 SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(body)])
             }
@@ -519,7 +656,12 @@ impl Lowering {
             Core::Prim(name, args) => {
                 let mark = self.pending.len();
                 let atoms = args.iter().map(|a| self.atom(a)).collect();
-                self.allocating(mark, SExpr::Prim(name.clone(), atoms))
+                let prim = self.allocating(mark, SExpr::Prim(name.clone(), atoms));
+                match self.raw_result() {
+                    // A primitive's result returned raw: its number (stored raw, or unboxed).
+                    Some(kind) => self.through_raw(prim, if name == "chr#" { NUM_CHAR } else { kind }),
+                    None => prim,
+                }
             }
             Core::Fail(msg) => SExpr::Fail(msg.clone()),
         }
@@ -552,7 +694,7 @@ impl Lowering {
             match direct {
                 Some(at) => atoms[i] = Some(at),
                 None => {
-                    let scrut = self.strict(a);
+                    let scrut = self.strict_in(a, Ctx::RawScrut);
                     let slot = self.bind_raw(&format!("w%{}", self.next_join), false);
                     self.next_join += 1;
                     evals.push((slot, scrut));
@@ -807,7 +949,7 @@ mod raw_slot_tests {
 
     /// Every parameter typed as an Int (the types themselves are not under test here).
     fn numeric_all(binds: &[TopBind]) -> NumericParams {
-        binds.iter().map(|b| (b.name.clone(), vec![NUM_INT; 8])).collect()
+        NumericParams { params: binds.iter().map(|b| (b.name.clone(), vec![NUM_INT; 8])).collect(), results: HashMap::new() }
     }
 
     fn case(s: Core, b: &str, body: Core) -> Core {
@@ -903,7 +1045,7 @@ mod raw_slot_tests {
             name: "Test.f".into(),
             body: Core::Lam("t".into(), Box::new(Core::Lam("x".into(), Box::new(body)))),
         }];
-        let untyped: NumericParams = [("Test.f".to_string(), vec![0, 0])].into_iter().collect();
+        let untyped = NumericParams { params: [("Test.f".to_string(), vec![0, 0])].into_iter().collect(), results: HashMap::new() };
         assert!(workers(&binds, &untyped).is_empty());
     }
 
