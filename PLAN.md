@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 230 differential tests for both back ends, compared with GHC.
+- **Corpus:** 231 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -262,9 +262,12 @@ a 1.026× geometric-mean speedup, but a second run measures 0.993× and Integer 
 No consistent overall speedup is established; fib improves in both runs. All runtime
 targets remain unmet. [Raw samples, conditions and graphs](bench/results/runtime-direct-calls.md).
 
-Next candidate: classify common binary Int arithmetic and comparisons once at startup,
-avoiding repeated string dispatch. Forcing, scheduling, reservation and result handling
-retain their existing paths. Corpus validation and paired runtime measurements are pending.
+Common binary Int arithmetic and comparisons are classified once at startup, avoiding
+repeated string dispatch. Forcing, scheduling, reservation and result handling retain their
+existing paths. Both corpora pass 231/231 and all 59 unit tests pass. A three-pair hosted
+comparison measures 1.034× geometric-mean speedup; all eight medians improve, though
+small differences may be noise. All runtime targets remain unmet.
+[Raw samples, conditions and graphs](bench/results/runtime-int-operations.md).
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
