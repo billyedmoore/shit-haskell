@@ -399,7 +399,14 @@ The work:
   3. Rewrite in the simplifier: match a LHS (a global applied to argument patterns, binders
      matching any expression, repeated binders compared) at each call, substitute the RHS
      (fresh binders), with GHC's phases: run phases 2, 1, 0 in order, a rule active per its
-     annotation, so "map" (`[~1]`) builds and "mapList" (`[1]`) restores unfused leftovers.
+     annotation, so "map" (`[~1]`) builds and "mapList" (`[1]`) restores unfused leftovers
+     (done, behind `HSC_RULES=1`: the simplifier's passes are phases 2, 1, 0, functions the
+     rules mention are not inlined before phase 0, "fold/build" and "foldr/augment" are built
+     in. Both corpora pass with it on. It is off by default because fusion alone is slower:
+     nqueens 407 → 490 M instructions, strings +5%, as each element becomes a call of an
+     unknown function. Next, so that fused code becomes loops: inline small lambdas at their
+     call sites even under other lambdas, inline `eftIntFB`-style producers once their
+     consumer is known, and drop the `c`/`n` closures `build` leaves.)
   4. Measure, then add `INLINE [n]` phase control where base relies on it (`build`, `augment`,
      `mapFB`).
 

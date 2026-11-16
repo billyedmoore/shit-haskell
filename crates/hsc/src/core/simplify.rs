@@ -41,15 +41,21 @@ const TRUE: &str = "GHC.Types.True";
 const FALSE: &str = "GHC.Types.False";
 
 pub fn simplify(binds: &mut [TopBind]) {
-    // The second pass inlines the bodies the first simplified; the last cleans up after the
-    // calls by value.
-    pass(binds);
-    pass(binds);
+    // The rewrite rules, taken before any pass changes their sides, and the functions they
+    // mention, which are not inlined while rules may still need to see them (phases 2 and 1).
+    // Off unless HSC_RULES is set, until fused code is also inlined into loops (the rules alone
+    // leave calls of unknown functions per element, slower than the lists they replace).
+    let enabled = std::env::var_os("HSC_RULES").is_some();
+    let rules = if enabled { Rules::new(extract_rules(binds)) } else { Rules { by_head: HashMap::new(), protected: HashSet::new() } };
+    // The passes are GHC's phases 2, 1 and 0: the second inlines the bodies the first
+    // simplified; the last cleans up after the calls by value.
+    pass(binds, 2, &rules);
+    pass(binds, 1, &rules);
     call_by_value(binds);
-    pass(binds);
+    pass(binds, 0, &rules);
 }
 
-fn pass(binds: &mut [TopBind]) {
+fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
     let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
     let direct: HashMap<&str, &Core> = binds.iter().map(|b| (b.name.as_str(), &b.body)).collect();
     // Globals that are (aliases of) constructor applications to atoms, and global aliases.
@@ -80,6 +86,9 @@ fn pass(binds: &mut [TopBind]) {
         if arity == 0 || size(inner, INLINE_SIZE + 1) > INLINE_SIZE || mentions(&b.body, &b.name) {
             continue;
         }
+        if is_rule_binding(&b.name) || (phase > 0 && rules.protected.contains(&b.name)) {
+            continue;
+        }
         let mut names = HashSet::new();
         if unique_binders(&b.body, &globals, &mut names) {
             templates.insert(b.name.clone(), (arity, b.body.clone()));
@@ -87,6 +96,9 @@ fn pass(binds: &mut [TopBind]) {
     }
     let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
     for bind in binds.iter_mut() {
+        if is_rule_binding(&bind.name) {
+            continue;
+        }
         let mut names = HashSet::new();
         if !unique_binders(&bind.body, &globals, &mut names) {
             // Rebound names (from pattern bindings and cloned alternatives) are renamed apart.
@@ -124,6 +136,9 @@ fn pass(binds: &mut [TopBind]) {
                 aliases: &aliases,
                 templates: &templates,
                 this: &bind.name,
+                rules,
+                phase,
+                rule_budget: RULE_BUDGET,
                 atoms: HashMap::new(),
                 evaluated: HashSet::new(),
                 fresh: &mut fresh,
@@ -152,6 +167,11 @@ struct Simp<'a> {
     templates: &'a HashMap<String, (usize, Core)>,
     /// The binding being simplified (never inlined into itself).
     this: &'a str,
+    /// The rewrite rules, and the phase (2, 1, 0) of this pass.
+    rules: &'a Rules,
+    phase: u32,
+    /// The rewrites left to this binding in this round.
+    rule_budget: usize,
     /// Locals bound to atoms, substituted at their uses.
     atoms: HashMap<String, Core>,
     /// Case binders: variables known to be evaluated.
@@ -178,6 +198,11 @@ impl Simp<'_> {
             Core::App(f, a) => {
                 self.expr(f);
                 self.expr(a);
+                if self.rewrite(c) {
+                    self.changed = true;
+                    self.expr(c);
+                    return;
+                }
                 self.inline_call(c);
                 self.reduce(c);
             }
@@ -363,6 +388,71 @@ impl Simp<'_> {
         }
         *c = Core::Case(Box::new(e), x, alts);
         self.changed = true;
+    }
+
+    /// Rewrites a call that matches an active rule's left side by the rule's right side (a fresh
+    /// copy, its variables bound to what they matched, further arguments applied after).
+    fn rewrite(&mut self, c: &mut Core) -> bool {
+        if self.rule_budget == 0 {
+            return false;
+        }
+        let (head, args) = {
+            let mut args = Vec::new();
+            let mut h = &*c;
+            while let Core::App(f, a) = h {
+                args.push(&**a);
+                h = f;
+            }
+            args.reverse();
+            (h, args)
+        };
+        let Core::Var(g) = head else { return false };
+        let Some(candidates) = self.rules.by_head.get(g.as_str()) else { return false };
+        for rule in candidates {
+            if !rule.active(self.phase) || args.len() < rule.args.len() {
+                continue;
+            }
+            let vars: HashSet<&str> = rule.vars.iter().map(String::as_str).collect();
+            let mut sub: HashMap<String, Core> = HashMap::new();
+            let mut bound = Vec::new();
+            if !rule.args.iter().zip(&args).all(|(p, e)| match_core(p, e, &vars, &mut sub, &mut bound)) {
+                continue;
+            }
+            if rule.vars.iter().any(|v| !sub.contains_key(v)) {
+                continue;
+            }
+            // A fresh copy of the right side, its variables bound to their matches: atoms in
+            // place, anything else shared through a let (a variable may occur more than once).
+            *self.fresh += 1;
+            let tag = format!("~r{}", self.fresh);
+            let mut rhs = rule.rhs.clone();
+            freshen(&mut rhs, &tag, &mut HashMap::new());
+            let mut lets = Vec::new();
+            for v in &rule.vars {
+                let e = sub.remove(v).expect("matched");
+                if is_atom(&e) {
+                    subst(&mut rhs, v, &e);
+                } else {
+                    let name = format!("{v}{tag}");
+                    subst(&mut rhs, v, &Core::Var(name.clone()));
+                    lets.push((name, e));
+                }
+            }
+            let mut out = rhs;
+            for a in args.iter().skip(rule.args.len()) {
+                out = Core::App(Box::new(out), Box::new((*a).clone()));
+            }
+            for (name, e) in lets.into_iter().rev() {
+                out = Core::Let(vec![(name, e)], Box::new(out));
+            }
+            if std::env::var_os("HSC_DEBUG_RULES").is_some() {
+                eprintln!("rule {} fired in {}", rule.name, self.this);
+            }
+            *c = out;
+            self.rule_budget -= 1;
+            return true;
+        }
+        false
     }
 
     /// Replaces the head of a saturated call of a small global function by a fresh copy of it.
@@ -816,6 +906,223 @@ fn drop_args(c: &mut Core, f: &str, constant: &[Option<String>]) {
             }
         }
         Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| drop_args(a, f, constant)),
+    }
+}
+
+/// The rewrites a binding may take in one round (rules could otherwise rewrite each other's
+/// results forever).
+const RULE_BUDGET: usize = 256;
+
+/// Whether a top-level binding is a rewrite rule (see `rename::RULE_PREFIX`).
+fn is_rule_binding(name: &str) -> bool {
+    name.contains(".$rule%")
+}
+
+/// When a rule is active, in the phases 2, 1, 0 (see `syntax::ast::Activation`).
+#[derive(Clone, Copy, Debug)]
+enum Act {
+    Always,
+    From(u32),
+    Before(u32),
+    Never,
+}
+
+/// A rewrite rule: `head args = rhs`, with its variables (free in `args` and `rhs`).
+#[derive(Clone, Debug)]
+struct RuleDef {
+    name: String,
+    act: Act,
+    vars: Vec<String>,
+    head: String,
+    args: Vec<Core>,
+    rhs: Core,
+}
+
+impl RuleDef {
+    fn active(&self, phase: u32) -> bool {
+        match self.act {
+            Act::Always => true,
+            Act::From(n) => phase <= n,
+            Act::Before(n) => phase > n,
+            Act::Never => false,
+        }
+    }
+}
+
+/// The rules by the function their left sides apply, and every global those sides mention.
+struct Rules {
+    by_head: HashMap<String, Vec<RuleDef>>,
+    protected: HashSet<String>,
+}
+
+impl Rules {
+    fn new(mut rules: Vec<RuleDef>) -> Rules {
+        rules.extend(builtin_rules());
+        let mut by_head: HashMap<String, Vec<RuleDef>> = HashMap::new();
+        let mut protected = HashSet::new();
+        for r in rules {
+            protected.insert(r.head.clone());
+            for a in &r.args {
+                globals_in(a, &r.vars, &mut protected);
+            }
+            by_head.entry(r.head.clone()).or_default().push(r);
+        }
+        Rules { by_head, protected }
+    }
+}
+
+/// The global variables an expression mentions (those not among `locals`, nor bound in it).
+fn globals_in(e: &Core, locals: &[String], out: &mut HashSet<String>) {
+    match e {
+        Core::Var(v) => {
+            if v.contains('.') && !locals.contains(v) {
+                out.insert(v.clone());
+            }
+        }
+        Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            globals_in(f, locals, out);
+            globals_in(a, locals, out);
+        }
+        Core::Lam(_, b) => globals_in(b, locals, out),
+        Core::Let(binds, body) => {
+            binds.iter().for_each(|(_, r)| globals_in(r, locals, out));
+            globals_in(body, locals, out);
+        }
+        Core::Case(s, _, alts) => {
+            globals_in(s, locals, out);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => globals_in(b, locals, out),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| globals_in(a, locals, out)),
+    }
+}
+
+/// The rules among the bindings: `\vars -> [lhs, rhs]` (the parameters' alias lets resolved),
+/// with a left side that applies a global.
+fn extract_rules(binds: &[TopBind]) -> Vec<RuleDef> {
+    let mut out = Vec::new();
+    for b in binds {
+        if !is_rule_binding(&b.name) {
+            continue;
+        }
+        let act = match b.name.rsplit('%').next() {
+            Some("A") => Act::Always,
+            Some("N") => Act::Never,
+            Some(t) if t.starts_with('F') => t[1..].parse().map(Act::From).unwrap_or(Act::Never),
+            Some(t) if t.starts_with('B') => t[1..].parse().map(Act::Before).unwrap_or(Act::Never),
+            _ => continue,
+        };
+        let mut vars = Vec::new();
+        let mut cur = b.body.clone();
+        while let Core::Lam(x, inner) = cur {
+            vars.push(x);
+            cur = *inner;
+        }
+        // `let k = arg in ..`: the clause's names for its parameters.
+        while let Core::Let(bs, body) = &cur {
+            match &bs[..] {
+                [(x, Core::Var(y))] if vars.contains(y) => {
+                    let (x, y) = (x.clone(), y.clone());
+                    let Core::Let(_, mut body) = cur else { unreachable!() };
+                    subst(&mut body, &x, &Core::Var(y));
+                    cur = *body;
+                }
+                _ => break,
+            }
+        }
+        let Core::Con(cons, sides) = &cur else { continue };
+        let (lhs, rhs) = match (cons.as_str(), &sides[..]) {
+            ("Builtin.:", [lhs, rest]) => match rest {
+                Core::Con(c2, more) if c2 == "Builtin.:" && more.len() == 2 => (lhs.clone(), more[0].clone()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let mut args = Vec::new();
+        let mut h = &lhs;
+        while let Core::App(f, a) = h {
+            args.push((**a).clone());
+            h = f;
+        }
+        args.reverse();
+        let Core::Var(head) = h else { continue };
+        if vars.contains(head) || args.is_empty() {
+            continue;
+        }
+        out.push(RuleDef { name: b.name.clone(), act, vars, head: head.clone(), args, rhs });
+    }
+    out
+}
+
+/// "fold/build" and "foldr/augment", whose `g` has a rank-2 type the checker cannot give a rule
+/// binder: built in, as base states them.
+fn builtin_rules() -> Vec<RuleDef> {
+    let v = |n: &str| Core::Var(n.to_string());
+    let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+    let foldr = "GHC.Internal.Base.foldr";
+    vec![
+        RuleDef {
+            name: "fold/build".into(),
+            act: Act::Always,
+            vars: vec!["k%rule".into(), "z%rule".into(), "g%rule".into()],
+            head: foldr.into(),
+            args: vec![v("k%rule"), v("z%rule"), app(v("GHC.Internal.Base.build"), v("g%rule"))],
+            rhs: app(app(v("g%rule"), v("k%rule")), v("z%rule")),
+        },
+        RuleDef {
+            name: "foldr/augment".into(),
+            act: Act::Always,
+            vars: vec!["k%rule".into(), "z%rule".into(), "g%rule".into(), "xs%rule".into()],
+            head: foldr.into(),
+            args: vec![v("k%rule"), v("z%rule"), app(app(v("GHC.Internal.Base.augment"), v("g%rule")), v("xs%rule"))],
+            rhs: app(app(v("g%rule"), v("k%rule")), app(app(app(v(foldr), v("k%rule")), v("z%rule")), v("xs%rule"))),
+        },
+    ]
+}
+
+/// Matches a rule's argument pattern against an expression: the rule's variables match
+/// anything (the same expression at each occurrence), lambdas up to the names they bind.
+fn match_core(
+    p: &Core,
+    e: &Core,
+    vars: &HashSet<&str>,
+    sub: &mut HashMap<String, Core>,
+    bound: &mut Vec<(String, String)>,
+) -> bool {
+    match (p, e) {
+        (Core::Var(v), _) if vars.contains(v.as_str()) => {
+            // An expression mentioning a variable the pattern's lambdas bind cannot be a match.
+            if bound.iter().any(|(_, ev)| mentions(e, ev)) {
+                return false;
+            }
+            match sub.get(v.as_str()) {
+                Some(prev) => prev == e,
+                None => {
+                    sub.insert(v.clone(), e.clone());
+                    true
+                }
+            }
+        }
+        (Core::Var(v), Core::Var(w)) => match bound.iter().rev().find(|(pv, _)| pv == v) {
+            Some((_, ev)) => ev == w,
+            None => v == w && !bound.iter().any(|(_, ev)| ev == w),
+        },
+        (Core::Lit(a), Core::Lit(b)) => a == b,
+        (Core::App(f1, a1), Core::App(f2, a2)) => match_core(f1, f2, vars, sub, bound) && match_core(a1, a2, vars, sub, bound),
+        (Core::Lam(x, b1), Core::Lam(y, b2)) => {
+            bound.push((x.clone(), y.clone()));
+            let ok = match_core(b1, b2, vars, sub, bound);
+            bound.pop();
+            ok
+        }
+        (Core::Con(c1, a1), Core::Con(c2, a2)) | (Core::Prim(c1, a1), Core::Prim(c2, a2)) => {
+            c1 == c2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| match_core(x, y, vars, sub, bound))
+        }
+        _ => false,
     }
 }
 
@@ -1376,4 +1683,73 @@ fn by_value(c: &mut Core, strict: &HashMap<String, Vec<bool>>, fresh: &mut u64) 
         e = Core::Case(Box::new(a), v, vec![Alt::Default(e)]);
     }
     *c = e;
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    fn v(n: &str) -> Core {
+        Core::Var(n.into())
+    }
+
+    fn app(f: Core, args: Vec<Core>) -> Core {
+        args.into_iter().fold(f, |f, a| Core::App(Box::new(f), Box::new(a)))
+    }
+
+    fn rule(vars: &[&str], head: &str, args: Vec<Core>, rhs: Core, act: Act) -> RuleDef {
+        RuleDef { name: "t".into(), act, vars: vars.iter().map(|s| s.to_string()).collect(), head: head.into(), args, rhs }
+    }
+
+    fn rewrite_with(rules: Vec<RuleDef>, phase: u32, mut e: Core) -> Option<Core> {
+        let rules = Rules { by_head: rules.into_iter().fold(HashMap::new(), |mut m: HashMap<String, Vec<RuleDef>>, r| { m.entry(r.head.clone()).or_default().push(r); m }), protected: HashSet::new() };
+        let (once, dead, known, aliases, templates) = (HashSet::new(), HashSet::new(), HashMap::new(), HashMap::new(), HashMap::new());
+        let mut fresh = 0;
+        let mut s = Simp {
+            once: &once, dead: &dead, pending: HashMap::new(), known: &known, aliases: &aliases, templates: &templates,
+            this: "Test.x", rules: &rules, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(),
+            fresh: &mut fresh, budget: 0, changed: false,
+        };
+        s.rewrite(&mut e).then_some(e)
+    }
+
+    #[test]
+    fn fold_build_rewrites_with_further_arguments() {
+        let r = builtin_rules().remove(0);
+        let e = app(v("GHC.Internal.Base.foldr"), vec![v("k"), v("z"), app(v("GHC.Internal.Base.build"), vec![v("g")]), v("extra")]);
+        let out = rewrite_with(vec![r], 2, e).expect("fires");
+        assert_eq!(out, app(v("g"), vec![v("k"), v("z"), v("extra")]));
+    }
+
+    #[test]
+    fn repeated_variables_must_match_the_same_expression() {
+        // f x x = x
+        let r = rule(&["x"], "T.f", vec![v("x"), v("x")], v("x"), Act::Always);
+        assert!(rewrite_with(vec![r.clone()], 0, app(v("T.f"), vec![v("a"), v("a")])).is_some());
+        assert!(rewrite_with(vec![r], 0, app(v("T.f"), vec![v("a"), v("b")])).is_none());
+    }
+
+    #[test]
+    fn lambda_patterns_match_up_to_renaming_and_activation_is_respected() {
+        // mapFB c (\y -> y) = c, active before phase 1 only
+        let lam = |x: &str| Core::Lam(x.into(), Box::new(v(x)));
+        let r = rule(&["c"], "T.mapFB", vec![v("c"), lam("y")], v("c"), Act::Before(1));
+        let e = app(v("T.mapFB"), vec![v("k"), lam("q")]);
+        assert_eq!(rewrite_with(vec![r.clone()], 2, e.clone()), Some(v("k")));
+        assert!(rewrite_with(vec![r.clone()], 1, e.clone()).is_none());
+        // A lambda that is not the identity does not match.
+        let other = app(v("T.mapFB"), vec![v("k"), Core::Lam("q".into(), Box::new(v("w")))]);
+        assert!(rewrite_with(vec![r], 2, other).is_none());
+    }
+
+    #[test]
+    fn non_atomic_matches_are_shared_through_a_let() {
+        // dup x = pair x x, applied to a call: the call is bound once.
+        let pair = |a: Core, b: Core| Core::Con("T.P".into(), vec![a, b]);
+        let r = rule(&["x"], "T.dup", vec![v("x")], pair(v("x"), v("x")), Act::Always);
+        let out = rewrite_with(vec![r], 0, app(v("T.dup"), vec![app(v("T.g"), vec![v("a")])])).expect("fires");
+        let Core::Let(bs, body) = out else { panic!("{out:?}") };
+        assert_eq!(bs[0].1, app(v("T.g"), vec![v("a")]));
+        assert_eq!(*body, pair(v(&bs[0].0), v(&bs[0].0)));
+    }
 }
