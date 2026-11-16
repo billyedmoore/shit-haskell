@@ -934,7 +934,8 @@ fn call_by_value(binds: &mut [TopBind]) {
             strict.insert(b.name.clone(), vec![true; n]);
         }
     }
-    for _ in 0..20 {
+    // Marks only weaken, so this ends; stopping early would keep unproven marks.
+    loop {
         let mut changed = false;
         for b in binds.iter() {
             let Some(old) = strict.get(&b.name) else { continue };
@@ -997,6 +998,16 @@ fn forced(e: &Core, strict: &HashMap<String, Vec<bool>>) -> HashSet<String> {
             for (x, _) in binds {
                 out.remove(x);
             }
+        }
+        // After an effect (a primitive with one, or an application answering a pair, as IO
+        // actions do), what the continuation evaluates is not certain to be evaluated: it may
+        // raise or loop first. Only the scrutinee counts (GHC's "IO hack").
+        Core::Case(s, _, alts)
+            if matches!(&**s, Core::Prim(p, _) if !STRICT_PRIMS.contains(&p.as_str()))
+                || (matches!(&**s, Core::App(..))
+                    && alts.iter().any(|a| matches!(a, Alt::Con(k, _, _) if k == "Builtin.(,)"))) =>
+        {
+            out = forced(s, strict);
         }
         Core::Case(s, b, alts) => {
             let mut common: Option<HashSet<String>> = None;

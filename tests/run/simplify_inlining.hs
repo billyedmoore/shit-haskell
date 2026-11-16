@@ -41,8 +41,15 @@ known n = case A n of
   A k -> k * 2
   B -> 0
 
+-- An action's later argument is evaluated only after the effect before it has run.
+after :: IO () -> IO () -> IO ()
+after a b = a >> b
+{-# NOINLINE after #-}
+
 main :: IO ()
 main = do
+  r0 <- try (after (putStrLn "effect first") (if length [()] > 5 then pure () else error "then the error"))
+  putStrLn (either (\(ErrorCall m) -> m) show r0)
   print (pick 0 undefined)
   print (pick 1 7)
   r <- try (evaluate (errs True (error "second")))
