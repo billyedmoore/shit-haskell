@@ -127,6 +127,10 @@ pub struct Gen {
     nullary_cons: HashMap<u32, String>,
     /// Byte strings (label, bytes).
     strings: Vec<(String, Vec<u8>)>,
+    /// The frame slots still used after the scrutinee being generated returns (innermost last).
+    live: Vec<std::collections::HashSet<u32>>,
+    /// The slots each join point's code uses (a jump to it uses them).
+    join_uses: HashMap<u32, std::collections::HashSet<u32>>,
     /// The static INT cells 0 and 1 (made when first used).
     bool_cells: Option<(String, String)>,
     /// The code labels and parameter slots of the join points generated so far.
@@ -142,6 +146,9 @@ fn header(kind: u8, size: u64, aux: u64) -> u64 {
 fn closure_words(c: &SClosure) -> usize {
     (c.captures.len() + 2).max(2)
 }
+
+/// A slot use that stands for every slot (nothing may be cleared).
+const ALL_LIVE: u32 = u32::MAX;
 
 /// Argument registers for the calls into the runtime (rdi carries the machine record).
 const RT_ARGS: [&str; 5] = ["%rsi", "%rdx", "%rcx", "%r8", "%r9"];
@@ -164,6 +171,8 @@ impl Gen {
             strings: Vec::new(),
             joins: HashMap::new(),
             bool_cells: None,
+            live: Vec::new(),
+            join_uses: HashMap::new(),
         }
     }
 
@@ -335,6 +344,7 @@ impl Gen {
         match e {
             SExpr::Atom(a) => {
                 self.load(a, p, "%r14");
+                self.clear_dead(std::slice::from_ref(a), p);
                 self.eval_result(p);
             }
             SExpr::App(func, args) => {
@@ -358,6 +368,10 @@ impl Gen {
                         self.emit(&format!("movq %rcx, {}(%rbp)", 8 * (i + s)));
                     }
                     self.emit(&format!("addq ${}, %rbp", 8 * s));
+                } else {
+                    let mut used = vec![func.clone()];
+                    used.extend(args.iter().cloned());
+                    self.clear_dead(&used, inner);
                 }
                 self.emit(&format!("movl ${}, %ecx", n));
                 if let Some(entry) = direct {
@@ -408,7 +422,21 @@ impl Gen {
                 self.emit(&format!("leaq {cont}(%rip), %rax"));
                 self.emit("movq %rax, (%rbp)");
                 let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
+                // What the alternatives (and, for a nested case, what follows it) still use.
+                let mut live = std::collections::HashSet::new();
+                for a in alts {
+                    match a {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => self.slot_uses(b, &mut live),
+                    }
+                }
+                if p.mode == Mode::Scrut {
+                    if let Some(outer) = self.live.last() {
+                        live.extend(outer.iter().copied());
+                    }
+                }
+                self.live.push(live);
                 self.expr(scrut, sp);
+                self.live.pop();
                 // The info of the return address: its kind at -16 and the size of the frame above it
                 // at -8. Control reaches the label only by a return, never by falling through. A case
                 // in a scrutinee (nested) has the outer case's return address above it, not the
@@ -434,6 +462,9 @@ impl Gen {
                 // the body; jumps reach it in the same frame and mode.
                 let l = self.label("join");
                 self.joins.insert(*id, (l.clone(), params.clone()));
+                let mut uses = std::collections::HashSet::new();
+                self.slot_uses(code, &mut uses);
+                self.join_uses.insert(*id, uses);
                 self.expr(body, p);
                 self.put_label(&l);
                 self.expr(code, p);
@@ -835,6 +866,100 @@ impl Gen {
         true
     }
 
+    /// In a scrutinee (the frame stays while the callee runs), clears the frame slots among
+    /// `atoms` that nothing uses after it returns, so that the frame does not keep what the
+    /// callee no longer needs (a `forM_` chain of actions, say) alive.
+    fn clear_dead(&mut self, atoms: &[Atom], p: Pos) {
+        if p.mode != Mode::Scrut {
+            return;
+        }
+        let Some(live) = self.live.last() else { return };
+        if live.contains(&ALL_LIVE) {
+            return;
+        }
+        let mut dead: Vec<u32> = atoms
+            .iter()
+            .filter_map(|a| match a {
+                Atom::Slot(k) if *k != 0 && !live.contains(k) => Some(*k),
+                _ => None,
+            })
+            .collect();
+        dead.sort_unstable();
+        dead.dedup();
+        for k in dead {
+            self.emit(&format!("movq $0, {}", p.slot(k)));
+        }
+    }
+
+    /// The frame slots an expression uses (including the code of the join points it jumps to).
+    fn slot_uses(&self, e: &SExpr, out: &mut std::collections::HashSet<u32>) {
+        self.slot_uses_in(e, out, &mut HashMap::new());
+    }
+
+    /// `slot_uses`, with the uses of the join points defined inside the expression in `local`.
+    fn slot_uses_in(
+        &self,
+        e: &SExpr,
+        out: &mut std::collections::HashSet<u32>,
+        local: &mut HashMap<u32, std::collections::HashSet<u32>>,
+    ) {
+        let atom = |a: &Atom, out: &mut std::collections::HashSet<u32>| {
+            match a {
+                Atom::Slot(k) => {
+                    out.insert(*k);
+                }
+                // A captured variable is read through the closure in slot 0.
+                Atom::Free(_) => {
+                    out.insert(0);
+                }
+                _ => {}
+            }
+        };
+        match e {
+            SExpr::Atom(a) => atom(a, out),
+            SExpr::App(f, args) => {
+                atom(f, out);
+                args.iter().for_each(|a| atom(a, out));
+            }
+            SExpr::Con(_, args) | SExpr::Prim(_, args) => args.iter().for_each(|a| atom(a, out)),
+            SExpr::Let(binds, body) => {
+                for (_, c) in binds {
+                    c.captures.iter().for_each(|a| atom(a, out));
+                }
+                self.slot_uses_in(body, out, local);
+            }
+            SExpr::Case(s, _, alts) => {
+                self.slot_uses_in(s, out, local);
+                for a in alts {
+                    match a {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => self.slot_uses_in(b, out, local),
+                    }
+                }
+            }
+            SExpr::Closure(c) => c.captures.iter().for_each(|a| atom(a, out)),
+            SExpr::Fail(_) => {}
+            SExpr::Join(id, _, code, body) => {
+                // The code first: jumps in the body (and code) to this join point use its slots.
+                let mut uses = std::collections::HashSet::new();
+                self.slot_uses_in(code, &mut uses, local);
+                out.extend(uses.iter().copied());
+                local.insert(*id, uses);
+                self.slot_uses_in(body, out, local);
+            }
+            SExpr::Jump(id, args) => {
+                args.iter().for_each(|a| atom(a, out));
+                match local.get(id).or_else(|| self.join_uses.get(id)) {
+                    Some(u) => out.extend(u.iter().copied()),
+                    // Not known (join points are lowered before their uses, so this should not
+                    // happen): everything counts as live.
+                    None => {
+                        out.insert(ALL_LIVE);
+                    }
+                }
+            }
+        }
+    }
+
     /// The static INT cells 0 and 1, shared by the inline comparisons.
     fn bool_cells(&mut self) -> (String, String) {
         if let Some(c) = &self.bool_cells {
@@ -1222,5 +1347,64 @@ mod known_global_call_tests {
             let label = row.rsplit_once(',').unwrap().1.trim();
             assert!(asm.contains(&format!("jmp {label}\n")));
         }
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    fn case_of_call(alt_uses: Vec<Atom>) -> SExpr {
+        // case f@1 x@2 of _ -> Con [alt_uses]
+        SExpr::Case(
+            Box::new(SExpr::App(Atom::Slot(1), vec![Atom::Slot(2)])),
+            3,
+            vec![SAlt::Default(SExpr::Con("Test.K".into(), alt_uses))],
+        )
+    }
+
+    fn gen(e: &SExpr, mode: Mode) -> String {
+        let mut g = Gen::new();
+        g.expr(e, Pos { f: Frame { s: 4, a: 2 }, mode, pushed: 0 });
+        g.out
+    }
+
+    #[test]
+    fn a_scrutinee_call_clears_the_slots_nothing_uses_after_it() {
+        // Neither the function nor its argument is used by the alternative: both are cleared.
+        let out = gen(&case_of_call(vec![Atom::Lit(SLit::Int(1))]), Mode::Tail);
+        assert_eq!(out.matches("movq $0,").count(), 2, "{out}");
+        // The argument is used afterwards: only the function's slot is cleared.
+        let out = gen(&case_of_call(vec![Atom::Slot(2)]), Mode::Tail);
+        assert_eq!(out.matches("movq $0,").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn tail_calls_and_the_closure_slot_are_left_alone() {
+        let out = gen(&SExpr::App(Atom::Slot(1), vec![Atom::Slot(2)]), Mode::Tail);
+        assert!(!out.contains("movq $0,"), "{out}");
+        let e = SExpr::Case(
+            Box::new(SExpr::App(Atom::Slot(0), vec![Atom::Slot(2)])),
+            3,
+            vec![SAlt::Default(SExpr::Con("Test.K".into(), vec![Atom::Slot(2)]))],
+        );
+        assert!(!gen(&e, Mode::Tail).contains("movq $0,"));
+    }
+
+    #[test]
+    fn slots_a_join_point_uses_stay_live_across_a_jump() {
+        // join j = Con [x@2] in case f@1 of _ -> jump j
+        let e = SExpr::Join(
+            7,
+            Vec::new(),
+            Box::new(SExpr::Con("Test.K".into(), vec![Atom::Slot(2)])),
+            Box::new(SExpr::Case(
+                Box::new(SExpr::App(Atom::Slot(1), vec![Atom::Slot(2)])),
+                3,
+                vec![SAlt::Default(SExpr::Jump(7, Vec::new()))],
+            )),
+        );
+        let out = gen(&e, Mode::Tail);
+        assert_eq!(out.matches("movq $0,").count(), 1, "{out}");
     }
 }
