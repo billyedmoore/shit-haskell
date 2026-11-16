@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 237 differential tests for both back ends, compared with GHC.
+- **Corpus:** 238 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -328,7 +328,16 @@ Strictness treats a pattern-match failure as bottom, as GHC does: the matcher's 
 `FAIL` default no longer erased every demand, so `length`'s accumulator (`lenAcc`) is strict and
 `n + 1` is evaluated before the call instead of built as a thunk per element. A case scrutinee
 with an inline fast path is computed in place, and a case's alternatives share frame slots.
-Instructions: strings 49.5 → 38.0 M (500 repetitions), mapops 549 → 534 M, others flat.
+Hosted (PR #49): strings 1.139 → 0.684 s, mapops 145 → 125 ms, the others within noise.
+[Raw samples, conditions and graphs](bench/results/runtime-strictness-failures.md).
+
+Frames can hold raw (unboxed) words: a body frame's size word is `words | raw << 32`, and the
+collector, unwinder and `TOP` skip the raw words at the frame's low end. The result of an inline
+`Int#`/`Word#`/`Char#` primitive whose every use is another inline primitive or a literal case
+is kept raw: no cell is allocated and no kind is checked. Raw operands are boxed only for the
+runtime's slow path. Instructions: sumloop 2,338 → 1,539 M, fib 64.6 → 56.6 M, mapops
+534 → 510 M, strings 38.0 → 35.9 M (500 repetitions), nqueens 419 → 409 M. Next: raw values
+across calls (worker/wrapper), so loop arguments are not boxed.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.

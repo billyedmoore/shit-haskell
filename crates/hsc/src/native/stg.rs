@@ -72,7 +72,54 @@ pub struct SClosure {
     pub captures: Vec<Atom>,
     /// The number of frame slots: slot 0 is the closure, then the arguments, then the locals.
     pub nslots: u32,
+    /// The raw (unboxed) slots, numbered `RAW | i` (see `RAW`), apart from those.
+    pub nraw: u32,
     pub body: SExpr,
+}
+
+/// The bit that marks a slot number as a raw slot: it holds an unboxed `Int#`/`Word#`/`Char#`
+/// (a number, not a pointer), which the collector does not read.
+pub const RAW: u32 = 1 << 31;
+
+/// Primitives whose result can be held raw: computed inline from raw or boxed operands.
+pub const RAW_RESULT_PRIMS: &[&str] = &[
+    "+#", "-#", "*#", "andI#", "orI#", "xorI#", "negateInt#", "notI#", "quotInt#", "remInt#",
+    "uncheckedIShiftL#", "uncheckedIShiftRA#", "uncheckedIShiftRL#", "==#", "/=#", "<#", "<=#",
+    ">#", ">=#", "plusWord#", "minusWord#", "timesWord#", "and#", "or#", "xor#", "eqWord#",
+    "neWord#", "ltWord#", "leWord#", "gtWord#", "geWord#", "uncheckedShiftL#",
+    "uncheckedShiftRL#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#", "geChar#",
+    "ord#", "chr#",
+];
+
+/// Primitives that can take raw operands (those, and `tagToEnum#`).
+fn raw_operand_prim(p: &str) -> bool {
+    p == "tagToEnum#" || RAW_RESULT_PRIMS.contains(&p)
+}
+
+/// Whether every use of `x` in `e` can take it raw: as an operand of an inline primitive, or as
+/// the scrutinee of a case on literals whose binder is unused.
+fn raw_uses(e: &Core, x: &str) -> bool {
+    match e {
+        Core::Var(v) => v != x,
+        Core::Lit(_) | Core::Fail(_) => true,
+        Core::Prim(p, args) if raw_operand_prim(p) => args.iter().all(|a| matches!(a, Core::Var(v) if v == x) || raw_uses(a, x)),
+        Core::Case(s, b, alts) if matches!(&**s, Core::Var(v) if v == x) => {
+            alts.iter().all(|a| match a {
+                Alt::Lit(Lit::Int(_) | Lit::Char(_), body) | Alt::Default(body) => !mentions(body, b) && raw_uses(body, x),
+                _ => false,
+            })
+        }
+        Core::App(f, a) => raw_uses(f, x) && raw_uses(a, x),
+        Core::Lam(_, b) => !mentions(b, x),
+        Core::Let(binds, body) => binds.iter().all(|(_, r)| !mentions(r, x)) && raw_uses(body, x),
+        Core::Case(s, _, alts) => {
+            raw_uses(s, x)
+                && alts.iter().all(|a| match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => raw_uses(b, x),
+                })
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, x)),
+    }
 }
 
 /// A top-level binding: a closure with no captures (a function, or a CAF thunk).
@@ -91,6 +138,8 @@ struct Body {
     /// Local names bound in this body, to their slots.
     locals: HashMap<String, u32>,
     nslots: u32,
+    /// Raw slots allocated.
+    nraw: u32,
     /// Captured names, to their index, with the outer variable each is copied from.
     captures: Vec<(String, Atom)>,
     /// Captured names by index into `captures`.
@@ -113,7 +162,7 @@ pub struct Lowering {
 impl Body {
     fn new() -> Body {
         // Slot 0 is the closure itself.
-        Body { locals: HashMap::new(), nslots: 1, captures: Vec::new(), capture_index: HashMap::new(), joins: HashMap::new() }
+        Body { locals: HashMap::new(), nslots: 1, nraw: 0, captures: Vec::new(), capture_index: HashMap::new(), joins: HashMap::new() }
     }
 
     fn fresh_slot(&mut self) -> u32 {
@@ -167,7 +216,7 @@ impl Lowering {
         let body = self.strict(body_expr);
         let b = self.bodies.pop().expect("body");
         let captures = b.captures.iter().map(|(_, a)| a.clone()).collect();
-        SClosure { arity, captures, nslots: b.nslots, body }
+        SClosure { arity, captures, nslots: b.nslots, nraw: b.nraw, body }
     }
 
     /// Resolves a variable in the current body: a slot, a captured variable (captured now from
@@ -265,19 +314,31 @@ impl Lowering {
                     }
                     _ => {}
                 }
+                // The result of an inline primitive that is only used raw is kept unboxed.
+                let raw = matches!(scrut.as_ref(), Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str()))
+                    && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder));
                 let scrut = self.strict(scrut);
-                let bslot = self.bind_local(binder);
+                let bslot = if raw { self.bind_raw(binder) } else { self.bind_local(binder) };
                 // Only one alternative runs, so their locals share the slots after the binder: the
                 // frame needs the largest alternative's, not their sum.
-                let base = self.bodies.last().expect("body").nslots;
-                let mut top = base;
+                let (base, raw_base) = {
+                    let b = self.bodies.last().expect("body");
+                    (b.nslots, b.nraw)
+                };
+                let (mut top, mut raw_top) = (base, raw_base);
                 let mut lowered = Vec::with_capacity(alts.len());
                 for a in alts {
-                    self.bodies.last_mut().expect("body").nslots = base;
+                    let b = self.bodies.last_mut().expect("body");
+                    b.nslots = base;
+                    b.nraw = raw_base;
                     lowered.push(self.alt(a));
-                    top = top.max(self.bodies.last().expect("body").nslots);
+                    let b = self.bodies.last().expect("body");
+                    top = top.max(b.nslots);
+                    raw_top = raw_top.max(b.nraw);
                 }
-                self.bodies.last_mut().expect("body").nslots = top;
+                let b = self.bodies.last_mut().expect("body");
+                b.nslots = top;
+                b.nraw = raw_top;
                 SExpr::Case(Box::new(scrut), bslot, lowered)
             }
             Core::Con(name, args) => {
@@ -317,6 +378,16 @@ impl Lowering {
     fn join(&self, name: &str, n: usize) -> Option<u32> {
         let b = self.bodies.last()?;
         b.joins.get(name).filter(|(_, arity)| *arity == n).map(|(id, _)| *id)
+    }
+
+    /// Binds a name to a fresh raw slot.
+    fn bind_raw(&mut self, name: &str) -> u32 {
+        let b = self.bodies.last_mut().expect("body");
+        b.joins.remove(name);
+        let s = RAW | b.nraw;
+        b.nraw += 1;
+        b.locals.insert(name.to_string(), s);
+        s
     }
 
     fn bind_local(&mut self, name: &str) -> u32 {
@@ -514,5 +585,63 @@ fn slit(l: &Lit) -> SLit {
         Lit::Char(c) => SLit::Char(*c),
         Lit::Str(s) => SLit::Str(s.clone()),
         Lit::Addr(s) => SLit::Addr(s.clone()),
+    }
+}
+
+#[cfg(test)]
+mod raw_slot_tests {
+    use super::*;
+
+    fn var(v: &str) -> Core {
+        Core::Var(v.into())
+    }
+
+    fn prim(p: &str, args: Vec<Core>) -> Core {
+        Core::Prim(p.into(), args)
+    }
+
+    fn case(s: Core, b: &str, body: Core) -> Core {
+        Core::Case(Box::new(s), b.into(), vec![Alt::Default(body)])
+    }
+
+    fn lower(body: Core) -> SClosure {
+        let binds = vec![TopBind { name: "Test.f".into(), body: Core::Lam("x".into(), Box::new(body)) }];
+        Lowering::program(&binds).globals.remove(0).closure
+    }
+
+    #[test]
+    fn a_result_used_only_by_inline_primitives_is_raw() {
+        // case x +# 1# as y of _ -> y *# y
+        let c = lower(case(prim("+#", vec![var("x"), Core::Lit(Lit::Int(1))]), "y", prim("*#", vec![var("y"), var("y")])));
+        assert_eq!(c.nraw, 1);
+        let SExpr::Case(_, b, _) = &c.body else { panic!("{:?}", c.body) };
+        assert_ne!(b & RAW, 0);
+    }
+
+    #[test]
+    fn a_literal_case_on_the_result_keeps_it_raw() {
+        let lits = Core::Case(
+            Box::new(var("y")),
+            "z".into(),
+            vec![Alt::Lit(Lit::Int(0), Core::Lit(Lit::Int(1))), Alt::Default(Core::Lit(Lit::Int(2)))],
+        );
+        let c = lower(case(prim("remInt#", vec![var("x"), Core::Lit(Lit::Int(4))]), "y", lits));
+        assert_eq!(c.nraw, 1);
+    }
+
+    #[test]
+    fn results_that_escape_stay_boxed() {
+        // Returned, passed to a call, stored in a constructor, captured, or the case binder used.
+        let escapes = vec![
+            var("y"),
+            Core::App(Box::new(var("Test.f")), Box::new(var("y"))),
+            Core::Con("Test.K".into(), vec![var("y")]),
+            Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t"))),
+            Core::Case(Box::new(var("y")), "z".into(), vec![Alt::Default(var("z"))]),
+        ];
+        for body in escapes {
+            let c = lower(case(prim("+#", vec![var("x"), var("x")]), "y", body.clone()));
+            assert_eq!(c.nraw, 0, "{body:?}");
+        }
     }
 }

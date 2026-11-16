@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use super::stg::{Atom, SAlt, SClosure, SExpr, SLit, SProgram};
+use super::stg::{Atom, SAlt, SClosure, SExpr, SLit, SProgram, RAW};
 use crate::core::Lit;
 
 /// Header kinds (mirrors `machine::heap::kind`).
@@ -30,8 +30,20 @@ pub const IND: u8 = 9;
 
 /// Frame kinds, as the collector reads them from the info of a return address.
 pub mod frame {
-    /// A body's frame: all words are pointers.
+    /// A body's frame. Its size word is `words | raw << 32`: the lowest `raw` of its `words` hold
+    /// raw (unboxed) numbers, the rest pointers. The same encoding gives the words at the top of
+    /// the stack that the runtime is told about (`mach::TOP`).
     pub const BODY: u64 = 1;
+
+    /// The words of a body frame (or of the top of the stack), from its size word.
+    pub fn words(size: u64) -> u64 {
+        size & 0xffff_ffff
+    }
+
+    /// The raw (non-pointer) words at its low end.
+    pub fn raw(size: u64) -> u64 {
+        size >> 32
+    }
     /// An update frame: the thunk being evaluated (one pointer).
     pub const UPDATE: u64 = 2;
     /// A catch frame: the handler (one pointer, the other word is unused).
@@ -70,23 +82,34 @@ enum Mode {
 /// The frame of the body being generated.
 #[derive(Clone, Copy)]
 struct Frame {
-    /// Total slots: closure, arguments and locals.
+    /// Total slots: raw slots, locals, the closure and the arguments.
     s: u32,
     /// The arguments.
     a: u32,
+    /// The raw slots (unboxed numbers, at the frame's low end).
+    r: u32,
 }
 
 impl Frame {
-    /// The offset, from the frame's base (its lowest address), of a slot.
+    /// The offset, from the frame's base (its lowest address), of a slot. Raw slots come first,
+    /// then the locals, the closure (slot 0) and the arguments (slots 1..=a).
     fn off(&self, k: u32) -> i64 {
-        let (s, a, k) = (self.s as i64, self.a as i64, k as i64);
+        if k & RAW != 0 {
+            return 8 * (k & !RAW) as i64;
+        }
+        let (s, a, r, k) = (self.s as i64, self.a as i64, self.r as i64, k as i64);
         if k == 0 {
             8 * (s - a - 1)
         } else if k <= a {
             8 * (s - a + k - 1)
         } else {
-            8 * (k - a - 1)
+            8 * (r + k - a - 1)
         }
+    }
+
+    /// The size word that describes the frame to the runtime (`frame::BODY`).
+    fn size_word(&self) -> u64 {
+        self.s as u64 | (self.r as u64) << 32
     }
 }
 
@@ -131,6 +154,8 @@ pub struct Gen {
     live: Vec<std::collections::HashSet<u32>>,
     /// The slots each join point's code uses (a jump to it uses them).
     join_uses: HashMap<u32, std::collections::HashSet<u32>>,
+    /// The raw slot an inline primitive's number goes to (a case binder kept unboxed).
+    raw_dest: Option<u32>,
     /// Where an inline primitive's value goes when it is a case scrutinee computed in place.
     fast_done: Option<String>,
     /// The next primitive is a scrutinee whose fast path is already emitted: only the slow path.
@@ -149,6 +174,20 @@ fn header(kind: u8, size: u64, aux: u64) -> u64 {
 /// The words a closure occupies: its header, code word and captures (at least two).
 fn closure_words(c: &SClosure) -> usize {
     (c.captures.len() + 2).max(2)
+}
+
+/// Whether an atom is a raw slot (an unboxed number).
+fn is_raw(a: &Atom) -> bool {
+    matches!(a, Atom::Slot(k) if k & RAW != 0)
+}
+
+/// The cell kind of a primitive's raw operands, when they are boxed for the runtime.
+fn operand_kind(prim: &str) -> u8 {
+    if prim.ends_with("Char#") || prim == "ord#" {
+        CHAR
+    } else {
+        INT
+    }
 }
 
 /// A slot use that stands for every slot (nothing may be cleared).
@@ -177,6 +216,7 @@ impl Gen {
             bool_cells: None,
             fast_done: None,
             slow_only: false,
+            raw_dest: None,
             live: Vec::new(),
             join_uses: HashMap::new(),
         }
@@ -342,11 +382,12 @@ impl Gen {
     /// A closure's code: the prologue, then its expression in tail position.
     fn closure_code(&mut self, label: &str, c: &SClosure, name: &str) {
         self.current_name = name.to_string();
-        let f = Frame { s: c.nslots, a: c.arity };
+        let f = Frame { s: c.nslots + c.nraw, a: c.arity, r: c.nraw };
         self.put_label(label);
         // R1 is the closure; the arguments are above the new frame (they were pushed by the caller).
         self.emit(&format!("subq ${}, %rbp", 8 * (f.s - f.a) as i64));
-        for k in (f.a + 1)..f.s {
+        // The pointer locals start empty for the collector; raw slots are not read by it.
+        for k in (f.a + 1)..(f.s - f.r) {
             self.emit(&format!("movq $0, {}(%rbp)", f.off(k)));
         }
         self.emit(&format!("movq %r14, {}(%rbp)", f.off(0)));
@@ -453,8 +494,47 @@ impl Gen {
                 }
                 self.expr(body, p);
             }
+            SExpr::Case(scrut, _, alts) if matches!(scrut.as_ref(), SExpr::Atom(a) if is_raw(a)) => {
+                // A case of a raw number: its literal alternatives compare the number itself (the
+                // binder is unused, see `stg::raw_uses`).
+                let SExpr::Atom(Atom::Slot(k)) = scrut.as_ref() else { unreachable!() };
+                self.emit(&format!("movq {}, %rax", p.slot(*k)));
+                let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
+                let mut default = false;
+                for (a, l) in alts.iter().zip(&labels) {
+                    match a {
+                        SAlt::Lit(lit, _) => {
+                            let v = match lit {
+                                Lit::Int(i) => *i as u64,
+                                Lit::Char(c) => crate::syntax::lexer::char_code(*c) as u64,
+                                other => panic!("internal: raw case on literal {other:?}"),
+                            };
+                            self.emit(&format!("movabsq ${v}, %rcx"));
+                            self.emit("cmpq %rcx, %rax");
+                            self.emit(&format!("je {l}"));
+                        }
+                        SAlt::Default(_) => {
+                            self.emit(&format!("jmp {l}"));
+                            default = true;
+                            break;
+                        }
+                        SAlt::Con(..) => panic!("internal: raw case on a constructor"),
+                    }
+                }
+                if !default {
+                    self.fail("Non-exhaustive patterns in case", p);
+                }
+                for (a, l) in alts.iter().zip(&labels) {
+                    self.put_label(l);
+                    match a {
+                        SAlt::Lit(_, body) | SAlt::Default(body) => self.expr(body, p),
+                        SAlt::Con(..) => unreachable!(),
+                    }
+                }
+            }
             SExpr::Case(scrut, bslot, alts) => {
                 let cont = self.label("k");
+                let raw_binder = *bslot & RAW != 0;
                 // A variable that is already a value (not a thunk or an indirection) goes straight
                 // to the alternatives, without the return address and `hsc_eval`.
                 let ready = match scrut.as_ref() {
@@ -486,7 +566,10 @@ impl Gen {
                         let ready = self.label("ready");
                         let slow = self.label("slow");
                         self.fast_done = Some(ready.clone());
+                        // A raw binder takes the number straight from the inline path.
+                        self.raw_dest = raw_binder.then_some(*bslot);
                         let fast = self.int_fast_path(name, args, p, &slow);
+                        self.raw_dest = None;
                         self.fast_done = None;
                         if fast {
                             self.put_label(&slow);
@@ -512,10 +595,22 @@ impl Gen {
                 // at -8. Control reaches the label only by a return, never by falling through. A case
                 // in a scrutinee (nested) has the outer case's return address above it, not the
                 // frame: its own frame is empty (the collector reads the outer one's next).
-                let size = if p.pushed == 0 { p.f.s } else { 0 };
+                let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
                 let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
                 self.put_label(&cont);
                 self.emit("addq $8, %rbp");
+                if raw_binder {
+                    // The runtime answered a cell: its number goes to the raw binder. (The inline
+                    // path stored it already and continues after this.)
+                    self.emit("movq 8(%r14), %rcx");
+                    self.emit(&format!("movq %rcx, {}", p.slot(*bslot)));
+                    if let Some(ready) = ready {
+                        self.put_label(&ready);
+                    }
+                    let [SAlt::Default(body)] = &alts[..] else { panic!("internal: raw binder with alternatives") };
+                    self.expr(body, p);
+                    return;
+                }
                 if let Some(ready) = ready {
                     self.put_label(&ready);
                 }
@@ -661,6 +756,7 @@ impl Gen {
     /// Loads an atom into a register.
     fn load(&mut self, a: &Atom, p: Pos, reg: &str) {
         match a {
+            Atom::Slot(k) if k & RAW != 0 => panic!("internal: raw slot {k:#x} used as a pointer"),
             Atom::Slot(k) => self.emit(&format!("movq {}, {reg}", p.slot(*k))),
             Atom::Free(i) => {
                 self.emit(&format!("movq {}, {reg}", p.slot(0)));
@@ -806,6 +902,18 @@ impl Gen {
         }
         let id = self.prim_id(name);
         for (i, a) in args.iter().enumerate() {
+            if let Atom::Slot(k) = a {
+                if k & RAW != 0 {
+                    // A raw operand is boxed for the runtime (the arguments in the record are roots,
+                    // so a collection here keeps those already stored).
+                    self.alloc(2, p);
+                    self.emit(&format!("movq ${}, (%rax)", header(operand_kind(name), 1, 0)));
+                    self.emit(&format!("movq {}, %rcx", p.slot(*k)));
+                    self.emit("movq %rcx, 8(%rax)");
+                    self.emit(&format!("movq %rax, {}(%rbx)", mach::ARGS + 8 * i as i64));
+                    continue;
+                }
+            }
             self.load(a, p, "%rdx");
             self.emit(&format!("movq %rdx, {}(%rbx)", mach::ARGS + 8 * i as i64));
         }
@@ -858,7 +966,16 @@ impl Gen {
         if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
             return false;
         }
+        // A raw destination (a case binder kept unboxed) takes the number itself.
+        let dest = self.raw_dest;
+        if dest.is_some() && k == K::TagToEnum {
+            return false;
+        }
+        // Boxed operands must already be cells of the operand kind; raw ones are numbers.
         for a in args {
+            if is_raw(a) {
+                continue;
+            }
             self.load(a, p, "%rax");
             self.emit(&format!("cmpb ${in_kind}, (%rax)"));
             self.emit(&format!("jne {slow}"));
@@ -867,7 +984,7 @@ impl Gen {
         self.emit(&format!("jne {slow}"));
         if matches!(k, K::Div(_)) {
             // A divisor of 0 or -1 takes the runtime's path (x86 faults on minBound / -1).
-            self.emit("movq 8(%rax), %rax");
+            self.operand(&args[1], p, "%rax");
             self.emit("leaq 1(%rax), %rcx");
             self.emit("cmpq $1, %rcx");
             self.emit(&format!("jbe {slow}"));
@@ -876,8 +993,8 @@ impl Gen {
             let t = self.con_id("GHC.Types.True");
             let f = self.con_id("GHC.Types.False");
             let (t, f) = (self.nullary_con(t), self.nullary_con(f));
-            self.load(&args[0], p, "%rcx");
-            self.emit("cmpq $0, 8(%rcx)");
+            self.operand(&args[0], p, "%rcx");
+            self.emit("testq %rcx, %rcx");
             self.emit(&format!("leaq {f}(%rip), %r14"));
             self.emit(&format!("leaq {t}(%rip), %rax"));
             self.emit("cmovneq %rax, %r14");
@@ -885,32 +1002,38 @@ impl Gen {
             return true;
         }
         if matches!(k, K::Cmp(_) | K::CharCmp(_)) {
-            // A comparison answers one of two shared static cells: nothing is allocated.
-            let (zero, one) = self.bool_cells();
-            self.load(&args[0], p, "%rcx");
-            self.emit("movq 8(%rcx), %rcx");
-            self.load(&args[1], p, "%rdx");
-            self.emit("movq 8(%rdx), %rdx");
+            self.operand(&args[0], p, "%rcx");
+            self.operand(&args[1], p, "%rdx");
             let (cmp, set) = match k {
                 K::Cmp(set) => ("cmpq %rdx, %rcx", set),
                 K::CharCmp(set) => ("cmpl %edx, %ecx", set),
                 _ => unreachable!(),
             };
             self.emit(cmp);
-            self.emit(&format!("leaq {zero}(%rip), %r14"));
-            self.emit(&format!("leaq {one}(%rip), %rax"));
-            let cmov = set.replacen("set", "cmov", 1);
-            self.emit(&format!("{cmov}q %rax, %r14"));
+            if let Some(d) = dest {
+                self.emit(&format!("{set} %cl"));
+                self.emit("movzbl %cl, %ecx");
+                self.emit(&format!("movq %rcx, {}", p.slot(d)));
+            } else {
+                // A comparison answers one of two shared static cells: nothing is allocated.
+                let (zero, one) = self.bool_cells();
+                self.emit(&format!("leaq {zero}(%rip), %r14"));
+                self.emit(&format!("leaq {one}(%rip), %rax"));
+                let cmov = set.replacen("set", "cmov", 1);
+                self.emit(&format!("{cmov}q %rax, %r14"));
+            }
             self.fast_ret(p);
             return true;
         }
-        // The cell is allocated first: a collection moves the arguments, so they are loaded after.
-        self.alloc(2, p);
-        self.load(&args[0], p, "%rcx");
-        self.emit("movq 8(%rcx), %rcx");
+        // A boxed result's cell is allocated first: a collection moves the boxed operands, so
+        // they are loaded after.
+        if dest.is_none() {
+            self.alloc(2, p);
+            self.emit("movq %rax, %r8");
+        }
+        self.operand(&args[0], p, "%rcx");
         if arity == 2 {
-            self.load(&args[1], p, "%rdx");
-            self.emit("movq 8(%rdx), %rdx");
+            self.operand(&args[1], p, "%rdx");
         }
         match k {
             K::Bin(op) => self.emit(&format!("{op} %rdx, %rcx")),
@@ -920,13 +1043,11 @@ impl Gen {
                 self.emit("movq %rdx, %rcx");
             }
             K::Div(quot) => {
-                self.emit("movq %rax, %r8");
                 self.emit("movq %rcx, %rax");
                 self.emit("movq %rdx, %rcx");
                 self.emit("cqto");
                 self.emit("idivq %rcx");
                 self.emit(if quot { "movq %rax, %rcx" } else { "movq %rdx, %rcx" });
-                self.emit("movq %r8, %rax");
             }
             K::Un(op) => self.emit(&format!("{op} %rcx")),
             K::Ord => {}
@@ -934,11 +1055,28 @@ impl Gen {
             K::Chr => self.emit("movl %ecx, %ecx"),
             K::Cmp(_) | K::CharCmp(_) | K::TagToEnum => unreachable!("answered without allocating"),
         }
-        self.emit(&format!("movq ${}, (%rax)", header(out_kind, 1, 0)));
-        self.emit("movq %rcx, 8(%rax)");
-        self.emit("movq %rax, %r14");
+        match dest {
+            Some(d) => self.emit(&format!("movq %rcx, {}", p.slot(d))),
+            None => {
+                self.emit(&format!("movq ${}, (%r8)", header(out_kind, 1, 0)));
+                self.emit("movq %rcx, 8(%r8)");
+                self.emit("movq %r8, %r14");
+            }
+        }
         self.fast_ret(p);
         true
+    }
+
+    /// The number an operand of an inline primitive holds: a raw slot's, or a boxed cell's.
+    fn operand(&mut self, a: &Atom, p: Pos, reg: &str) {
+        if let Atom::Slot(k) = a {
+            if k & RAW != 0 {
+                self.emit(&format!("movq {}, {reg}", p.slot(*k)));
+                return;
+            }
+        }
+        self.load(a, p, reg);
+        self.emit(&format!("movq 8({reg}), {reg}"));
     }
 
     /// The slots used after a case's scrutinee: by its alternatives and, for a case in a
@@ -972,7 +1110,7 @@ impl Gen {
         let mut dead: Vec<u32> = atoms
             .iter()
             .filter_map(|a| match a {
-                Atom::Slot(k) if *k != 0 && !live.contains(k) => Some(*k),
+                Atom::Slot(k) if *k != 0 && k & RAW == 0 && !live.contains(k) => Some(*k),
                 _ => None,
             })
             .collect();
@@ -1079,9 +1217,15 @@ impl Gen {
     /// when a return address is on top).
     fn rt_call(&mut self, name: &str, p: Pos, nargs: usize) {
         let _ = nargs;
-        let top = if p.pushed == 0 { p.f.s as i64 } else { 0 };
+        let top = if p.pushed == 0 { p.f.size_word() } else { 0 };
         self.emit(&format!("movq %r12, {}(%rbx)", mach::HP));
-        self.emit(&format!("movq ${top}, {}(%rbx)", mach::TOP));
+        if top > i32::MAX as u64 {
+            // A size word with raw slots does not fit an immediate store (%rax is no argument).
+            self.emit(&format!("movabsq ${top}, %rax"));
+            self.emit(&format!("movq %rax, {}(%rbx)", mach::TOP));
+        } else {
+            self.emit(&format!("movq ${top}, {}(%rbx)", mach::TOP));
+        }
         self.emit(&format!("movq %rbp, {}(%rbx)", mach::SP));
         self.emit("movq %rbx, %rdi");
         // The C ABI wants a 16-byte aligned stack at each call; r15 keeps the old stack pointer (the
@@ -1411,7 +1555,7 @@ mod nullary_constructor_tests {
     use super::*;
 
     fn position(mode: Mode) -> Pos {
-        Pos { f: Frame { s: 1, a: 0 }, mode, pushed: 0 }
+        Pos { f: Frame { s: 1, a: 0, r: 0 }, mode, pushed: 0 }
     }
 
     #[test]
@@ -1448,7 +1592,7 @@ mod known_global_call_tests {
     use crate::native::stg::SGlobal;
 
     fn position(mode: Mode) -> Pos {
-        Pos { f: Frame { s: 3, a: 2 }, mode, pushed: if mode == Mode::Scrut { 1 } else { 0 } }
+        Pos { f: Frame { s: 3, a: 2, r: 0 }, mode, pushed: if mode == Mode::Scrut { 1 } else { 0 } }
     }
 
     #[test]
@@ -1479,8 +1623,8 @@ mod known_global_call_tests {
     #[test]
     fn forward_and_mutual_entries_are_registered_before_body_generation() {
         let globals = vec![
-            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) } },
-            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) } },
+            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, nraw: 0, body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) } },
+            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, nraw: 0, body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) } },
         ];
         let index = [("Main.main".to_string(), 0), ("Test.other".to_string(), 1)].into_iter().collect();
         let asm = Gen::program(&SProgram { globals, index });
@@ -1507,7 +1651,7 @@ mod liveness_tests {
 
     fn gen(e: &SExpr, mode: Mode) -> String {
         let mut g = Gen::new();
-        g.expr(e, Pos { f: Frame { s: 4, a: 2 }, mode, pushed: 0 });
+        g.expr(e, Pos { f: Frame { s: 4, a: 2, r: 0 }, mode, pushed: 0 });
         g.out
     }
 
