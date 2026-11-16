@@ -49,6 +49,11 @@ pub enum SExpr {
     /// Allocate a closure and return it (a lambda in a strict position).
     Closure(Box<SClosure>),
     Fail(String),
+    /// A join point `id` with its parameter slots and code, in scope in the body: it runs in the
+    /// frame of the enclosing closure, and is reached only by jumps in tail position.
+    Join(u32, Vec<u32>, Box<SExpr>, Box<SExpr>),
+    /// Stores the atoms in the join point's parameter slots and continues at its code.
+    Jump(u32, Vec<Atom>),
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +95,8 @@ struct Body {
     captures: Vec<(String, Atom)>,
     /// Captured names by index into `captures`.
     capture_index: HashMap<String, u32>,
+    /// The join points in scope, to their id and arity.
+    joins: HashMap<String, (u32, usize)>,
 }
 
 pub struct Lowering {
@@ -99,12 +106,14 @@ pub struct Lowering {
     bodies: Vec<Body>,
     /// Thunks for the non-atomic arguments of the operation being lowered, to be allocated before it.
     pending: Vec<(u32, SClosure)>,
+    /// The next join point id (unique in the program).
+    next_join: u32,
 }
 
 impl Body {
     fn new() -> Body {
         // Slot 0 is the closure itself.
-        Body { locals: HashMap::new(), nslots: 1, captures: Vec::new(), capture_index: HashMap::new() }
+        Body { locals: HashMap::new(), nslots: 1, captures: Vec::new(), capture_index: HashMap::new(), joins: HashMap::new() }
     }
 
     fn fresh_slot(&mut self) -> u32 {
@@ -123,6 +132,7 @@ impl Lowering {
             index: index.clone(),
             bodies: Vec::new(),
             pending: Vec::new(),
+            next_join: 0,
         };
         let globals = binds
             .iter()
@@ -195,16 +205,43 @@ impl Lowering {
     /// An expression evaluated in place (a case scrutinee, a body's result).
     fn strict(&mut self, e: &Core) -> SExpr {
         match e {
-            Core::Var(v) => SExpr::Atom(self.resolve(v)),
+            Core::Var(v) => match self.join(v, 0) {
+                Some(id) => SExpr::Jump(id, Vec::new()),
+                None => SExpr::Atom(self.resolve(v)),
+            },
             Core::Lit(l) => SExpr::Atom(Atom::Lit(slit(l))),
             Core::App(..) => {
                 let mark = self.pending.len();
                 let (f, args) = spine(e);
+                if let Some(id) = match f { Core::Var(v) => self.join(v, args.len()), _ => None } {
+                    let aa = args.iter().map(|a| self.atom(a)).collect();
+                    return self.allocating(mark, SExpr::Jump(id, aa));
+                }
                 let fa = self.atom(f);
                 let aa = args.iter().map(|a| self.atom(a)).collect();
                 self.allocating(mark, SExpr::App(fa, aa))
             }
             Core::Lam(..) => SExpr::Closure(Box::new(self.closure_of(e))),
+            Core::Let(binds, body) if is_join(binds, body) => {
+                let (name, rhs) = &binds[0];
+                let mut params = Vec::new();
+                let mut code = rhs;
+                while let Core::Lam(x, b) = code {
+                    params.push(self.bind_local(x));
+                    code = b;
+                }
+                let code = self.strict(code);
+                let id = self.next_join;
+                self.next_join += 1;
+                let prev = self.bodies.last_mut().expect("body").joins.insert(name.clone(), (id, params.len()));
+                let body = self.strict(body);
+                let joins = &mut self.bodies.last_mut().expect("body").joins;
+                match prev {
+                    Some(p) => joins.insert(name.clone(), p),
+                    None => joins.remove(name),
+                };
+                SExpr::Join(id, params, Box::new(code), Box::new(body))
+            }
             Core::Let(binds, body) => {
                 let (slots, rhs) = self.let_binds(binds);
                 let body = self.strict(body);
@@ -245,7 +282,7 @@ impl Lowering {
                 let body = self.strict(&args[1]);
                 SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(body)])
             }
-            Core::Prim(name, args) if matches!(name.as_str(), "unsafeCoerce" | "unsafeCoerce#" | "lazy" | "oneShot" | "inline" | "noinline") && args.len() == 1 => {
+            Core::Prim(name, args) if IDENTITY_PRIMS.contains(&name.as_str()) && args.len() == 1 => {
                 self.strict(&args[0])
             }
             Core::Prim(name, args) => {
@@ -266,8 +303,15 @@ impl Lowering {
         SExpr::Let(bindings, Box::new(op))
     }
 
+    /// The join point a variable names in the current body, when it is applied to `n` arguments.
+    fn join(&self, name: &str, n: usize) -> Option<u32> {
+        let b = self.bodies.last()?;
+        b.joins.get(name).filter(|(_, arity)| *arity == n).map(|(id, _)| *id)
+    }
+
     fn bind_local(&mut self, name: &str) -> u32 {
         let b = self.bodies.last_mut().expect("body");
+        b.joins.remove(name);
         let s = b.fresh_slot();
         b.locals.insert(name.to_string(), s);
         s
@@ -339,6 +383,93 @@ fn redirect(e: &Core, j: &str) -> Core {
         ),
         Core::Fail(_) => e.clone(),
         other => Core::App(Box::new(Core::Var(j.to_string())), Box::new(other.clone())),
+    }
+}
+
+/// Whether a let is lowered as a join point: one non-recursive binding all of whose uses in the
+/// body are calls with as many arguments as it has parameters, in tail position.
+fn is_join(binds: &[(String, Core)], body: &Core) -> bool {
+    let [(name, rhs)] = binds else { return false };
+    !mentions(rhs, name) && tail_calls(body, name, lambdas(rhs).0)
+}
+
+/// The leading parameters of an expression, and what is under them.
+fn lambdas(e: &Core) -> (usize, &Core) {
+    let mut n = 0;
+    let mut cur = e;
+    while let Core::Lam(_, b) = cur {
+        n += 1;
+        cur = b;
+    }
+    (n, cur)
+}
+
+const IDENTITY_PRIMS: [&str; 6] = ["unsafeCoerce", "unsafeCoerce#", "lazy", "oneShot", "inline", "noinline"];
+
+/// Whether every use of `j` in `e` is a call `j a1 .. an` in tail position (its arguments not
+/// mentioning `j`). Tail positions are those `strict` lowers in the frame and mode of `e`: case
+/// alternatives, let bodies, the code of join points, and the result of `seq` and identities.
+fn tail_calls(e: &Core, j: &str, n: usize) -> bool {
+    match e {
+        Core::Var(v) => v != j || n == 0,
+        Core::Lit(_) | Core::Fail(_) => true,
+        Core::App(..) => {
+            let (f, args) = spine(e);
+            match f {
+                Core::Var(v) if v == j => args.len() == n && args.iter().all(|a| !mentions(a, j)),
+                _ => !mentions(e, j),
+            }
+        }
+        Core::Lam(x, b) => x == j || !mentions(b, j),
+        Core::Let(binds, body) => {
+            if binds.iter().any(|(x, _)| x == j) {
+                return true;
+            }
+            if is_join(binds, body) {
+                let (_, code) = lambdas(&binds[0].1);
+                let shadowed = {
+                    let mut cur = &binds[0].1;
+                    let mut hit = false;
+                    while let Core::Lam(x, b) = cur {
+                        hit |= x == j;
+                        cur = b;
+                    }
+                    hit
+                };
+                (shadowed || tail_calls(code, j, n)) && tail_calls(body, j, n)
+            } else {
+                binds.iter().all(|(_, rhs)| !mentions(rhs, j)) && tail_calls(body, j, n)
+            }
+        }
+        Core::Case(scrut, binder, alts) => {
+            !mentions(scrut, j)
+                && (binder == j
+                    || alts.iter().all(|a| match a {
+                        Alt::Con(_, vars, b) => vars.iter().any(|v| v == j) || tail_calls(b, j, n),
+                        Alt::Lit(_, b) | Alt::Default(b) => tail_calls(b, j, n),
+                    }))
+        }
+        Core::Prim(p, args) if p == "seq" && args.len() == 2 => !mentions(&args[0], j) && tail_calls(&args[1], j, n),
+        Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => tail_calls(&args[0], j, n),
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, j)),
+    }
+}
+
+/// Whether a variable occurs in an expression (shadowing ignored: a conservative answer).
+fn mentions(e: &Core, j: &str) -> bool {
+    match e {
+        Core::Var(v) => v == j,
+        Core::Lit(_) | Core::Fail(_) => false,
+        Core::App(f, a) => mentions(f, j) || mentions(a, j),
+        Core::Lam(_, b) => mentions(b, j),
+        Core::Let(binds, body) => binds.iter().any(|(_, r)| mentions(r, j)) || mentions(body, j),
+        Core::Case(s, _, alts) => {
+            mentions(s, j)
+                || alts.iter().any(|a| match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => mentions(b, j),
+                })
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| mentions(a, j)),
     }
 }
 

@@ -127,6 +127,8 @@ pub struct Gen {
     nullary_cons: HashMap<u32, String>,
     /// Byte strings (label, bytes).
     strings: Vec<(String, Vec<u8>)>,
+    /// The code labels and parameter slots of the join points generated so far.
+    joins: HashMap<u32, (String, Vec<u32>)>,
 }
 
 /// The header word of an object: `kind | size << 8 | aux << 32`.
@@ -158,6 +160,7 @@ impl Gen {
             statics: Vec::new(),
             nullary_cons: HashMap::new(),
             strings: Vec::new(),
+            joins: HashMap::new(),
         }
     }
 
@@ -422,6 +425,24 @@ impl Gen {
             }
             SExpr::Fail(msg) => {
                 self.fail(msg, p);
+            }
+            SExpr::Join(id, params, code, body) => {
+                // Every expression ends in a transfer of control, so the join point's code follows
+                // the body; jumps reach it in the same frame and mode.
+                let l = self.label("join");
+                self.joins.insert(*id, (l.clone(), params.clone()));
+                self.expr(body, p);
+                self.put_label(&l);
+                self.expr(code, p);
+            }
+            SExpr::Jump(id, args) => {
+                let (l, params) = self.joins[id].clone();
+                // The parameters are fresh slots that no argument refers to.
+                for (a, s) in args.iter().zip(&params) {
+                    self.load(a, p, "%rcx");
+                    self.emit(&format!("movq %rcx, {}", p.slot(*s)));
+                }
+                self.emit(&format!("jmp {l}"));
             }
         }
     }

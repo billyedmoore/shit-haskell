@@ -418,6 +418,7 @@ fn with_runtime<T: Send + 'static>(
     crate::core::opt::inline_prim_wrappers(&mut binds);
     crate::core::opt::specialise_literals(&mut binds);
     crate::core::opt::resolve_known_methods(&mut binds);
+    crate::core::opt::simplify(&mut binds);
     let handle = std::thread::Builder::new()
         .stack_size(4 << 30)
         .spawn(move || -> Result<T, String> {
