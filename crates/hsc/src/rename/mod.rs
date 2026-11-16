@@ -280,6 +280,8 @@ impl<'a> Renamer<'a> {
             imports,
             decls,
             loc: m.loc,
+            // Rules are not renamed yet: they are not used past the parser.
+            rules: Vec::new(),
         };
         Ok((module, iface))
     }

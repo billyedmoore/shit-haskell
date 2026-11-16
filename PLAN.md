@@ -387,7 +387,9 @@ The work:
   happens, and lazy intermediate lists dominate nqueens, strings and ioref (generic eval/apply
   is 30-40% of their instructions). Plan, in steps:
   1. Parse rule pragmas (name, activation `[n]`/`[~n]`, `forall` binders with optional
-     signatures, LHS = RHS) into the module's declarations.
+     signatures, LHS = RHS) into the module's `rules` (done: every rule in base parses; one
+     that does not is skipped, since rules never change meaning; `HSC_DEBUG_RULES` reports it;
+     the renamer drops them until step 2).
   2. Type-check each side with the binders in scope (the LHS's type is the RHS's), desugar both
      to Core; the LHS's dictionary arguments become pattern variables. Rules travel in
      interfaces and the module cache like the bindings they mention.

@@ -69,15 +69,30 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     } else {
         lexed
     };
+    let rule_pragmas: Vec<lexer::Pragma> = lexed.pragmas.iter().filter(|p| p.name == "RULES").cloned().collect();
     let mut tokens = lexed.tokens;
     if th_quotes {
         tokens = quote_brackets(tokens);
     }
-    let module = parser::parse_module(tokens, exts.clone()).map_err(|e| SyntaxError {
+    let mut module = parser::parse_module(tokens, exts.clone()).map_err(|e| SyntaxError {
         line: e.line,
         col: e.col,
         msg: e.msg,
     })?;
+    // Rewrite rules: each pragma's body is lexed on its own, at the pragma's lines.
+    for p in rule_pragmas {
+        let Ok(lexed) = lexer::lex_with(&p.body, exts.is_on("MagicHash")) else { continue };
+        let tokens: Vec<token::Token> = lexed
+            .tokens
+            .into_iter()
+            .map(|mut t| {
+                t.line += p.line - 1;
+                t.end_line += p.line - 1;
+                t
+            })
+            .collect();
+        module.rules.extend(parser::parse_rules(tokens, &exts));
+    }
     Ok((module, exts))
 }
 
@@ -266,4 +281,37 @@ fn rewrite_quasiquotes(src: &str, th_quotes: bool) -> Option<String> {
         i += 1;
     }
     changed.then_some(out)
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::ast::Activation;
+
+    #[test]
+    fn base_style_rules_parse_with_activations_and_binder_signatures() {
+        let src = r#"module M where
+{-# RULES
+"fold/build"    forall k z (g::forall b. (a->b->b) -> b -> b) .
+                foldr k z (build g) = g k z
+"map"       [~1] forall f xs.   map f xs                = build (\c n -> foldr (mapFB c f) n xs)
+"mapList"   [1]  forall f.      foldr (mapFB (:) f) []  = map f
+"foldr/id"                        foldr (:) [] = \x  -> x
+  #-}
+{-# RULES "a" forall x. f x = x ; "b" [~] g = h #-}
+f x = x
+"#;
+        let (m, _) = super::parse_module_source(src, &[]).expect("parses");
+        let names: Vec<&str> = m.rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["fold/build", "map", "mapList", "foldr/id", "a", "b"]);
+        let acts: Vec<Activation> = m.rules.iter().map(|r| r.activation).collect();
+        assert_eq!(
+            acts,
+            [Activation::Always, Activation::Before(1), Activation::From(1), Activation::Always, Activation::Always, Activation::Never]
+        );
+        let fb = &m.rules[0];
+        assert_eq!(fb.binders.iter().map(|(b, _)| b.as_str()).collect::<Vec<_>>(), ["k", "z", "g"]);
+        assert!(fb.binders[2].1.is_some(), "g's rank-2 signature is kept");
+        assert!(m.rules[3].binders.is_empty());
+        assert_eq!(fb.loc.line, 3);
+    }
 }

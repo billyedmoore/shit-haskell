@@ -71,6 +71,157 @@ pub fn parse_module(toks: Vec<Token>, exts: Extensions) -> PResult<Module> {
     Ok(m)
 }
 
+/// Parses the body of a `{-# RULES #-}` pragma (lexed, with the pragma's line) into its rules.
+/// A rule this parser cannot read is left out: rules only make programs faster, so a skipped one
+/// changes no result (`HSC_DEBUG_RULES` reports it).
+pub fn parse_rules(toks: Vec<Token>, exts: &Extensions) -> Vec<crate::syntax::ast::Rule> {
+    // Each rule starts at its name, a string literal that begins a line (or the pragma), or
+    // follows a `;`.
+    let mut starts = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let after_semi = i > 0 && matches!(toks[i - 1].tok, Tok::Special(';'));
+        if matches!(t.tok, Tok::Str(_)) && (i == 0 || t.first_on_line || after_semi) {
+            starts.push(i);
+        }
+    }
+    let mut out = Vec::new();
+    for (k, &start) in starts.iter().enumerate() {
+        let mut end = starts.get(k + 1).copied().unwrap_or(toks.len());
+        while end > start && matches!(toks[end - 1].tok, Tok::Special(';') | Tok::Eof) {
+            end -= 1;
+        }
+        let rule_toks = toks[start..end].to_vec();
+        match parse_rule(rule_toks, exts) {
+            Ok(r) => out.push(r),
+            Err(e) => {
+                if std::env::var_os("HSC_DEBUG_RULES").is_some() {
+                    eprintln!("rule at line {} not read: {}", toks[start].line, e.msg);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax::ast::Rule> {
+    use crate::syntax::ast::{Activation, Rule};
+    let loc = Loc { line: toks[0].line, col: toks[0].col };
+    let fail = |msg: &str| ParseError { line: loc.line, col: loc.col, msg: msg.to_string() };
+    let Tok::Str(name) = toks[0].tok.clone() else { return Err(fail("a rule starts with its name")) };
+    let mut i = 1;
+    // [n], [~n] or [~]
+    let mut activation = Activation::Always;
+    if matches!(toks.get(i).map(|t| &t.tok), Some(Tok::Special('['))) {
+        let before = matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::Res(ROp::Tilde)))
+            || matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::VarSym(s)) if s == "~");
+        let j = if before { i + 2 } else { i + 1 };
+        match (toks.get(j).map(|t| &t.tok), toks.get(j + 1).map(|t| &t.tok)) {
+            (Some(Tok::Int(n)), Some(Tok::Special(']'))) => {
+                let n: u32 = n.parse().map_err(|_| fail("a phase is a number"))?;
+                activation = if before { Activation::Before(n) } else { Activation::From(n) };
+                i = j + 2;
+            }
+            (Some(Tok::Special(']')), _) if before => {
+                activation = Activation::Never;
+                i = j + 1;
+            }
+            _ => return Err(fail("unreadable activation")),
+        }
+    }
+    // A `=` at bracket depth 0 separates the two sides.
+    let mut depth = 0i32;
+    let mut eq = None;
+    for (j, t) in toks.iter().enumerate().skip(i) {
+        match &t.tok {
+            Tok::Special('(' | '[' | '{') => depth += 1,
+            Tok::Special(')' | ']' | '}') => depth -= 1,
+            Tok::Res(ROp::Eq) if depth == 0 => {
+                eq = Some(j);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(eq) = eq else { return Err(fail("a rule has an `=`")) };
+    let mut rhs_toks = toks.split_off(eq + 1);
+    toks.pop();
+    let mut lhs_toks = toks.split_off(i);
+    // forall binders . (a type-level `forall a .` before them is skipped)
+    let mut binders = Vec::new();
+    let is_forall = |t: &Token| matches!(&t.tok, Tok::VarId(v) if v == "forall");
+    while lhs_toks.first().is_some_and(is_forall) {
+        // The `.` that ends the binders, outside their (possibly forall-typed) signatures.
+        let mut depth = 0i32;
+        let dot = lhs_toks
+            .iter()
+            .position(|t| {
+                match &t.tok {
+                    Tok::Special('(') => depth += 1,
+                    Tok::Special(')') => depth -= 1,
+                    _ => {}
+                }
+                depth == 0 && matches!(&t.tok, Tok::VarSym(s) if s == ".")
+            })
+            .ok_or_else(|| fail("forall without `.`"))?;
+        let bs: Vec<Token> = lhs_toks.drain(..=dot).skip(1).collect();
+        let bs = &bs[..bs.len() - 1];
+        binders.clear();
+        let mut j = 0;
+        while j < bs.len() {
+            match &bs[j].tok {
+                Tok::VarId(v) => {
+                    binders.push((v.clone(), None));
+                    j += 1;
+                }
+                Tok::Special('(') => {
+                    let close = (j + 1..bs.len()).find(|&k| {
+                        let d: i32 = bs[j..=k].iter().map(|t| match t.tok { Tok::Special('(') => 1, Tok::Special(')') => -1, _ => 0 }).sum();
+                        d == 0
+                    }).ok_or_else(|| fail("unclosed binder"))?;
+                    let Some(Tok::VarId(v)) = bs.get(j + 1).map(|t| &t.tok) else { return Err(fail("a binder is a variable")) };
+                    let ty = if matches!(bs.get(j + 2).map(|t| &t.tok), Some(Tok::Res(ROp::DColon))) {
+                        let mut ty_toks = bs[j + 3..close].to_vec();
+                        ty_toks.push(eof_after(&bs[close]));
+                        let mut tp = Parser { toks: ty_toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone() };
+                        let t = tp.sigtype()?;
+                        if !tp.at_eof() {
+                            return Err(fail("unreadable binder type"));
+                        }
+                        Some(t)
+                    } else {
+                        None
+                    };
+                    binders.push((v.clone(), ty));
+                    j = close + 1;
+                }
+                _ => return Err(fail("unreadable binder")),
+            }
+        }
+    }
+    let side = |mut ts: Vec<Token>, exts: &Extensions| -> PResult<Expr> {
+        if ts.is_empty() {
+            return Err(fail("an empty side"));
+        }
+        let last = ts[ts.len() - 1].clone();
+        ts.push(eof_after(&last));
+        let mut ep = Parser { toks: ts, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone() };
+        let e = ep.expr()?;
+        if !ep.at_eof() {
+            return Err(fail("unread tokens after a side"));
+        }
+        Ok(e)
+    };
+    let lhs = side(lhs_toks, exts)?;
+    rhs_toks.retain(|t| !matches!(t.tok, Tok::Eof));
+    let rhs = side(rhs_toks, exts)?;
+    Ok(Rule { name, activation, binders, lhs, rhs, loc })
+}
+
+/// An end-of-input token just after `t`.
+fn eof_after(t: &Token) -> Token {
+    Token { tok: Tok::Eof, line: t.end_line, col: t.end_col + 1, end_line: t.end_line, end_col: t.end_col + 1, first_on_line: false, space_before: true, space_after: true }
+}
+
 /// A GADT-syntax operator constructor with two arguments is infix for `deriving Show`
 /// when the module gives it a fixity declaration (GHC's rule).
 fn mark_gadt_infix(m: &mut Module) {
@@ -494,6 +645,7 @@ impl Parser {
             imports,
             decls: group_binds(decls),
             loc,
+            rules: Vec::new(),
         })
     }
 

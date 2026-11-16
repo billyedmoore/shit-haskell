@@ -9,7 +9,7 @@ pub struct LexError {
     pub msg: String,
 }
 
-/// A `{-# NAME body #-}` pragma. Only LANGUAGE and OPTIONS_GHC are kept.
+/// A `{-# NAME body #-}` pragma. Only LANGUAGE, OPTIONS_GHC and RULES are kept.
 #[derive(Debug, Clone)]
 pub struct Pragma {
     pub name: String,
@@ -308,8 +308,14 @@ impl Lexer {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect::<String>()
             .to_ascii_uppercase();
-        if name == "LANGUAGE" || name == "OPTIONS_GHC" {
-            let rest = trimmed[name.len().min(trimmed.len())..].trim().to_string();
+        if name == "LANGUAGE" || name == "OPTIONS_GHC" || name == "RULES" {
+            // A RULES body keeps its line breaks (its rules' positions count lines from here).
+            let rest = if name == "RULES" {
+                let at = body.len() - body.trim_start().len() + name.len();
+                body[at.min(body.len())..].to_string()
+            } else {
+                trimmed[name.len().min(trimmed.len())..].trim().to_string()
+            };
             self.pragmas.push(Pragma {
                 name,
                 body: rest,
