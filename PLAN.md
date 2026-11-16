@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 235 differential tests for both back ends, compared with GHC.
+- **Corpus:** 236 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -302,15 +302,26 @@ A body's frame kept every slot alive until the body returned, so during `case m 
 slot holding `m` kept the chain of actions `forM_` builds reachable (ioref held ~19M words). A
 call or evaluation in a scrutinee now clears the slots it mentions that nothing uses after it
 (the alternatives, enclosing continuations and the code of join points they jump to). ioref
-keeps 2,434 live words; locally it takes 682 → 237 ms and strings 998 → 769 ms.
+keeps 2,434 live words (PR #46). Hosted, ioref takes 633 → 166 ms; the others are unchanged
+(a local strings gain did not reproduce). [Raw samples, conditions and graphs](bench/results/runtime-frame-liveness.md).
+
+A local function generalised over class constraints but called with the same global
+dictionaries everywhere (recursive calls may pass the parameter itself) is specialised: the
+dictionaries are substituted and the parameters dropped, so its methods resolve and inline.
+nqueens' `safe` compared through three dictionaries; locally nqueens takes 93 → 56 ms
+(instructions 831 → 434 M). `HSC_DEBUG` builds give every generated body a sized symbol, so
+cachegrind attributes time to Haskell bindings. The nqueens profile now shows ~32% in the
+generic eval/apply/update runtime: unknown calls and laziness, the target of worker/wrapper and
+wider specialisation.
 
 The work:
 - Space: thunk retention, selector thunks in the GC, blackholing.
 - Code: inline `Int#`, `Word#`, `Char#` and `tagToEnum#` operations, static small `Integer`
   literals, and folds of Int/Word/Integer conversions (done); next Double, then unboxed values in
   registers (worker/wrapper) and a direct calling convention.
-- Optimiser: inlining, case-of-case, strictness and call by value (done, first versions); next
-  specialisation at known dictionaries, worker/wrapper, rewrite rules (for `-O1`'s list fusion).
+- Optimiser: inlining, case-of-case, strictness and call by value, specialisation of local
+  functions at constant dictionaries (done, first versions); next specialisation of global
+  functions at known dictionaries, worker/wrapper, rewrite rules (for `-O1`'s list fusion).
 - Strictness: the analysis's effect boundary (GHC's IO hack) recognises effectful primitives
   and applications matched against a pair; a helper answering only `State#` under a default
   alternative is not recognised, so a later demand could be evaluated before its effect. No
