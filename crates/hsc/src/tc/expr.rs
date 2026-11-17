@@ -1590,50 +1590,53 @@ impl Checker {
         self.desugar_comp(body, &[Stmt::Bind { pat, expr: list, loc }], loc)
     }
 
+    /// `[e | quals]`, as GHC desugars it: `build (\c n -> T[e | quals] c n)` with
+    /// `T[e | ] c r = c e r`, `T[e | b, Q] c r = if b then T[e | Q] c r else r`,
+    /// `T[e | let ds, Q] c r = let ds in T[e | Q] c r` and
+    /// `T[e | p <- l, Q] c r = foldr (\x acc -> case x of p -> T[e | Q] c acc; _ -> acc) r l`,
+    /// so that a comprehension fuses with what consumes it and its generators (no `++`). Where
+    /// `build` is not defined yet (the first base modules), `c` and `n` are `(:)` and `[]`.
     fn desugar_comp(&mut self, body: &Expr, quals: &[Stmt], loc: Loc) -> Expr {
-        let Some((first, rest)) = quals.split_first() else {
-            return Expr::List(vec![body.clone()], loc);
+        let build = self.resolve_key("Base.build");
+        if self.lookup_var(&build).is_none() {
+            let cons = Expr::Con(QName { qual: Some(crate::rename::BUILTIN.into()), name: ":".into() }, loc);
+            return self.comp_fold(body, quals, &cons, Expr::List(vec![], loc), loc);
+        }
+        let c = self.fresh_name("lcc");
+        let n = self.fresh_name("lcn");
+        let inner = self.comp_fold(body, quals, &var(&c, loc), var(&n, loc), loc);
+        app(prelude("build", loc), Expr::Lam(vec![Pat::Var(c, loc), Pat::Var(n, loc)], Box::new(inner), loc))
+    }
+
+    /// `T[body | quals] cons rest` (see `desugar_comp`).
+    fn comp_fold(&mut self, body: &Expr, quals: &[Stmt], cons: &Expr, rest: Expr, loc: Loc) -> Expr {
+        let Some((first, more)) = quals.split_first() else {
+            return app(app(cons.clone(), body.clone()), rest);
         };
-        let tail = self.desugar_comp(body, rest, loc);
         match first {
-            Stmt::Expr { expr, loc: l } => Expr::If(
-                Box::new(expr.clone()),
-                Box::new(tail),
-                Box::new(Expr::List(vec![], *l)),
-                *l,
-            ),
-            Stmt::Let { decls, loc: l } => Expr::Let(decls.clone(), Box::new(tail), *l),
+            Stmt::Expr { expr, loc: l } => {
+                let tail = self.comp_fold(body, more, cons, rest.clone(), loc);
+                Expr::If(Box::new(expr.clone()), Box::new(tail), Box::new(rest), *l)
+            }
+            Stmt::Let { decls, loc: l } => {
+                let tail = self.comp_fold(body, more, cons, rest, loc);
+                Expr::Let(decls.clone(), Box::new(tail), *l)
+            }
             Stmt::Bind { pat, expr, loc: l } => {
+                // A fresh name for each (a comprehension in another's qualifiers has its own).
                 let x = self.fresh_name("lcx");
+                let acc = self.fresh_name("lcacc");
+                let tail = self.comp_fold(body, more, cons, var(&acc, *l), loc);
                 let case = Expr::Case(
                     Box::new(var(&x, *l)),
                     vec![
-                        AstAlt {
-                            pat: pat.clone(),
-                            rhs: plain_rhs(tail),
-                            loc: *l,
-                        },
-                        AstAlt {
-                            pat: Pat::Wild(*l),
-                            rhs: plain_rhs(Expr::List(vec![], *l)),
-                            loc: *l,
-                        },
+                        AstAlt { pat: pat.clone(), rhs: plain_rhs(tail), loc: *l },
+                        AstAlt { pat: Pat::Wild(*l), rhs: plain_rhs(var(&acc, *l)), loc: *l },
                     ],
                     *l,
                 );
-                // foldr (\x acc -> case .. ++ acc) [] xs: built from foldr and (++), which every
-                // base module defines (concatMap lives in a later module).
-                // A fresh name for each (a comprehension in another's qualifiers has its own).
-                let acc = self.fresh_name("lcacc");
-                let step = Expr::Lam(
-                    vec![Pat::Var(x, *l), Pat::Var(acc.clone(), *l)],
-                    Box::new(app(
-                        app(prelude("++", *l), case),
-                        Expr::Var(QName::unqual(acc), *l),
-                    )),
-                    *l,
-                );
-                app(app(app(prelude("foldr", *l), step), Expr::List(vec![], *l)), expr.clone())
+                let step = Expr::Lam(vec![Pat::Var(x, *l), Pat::Var(acc, *l)], Box::new(case), *l);
+                app(app(app(prelude("foldr", *l), step), rest), expr.clone())
             }
         }
     }
