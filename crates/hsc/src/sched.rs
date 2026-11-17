@@ -781,6 +781,41 @@ impl<V> Sched<V> {
         }
     }
 
+    /// Green threads (the native runtime, where every Haskell thread is a coroutine on one OS
+    /// thread): the thread to run after the running one has been queued or blocked, made the
+    /// running one. It may be the same thread.
+    pub fn pick_next(&mut self) -> Tid {
+        let next = self.next();
+        self.cur = next;
+        next
+    }
+
+    /// Green threads: ends the running thread (as `finish`) and answers the next, made the running
+    /// one.
+    pub fn finish_pick(&mut self) -> Tid {
+        let me = self.cur;
+        if let Some(t) = self.threads.remove(&me) {
+            for (_, from) in t.pending {
+                if let Some(f) = from {
+                    self.wake_thrower(f, me);
+                }
+            }
+        }
+        self.pick_next()
+    }
+
+    /// Green threads: the running thread makes a safe foreign call on the OS thread `os_thread`
+    /// (a worker), and is blocked until the worker leaves its number in the list answered (the
+    /// caller then switches).
+    pub fn foreign_begin(&mut self, interruptible: bool, os_thread: u64) -> Arc<(Mutex<Vec<Tid>>, Condvar)> {
+        let t = self.me();
+        t.state = State::Blocked(Why::Foreign);
+        t.interruptible = interruptible;
+        t.os_thread = os_thread;
+        self.in_foreign += 1;
+        self.returned.clone()
+    }
+
     /// Every value the scheduler holds (for the collector of the native runtime).
     pub fn roots(&mut self, f: &mut dyn FnMut(&mut V)) {
         for t in self.threads.values_mut() {

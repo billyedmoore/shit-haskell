@@ -54,10 +54,11 @@ test suites, and never slower than `ghc -O0`. Compile times comparable to GHC's.
 
 **Done so far (details in `bench/results/`):** direct calls, unboxed workers and raw returns,
 join points, RULES and foldr/build fusion, oneShot, case-of-case, calls by value, INLINE
-pragmas, eta-expansion, raw numbers in registers with constant division (PR #63).
+pragmas, eta-expansion, raw numbers in registers with constant division (PR #63), green
+threads: coroutines on one OS thread, safe foreign calls on worker threads (PR #64).
 
 **Next:**
-- Green threads instead of OS threads (mvar).
+- mvar: the MVar primitives and thread switches still go through the generic runtime.
 - Less boxing and generic application (nqueens, ioref).
 - Leaner frame prologues (pointer locals are zeroed at every entry).
 - Strings: `[Char]` processing and `show`.

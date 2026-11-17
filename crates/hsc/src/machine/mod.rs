@@ -65,6 +65,8 @@ pub struct Machine {
     pub sched: crate::sched::Sched<Word>,
     /// The registers of the threads waiting for their turn (their roots), by thread.
     pub suspended: crate::sched::IntMap<crate::sched::Tid, conc::Ctx>,
+    /// The coroutines of the threads that are not running.
+    pub coros: conc::Coros,
     /// The writes of the running transaction: each variable with its contents before.
     pub stm_log: Vec<(Word, Word)>,
     /// The transactions the running thread is in.
@@ -137,6 +139,7 @@ impl Machine {
             tid: 1,
             sched: crate::sched::Sched::new(conc::SLICE_MS),
             suspended: crate::sched::IntMap::default(),
+            coros: conc::Coros::default(),
             stm_log: Vec::new(),
             stm_depth: 0,
             stm_retry: false,
