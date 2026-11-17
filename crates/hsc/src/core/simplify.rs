@@ -363,6 +363,22 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
         })
         .collect();
     let arities = &arity_map;
+    // The same, counting the parameters of a local function the body answers after its own
+    // (`foldr k z = let go = \xs -> .. in go` takes three): applied to fewer, it only allocates.
+    let cheap_arities: HashMap<&str, usize> = binds
+        .iter()
+        .filter_map(|b| {
+            let (n, inner) = lambdas(&b.body);
+            let extra = match inner {
+                Core::Let(bs, body) if bs.iter().all(|(_, r)| matches!(r, Core::Lam(..))) => match &**body {
+                    Core::Var(v) => bs.iter().find(|(x, _)| x == v).map_or(0, |(_, r)| lambdas(r).0),
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            (n + extra > 0).then_some((b.name.as_str(), n + extra))
+        })
+        .collect();
     let mut templates: HashMap<String, (usize, Core)> = HashMap::new();
     for b in binds.iter() {
         let (arity, inner) = lambdas(&b.body);
@@ -373,6 +389,21 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
             Some((_, act)) if !act.active(phase) => 0,
             _ => INLINE_SIZE,
         };
+        // A partial application of a known function to atoms (`mconcat = foldr mappend mempty`)
+        // inlines where it is applied, so that the call it makes is seen (and fuses).
+        if arity == 0 && limit > 0 && !is_rule_binding(&b.name) && !rules.protected.contains(&b.name) {
+            let mut args: Vec<&Core> = Vec::new();
+            let mut f = &b.body;
+            while let Core::App(g, a) = f {
+                args.push(a);
+                f = g;
+            }
+            let partial = matches!(f, Core::Var(g) if g != &b.name && cheap_arities.get(g.as_str()).is_some_and(|n| *n > args.len()));
+            if partial && !args.is_empty() && args.iter().all(|a| is_atom(a)) {
+                templates.insert(b.name.clone(), (1, b.body.clone()));
+                continue;
+            }
+        }
         if arity == 0 || size(inner, limit + 1) > limit || mentions(&b.body, &b.name) {
             continue;
         }
@@ -655,9 +686,12 @@ impl Simp<'_> {
                     }
                 }
             }
-            // Representation identities (Int# and Word# share it), and Integer conversions of
-            // small literals and of `IS`.
-            Core::Prim(p, args) if args.len() == 1 && matches!(p.as_str(), "int2Word#" | "word2Int#" | "integerToInt" | "integerToWord") => {
+            // Representation identities (Int# and Word# share it; Core is untyped, so coercions
+            // are nothing), and Integer conversions of small literals and of `IS`.
+            Core::Prim(p, args)
+                if args.len() == 1
+                    && matches!(p.as_str(), "int2Word#" | "word2Int#" | "integerToInt" | "integerToWord" | "unsafeCoerce" | "unsafeCoerce#" | "coerce") =>
+            {
                 self.expr(&mut args[0]);
                 let integer = p.starts_with("integer");
                 let folded = match &mut args[0] {

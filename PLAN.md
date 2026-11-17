@@ -55,11 +55,13 @@ test suites, and never slower than `ghc -O0`. Compile times comparable to GHC's.
 **Done so far (details in `bench/results/`):** direct calls, unboxed workers and raw returns,
 join points, RULES and foldr/build fusion, oneShot, case-of-case, calls by value, INLINE
 pragmas, eta-expansion, raw numbers in registers with constant division (PR #63), green
-threads: coroutines on one OS thread, safe foreign calls on worker threads (PR #64).
+threads: coroutines on one OS thread, safe foreign calls on worker threads (PR #64); list
+comprehensions desugared with foldr/build, coercions dropped, partial applications inlined
+(PR #65).
 
 **Next:**
 - mvar: the MVar primitives and thread switches still go through the generic runtime.
-- Less boxing and generic application (nqueens, ioref).
+- Fusion of `zip` with enumerations (`foldr2`); less boxing and generic application (ioref).
 - Leaner frame prologues (pointer locals are zeroed at every entry).
 - Strings: `[Char]` processing and `show`.
 - Compile time: real interface files; parallel module compilation.
