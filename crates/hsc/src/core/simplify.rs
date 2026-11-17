@@ -79,6 +79,15 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
             }
         }
     }
+    // Each global function's number of parameters (for partial applications, see `let_values`).
+    let arity_map: HashMap<String, usize> = binds
+        .iter()
+        .filter_map(|b| {
+            let (n, _) = lambdas(&b.body);
+            (n > 0).then(|| (b.name.clone(), n))
+        })
+        .collect();
+    let arities = &arity_map;
     let mut templates: HashMap<String, (usize, Core)> = HashMap::new();
     for b in binds.iter() {
         let (arity, inner) = lambdas(&b.body);
@@ -120,13 +129,18 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
             occurrences(&bind.body, 0, &mut depth, &mut occ);
             let mut once = HashSet::new();
             let mut dead = HashSet::new();
-            let values = let_values(&bind.body);
-            for (n, o) in occ {
+            // Single uses outside lambdas first; then values (see `let_values`) used once even
+            // under a lambda: no work is repeated, and the call site can reduce them.
+            for (n, o) in &occ {
                 if o.count == 0 {
-                    dead.insert(n);
-                } else if o.count == 1 && !o.recursive && (!o.under_lambda || values.contains(&n)) {
-                    // A value (a lambda, or a global applied to atoms) moves even under a
-                    // lambda: no work is repeated, and its call site can then reduce it.
+                    dead.insert(n.clone());
+                } else if o.count == 1 && !o.under_lambda && !o.recursive {
+                    once.insert(n.clone());
+                }
+            }
+            let values = let_values(&bind.body, arities, &once);
+            for (n, o) in occ {
+                if o.count == 1 && o.under_lambda && !o.recursive && values.contains(&n) {
                     once.insert(n);
                 }
             }
@@ -434,7 +448,7 @@ impl Simp<'_> {
                 let e = sub.remove(v).expect("matched");
                 // An atom, or an expression the right side uses once (its lambdas are those of
                 // `build`'s argument, called once): in place, so later rules see it.
-                if is_atom(&e) || occurrences_of(&rhs, v) == 1 {
+                if is_atom(&e) || (occurrences_of(&rhs, v) == 1 && one_shot_use(&rhs, v, false)) {
                     subst(&mut rhs, v, &e);
                 } else {
                     let name = format!("{v}{tag}");
@@ -915,54 +929,92 @@ fn drop_args(c: &mut Core, f: &str, constant: &[Option<String>]) {
 
 /// The let-bound locals of an expression whose right sides are values: lambdas, or globals
 /// applied to atoms (partial applications), whose copies cost no repeated work.
-fn let_values(e: &Core) -> HashSet<String> {
-    fn is_value(e: &Core) -> bool {
+fn let_values(e: &Core, arity: &HashMap<String, usize>, moving: &HashSet<String>) -> HashSet<String> {
+    // A lambda, or a global applied to fewer arguments than it takes (a partial application:
+    // no work), each argument a lambda or an atom that is not itself moving (whose work would
+    // otherwise move along).
+    let is_value = |e: &Core| -> bool {
         match e {
             Core::Lam(..) => true,
             Core::App(..) => {
                 let mut h = e;
+                let mut n = 0;
                 while let Core::App(f, a) = h {
-                    if !is_atom(a) && !matches!(**a, Core::Lam(..)) {
+                    let ok = matches!(**a, Core::Lam(..))
+                        || (is_atom(a) && !matches!(&**a, Core::Var(v) if moving.contains(v.as_str())));
+                    if !ok {
                         return false;
                     }
+                    n += 1;
                     h = f;
                 }
-                matches!(h, Core::Var(v) if v.contains('.'))
+                matches!(h, Core::Var(v) if arity.get(v.as_str()).is_some_and(|k| *k > n))
             }
             _ => false,
         }
-    }
-    fn go(e: &Core, out: &mut HashSet<String>) {
+    };
+    fn go(e: &Core, is_value: &dyn Fn(&Core) -> bool, out: &mut HashSet<String>) {
         match e {
             Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
             Core::App(f, a) => {
-                go(f, out);
-                go(a, out);
+                go(f, is_value, out);
+                go(a, is_value, out);
             }
-            Core::Lam(_, b) => go(b, out),
+            Core::Lam(_, b) => go(b, is_value, out),
             Core::Let(binds, body) => {
                 for (x, r) in binds {
                     if is_value(r) {
                         out.insert(x.clone());
                     }
-                    go(r, out);
+                    go(r, is_value, out);
                 }
-                go(body, out);
+                go(body, is_value, out);
             }
             Core::Case(s, _, alts) => {
-                go(s, out);
+                go(s, is_value, out);
                 for a in alts {
                     match a {
-                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => go(b, out),
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => go(b, is_value, out),
                     }
                 }
             }
-            Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| go(a, out)),
+            Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| go(a, is_value, out)),
         }
     }
     let mut out = HashSet::new();
-    go(e, &mut out);
+    go(e, &is_value, &mut out);
     out
+}
+
+/// Whether the use of `x` in `e` is under no lambda but those of `build`'s or `augment`'s
+/// argument (which run once): moving an expression there repeats no work.
+fn one_shot_use(e: &Core, x: &str, under: bool) -> bool {
+    match e {
+        Core::Var(v) => v != x || !under,
+        Core::Lit(_) | Core::Fail(_) => true,
+        Core::App(f, a) => {
+            let builder = matches!(&**f, Core::Var(g) if g == "GHC.Internal.Base.build" || g == "GHC.Internal.Base.augment")
+                || matches!(&**f, Core::App(ff, _) if matches!(&**ff, Core::Var(g) if g == "GHC.Internal.Base.augment"));
+            if builder {
+                // The argument's own lambdas run once.
+                let mut body = &**a;
+                while let Core::Lam(_, b) = body {
+                    body = b;
+                }
+                return one_shot_use(f, x, under) && one_shot_use(body, x, under);
+            }
+            one_shot_use(f, x, under) && one_shot_use(a, x, under)
+        }
+        Core::Lam(_, b) => one_shot_use(b, x, true),
+        Core::Let(binds, body) => binds.iter().all(|(_, r)| one_shot_use(r, x, true)) && one_shot_use(body, x, under),
+        Core::Case(s, _, alts) => {
+            one_shot_use(s, x, under)
+                && alts.iter().all(|a| match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => one_shot_use(b, x, under),
+                })
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| one_shot_use(a, x, true)),
+    }
 }
 
 /// The occurrences of a variable in an expression.
