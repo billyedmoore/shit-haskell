@@ -412,7 +412,20 @@ impl Gen {
             self.emit(&format!("movq %rcx, {}(%rbp)", f.off(*raw)));
             self.emit(&format!("movq $0, {}(%rbp)", f.off(*arg)));
         }
-        self.expr(&c.body, Pos { f, mode: Mode::Tail, pushed: 0 });
+        let p = Pos { f, mode: Mode::Tail, pushed: 0 };
+        // A function's entry is a preemption point (inline arithmetic has none, and every loop
+        // goes through one): at the end of a time slice another thread runs, and an exception
+        // thrown to this one is raised.
+        if c.arity > 0 {
+            let go = self.label("go");
+            self.emit("cmpb $0, hsc_preempt(%rip)");
+            self.emit(&format!("je {go}"));
+            self.rt_call("hsc_yield", p, 0);
+            self.emit("testq %rax, %rax");
+            self.emit("jnz hsc_raise_pending");
+            self.put_label(&go);
+        }
+        self.expr(&c.body, p);
     }
 
     /// Leaves a WHNF value in R1 as the result of the expression.
@@ -960,8 +973,9 @@ impl Gen {
     }
 
     /// An `Int#` operation on arguments that are already INT cells, computed inline; otherwise (or
-    /// when a thread switch is due, or a division could fault) control goes to `slow`, the
-    /// runtime's primitive. Answers whether the fast path was emitted.
+    /// when a division could fault) control goes to `slow`, the runtime's primitive. (Thread
+    /// switches wait for a function's entry, see `closure_code`.) Answers whether the fast path
+    /// was emitted.
     fn int_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
         if self.raw_dest.is_none() && self.mutvar_fast_path(name, args, p, slow) {
             return true;
@@ -1017,8 +1031,6 @@ impl Gen {
             self.emit(&format!("cmpb ${in_kind}, (%rax)"));
             self.emit(&format!("jne {slow}"));
         }
-        self.emit("cmpb $0, hsc_preempt(%rip)");
-        self.emit(&format!("jne {slow}"));
         if matches!(k, K::Div(_)) {
             // A divisor of 0 or -1 takes the runtime's path (x86 faults on minBound / -1).
             self.operand(&args[1], p, "%rax");

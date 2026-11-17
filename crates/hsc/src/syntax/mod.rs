@@ -70,6 +70,10 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
         lexed
     };
     let rule_pragmas: Vec<lexer::Pragma> = lexed.pragmas.iter().filter(|p| p.name == "RULES").cloned().collect();
+    // Top-level INLINE and NOINLINE pragmas (those in class, instance and local bodies are
+    // indented, and ignored).
+    let inline_pragmas: Vec<lexer::Pragma> =
+        lexed.pragmas.iter().filter(|p| (p.name == "INLINE" || p.name == "NOINLINE") && p.col == 1).cloned().collect();
     let mut tokens = lexed.tokens;
     if th_quotes {
         tokens = quote_brackets(tokens);
@@ -92,6 +96,15 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
             })
             .collect();
         module.rules.extend(parser::parse_rules(tokens, &exts));
+    }
+    for p in inline_pragmas {
+        let Ok(lexed) = lexer::lex_with(&p.body, exts.is_on("MagicHash")) else { continue };
+        let tokens: Vec<token::Token> = lexed.tokens.into_iter().map(|mut t| {
+            t.line += p.line - 1;
+            t.end_line += p.line - 1;
+            t
+        }).collect();
+        module.inlines.extend(parser::parse_inline(&tokens, p.name == "INLINE"));
     }
     Ok((module, exts))
 }

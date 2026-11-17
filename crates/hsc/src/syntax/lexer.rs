@@ -9,12 +9,15 @@ pub struct LexError {
     pub msg: String,
 }
 
-/// A `{-# NAME body #-}` pragma. Only LANGUAGE, OPTIONS_GHC and RULES are kept.
+/// A `{-# NAME body #-}` pragma. Only LANGUAGE, OPTIONS_GHC, RULES, INLINE and NOINLINE are
+/// kept.
 #[derive(Debug, Clone)]
 pub struct Pragma {
     pub name: String,
     pub body: String,
     pub line: u32,
+    /// The column of its `{-#` (1 for one at a module's top level).
+    pub col: u32,
 }
 
 pub struct Lexed {
@@ -280,8 +283,7 @@ impl Lexer {
     }
 
     fn pragma(&mut self) -> Result<bool, LexError> {
-        let (line, start_line) = (self.line, self.line);
-        let _ = start_line;
+        let (line, col) = (self.line, self.col);
         self.bump();
         self.bump();
         self.bump();
@@ -308,7 +310,8 @@ impl Lexer {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect::<String>()
             .to_ascii_uppercase();
-        if name == "LANGUAGE" || name == "OPTIONS_GHC" || name == "RULES" {
+        let name = if name == "NOTINLINE" { "NOINLINE".to_string() } else { name };
+        if ["LANGUAGE", "OPTIONS_GHC", "RULES", "INLINE", "NOINLINE"].contains(&name.as_str()) {
             // A RULES body keeps its line breaks (its rules' positions count lines from here).
             let rest = if name == "RULES" {
                 let at = body.len() - body.trim_start().len() + name.len();
@@ -320,6 +323,7 @@ impl Lexer {
                 name,
                 body: rest,
                 line,
+                col: col as u32,
             });
         }
         Ok(nl)

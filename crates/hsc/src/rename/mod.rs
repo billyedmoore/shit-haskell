@@ -103,14 +103,34 @@ pub const RULE_PREFIX: &str = "$rule%";
 
 /// A rewrite rule as a top-level binding: its binders are the parameters (with their
 /// signatures), its body the list of its two sides.
-fn rule_binding(i: usize, r: crate::syntax::ast::Rule) -> Decl {
-    use crate::syntax::ast::{Activation, Body, Clause, Expr, Pat, Rhs};
-    let act = match r.activation {
+/// An activation as rule and inline marker names end: `A`, `F<n>`, `B<n>` or `N`.
+fn activation_code(a: crate::syntax::ast::Activation) -> String {
+    use crate::syntax::ast::Activation;
+    match a {
         Activation::Always => "A".to_string(),
         Activation::From(n) => format!("F{n}"),
         Activation::Before(n) => format!("B{n}"),
         Activation::Never => "N".to_string(),
-    };
+    }
+}
+
+/// An INLINE (`I`) or NOINLINE (`N`) pragma on the global `target`, as a binding
+/// `$rule%inl<i>%<target>%<kind>%<activation> = 'i'` (checked, and kept private, as rules are;
+/// see `core::simplify`, which reads it).
+fn inline_binding(i: usize, target: &str, p: &crate::syntax::ast::InlinePragma) -> Decl {
+    use crate::syntax::ast::{Body, Clause, Expr, Lit, Rhs};
+    let kind = if p.inline { "I" } else { "N" };
+    let body = Expr::Lit(Lit::Char('i'), p.loc);
+    Decl::Fun {
+        name: format!("{RULE_PREFIX}inl{i}%{target}%{kind}%{}", activation_code(p.activation)),
+        clauses: vec![Clause { pats: Vec::new(), rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() }, loc: p.loc, end: p.loc }],
+        loc: p.loc,
+    }
+}
+
+fn rule_binding(i: usize, r: crate::syntax::ast::Rule) -> Decl {
+    use crate::syntax::ast::{Activation, Body, Clause, Expr, Pat, Rhs};
+    let act = activation_code(r.activation);
     let pats = r
         .binders
         .into_iter()
@@ -310,6 +330,16 @@ impl<'a> Renamer<'a> {
             }
         }
 
+        // INLINE and NOINLINE pragmas on the module's globals, as marker bindings.
+        for (i, p) in m.inlines.iter().enumerate() {
+            let Ok(q) = self.value_ref_in_scope(&p.name, p.loc, false) else { continue };
+            let Some(module) = q.qual.as_deref().filter(|m| *m == self.module) else { continue };
+            let target = format!("{module}.{}", q.name);
+            if let Ok(d) = self.top_decl(inline_binding(i, &target, p)) {
+                decls.push(d);
+            }
+        }
+
         // Exports.
         let exports = self.compute_exports(&m.exports, m.loc)?;
         let mut fixities = BTreeMap::new();
@@ -338,6 +368,7 @@ impl<'a> Renamer<'a> {
             loc: m.loc,
             // Rules are among the declarations now (`rule_binding`).
             rules: Vec::new(),
+            inlines: Vec::new(),
         };
         Ok((module, iface))
     }

@@ -171,6 +171,13 @@ pub extern "C" fn hsc_gc(m: *mut Machine, words: u64) {
     m.collect(words as usize);
 }
 
+/// A preemption point at a function's entry (see `conc::safe_point`): answers 1 with an
+/// exception for this thread raised in `exc`, else 0.
+#[no_mangle]
+pub extern "C" fn hsc_yield(mp: *mut Machine) -> u64 {
+    super::conc::safe_point(mp) as u64
+}
+
 /// A primitive operation: `id` names it in the program's table; its arguments are in the record.
 /// Returns the result, or 0 with the exception raised in `exc`.
 #[no_mangle]
