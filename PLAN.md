@@ -455,7 +455,9 @@ The work:
      bindings with fields that are not atoms (IO's Monad dictionary, whose `return` is a
      default) get those fields as globals of their own, so method selection from them
      resolves; and `(seq a f) x` is `seq a (f x)`. ioref 1,015 → 419 M instructions,
-     nqueens 353 → 282 M, mvar 185 → 169 M; strings +0.6%, others within 0.5%.
+     nqueens 353 → 282 M, mvar 185 → 169 M; strings +0.6%, others within 0.5% (PR #62).
+     Hosted: ioref 77.3 → 52.2 ms, nqueens 53.7 → 48.3 ms, integer 19.5 → 16.5 ms, mvar 141 →
+     135 ms. [Raw samples, conditions and graphs](bench/results/runtime-eta-expansion.md).
      Next: register allocation for raw values (sumloop still moves every intermediate through
      its frame); green threads; leaner frame prologues.
 
