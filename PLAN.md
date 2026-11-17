@@ -431,7 +431,9 @@ The work:
      fusion makes local loops, followed by one more phase-0 pass. The sum/map loop becomes a
      direct tail-calling loop with unboxed arguments: 483 → 138 M instructions; integer
      170 → 161 M, nqueens 366 → 353 M, mvar 188 → 185 M; mapops 482 → 502 M (more GC
-     copying of its tree, generated code unchanged), strings 2,578 → 2,599 M.
+     copying of its tree, generated code unchanged), strings 2,578 → 2,599 M (PR #60). Hosted,
+     on a slower runner, every benchmark is within noise (geometric mean 0.99; none has a fused
+     local loop). [Raw samples, conditions and graphs](bench/results/runtime-case-of-case.md).
      Next: `INLINE [n]` phases; green threads; leaner frame prologues.
 
 ### 2. Large projects
