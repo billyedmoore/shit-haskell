@@ -1,11 +1,14 @@
 //! Concurrency in the native runtime: Haskell threads, `MVar#`, masking, asynchronous exceptions
 //! and transactions over `TVar#`, on the shared scheduler (`crate::sched`).
 //!
-//! Every Haskell thread runs on an OS thread of its own with a Haskell stack of its own; the heap,
-//! the globals and the machine record are shared, and only the thread holding the scheduler's baton
-//! runs. A thread switches only inside the runtime (a primitive, the wait for a thunk another thread
-//! evaluates): its registers in the record are saved in its context first and put back when it
-//! runs again, and while it waits the collector finds its roots through that context.
+//! Every Haskell thread is a coroutine on the one OS thread that runs Haskell code, with a C stack
+//! and a Haskell stack of its own; the heap, the globals and the machine record are shared. A
+//! thread switches only inside the runtime (a primitive, the wait for a thunk another thread
+//! evaluates): its registers in the record are saved in its context, the C stacks are swapped
+//! (`hsc_coro_swap`, a few instructions instead of an OS thread's sleep and wake-up), and the
+//! registers are put back when it runs again; while it waits the collector finds its roots through
+//! that context. A safe foreign call runs on a worker OS thread while the caller is blocked, so
+//! that the other threads go on (as GHC's runtime does).
 //!
 //! A transaction runs without giving way to other threads, writing its variables in place and
 //! keeping the old contents in a log: `retry#` and exceptions undo the writes.
@@ -14,13 +17,235 @@ use super::heap::{self, kind, Word};
 use super::prims::{force_arg, int_of, int_value};
 use super::prims_mem::{state_pair, unit};
 use super::{Machine, ARG_SLOTS};
-use crate::sched::{Interrupt, Sched, Thrown, Tid, WaitKind, PREEMPT};
+use crate::sched::{Interrupt, Thrown, Tid, WaitKind, PREEMPT};
 use std::sync::atomic::Ordering;
 
 extern "C" {
     fn hsc_enter(m: *mut Machine, closure: Word) -> i32;
     fn hsc_stop_ret();
     fn hsc_mask_ret();
+}
+
+// The switch between coroutines: `hsc_coro_swap(save, to)` keeps the callee-saved registers on
+// the current stack, stores its pointer in `*save` and continues on the stack `to` (saved the same
+// way). A new coroutine's stack starts with registers whose return goes to `hsc_coro_start`, which
+// calls the function in r13 with the argument in r12.
+std::arch::global_asm!(
+    ".text",
+    ".p2align 4",
+    ".globl hsc_coro_swap",
+    "hsc_coro_swap:",
+    "push rbp",
+    "push rbx",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov [rdi], rsp",
+    "mov rsp, rsi",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbx",
+    "pop rbp",
+    "ret",
+    ".p2align 4",
+    ".globl hsc_coro_start",
+    "hsc_coro_start:",
+    "mov rdi, r12",
+    "call r13",
+    "ud2",
+);
+
+extern "C" {
+    fn hsc_coro_swap(save: *mut usize, to: usize);
+    fn hsc_coro_start();
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+    fn __errno_location() -> *mut i32;
+    fn pthread_self() -> u64;
+}
+
+/// The C stack of a coroutine (reserved; the kernel commits it on use), with a guard page.
+pub struct CStack {
+    base: *mut u8,
+}
+
+impl CStack {
+    fn new() -> Option<CStack> {
+        const PROT_RW: i32 = 3;
+        const FLAGS: i32 = 0x02 | 0x20 | 0x4000 | 0x20000; // private, anonymous, no reserve, stack
+        // SAFETY: a fresh anonymous mapping.
+        let base = unsafe { mmap(std::ptr::null_mut(), FORK_C_STACK, PROT_RW, FLAGS, -1, 0) };
+        if base.is_null() || base as isize == -1 {
+            return None;
+        }
+        // SAFETY: the lowest page of the mapping becomes the guard.
+        unsafe { mprotect(base, 4096, 0) };
+        Some(CStack { base })
+    }
+
+    fn top(&self) -> usize {
+        self.base as usize + FORK_C_STACK
+    }
+}
+
+impl Drop for CStack {
+    fn drop(&mut self) {
+        // SAFETY: the mapping made in `new`, no longer in use.
+        unsafe { munmap(self.base, FORK_C_STACK) };
+    }
+}
+
+/// A coroutine's saved stack pointer (boxed: `hsc_coro_swap` writes it while the table changes).
+pub struct Coro {
+    sp: usize,
+    stack: Option<CStack>,
+}
+
+/// The coroutines of the threads that are not running, and the stacks of finished ones (freed
+/// by the next thread to run: a stack cannot be freed while it is in use).
+#[derive(Default)]
+pub struct Coros {
+    map: crate::sched::IntMap<Tid, Box<Coro>>,
+    dead: Vec<CStack>,
+}
+
+/// What a new coroutine starts with.
+struct Start {
+    mp: *mut Machine,
+    id: Tid,
+    slot: usize,
+}
+
+/// Continues on thread `next`'s coroutine; returns when this one (`me`) runs again.
+///
+/// # Safety
+/// The caller holds no reference into the machine; `next` was suspended by a switch or is new.
+unsafe fn swap_to(mp: *mut Machine, me: Tid, next: Tid) {
+    let coros = &mut (*mp).coros;
+    let to = match coros.map.get(&next) {
+        Some(c) => c.sp,
+        None => panic!("internal: thread {next} has no coroutine"),
+    };
+    let mine: *mut usize = &mut coros.map.entry(me).or_insert_with(|| Box::new(Coro { sp: 0, stack: None })).sp;
+    hsc_coro_swap(mine, to);
+    (*mp).coros.dead.clear();
+}
+
+/// The body of a forked thread's coroutine: it runs the action and ends the thread.
+extern "C" fn coro_main(arg: usize) {
+    // SAFETY: `fork` made the argument; this coroutine runs with the machine to itself.
+    unsafe {
+        let Start { mp, id, slot } = *Box::from_raw(arg as *mut Start);
+        (*mp).coros.dead.clear();
+        let mut stack: Vec<Word> = vec![0; FORK_STACK_WORDS];
+        {
+            let m = &mut *mp;
+            let action = std::mem::replace(&mut m.stable[slot], 0);
+            m.tid = id;
+            m.saved_args.clear();
+            m.stm_log.clear();
+            m.stm_depth = 0;
+            m.stm_retry = false;
+            m.exc = 0;
+            m.prim_failed = false;
+            m.top = 0;
+            // [state token][stop frame with no outer stack]
+            let end = stack.as_mut_ptr() as Word + (FORK_STACK_WORDS as Word) * 8;
+            let a = end - 24;
+            m.stack_store(a, hsc_stop_ret as usize as Word);
+            m.stack_store(a + 8, 0);
+            m.stack_store(a + 16, 0);
+            m.stack_store(a - 8, 0);
+            m.sp = a - 8;
+            m.nargs = 1;
+            // A thread killed before it first runs does nothing.
+            if m.sched.interrupt().is_none() {
+                // An exception the thread does not handle ends it (forkIO's handler reports it).
+                let _ = hsc_enter(mp, action);
+            }
+        }
+        drop(stack);
+        let next = (*mp).sched.finish_pick();
+        // This coroutine is done: its stack goes once the next one runs.
+        let coros = &mut (*mp).coros;
+        if let Some(mut c) = coros.map.remove(&id) {
+            if let Some(st) = c.stack.take() {
+                coros.dead.push(st);
+            }
+        }
+        let to = match coros.map.get(&next) {
+            Some(c) => c.sp,
+            None => panic!("internal: thread {next} has no coroutine"),
+        };
+        let mut gone = 0usize;
+        hsc_coro_swap(&mut gone, to);
+        unreachable!("a finished thread ran again");
+    }
+}
+
+/// A job for a worker: a function of two words, and where to say it is done.
+struct Job {
+    run: unsafe fn(usize, usize),
+    a: usize,
+    b: usize,
+    tid: Tid,
+    errno: *mut i32,
+    returned: std::sync::Arc<(std::sync::Mutex<Vec<Tid>>, std::sync::Condvar)>,
+}
+
+// SAFETY: the words point into the stack of a coroutine blocked until the job is done.
+unsafe impl Send for Job {}
+
+/// An idle worker OS thread for safe foreign calls.
+#[derive(Clone)]
+struct Worker {
+    jobs: std::sync::mpsc::Sender<Job>,
+    os_thread: u64,
+}
+
+static WORKERS: std::sync::Mutex<Vec<Worker>> = std::sync::Mutex::new(Vec::new());
+
+/// An idle worker, or a new one.
+fn worker() -> Option<Worker> {
+    if let Some(w) = WORKERS.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        return Some(w);
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Job>();
+    let (idt, idr) = std::sync::mpsc::channel::<u64>();
+    let me = tx.clone();
+    std::thread::Builder::new()
+        .name("hsc-foreign".into())
+        .stack_size(FORK_C_STACK)
+        .spawn(move || {
+            // SAFETY: no arguments.
+            let os_thread = unsafe { pthread_self() };
+            let _ = idt.send(os_thread);
+            let back = Worker { jobs: me, os_thread };
+            while let Ok(job) = rx.recv() {
+                // SAFETY: the caller is blocked until the job is done (see `foreign_call`).
+                unsafe {
+                    (job.run)(job.a, job.b);
+                    *job.errno = *__errno_location();
+                }
+                WORKERS.lock().unwrap_or_else(|e| e.into_inner()).push(back.clone());
+                let (list, cv) = &*job.returned;
+                list.lock().unwrap_or_else(|e| e.into_inner()).push(job.tid);
+                cv.notify_all();
+            }
+        })
+        .ok()?;
+    let os_thread = idr.recv().ok()?;
+    Some(Worker { jobs: tx, os_thread })
+}
+
+/// Runs the call in `*a` (an `Option<F>`) and leaves its result in `*b` (an `Option<R>`).
+unsafe fn run_call<F: FnOnce() -> R, R>(a: usize, b: usize) {
+    let f = (*(a as *mut Option<F>)).take().expect("internal: a foreign call ran twice");
+    *(b as *mut Option<R>) = Some(f());
 }
 
 /// Words of the Haskell stack of a forked thread (reserved; the kernel commits it on use).
@@ -105,32 +330,48 @@ impl Ctx {
 ///
 /// The machine is only reached through the pointer: other threads change it meanwhile.
 #[inline(never)]
-/// Runs a safe foreign call: when another thread can run, it has the baton (and the machine)
-/// while this one is in C, and this thread's context is saved and restored around it.
+/// Runs a safe foreign call: when other threads exist, on a worker OS thread while this one is
+/// blocked and the others run (errno comes back with the result).
 pub fn foreign_call<R>(m: &mut Machine, interruptible: bool, call: impl FnOnce() -> R) -> R {
-    let mp: *mut Machine = m;
-    // SAFETY: the caller holds the baton; while another thread runs, this one touches neither the
-    // machine nor the scheduler (the call only uses the C arguments it was given).
-    unsafe {
-        if !(*mp).sched.multi() {
-            return call();
-        }
-        let me = (*mp).sched.current();
-        let ctx = Ctx::save(&mut *mp);
-        (*mp).suspended.insert(me, ctx);
-        let s: *mut Sched<Word> = &mut (*mp).sched;
-        let back = Sched::enter_foreign(s, interruptible);
-        let r = call();
-        if let Some(back) = back {
-            back.wait();
-        }
-        if let Some(ctx) = (*mp).suspended.remove(&me) {
-            ctx.restore(&mut *mp, me);
-        }
-        r
+    if !m.sched.multi() {
+        return call();
     }
+    let Some(w) = worker() else { return call() };
+    let mp: *mut Machine = m;
+    let mut call = Some(call);
+    let mut result: Option<R> = None;
+    let mut errno: i32 = 0;
+    // SAFETY: the job's words point at `call` and `result`, which live until this thread runs
+    // again: it is blocked until the worker has finished with them.
+    unsafe {
+        let returned = (*mp).sched.foreign_begin(interruptible, w.os_thread);
+        let job = Job {
+            run: run_call_of(&call, &result),
+            a: &mut call as *mut _ as usize,
+            b: &mut result as *mut _ as usize,
+            tid: (*mp).sched.current(),
+            errno: &mut errno,
+            returned,
+        };
+        if w.jobs.send(job).is_err() {
+            panic!("internal: a foreign-call worker is gone");
+        }
+        switch(mp);
+        *__errno_location() = errno;
+    }
+    result.expect("internal: a foreign call came back without its result")
 }
 
+/// `run_call` for the types of these two places.
+fn run_call_of<F: FnOnce() -> R, R>(_: &Option<F>, _: &Option<R>) -> unsafe fn(usize, usize) {
+    run_call::<F, R>
+}
+
+/// Gives the turn to the next thread (the running one has been queued or blocked in the
+/// scheduler) and returns when this one has it again, with its registers back.
+///
+/// The machine is only reached through the pointer: other threads change it meanwhile.
+#[inline(never)]
 pub fn switch(mp: *mut Machine) {
     // SAFETY: the caller holds the baton; the machine outlives every thread.
     unsafe {
@@ -139,8 +380,10 @@ pub fn switch(mp: *mut Machine) {
             let me = (*mp).sched.current();
             let ctx = Ctx::save(&mut *mp);
             (*mp).suspended.insert(me, ctx);
-            let s: *mut Sched<Word> = &mut (*mp).sched;
-            Sched::switch(s);
+            let next = (*mp).sched.pick_next();
+            if next != me {
+                swap_to(mp, me, next);
+            }
             if let Some(ctx) = (*mp).suspended.remove(&me) {
                 ctx.restore(&mut *mp, me);
             }
@@ -304,53 +547,26 @@ pub fn unwind_mask(m: &mut Machine, saved: Word) {
     m.sched.set_mask(saved as u8);
 }
 
-/// Starts a Haskell thread on an OS thread of its own; it runs when the scheduler gives it the turn.
+/// Starts a Haskell thread: a coroutine that runs when the scheduler gives it the turn.
 fn fork(m: &mut Machine, action: Word) -> Word {
-    let (id, baton, cv) = m.sched.spawn();
+    let Some(stack) = CStack::new() else {
+        m.exc = m.error_value("cannot create a thread");
+        return 0;
+    };
+    let (id, _, _) = m.sched.spawn();
     // The action waits in the stable table until the thread starts (it is a root there).
     m.stable.push(action);
     let slot = m.stable.len() - 1;
-    let mp = m as *mut Machine as usize;
-    let spawned = std::thread::Builder::new().stack_size(FORK_C_STACK).spawn(move || {
-        baton.wait(id, &cv);
-        let mp = mp as *mut Machine;
-        let mut stack: Vec<Word> = vec![0; FORK_STACK_WORDS];
-        // SAFETY: this thread holds the baton; the machine outlives every thread.
-        unsafe {
-            super::set_current(mp);
-            let m = &mut *mp;
-            let action = std::mem::replace(&mut m.stable[slot], 0);
-            m.tid = id;
-            m.saved_args.clear();
-            m.stm_log.clear();
-            m.stm_depth = 0;
-            m.stm_retry = false;
-            m.exc = 0;
-            m.prim_failed = false;
-            m.top = 0;
-            // [state token][stop frame with no outer stack]
-            let end = stack.as_mut_ptr() as Word + (FORK_STACK_WORDS as Word) * 8;
-            let a = end - 24;
-            m.stack_store(a, hsc_stop_ret as usize as Word);
-            m.stack_store(a + 8, 0);
-            m.stack_store(a + 16, 0);
-            m.stack_store(a - 8, 0);
-            m.sp = a - 8;
-            m.nargs = 1;
-            // A thread killed before it first runs does nothing.
-            if m.sched.interrupt().is_none() {
-                // An exception the thread does not handle ends it (forkIO's handler reports it).
-                let _ = hsc_enter(mp, action);
-            }
-            let s: *mut Sched<Word> = &mut (*mp).sched;
-            Sched::finish(s);
-        }
-        drop(stack);
-    });
-    if spawned.is_err() {
-        m.exc = m.error_value("cannot create a thread");
-        return 0;
+    let start = Box::into_raw(Box::new(Start { mp: m, id, slot })) as usize;
+    // The registers `hsc_coro_swap` takes back first: r15, r14, r13 (the function), r12 (its
+    // argument), rbx, rbp, then the return to `hsc_coro_start`, which finds the stack aligned.
+    let sp = (stack.top() & !15) - 72;
+    let words = [0, 0, coro_main as usize, start, 0, 0, hsc_coro_start as usize];
+    for (i, w) in words.iter().enumerate() {
+        // SAFETY: the top of the new stack, below its end.
+        unsafe { *((sp + 8 * i) as *mut usize) = *w };
     }
+    m.coros.map.insert(id, Box::new(Coro { sp, stack: Some(stack) }));
     let t = int_value(m, id as i64);
     state_pair(m, t)
 }
