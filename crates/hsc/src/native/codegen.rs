@@ -169,6 +169,149 @@ pub struct Gen {
     bool_cells: Option<(String, String)>,
     /// The code labels and parameter slots of the join points generated so far.
     joins: HashMap<u32, (String, Vec<u32>)>,
+    /// Raw slots whose numbers are in registers (see `CACHE_REGS`), oldest first.
+    cache: Vec<Cached>,
+    /// The raw slots each expression of the body being generated uses (sorted; by address).
+    raw_uses: HashMap<*const SExpr, Vec<u32>>,
+}
+
+/// A raw slot's number held in a register; `dirty` when the slot itself may not have it yet.
+#[derive(Clone, Copy)]
+struct Cached {
+    slot: u32,
+    reg: &'static str,
+    dirty: bool,
+}
+
+/// A raw operand: a register or an immediate.
+#[derive(Clone, Copy)]
+enum Src {
+    Reg(&'static str),
+    Imm(i64),
+}
+
+/// The registers that hold raw slots' numbers through straight-line arithmetic. They are
+/// caller-saved and nothing else in a body keeps values in them across code it generates, so
+/// they are stored back (`Gen::flush`) before any code that calls out, allocates or jumps to a
+/// label reached from elsewhere.
+const CACHE_REGS: [&str; 6] = ["%rsi", "%rdi", "%r8", "%r9", "%r10", "%r11"];
+
+/// The low byte of a cache register (for `setcc`).
+fn byte_reg(r: &str) -> &'static str {
+    match r {
+        "%rsi" => "%sil",
+        "%rdi" => "%dil",
+        "%r8" => "%r8b",
+        "%r9" => "%r9b",
+        "%r10" => "%r10b",
+        "%r11" => "%r11b",
+        _ => panic!("internal: no byte register for {r}"),
+    }
+}
+
+/// The 32-bit part of a cache register.
+fn low32(r: &str) -> &'static str {
+    match r {
+        "%rsi" => "%esi",
+        "%rdi" => "%edi",
+        "%r8" => "%r8d",
+        "%r9" => "%r9d",
+        "%r10" => "%r10d",
+        "%r11" => "%r11d",
+        _ => panic!("internal: no 32-bit register for {r}"),
+    }
+}
+
+/// The multiplier and shift that divide a signed 64-bit number by `d` (2 <= |d| < 2^62) with a
+/// high multiplication (Hacker's Delight, 10-1): `q = (mulhi(m, n) + (n if d > 0 and m < 0) -
+/// (n if d < 0 and m > 0)) >> s`, plus one when that is negative.
+fn signed_magic(d: i64) -> (i64, u32) {
+    // Unsigned 64-bit arithmetic, wrapping as in the reference.
+    let two63: u64 = 1 << 63;
+    let ad = d.unsigned_abs();
+    let t = two63 + ((d as u64) >> 63);
+    let anc = t - 1 - t % ad;
+    let mut p = 63u32;
+    let (mut q1, mut r1) = (two63 / anc, two63 - (two63 / anc) * anc);
+    let (mut q2, mut r2) = (two63 / ad, two63 - (two63 / ad) * ad);
+    loop {
+        p += 1;
+        q1 = q1.wrapping_mul(2);
+        r1 = r1.wrapping_mul(2);
+        if r1 >= anc {
+            q1 = q1.wrapping_add(1);
+            r1 = r1.wrapping_sub(anc);
+        }
+        q2 = q2.wrapping_mul(2);
+        r2 = r2.wrapping_mul(2);
+        if r2 >= ad {
+            q2 = q2.wrapping_add(1);
+            r2 = r2.wrapping_sub(ad);
+        }
+        let delta = ad - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    let m = q2.wrapping_add(1) as i64;
+    let m = if d < 0 { m.wrapping_neg() } else { m };
+    (m, p - 64)
+}
+
+/// A literal divisor that `signed_magic` handles.
+fn magic_divisor(a: &Atom) -> Option<i64> {
+    match a {
+        Atom::Lit(SLit::Int(d)) if d.unsigned_abs() >= 2 && d.unsigned_abs() < 1 << 62 => Some(*d),
+        _ => None,
+    }
+}
+
+/// Whether `name args` with a raw binder is computed inline from raw numbers and literals alone,
+/// with no slow path (no cell checks, no faulting division): see `Gen::raw_op`.
+fn total_raw_op(name: &str, args: &[Atom]) -> bool {
+    let Some(k) = int_op(name) else { return false };
+    let arity = if matches!(k, K::Un(_) | K::Ord | K::Chr | K::TagToEnum) { 1 } else { 2 };
+    let in_char = matches!(k, K::CharCmp(_) | K::Ord);
+    let num = |a: &Atom| match a {
+        Atom::Slot(k) => k & RAW != 0,
+        Atom::Lit(SLit::Int(_)) => !in_char,
+        Atom::Lit(SLit::Char(_)) => in_char,
+        _ => false,
+    };
+    args.len() == arity
+        && k != K::TagToEnum
+        && args.iter().all(num)
+        && (!matches!(k, K::Div(_)) || magic_divisor(&args[1]).is_some())
+}
+
+/// The inline `Int#`/`Word#`/`Char#` operations (see `Gen::int_fast_path`).
+#[derive(PartialEq, Clone, Copy)]
+enum K { Bin(&'static str), Cmp(&'static str), Shift(&'static str), Div(bool), Un(&'static str), CharCmp(&'static str), Ord, Chr, TagToEnum }
+
+fn int_op(name: &str) -> Option<K> {
+    Some(match name {
+        "+#" => K::Bin("addq"), "-#" => K::Bin("subq"), "*#" => K::Bin("imulq"),
+        "andI#" => K::Bin("andq"), "orI#" => K::Bin("orq"), "xorI#" => K::Bin("xorq"),
+        "==#" => K::Cmp("sete"), "/=#" => K::Cmp("setne"), "<#" => K::Cmp("setl"),
+        "<=#" => K::Cmp("setle"), ">#" => K::Cmp("setg"), ">=#" => K::Cmp("setge"),
+        "uncheckedIShiftL#" => K::Shift("shlq"), "uncheckedIShiftRA#" => K::Shift("sarq"),
+        "uncheckedIShiftRL#" => K::Shift("shrq"),
+        "quotInt#" => K::Div(true), "remInt#" => K::Div(false),
+        "negateInt#" => K::Un("negq"), "notI#" => K::Un("notq"),
+        // Char# comparisons are on the (unsigned) code points.
+        "eqChar#" => K::CharCmp("sete"), "neChar#" => K::CharCmp("setne"), "ltChar#" => K::CharCmp("setb"),
+        "leChar#" => K::CharCmp("setbe"), "gtChar#" => K::CharCmp("seta"), "geChar#" => K::CharCmp("setae"),
+        "ord#" => K::Ord, "chr#" => K::Chr,
+        // Bool, as the runtime's primitive takes it.
+        "tagToEnum#" => K::TagToEnum,
+        // Word# shares Int#'s cells; its comparisons are unsigned.
+        "plusWord#" => K::Bin("addq"), "minusWord#" => K::Bin("subq"), "timesWord#" => K::Bin("imulq"),
+        "and#" => K::Bin("andq"), "or#" => K::Bin("orq"), "xor#" => K::Bin("xorq"),
+        "eqWord#" => K::Cmp("sete"), "neWord#" => K::Cmp("setne"), "ltWord#" => K::Cmp("setb"),
+        "leWord#" => K::Cmp("setbe"), "gtWord#" => K::Cmp("seta"), "geWord#" => K::Cmp("setae"),
+        "uncheckedShiftL#" => K::Shift("shlq"), "uncheckedShiftRL#" => K::Shift("shrq"),
+        _ => return None,
+    })
 }
 
 /// The header word of an object: `kind | size << 8 | aux << 32`.
@@ -226,6 +369,8 @@ impl Gen {
             ret_raw: false,
             live: Vec::new(),
             join_uses: HashMap::new(),
+            cache: Vec::new(),
+            raw_uses: HashMap::new(),
         }
     }
 
@@ -407,12 +552,26 @@ impl Gen {
         self.emit(&format!("movq %r14, {}(%rbp)", f.off(0)));
         // A worker's raw parameters arrive as numbers in their argument slots: they move to raw
         // slots, and the argument slots are emptied, before anything can collect.
+        // Their numbers stay in cache registers (see `expr`), stored only when needed.
+        let p = Pos { f, mode: Mode::Tail, pushed: 0 };
+        self.cache.clear();
+        self.raw_uses.clear();
+        let mut joins = HashMap::new();
+        self.find_raw_uses(&c.body, &mut joins);
         for (arg, raw) in &c.raw_args {
-            self.emit(&format!("movq {}(%rbp), %rcx", f.off(*arg)));
-            self.emit(&format!("movq %rcx, {}(%rbp)", f.off(*raw)));
+            let r = if self.cache.len() < CACHE_REGS.len() { Some(self.fresh_reg(p, &[])) } else { None };
+            match r {
+                Some(r) => {
+                    self.emit(&format!("movq {}(%rbp), {r}", f.off(*arg)));
+                    self.cache_put(*raw, r, true);
+                }
+                None => {
+                    self.emit(&format!("movq {}(%rbp), %rcx", f.off(*arg)));
+                    self.emit(&format!("movq %rcx, {}(%rbp)", f.off(*raw)));
+                }
+            }
             self.emit(&format!("movq $0, {}(%rbp)", f.off(*arg)));
         }
-        let p = Pos { f, mode: Mode::Tail, pushed: 0 };
         // A function's entry is a preemption point (inline arithmetic has none, and every loop
         // goes through one): at the end of a time slice another thread runs, and an exception
         // thrown to this one is raised.
@@ -420,9 +579,17 @@ impl Gen {
             let go = self.label("go");
             self.emit("cmpb $0, hsc_preempt(%rip)");
             self.emit(&format!("je {go}"));
+            // The cached numbers are stored around the call (the registers do not survive it).
+            let cached = self.cache.clone();
+            for c in &cached {
+                self.emit(&format!("movq {}, {}", c.reg, p.slot(c.slot)));
+            }
             self.rt_call("hsc_yield", p, 0);
             self.emit("testq %rax, %rax");
             self.emit("jnz hsc_raise_pending");
+            for c in &cached {
+                self.emit(&format!("movq {}, {}", p.slot(c.slot), c.reg));
+            }
             self.put_label(&go);
         }
         self.expr(&c.body, p);
@@ -453,11 +620,357 @@ impl Gen {
         (*arity > 0 && *arity as usize == nargs).then_some(entry.as_str())
     }
 
+    /// Generates an expression. Only straight-line raw arithmetic, a case of a raw number and a
+    /// tail call use the numbers cached in registers; anything else finds them in their slots.
+    /// Every expression ends in a transfer of control, so nothing is cached after it.
     fn expr(&mut self, e: &SExpr, p: Pos) {
+        self.drop_dead(e, p);
+        if !self.keeps_cache(e, p) {
+            self.flush(p);
+        }
+        self.expr_node(e, p);
+        self.cache.clear();
+    }
+
+    /// Records the raw slots each expression in `e` uses (its own, and those of the join points
+    /// it jumps to), answering `e`'s.
+    fn find_raw_uses(&mut self, e: &SExpr, joins: &mut HashMap<u32, Vec<u32>>) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        let atom = |a: &Atom, out: &mut Vec<u32>| {
+            if let Atom::Slot(k) = a {
+                if k & RAW != 0 {
+                    out.push(*k);
+                }
+            }
+        };
+        match e {
+            SExpr::Atom(a) => atom(a, &mut out),
+            SExpr::App(f, args) => {
+                atom(f, &mut out);
+                args.iter().for_each(|a| atom(a, &mut out));
+            }
+            SExpr::CallWorker(_, args) | SExpr::Con(_, args) | SExpr::Prim(_, args) => args.iter().for_each(|a| atom(a, &mut out)),
+            SExpr::Let(binds, body) => {
+                for (_, c) in binds {
+                    c.captures.iter().for_each(|a| atom(a, &mut out));
+                }
+                out.extend(self.find_raw_uses(body, joins));
+            }
+            SExpr::Case(scrut, _, alts) => {
+                out.extend(self.find_raw_uses(scrut, joins));
+                for a in alts {
+                    match a {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => out.extend(self.find_raw_uses(b, joins)),
+                    }
+                }
+            }
+            SExpr::Closure(c) => c.captures.iter().for_each(|a| atom(a, &mut out)),
+            SExpr::Fail(_) => {}
+            SExpr::Join(id, _, code, body) => {
+                let uses = self.find_raw_uses(code, joins);
+                joins.insert(*id, uses.clone());
+                out.extend(uses);
+                out.extend(self.find_raw_uses(body, joins));
+            }
+            SExpr::Jump(id, args) => {
+                args.iter().for_each(|a| atom(a, &mut out));
+                // A join point defined outside the body (none should be): everything is live.
+                match joins.get(id) {
+                    Some(u) => out.extend(u.iter().copied()),
+                    None => out.push(ALL_LIVE),
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        self.raw_uses.insert(e as *const SExpr, out.clone());
+        out
+    }
+
+    /// Whether raw slot `k` may be used by `e` or by what follows it (for a scrutinee, the
+    /// enclosing cases' alternatives).
+    fn raw_live(&self, k: u32, e: &SExpr, p: Pos) -> bool {
+        let Some(uses) = self.raw_uses.get(&(e as *const SExpr)) else { return true };
+        if uses.binary_search(&k).is_ok() || uses.binary_search(&ALL_LIVE).is_ok() {
+            return true;
+        }
+        p.mode == Mode::Scrut && self.live.last().is_none_or(|l| l.contains(&k) || l.contains(&ALL_LIVE))
+    }
+
+    /// Forgets the cached numbers that neither `e` nor what follows it uses.
+    fn drop_dead(&mut self, e: &SExpr, p: Pos) {
+        let cache = std::mem::take(&mut self.cache);
+        self.cache = cache.into_iter().filter(|c| self.raw_live(c.slot, e, p)).collect();
+    }
+
+    /// Whether an expression's code reads cached numbers from their registers (see `expr`).
+    fn keeps_cache(&self, e: &SExpr, p: Pos) -> bool {
+        let tail = p.mode == Mode::Tail;
+        // Atoms that are loaded without calling the runtime.
+        let plain = |a: &Atom| !matches!(a, Atom::Lit(l) if !matches!(l, SLit::Int(_) | SLit::Char(_) | SLit::Double(_)) && !matches!(l, SLit::Integer(s) if s.parse::<i64>().is_ok()));
+        match e {
+            SExpr::Case(scrut, b, alts) => match scrut.as_ref() {
+                SExpr::Prim(name, args) => b & RAW != 0 && matches!(&alts[..], [SAlt::Default(_)]) && total_raw_op(name, args),
+                SExpr::Atom(a) => is_raw(a),
+                _ => false,
+            },
+            SExpr::Atom(Atom::Slot(k)) => k & RAW != 0 && tail && self.ret_raw,
+            SExpr::Atom(Atom::Lit(SLit::Int(_) | SLit::Char(_))) => tail && self.ret_raw,
+            SExpr::App(f, args) => tail && plain(f) && args.iter().all(plain),
+            SExpr::CallWorker(_, args) => tail && args.iter().all(plain),
+            _ => false,
+        }
+    }
+
+    /// The register holding raw slot `k`'s number, if one does.
+    fn cached(&self, k: u32) -> Option<&'static str> {
+        self.cache.iter().find(|c| c.slot == k).map(|c| c.reg)
+    }
+
+    /// Stores the cached numbers their slots may not have yet, and forgets the registers.
+    fn flush(&mut self, p: Pos) {
+        for c in std::mem::take(&mut self.cache) {
+            if c.dirty {
+                self.emit(&format!("movq {}, {}", c.reg, p.slot(c.slot)));
+            }
+        }
+    }
+
+    /// A cache register for a new number, none of `avoid`: a free one, or the oldest one's (its
+    /// number stored first).
+    fn fresh_reg(&mut self, p: Pos, avoid: &[&str]) -> &'static str {
+        if let Some(r) = CACHE_REGS.iter().find(|r| !avoid.contains(r) && self.cache.iter().all(|c| c.reg != **r)) {
+            return r;
+        }
+        let i = self.cache.iter().position(|c| !avoid.contains(&c.reg)).expect("internal: no cache register");
+        let c = self.cache.remove(i);
+        if c.dirty {
+            self.emit(&format!("movq {}, {}", c.reg, p.slot(c.slot)));
+        }
+        c.reg
+    }
+
+    /// Records that `reg` holds raw slot `k`'s number; `dirty` when the slot does not have it.
+    fn cache_put(&mut self, k: u32, reg: &'static str, dirty: bool) {
+        self.cache.retain(|c| c.slot != k && c.reg != reg);
+        self.cache.push(Cached { slot: k, reg, dirty });
+    }
+
+    /// A raw operand (a raw slot, kept in a cache register from now on, or a literal).
+    fn raw_src(&mut self, a: &Atom, p: Pos, avoid: &[&str]) -> Src {
+        match a {
+            Atom::Slot(k) if k & RAW != 0 => {
+                if let Some(i) = self.cache.iter().position(|c| c.slot == *k) {
+                    // Used now: the last to be evicted.
+                    let c = self.cache.remove(i);
+                    self.cache.push(c);
+                    return Src::Reg(c.reg);
+                }
+                let r = self.fresh_reg(p, avoid);
+                self.emit(&format!("movq {}, {r}", p.slot(*k)));
+                self.cache_put(*k, r, false);
+                Src::Reg(r)
+            }
+            Atom::Lit(SLit::Int(v)) => Src::Imm(*v),
+            Atom::Lit(SLit::Char(c)) => Src::Imm(crate::syntax::lexer::char_code(*c) as i64),
+            other => panic!("internal: raw operand {other:?}"),
+        }
+    }
+
+    /// `movq src, dst` for a raw operand.
+    fn mov_src(&mut self, s: Src, dst: &str) {
+        match s {
+            Src::Reg(r) => self.emit(&format!("movq {r}, {dst}")),
+            Src::Imm(v) if i32::try_from(v).is_ok() => self.emit(&format!("movq ${v}, {dst}")),
+            Src::Imm(v) => self.emit(&format!("movabsq ${v}, {dst}")),
+        }
+    }
+
+    /// A raw operand as the source of a two-operand instruction (a large immediate goes through
+    /// `scratch` first).
+    fn src_text(&mut self, s: Src, scratch: &str) -> String {
+        match s {
+            Src::Reg(r) => r.to_string(),
+            Src::Imm(v) if i32::try_from(v).is_ok() => format!("${v}"),
+            Src::Imm(v) => {
+                self.emit(&format!("movabsq ${v}, {scratch}"));
+                scratch.to_string()
+            }
+        }
+    }
+
+    /// A total inline operation on raw numbers (`total_raw_op`) whose result goes to raw slot
+    /// `dest`, kept in a cache register.
+    fn raw_op(&mut self, name: &str, args: &[Atom], dest: u32, p: Pos) {
+        let k = int_op(name).expect("internal: not an inline operation");
+        let s0 = self.raw_src(&args[0], p, &[]);
+        let r0 = match s0 { Src::Reg(r) => Some(r), Src::Imm(_) => None };
+        let s1 = match args.get(1) {
+            Some(a) => Some(self.raw_src(a, p, &r0.into_iter().collect::<Vec<_>>())),
+            None => None,
+        };
+        let mut avoid: Vec<&str> = r0.into_iter().collect();
+        if let Some(Src::Reg(r)) = s1 {
+            avoid.push(r);
+        }
+        let d = self.fresh_reg(p, &avoid);
+        match k {
+            K::Bin(op) => {
+                self.mov_src(s0, d);
+                let t = self.src_text(s1.unwrap(), "%rdx");
+                self.emit(&format!("{op} {t}, {d}"));
+            }
+            K::Cmp(set) | K::CharCmp(set) => {
+                self.mov_src(s0, d);
+                if matches!(k, K::CharCmp(_)) {
+                    let t = match s1.unwrap() {
+                        Src::Reg(r) => low32(r).to_string(),
+                        Src::Imm(v) => format!("${}", v as u32 as i32),
+                    };
+                    self.emit(&format!("cmpl {t}, {}", low32(d)));
+                } else {
+                    let t = self.src_text(s1.unwrap(), "%rdx");
+                    self.emit(&format!("cmpq {t}, {d}"));
+                }
+                self.emit(&format!("{set} {}", byte_reg(d)));
+                self.emit(&format!("movzbl {}, {}", byte_reg(d), low32(d)));
+            }
+            K::Shift(op) => {
+                self.mov_src(s0, d);
+                match s1.unwrap() {
+                    Src::Imm(v) => self.emit(&format!("{op} ${}, {d}", v & 63)),
+                    Src::Reg(r) => {
+                        self.emit(&format!("movq {r}, %rcx"));
+                        self.emit(&format!("{op} %cl, {d}"));
+                    }
+                }
+            }
+            K::Div(quot) => {
+                let Some(Src::Imm(dv)) = s1 else { panic!("internal: division by a variable inline") };
+                let (m, sh) = signed_magic(dv);
+                let n = match s0 {
+                    Src::Reg(r) => r.to_string(),
+                    Src::Imm(_) => {
+                        self.mov_src(s0, "%rcx");
+                        "%rcx".to_string()
+                    }
+                };
+                self.emit(&format!("movabsq ${m}, %rax"));
+                self.emit(&format!("imulq {n}"));
+                if dv > 0 && m < 0 {
+                    self.emit(&format!("addq {n}, %rdx"));
+                } else if dv < 0 && m > 0 {
+                    self.emit(&format!("subq {n}, %rdx"));
+                }
+                if sh > 0 {
+                    self.emit(&format!("sarq ${sh}, %rdx"));
+                }
+                self.emit("movq %rdx, %rax");
+                self.emit("shrq $63, %rax");
+                self.emit("addq %rax, %rdx");
+                if quot {
+                    self.emit(&format!("movq %rdx, {d}"));
+                } else {
+                    if i32::try_from(dv).is_ok() {
+                        self.emit(&format!("imulq ${dv}, %rdx"));
+                    } else {
+                        self.emit(&format!("movabsq ${dv}, %rax"));
+                        self.emit("imulq %rax, %rdx");
+                    }
+                    self.emit(&format!("movq {n}, {d}"));
+                    self.emit(&format!("subq %rdx, {d}"));
+                }
+            }
+            K::Un(op) => {
+                self.mov_src(s0, d);
+                self.emit(&format!("{op} {d}"));
+            }
+            K::Ord => self.mov_src(s0, d),
+            K::Chr => {
+                self.mov_src(s0, d);
+                self.emit(&format!("movl {}, {}", low32(d), low32(d)));
+            }
+            K::TagToEnum => unreachable!("not total"),
+        }
+        self.cache_put(dest, d, true);
+    }
+
+    /// A comparison whose result only a case on it then uses (`case a <# b of 1# -> x; _ -> y`):
+    /// a compare and conditional jumps, without the 0 or 1. Answers whether it applied.
+    fn compare_and_branch(&mut self, name: &str, args: &[Atom], b: u32, body: &SExpr, p: Pos) -> bool {
+        let Some(k @ (K::Cmp(set) | K::CharCmp(set))) = int_op(name) else { return false };
+        let SExpr::Case(scrut, _, alts) = body else { return false };
+        if !matches!(scrut.as_ref(), SExpr::Atom(Atom::Slot(s)) if *s == b) {
+            return false;
+        }
+        let end = alts.iter().position(|a| matches!(a, SAlt::Default(_))).map_or(alts.len(), |i| i + 1);
+        let alts = &alts[..end];
+        let body_of = |a: &SAlt| match a {
+            SAlt::Lit(_, e) | SAlt::Default(e) | SAlt::Con(_, _, e) => e as *const SExpr,
+        };
+        let uses_b = alts.iter().any(|a| self.raw_uses.get(&body_of(a)).is_none_or(|u| u.binary_search(&b).is_ok() || u.binary_search(&ALL_LIVE).is_ok()));
+        if uses_b || p.mode == Mode::Scrut && self.live.last().is_none_or(|l| l.contains(&b) || l.contains(&ALL_LIVE)) {
+            return false;
+        }
+        if alts.iter().any(|a| matches!(a, SAlt::Lit(l, _) if !matches!(l, Lit::Int(_)))) || alts.iter().any(|a| matches!(a, SAlt::Con(..))) {
+            return false;
+        }
+        let s0 = self.raw_src(&args[0], p, &[]);
+        let avoid: Vec<&str> = match s0 { Src::Reg(r) => vec![r], Src::Imm(_) => vec![] };
+        let s1 = self.raw_src(&args[1], p, &avoid);
+        let lhs = match s0 {
+            Src::Reg(r) => r.to_string(),
+            Src::Imm(_) => {
+                self.mov_src(s0, "%rcx");
+                "%rcx".to_string()
+            }
+        };
+        if matches!(k, K::CharCmp(_)) {
+            let t = match s1 {
+                Src::Reg(r) => low32(r).to_string(),
+                Src::Imm(v) => format!("${}", v as u32 as i32),
+            };
+            let l = if lhs == "%rcx" { "%ecx" } else { low32(&lhs) };
+            self.emit(&format!("cmpl {t}, {l}"));
+        } else {
+            let t = self.src_text(s1, "%rdx");
+            self.emit(&format!("cmpq {t}, {lhs}"));
+        }
+        let cc = &set[3..];
+        let negated = match cc {
+            "e" => "ne", "ne" => "e", "l" => "ge", "le" => "g", "g" => "le", "ge" => "l",
+            "b" => "ae", "be" => "a", "a" => "be", "ae" => "b",
+            other => panic!("internal: condition {other}"),
+        };
+        let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
+        for (a, l) in alts.iter().zip(&labels) {
+            match a {
+                SAlt::Lit(Lit::Int(1), _) => self.emit(&format!("j{cc} {l}")),
+                SAlt::Lit(Lit::Int(0), _) => self.emit(&format!("j{negated} {l}")),
+                _ => {}
+            }
+        }
+        let snapshot = self.cache.clone();
+        match alts.last() {
+            Some(SAlt::Default(body)) => self.expr(body, p),
+            _ => self.fail("Non-exhaustive patterns in case", p),
+        }
+        for (a, l) in alts.iter().zip(&labels) {
+            if let SAlt::Lit(Lit::Int(0 | 1), body) = a {
+                self.put_label(l);
+                self.cache = snapshot.clone();
+                self.expr(body, p);
+            }
+        }
+        true
+    }
+
+    fn expr_node(&mut self, e: &SExpr, p: Pos) {
         match e {
             // A worker returning raw: its result's number goes back in R1.
             SExpr::Atom(Atom::Slot(k)) if *k & RAW != 0 && p.mode == Mode::Tail && self.ret_raw => {
-                self.emit(&format!("movq {}, %r14", p.slot(*k)));
+                let src = self.cached(*k).map(str::to_owned).unwrap_or_else(|| p.slot(*k));
+                self.emit(&format!("movq {src}, %r14"));
                 self.ret(p);
             }
             SExpr::Atom(Atom::Lit(l @ (SLit::Int(_) | SLit::Char(_)))) if p.mode == Mode::Tail && self.ret_raw => {
@@ -527,41 +1040,56 @@ impl Gen {
                 }
                 self.expr(body, p);
             }
+            // An operation on raw numbers that cannot fail, for a raw binder: computed into a
+            // register, with no return address or slow path.
+            SExpr::Case(scrut, b, alts) if self.keeps_cache(e, p) && matches!(scrut.as_ref(), SExpr::Prim(..)) => {
+                let (SExpr::Prim(name, args), [SAlt::Default(body)]) = (scrut.as_ref(), &alts[..]) else { unreachable!() };
+                if self.compare_and_branch(name, args, *b, body, p) {
+                    return;
+                }
+                self.raw_op(name, args, *b, p);
+                self.expr(body, p);
+            }
             SExpr::Case(scrut, _, alts) if matches!(scrut.as_ref(), SExpr::Atom(a) if is_raw(a)) => {
                 // A case of a raw number: its literal alternatives compare the number itself (the
-                // binder is unused, see `stg::raw_uses`).
-                let SExpr::Atom(Atom::Slot(k)) = scrut.as_ref() else { unreachable!() };
-                self.emit(&format!("movq {}, %rax", p.slot(*k)));
+                // binder is unused, see `stg::raw_uses`). Each alternative starts with the
+                // registers as they are here; the default one follows the comparisons.
+                let SExpr::Atom(a) = scrut.as_ref() else { unreachable!() };
+                if let Some(SAlt::Default(body)) = alts.first() {
+                    // Only a default (a bang pattern): nothing to compare.
+                    self.expr(body, p);
+                    return;
+                }
+                let Src::Reg(r) = self.raw_src(a, p, &[]) else { unreachable!() };
+                let end = alts.iter().position(|a| matches!(a, SAlt::Default(_))).map_or(alts.len(), |i| i + 1);
+                let alts = &alts[..end];
                 let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
-                let mut default = false;
                 for (a, l) in alts.iter().zip(&labels) {
                     match a {
                         SAlt::Lit(lit, _) => {
                             let v = match lit {
-                                Lit::Int(i) => *i as u64,
-                                Lit::Char(c) => crate::syntax::lexer::char_code(*c) as u64,
+                                Lit::Int(i) => *i,
+                                Lit::Char(c) => crate::syntax::lexer::char_code(*c) as i64,
                                 other => panic!("internal: raw case on literal {other:?}"),
                             };
-                            self.emit(&format!("movabsq ${v}, %rcx"));
-                            self.emit("cmpq %rcx, %rax");
+                            let t = self.src_text(Src::Imm(v), "%rcx");
+                            self.emit(&format!("cmpq {t}, {r}"));
                             self.emit(&format!("je {l}"));
                         }
-                        SAlt::Default(_) => {
-                            self.emit(&format!("jmp {l}"));
-                            default = true;
-                            break;
-                        }
+                        SAlt::Default(_) => {}
                         SAlt::Con(..) => panic!("internal: raw case on a constructor"),
                     }
                 }
-                if !default {
-                    self.fail("Non-exhaustive patterns in case", p);
+                let snapshot = self.cache.clone();
+                match alts.last() {
+                    Some(SAlt::Default(body)) => self.expr(body, p),
+                    _ => self.fail("Non-exhaustive patterns in case", p),
                 }
                 for (a, l) in alts.iter().zip(&labels) {
-                    self.put_label(l);
-                    match a {
-                        SAlt::Lit(_, body) | SAlt::Default(body) => self.expr(body, p),
-                        SAlt::Con(..) => unreachable!(),
+                    if let SAlt::Lit(_, body) = a {
+                        self.put_label(l);
+                        self.cache = snapshot.clone();
+                        self.expr(body, p);
                     }
                 }
             }
@@ -980,31 +1508,7 @@ impl Gen {
         if self.raw_dest.is_none() && self.mutvar_fast_path(name, args, p, slow) {
             return true;
         }
-        #[derive(PartialEq)]
-        enum K { Bin(&'static str), Cmp(&'static str), Shift(&'static str), Div(bool), Un(&'static str), CharCmp(&'static str), Ord, Chr, TagToEnum }
-        let k = match name {
-            "+#" => K::Bin("addq"), "-#" => K::Bin("subq"), "*#" => K::Bin("imulq"),
-            "andI#" => K::Bin("andq"), "orI#" => K::Bin("orq"), "xorI#" => K::Bin("xorq"),
-            "==#" => K::Cmp("sete"), "/=#" => K::Cmp("setne"), "<#" => K::Cmp("setl"),
-            "<=#" => K::Cmp("setle"), ">#" => K::Cmp("setg"), ">=#" => K::Cmp("setge"),
-            "uncheckedIShiftL#" => K::Shift("shlq"), "uncheckedIShiftRA#" => K::Shift("sarq"),
-            "uncheckedIShiftRL#" => K::Shift("shrq"),
-            "quotInt#" => K::Div(true), "remInt#" => K::Div(false),
-            "negateInt#" => K::Un("negq"), "notI#" => K::Un("notq"),
-            // Char# comparisons are on the (unsigned) code points.
-            "eqChar#" => K::CharCmp("sete"), "neChar#" => K::CharCmp("setne"), "ltChar#" => K::CharCmp("setb"),
-            "leChar#" => K::CharCmp("setbe"), "gtChar#" => K::CharCmp("seta"), "geChar#" => K::CharCmp("setae"),
-            "ord#" => K::Ord, "chr#" => K::Chr,
-            // Bool, as the runtime's primitive takes it.
-            "tagToEnum#" => K::TagToEnum,
-            // Word# shares Int#'s cells; its comparisons are unsigned.
-            "plusWord#" => K::Bin("addq"), "minusWord#" => K::Bin("subq"), "timesWord#" => K::Bin("imulq"),
-            "and#" => K::Bin("andq"), "or#" => K::Bin("orq"), "xor#" => K::Bin("xorq"),
-            "eqWord#" => K::Cmp("sete"), "neWord#" => K::Cmp("setne"), "ltWord#" => K::Cmp("setb"),
-            "leWord#" => K::Cmp("setbe"), "gtWord#" => K::Cmp("seta"), "geWord#" => K::Cmp("setae"),
-            "uncheckedShiftL#" => K::Shift("shlq"), "uncheckedShiftRL#" => K::Shift("shrq"),
-            _ => return false,
-        };
+        let Some(k) = int_op(name) else { return false };
         let arity = if matches!(k, K::Un(_) | K::Ord | K::Chr | K::TagToEnum) { 1 } else { 2 };
         let (in_kind, out_kind) = match k {
             K::CharCmp(_) => (CHAR, INT),
@@ -1129,12 +1633,60 @@ impl Gen {
         // below the frame; a tail call moves that area up over the frame it replaces.
         let n = args.len() as i64;
         self.load(func, p, "%r14");
+        if p.mode == Mode::Tail && p.pushed == 0 && self.in_place(args, p) {
+            // The arguments go straight to the top words of the frame, where the callee's
+            // arguments are (none of them is read from a word another one replaces).
+            let base = p.f.s as i64 - n;
+            for (i, a) in args.iter().enumerate() {
+                let dst = format!("{}(%rbp)", 8 * (base + i as i64));
+                match a {
+                    Atom::Slot(k) if k & RAW != 0 => match self.cached(*k) {
+                        Some(r) => self.emit(&format!("movq {r}, {dst}")),
+                        None if p.slot(*k) == dst => {}
+                        None => {
+                            self.emit(&format!("movq {}, %rcx", p.slot(*k)));
+                            self.emit(&format!("movq %rcx, {dst}"));
+                        }
+                    },
+                    Atom::Slot(k) if p.slot(*k) == dst => {}
+                    Atom::Lit(l @ (SLit::Int(_) | SLit::Char(_))) if raw_pos.get(i).copied().unwrap_or(false) => {
+                        let v = match l {
+                            SLit::Int(v) => *v,
+                            SLit::Char(c) => crate::syntax::lexer::char_code(*c) as i64,
+                            _ => unreachable!(),
+                        };
+                        if i32::try_from(v).is_ok() {
+                            self.emit(&format!("movq ${v}, {dst}"));
+                        } else {
+                            self.emit(&format!("movabsq ${v}, %rcx"));
+                            self.emit(&format!("movq %rcx, {dst}"));
+                        }
+                    }
+                    _ => {
+                        self.load(a, p, "%rcx");
+                        self.emit(&format!("movq %rcx, {dst}"));
+                    }
+                }
+            }
+            if base != 0 {
+                self.emit(&format!("addq ${}, %rbp", 8 * base));
+            }
+            self.emit(&format!("movl ${}, %ecx", n));
+            match direct {
+                Some(entry) => self.emit(&format!("jmp {entry}")),
+                None => self.emit("jmp hsc_apply"),
+            }
+            return;
+        }
         self.emit(&format!("subq ${}, %rbp", 8 * n));
         let inner = Pos { pushed: p.pushed + n, ..p };
         for (i, a) in args.iter().enumerate() {
             if raw_pos.get(i).copied().unwrap_or(false) {
                 match a {
-                    Atom::Slot(k) if k & RAW != 0 => self.emit(&format!("movq {}, %rcx", inner.slot(*k))),
+                    Atom::Slot(k) if k & RAW != 0 => match self.cached(*k) {
+                        Some(r) => self.emit(&format!("movq {r}, %rcx")),
+                        None => self.emit(&format!("movq {}, %rcx", inner.slot(*k))),
+                    },
                     Atom::Lit(SLit::Int(v)) => self.emit(&format!("movabsq ${v}, %rcx")),
                     Atom::Lit(SLit::Char(c)) => {
                         self.emit(&format!("movq ${}, %rcx", crate::syntax::lexer::char_code(*c)))
@@ -1165,6 +1717,34 @@ impl Gen {
         } else {
             self.emit("jmp hsc_apply");
         }
+    }
+
+    /// Whether a tail call's arguments can be written straight over the top `n` words of the
+    /// frame: no argument is read from one of those words, other than its own destination, and
+    /// none is a literal the runtime builds.
+    fn in_place(&self, args: &[Atom], p: Pos) -> bool {
+        let n = args.len() as i64;
+        let s = p.f.s as i64;
+        if n > s {
+            return false;
+        }
+        let range = 8 * (s - n)..8 * s;
+        args.iter().enumerate().all(|(i, a)| {
+            let own = 8 * (s - n + i as i64);
+            match a {
+                Atom::Slot(k) if k & RAW != 0 && self.cached(*k).is_some() => true,
+                Atom::Slot(k) => {
+                    let off = p.f.off(*k);
+                    off == own || !range.contains(&off)
+                }
+                Atom::Free(_) => !range.contains(&p.f.off(0)),
+                Atom::Global(_) => true,
+                Atom::Lit(l) => {
+                    matches!(l, SLit::Int(_) | SLit::Char(_) | SLit::Double(_))
+                        || matches!(l, SLit::Integer(s) if s.parse::<i64>().is_ok())
+                }
+            }
+        })
     }
 
     /// Whether an expression's result is a raw number: an exact call of a worker returning raw,
@@ -1853,5 +2433,44 @@ mod liveness_tests {
         );
         let out = gen(&e, Mode::Tail);
         assert_eq!(out.matches("movq $0,").count(), 1, "{out}");
+    }
+}
+
+#[cfg(test)]
+mod magic_division {
+    use super::signed_magic;
+
+    /// The quotient as the generated code computes it (see `Gen::raw_op`).
+    fn quot(n: i64, d: i64) -> i64 {
+        let (m, s) = signed_magic(d);
+        let mut q = ((m as i128 * n as i128) >> 64) as i64;
+        if d > 0 && m < 0 {
+            q = q.wrapping_add(n);
+        } else if d < 0 && m > 0 {
+            q = q.wrapping_sub(n);
+        }
+        q >>= s;
+        q.wrapping_add(((q as u64) >> 63) as i64)
+    }
+
+    #[test]
+    fn quotients_by_constants_match_division() {
+        let mut ds: Vec<i64> = (2..300).chain([1000, 1000003, 1000000007, 6700417, 1 << 20, (1 << 40) + 1, (1 << 62) - 1]).collect();
+        ds.extend(ds.clone().iter().map(|d| -d));
+        let mut ns: Vec<i64> = vec![0, 1, -1, i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1, 1 << 62, -(1 << 62)];
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ns.push(x as i64);
+            ns.push((x >> (x % 60)) as i64);
+            ns.push(-((x >> (x % 60)) as i64));
+        }
+        for &d in &ds {
+            for &n in &ns {
+                assert_eq!(quot(n, d), n.wrapping_div(d), "{n} quot {d}");
+            }
+        }
     }
 }

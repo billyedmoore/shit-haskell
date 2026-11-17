@@ -458,8 +458,20 @@ The work:
      nqueens 353 → 282 M, mvar 185 → 169 M; strings +0.6%, others within 0.5% (PR #62).
      Hosted: ioref 77.3 → 52.2 ms, nqueens 53.7 → 48.3 ms, integer 19.5 → 16.5 ms, mvar 141 →
      135 ms. [Raw samples, conditions and graphs](bench/results/runtime-eta-expansion.md).
-     Next: register allocation for raw values (sumloop still moves every intermediate through
-     its frame); green threads; leaner frame prologues.
+     Raw numbers live in registers: through straight-line unboxed arithmetic (operations
+     that cannot fail, on raw numbers and literals, for raw binders), cases of raw numbers and
+     tail calls, a raw slot's number stays in one of six caller-saved registers, stored to its
+     slot only before code that calls out, allocates or jumps elsewhere, and only when what
+     follows still uses it (a per-body liveness pass over raw slots). Those operations have no
+     slow path or return address any more; a worker's raw parameters go straight to registers
+     (stored around a thread switch); division by a constant is a multiplication (Hacker's
+     Delight); a comparison that only a case uses becomes a compare and conditional jump; and
+     a tail call writes its arguments straight over the frame when none is read from a word it
+     replaces. sumloop 512 → 252 M instructions, fib 28.8 → 21.1 M, mapops −4.6%, strings
+     −1.3%, ioref −2.4%, nqueens −1.7%, mvar +0.7% (PR #63). Locally sumloop takes 15 ms,
+     GHC -O1 13 ms.
+     Next: green threads; leaner frame prologues (pointer locals are zeroed at each entry);
+     boxing in nqueens and ioref.
 
 ### 2. Large projects
 

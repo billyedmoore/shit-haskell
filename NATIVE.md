@@ -46,6 +46,10 @@ the header; aux is a kind-specific id).
 - `r12`: heap allocation pointer; `r13`: heap limit.
 - `rbx`: the machine record (`*mut Machine`: thread state, globals, stable pointer table).
 - `r14`: R1, the value being returned or the closure being entered.
+- `rsi`, `rdi`, `r8`–`r11`: raw (unboxed) numbers of the current body's raw slots, through
+  straight-line arithmetic, cases of raw numbers and tail calls; stored to their slots before
+  anything that calls out, allocates or jumps to code reached from elsewhere. Nothing is kept in
+  them across a call or a return.
 - The C stack is used only for calls into the runtime (Rust).
 
 ## Calling convention
