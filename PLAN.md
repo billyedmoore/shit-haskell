@@ -443,7 +443,9 @@ The work:
      whose result is unused goes. Inline arithmetic no longer checks for a thread switch each
      operation: a function's entry does (`hsc_yield`). sumloop's `mod` (`modInt#`, INLINE [0])
      now inlines: 962 → 512 M instructions; fib 30.7 → 28.8 M, mapops 502 → 487 M, ioref
-     1,007 → 1,015 M, others within 0.3%.
+     1,007 → 1,015 M, others within 0.3% (PR #61). Hosted: sumloop 60.9 → 35.9 ms, fib 6.9 →
+     5.2 ms, ioref 104 → 108 ms, the rest within noise.
+     [Raw samples, conditions and graphs](bench/results/runtime-inline-pragmas.md).
      Next: register allocation for raw values (sumloop still moves every intermediate through
      its frame); green threads; leaner frame prologues.
 
