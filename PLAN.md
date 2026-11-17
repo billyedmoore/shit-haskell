@@ -416,9 +416,23 @@ The work:
      kept (never inlined) as the marker of a lambda called at most once, `let bs in oneShot
      (\z -> e)` becomes `oneShot (\z -> let bs in e)`, and `(case s of alts) a` applies `a` in
      each alternative; the marker goes after the last pass. The sum/map loop takes 625 →
-     483 M instructions, ioref 1,076 → 1,007 M, mvar 191 → 185 M; strings 2,549 → 2,581 M.
-     Next: case-of-case with a multi-alternative inner case (duplicating a small outer body),
-     so the loop's `id`-or-`go (x+1)` choice becomes a direct tail call; then `INLINE [n]`.
+     483 M instructions, ioref 1,076 → 1,007 M, mvar 191 → 185 M; strings 2,549 → 2,581 M
+     (PR #59). Its hosted run measured a 0.98× geometric mean: strings 364 → 355 ms, integer
+     17.3 → 16.7 ms, but mapops 74.5 → 82.5 ms and ioref 82.5 → 86.2 ms; locally mapops is 9%
+     faster (median of 9: 81.7 → 74.7 ms) and ioref within noise, so the next paired run is
+     to recheck them. [Raw samples, conditions and graphs](bench/results/runtime-one-shot.md).
+     Case-of-case now also takes an inner case with several results (up to 4) when the outer
+     case has one default alternative of at most 30 nodes: a fresh copy of it follows each
+     result (not when it mentions a single-use binding waiting to be inlined, which must keep
+     one occurrence). A case of a value (a lambda, or a function applied to fewer arguments
+     than it takes, counting lambdas under `oneShot`) binds it with a let, and strict lets
+     leave values alone. Calls by value now also cover local functions (each top binding's
+     let-bound functions, to a fixpoint with the globals'), and run again after phase 0, where
+     fusion makes local loops, followed by one more phase-0 pass. The sum/map loop becomes a
+     direct tail-calling loop with unboxed arguments: 483 → 138 M instructions; integer
+     170 → 161 M, nqueens 366 → 353 M, mvar 188 → 185 M; mapops 482 → 502 M (more GC
+     copying of its tree, generated code unchanged), strings 2,578 → 2,599 M.
+     Next: `INLINE [n]` phases; green threads; leaner frame prologues.
 
 ### 2. Large projects
 
