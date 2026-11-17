@@ -52,6 +52,38 @@ pub fn simplify(binds: &mut [TopBind]) {
     pass(binds, 1, &rules);
     call_by_value(binds);
     pass(binds, 0, &rules);
+    // `oneShot` was kept as a marker (see `into_one_shot`); it is the identity.
+    for b in binds.iter_mut() {
+        strip_one_shot(&mut b.body);
+    }
+}
+
+/// Replaces `oneShot e` by `e`.
+fn strip_one_shot(c: &mut Core) {
+    match c {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            strip_one_shot(f);
+            strip_one_shot(a);
+            if matches!(&**f, Core::Var(v) if v == ONE_SHOT) {
+                *c = take(a);
+            }
+        }
+        Core::Lam(_, b) => strip_one_shot(b),
+        Core::Let(binds, body) => {
+            binds.iter_mut().for_each(|(_, r)| strip_one_shot(r));
+            strip_one_shot(body);
+        }
+        Core::Case(s, _, alts) => {
+            strip_one_shot(s);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => strip_one_shot(b),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(strip_one_shot),
+    }
 }
 
 fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
@@ -94,7 +126,7 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
         if arity == 0 || size(inner, INLINE_SIZE + 1) > INLINE_SIZE || mentions(&b.body, &b.name) {
             continue;
         }
-        if is_rule_binding(&b.name) || (phase > 0 && rules.protected.contains(&b.name)) {
+        if is_rule_binding(&b.name) || b.name == ONE_SHOT || (phase > 0 && rules.protected.contains(&b.name)) {
             continue;
         }
         let mut names = HashSet::new();
@@ -214,7 +246,7 @@ impl Simp<'_> {
             Core::App(f, a) => {
                 self.expr(f);
                 self.expr(a);
-                if self.rewrite(c) {
+                if self.rewrite(c) || self.app_of_case(c) {
                     self.changed = true;
                     self.expr(c);
                     return;
@@ -225,6 +257,11 @@ impl Simp<'_> {
             Core::Lam(_, b) => self.expr(b),
             Core::Let(bindings, body) => {
                 let _ = (bindings, body);
+                if self.into_one_shot(c) {
+                    self.changed = true;
+                    self.expr(c);
+                    return;
+                }
                 if bang_lets(c) {
                     self.changed = true;
                     self.expr(c);
@@ -404,6 +441,51 @@ impl Simp<'_> {
         }
         *c = Core::Case(Box::new(e), x, alts);
         self.changed = true;
+    }
+
+    /// `let bs in oneShot (\x -> e)` as `\x -> let bs in e`: the lambda runs at most once, so
+    /// the bindings' work is not repeated, and the function it is the body of takes `x` too.
+    fn into_one_shot(&mut self, c: &mut Core) -> bool {
+        let Core::Let(_, body) = c else { return false };
+        if one_shot_lambda(body).is_none() {
+            return false;
+        }
+        let Core::Let(bs, body) = take(c) else { unreachable!() };
+        let Core::App(marker, lam) = *body else { unreachable!() };
+        let Core::Lam(x, inner) = *lam else { unreachable!() };
+        // Still marked: an enclosing let moves in too.
+        *c = Core::App(marker, Box::new(Core::Lam(x, Box::new(Core::Let(bs, inner)))));
+        true
+    }
+
+    /// `(case s of alts) a` as the case applying each alternative to `a` (let-bound first when it
+    /// is not an atom, so that it is not copied).
+    fn app_of_case(&mut self, c: &mut Core) -> bool {
+        let Core::App(f, _) = c else { return false };
+        if !matches!(**f, Core::Case(..)) {
+            return false;
+        }
+        let Core::App(f, a) = take(c) else { unreachable!() };
+        let Core::Case(s, b, mut alts) = *f else { unreachable!() };
+        let (arg, bind) = if is_atom(&a) {
+            (*a, None)
+        } else {
+            *self.fresh += 1;
+            let v = format!("a~{}", self.fresh);
+            (Core::Var(v.clone()), Some((v, *a)))
+        };
+        for alt in alts.iter_mut() {
+            let body = match alt {
+                Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => b,
+            };
+            *body = Core::App(Box::new(take(body)), Box::new(arg.clone()));
+        }
+        let case = Core::Case(s, b, alts);
+        *c = match bind {
+            Some((v, e)) => Core::Let(vec![(v, e)], Box::new(case)),
+            None => case,
+        };
+        true
     }
 
     /// Rewrites a call that matches an active rule's left side by the rule's right side (a fresh
@@ -1035,6 +1117,18 @@ fn occurrences_of(e: &Core, x: &str) -> usize {
                     .sum::<usize>()
         }
         Core::Con(_, args) | Core::Prim(_, args) => args.iter().map(|a| occurrences_of(a, x)).sum(),
+    }
+}
+
+/// `GHC.Magic.oneShot`: marks a lambda called at most once (never inlined, so the marker
+/// stays for `into_one_shot`; removed after the last pass).
+const ONE_SHOT: &str = "GHC.Magic.oneShot";
+
+/// The lambda of `oneShot (\x -> e)`, if `e` is that.
+fn one_shot_lambda(e: &Core) -> Option<&Core> {
+    match e {
+        Core::App(f, a) if matches!(&**f, Core::Var(v) if v == ONE_SHOT) && matches!(**a, Core::Lam(..)) => Some(a),
+        _ => None,
     }
 }
 

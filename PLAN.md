@@ -408,9 +408,17 @@ The work:
      takes, none of them a moving local) moves to its one use even under a lambda, so fused
      code reduces without repeating work: `sum (map (\x -> x * x) [1 .. n])` becomes one loop
      over the integers, 944 → 625 M instructions; nqueens 407 → 371 M, mapops 502 → 478 M,
-     strings 2,638 → 2,549 M, ioref 1,135 → 1,076 M.)
-  4. Next: eta-expand fused loops (a `foldl` fused through `foldr` returns a function per
-     element), and `INLINE [n]` phase control where base relies on it.
+     strings 2,638 → 2,549 M, ioref 1,135 → 1,076 M. Hosted (PR #58): geometric mean 1.03×;
+     strings 426 → 402 ms, ioref 84 → 78 ms, nqueens 57 → 54 ms; sumloop measured 42.7 →
+     52.1 ms with identical instructions (962 M) and equal local timings: runner noise.
+     [Raw samples, conditions and graphs](bench/results/runtime-fusion.md).)
+  4. Fused `foldl`/`foldl'` loops take their accumulator directly: `GHC.Magic.oneShot` is
+     kept (never inlined) as the marker of a lambda called at most once, `let bs in oneShot
+     (\z -> e)` becomes `oneShot (\z -> let bs in e)`, and `(case s of alts) a` applies `a` in
+     each alternative; the marker goes after the last pass. The sum/map loop takes 625 →
+     483 M instructions, ioref 1,076 → 1,007 M, mvar 191 → 185 M; strings 2,549 → 2,581 M.
+     Next: case-of-case with a multi-alternative inner case (duplicating a small outer body),
+     so the loop's `id`-or-`go (x+1)` choice becomes a direct tail call; then `INLINE [n]`.
 
 ### 2. Large projects
 
