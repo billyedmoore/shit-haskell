@@ -48,10 +48,16 @@ pub fn simplify(binds: &mut [TopBind]) {
     let rules = if enabled { Rules::new(extract_rules(binds)) } else { Rules { by_head: HashMap::new(), protected: HashSet::new() } };
     // The passes are GHC's phases 2, 1 and 0: the second inlines the bodies the first
     // simplified; the last cleans up after the calls by value.
-    pass(binds, 2, &rules);
-    pass(binds, 1, &rules);
+    pass(binds, 2, &rules, None);
+    pass(binds, 1, &rules, None);
     call_by_value(binds);
-    pass(binds, 0, &rules);
+    pass(binds, 0, &rules, None);
+    // Fusion in phase 0 makes local loops: their calls by value, and a clean-up of the
+    // bindings that changed.
+    let changed = call_by_value(binds);
+    if !changed.is_empty() {
+        pass(binds, 0, &rules, Some(&changed));
+    }
     // `oneShot` was kept as a marker (see `into_one_shot`); it is the identity.
     for b in binds.iter_mut() {
         strip_one_shot(&mut b.body);
@@ -86,7 +92,8 @@ fn strip_one_shot(c: &mut Core) {
     }
 }
 
-fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
+/// One simplifier pass over the bindings (`only`: just those).
+fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<String>>) {
     let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
     let direct: HashMap<&str, &Core> = binds.iter().map(|b| (b.name.as_str(), &b.body)).collect();
     // Globals that are (aliases of) constructor applications to atoms, and global aliases.
@@ -136,7 +143,7 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
     }
     let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
     for bind in binds.iter_mut() {
-        if is_rule_binding(&bind.name) {
+        if is_rule_binding(&bind.name) || only.is_some_and(|o| !o.contains(&bind.name)) {
             continue;
         }
         let mut names = HashSet::new();
@@ -189,6 +196,12 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules) {
                 rule_budget: RULE_BUDGET,
                 atoms: HashMap::new(),
                 evaluated: HashSet::new(),
+                arities,
+                local_arities: {
+                    let mut a = HashMap::new();
+                    local_arities(&bind.body, &mut a);
+                    a
+                },
                 fresh: &mut fresh,
                 budget: INLINE_BUDGET,
                 changed: false,
@@ -224,6 +237,10 @@ struct Simp<'a> {
     atoms: HashMap<String, Core>,
     /// Case binders: variables known to be evaluated.
     evaluated: HashSet<String>,
+    /// The number of parameters of the global and let-bound functions in scope.
+    arities: &'a HashMap<String, usize>,
+    /// The same for the let-bound functions of the binding being simplified.
+    local_arities: HashMap<String, usize>,
     fresh: &'a mut u64,
     budget: usize,
     changed: bool,
@@ -255,8 +272,13 @@ impl Simp<'_> {
                 self.reduce(c);
             }
             Core::Lam(_, b) => self.expr(b),
-            Core::Let(bindings, body) => {
-                let _ = (bindings, body);
+            Core::Let(bindings, _) => {
+                for (x, r) in bindings.iter() {
+                    let n = value_arity(r);
+                    if n > 0 {
+                        self.local_arities.insert(x.clone(), n);
+                    }
+                }
                 if self.into_one_shot(c) {
                     self.changed = true;
                     self.expr(c);
@@ -352,6 +374,19 @@ impl Simp<'_> {
                         return;
                     }
                 }
+                // Case of a case with several alternatives, the outer one small with a single
+                // default alternative: a copy of it at each result of the inner one.
+                if self.push_small_case(c) {
+                    self.changed = true;
+                    self.expr(c);
+                    return;
+                }
+                // A value as a scrutinee (nothing to evaluate): its binder is the value.
+                if self.case_of_value(c) {
+                    self.changed = true;
+                    self.expr(c);
+                    return;
+                }
                 if let Some(selected) = self.select(c) {
                     *c = selected;
                     self.changed = true;
@@ -415,7 +450,7 @@ impl Simp<'_> {
     fn strict_let(&mut self, c: &mut Core) {
         let Core::Let(bs, body) = c else { return };
         let [(x, e)] = &bs[..] else { return };
-        if mentions(e, x) || matches!(e, Core::Lam(..)) {
+        if mentions(e, x) || self.is_value(e) {
             return;
         }
         let direct = matches!(&**body, Core::Case(s, _, _) if matches!(&**s, Core::Var(v) if v == x));
@@ -441,6 +476,73 @@ impl Simp<'_> {
         }
         *c = Core::Case(Box::new(e), x, alts);
         self.changed = true;
+    }
+
+    /// `case (case s of alts1) as b of _ -> body` with `body` small: `body` (a fresh copy) after
+    /// each result of the inner case, which then needs no join point.
+    fn push_small_case(&mut self, c: &mut Core) -> bool {
+        let Core::Case(s, _, alts) = c else { return false };
+        let [Alt::Default(body)] = &alts[..] else { return false };
+        if !matches!(**s, Core::Case(..)) || size(body, PUSH_SIZE + 1) > PUSH_SIZE || results(s, PUSH_RESULTS) > PUSH_RESULTS {
+            return false;
+        }
+        // A single-use binding waiting for its occurrence (see `pending`) must keep one.
+        if self.pending.keys().any(|x| mentions(body, x)) {
+            return false;
+        }
+        let Core::Case(inner, b, mut alts) = take(c) else { unreachable!() };
+        let Alt::Default(body) = alts.pop().expect("one alternative") else { unreachable!() };
+        let mut inner = *inner;
+        let fresh = &mut *self.fresh;
+        at_results(&mut inner, &mut |r: &mut Core| {
+            *fresh += 1;
+            let tag = format!("~p{fresh}");
+            let mut copy = body.clone();
+            let mut map = HashMap::new();
+            let b2 = format!("{b}{tag}");
+            map.insert(b.clone(), b2.clone());
+            freshen(&mut copy, &tag, &mut map);
+            *r = Core::Case(Box::new(take(r)), b2, vec![Alt::Default(copy)]);
+        });
+        *c = inner;
+        true
+    }
+
+    /// `case v as b of _ -> e` with `v` a value (a lambda, a global function, or a function
+    /// applied to fewer arguments than it takes): `let b = v in e`.
+    fn case_of_value(&mut self, c: &mut Core) -> bool {
+        let Core::Case(s, _, alts) = c else { return false };
+        if !matches!(&alts[..], [Alt::Default(_)]) || !self.is_value(s) {
+            return false;
+        }
+        let Core::Case(s, b, mut alts) = take(c) else { unreachable!() };
+        let Some(Alt::Default(body)) = alts.pop() else { unreachable!() };
+        *c = Core::Let(vec![(b, *s)], Box::new(body));
+        true
+    }
+
+    fn arity(&self, v: &str) -> usize {
+        self.local_arities.get(v).or_else(|| self.arities.get(v)).copied().unwrap_or(0)
+    }
+
+    fn is_value(&self, e: &Core) -> bool {
+        match e {
+            Core::Lam(..) => true,
+            Core::Var(v) => self.arity(v) > 0,
+            Core::App(..) => {
+                let mut n = 0;
+                let mut h = e;
+                while let Core::App(f, a) = h {
+                    if !is_atom(a) {
+                        return false;
+                    }
+                    n += 1;
+                    h = f;
+                }
+                matches!(h, Core::Var(v) if self.arity(v) > n)
+            }
+            _ => false,
+        }
     }
 
     /// `let bs in oneShot (\x -> e)` as `\x -> let bs in e`: the lambda runs at most once, so
@@ -1138,6 +1240,90 @@ fn one_shot_lambda(e: &Core) -> Option<&Core> {
     }
 }
 
+/// The number of parameters of a function, counting those of lambdas under `oneShot`.
+fn value_arity(mut e: &Core) -> usize {
+    let mut n = 0;
+    loop {
+        if let Some(l) = one_shot_lambda(e) {
+            e = l;
+        }
+        let Core::Lam(_, b) = e else { return n };
+        n += 1;
+        e = b;
+    }
+}
+
+/// The let-bound lambdas of an expression, with their numbers of parameters.
+fn local_arities(e: &Core, out: &mut HashMap<String, usize>) {
+    match e {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            local_arities(f, out);
+            local_arities(a, out);
+        }
+        Core::Lam(_, b) => local_arities(b, out),
+        Core::Let(binds, body) => {
+            for (x, r) in binds {
+                let n = value_arity(r);
+                if n > 0 {
+                    out.insert(x.clone(), n);
+                }
+                local_arities(r, out);
+            }
+            local_arities(body, out);
+        }
+        Core::Case(s, _, alts) => {
+            local_arities(s, out);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => local_arities(b, out),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| local_arities(a, out)),
+    }
+}
+
+/// The largest outer case body copied to each result of an inner case, and the most results.
+const PUSH_SIZE: usize = 30;
+const PUSH_RESULTS: usize = 4;
+
+/// The results of an expression (the ends of its cases and lets), counted until past `limit`.
+fn results(e: &Core, limit: usize) -> usize {
+    match e {
+        Core::Case(_, _, alts) => {
+            let mut n = 0;
+            for a in alts {
+                let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                n += results(b, limit - n.min(limit));
+                if n > limit {
+                    break;
+                }
+            }
+            n
+        }
+        Core::Let(_, b) => results(b, limit),
+        Core::Fail(_) => 0,
+        _ => 1,
+    }
+}
+
+/// Applies `f` at each result of an expression (failures are left).
+fn at_results(e: &mut Core, f: &mut dyn FnMut(&mut Core)) {
+    match e {
+        Core::Case(_, _, alts) => {
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => at_results(b, f),
+                }
+            }
+        }
+        Core::Let(_, b) => at_results(b, f),
+        Core::Fail(_) => {}
+        _ => f(e),
+    }
+}
+
 /// The rewrites a binding may take in one round (rules could otherwise rewrite each other's
 /// results forever).
 const RULE_BUDGET: usize = 256;
@@ -1706,7 +1892,8 @@ fn occurrences(c: &Core, lam: i32, depth: &mut HashMap<String, (i32, bool)>, occ
 /// The analysis starts with every parameter strict and weakens to a fixpoint. A saturated
 /// call's non-atomic argument for a strict parameter is then evaluated before the call
 /// (`case a as v of _ -> f .. v ..`) instead of being allocated as a thunk.
-fn call_by_value(binds: &mut [TopBind]) {
+/// Answers the bindings it changed.
+fn call_by_value(binds: &mut [TopBind]) -> HashSet<String> {
     let mut strict: HashMap<String, Vec<bool>> = HashMap::new();
     for b in binds.iter() {
         let (n, _) = lambdas(&b.body);
@@ -1738,10 +1925,96 @@ fn call_by_value(binds: &mut [TopBind]) {
     }
     strict.retain(|_, s| s.iter().any(|x| *x));
     let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
+    let mut changed = HashSet::new();
     for b in binds.iter_mut() {
+        // The body's local functions (this relies on its binders being unique, as `uniquify`
+        // makes them; a function name bound twice, or named like a global, is left out): their strictness, with the globals', to a fixpoint.
+        let mut locals = Vec::new();
+        local_functions(&b.body, &mut locals);
+        let mut count: HashMap<&str, usize> = HashMap::new();
+        for (x, _) in &locals {
+            *count.entry(x).or_default() += 1;
+        }
+        locals.retain(|(x, _)| count[x] == 1 && !strict.contains_key(*x));
+        let names: Vec<String> = locals.iter().map(|(x, _)| x.to_string()).collect();
+        for (x, r) in &locals {
+            strict.insert(x.to_string(), vec![true; params(r).0.len()]);
+        }
+        loop {
+            let mut changed = false;
+            for (x, r) in &locals {
+                let (ps, body) = params(r);
+                let forced = forced(body, &strict);
+                let old = &strict[*x];
+                let new: Vec<bool> = ps.iter().zip(old).map(|(p, o)| *o && forced.contains(*p)).collect();
+                if &new != old {
+                    strict.insert(x.to_string(), new);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for x in &names {
+            if !strict[x].iter().any(|s| *s) {
+                strict.remove(x);
+            }
+        }
+        let before = fresh;
         by_value(&mut b.body, &strict, &mut fresh);
+        if fresh != before {
+            changed.insert(b.name.clone());
+        }
+        for x in &names {
+            strict.remove(x);
+        }
     }
     FRESH.store(fresh, std::sync::atomic::Ordering::Relaxed);
+    changed
+}
+
+/// The let-bound functions of an expression, with their right sides.
+fn local_functions<'a>(e: &'a Core, out: &mut Vec<(&'a str, &'a Core)>) {
+    match e {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            local_functions(f, out);
+            local_functions(a, out);
+        }
+        Core::Lam(_, b) => local_functions(b, out),
+        Core::Let(binds, body) => {
+            for (x, r) in binds {
+                if value_arity(r) > 0 {
+                    out.push((x, r));
+                }
+                local_functions(r, out);
+            }
+            local_functions(body, out);
+        }
+        Core::Case(s, _, alts) => {
+            local_functions(s, out);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => local_functions(b, out),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| local_functions(a, out)),
+    }
+}
+
+/// A function's parameters (those of lambdas under `oneShot` too) and its body.
+fn params(mut e: &Core) -> (Vec<&str>, &Core) {
+    let mut ps = Vec::new();
+    loop {
+        if let Some(l) = one_shot_lambda(e) {
+            e = l;
+        }
+        let Core::Lam(x, b) = e else { return (ps, e) };
+        ps.push(x.as_str());
+        e = b;
+    }
 }
 
 /// The variables an expression certainly evaluates when its value is demanded.
@@ -1934,9 +2207,10 @@ mod rule_tests {
         let rules = Rules { by_head: rules.into_iter().fold(HashMap::new(), |mut m: HashMap<String, Vec<RuleDef>>, r| { m.entry(r.head.clone()).or_default().push(r); m }), protected: HashSet::new() };
         let (once, dead, known, aliases, templates) = (HashSet::new(), HashSet::new(), HashMap::new(), HashMap::new(), HashMap::new());
         let mut fresh = 0;
+        let no_arities = HashMap::new();
         let mut s = Simp {
             once: &once, dead: &dead, pending: HashMap::new(), known: &known, aliases: &aliases, templates: &templates,
-            this: "Test.x", rules: &rules, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(),
+            this: "Test.x", rules: &rules, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
             fresh: &mut fresh, budget: 0, changed: false,
         };
         s.rewrite(&mut e).then_some(e)
