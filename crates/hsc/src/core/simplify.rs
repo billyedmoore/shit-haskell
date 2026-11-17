@@ -44,7 +44,8 @@ static FRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 const TRUE: &str = "GHC.Types.True";
 const FALSE: &str = "GHC.Types.False";
 
-pub fn simplify(binds: &mut [TopBind]) {
+pub fn simplify(binds: &mut Vec<TopBind>) {
+    float_con_fields(binds);
     // The rewrite rules, taken before any pass changes their sides, and the functions they
     // mention, which are not inlined while rules may still need to see them (phases 2 and 1).
     // HSC_NO_RULES: without them (to compare, or to rule them out).
@@ -72,6 +73,231 @@ pub fn simplify(binds: &mut [TopBind]) {
 }
 
 /// Replaces `oneShot e` by `e`.
+/// Bottom (a failing expression) as an arity: any number of arguments.
+const BOTTOM: usize = usize::MAX;
+
+/// Eta-expansion: a function whose body, after only cheap work (cases of variables and of
+/// total primitives, lets of values), is a function in every alternative takes one more
+/// parameter, `f = \xs -> \e -> body e` (the simplifier then pushes `e` into the alternatives,
+/// where calls become saturated: an IO loop's `thenIO m (go xs)` becomes a call taking the
+/// state token). Repeating the cheap work for each application of a partial application loses
+/// nothing worth sharing. Globals and let-bound functions; one parameter per pass.
+fn eta_expand(binds: &mut [TopBind], only: Option<&HashSet<String>>, rules: &Rules) {
+    let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
+    let bodies: HashMap<&str, &Core> = binds.iter().map(|b| (b.name.as_str(), &b.body)).collect();
+    // Each global's parameters, through aliases.
+    let mut arity: HashMap<String, usize> = HashMap::new();
+    for b in binds.iter() {
+        let mut cur = &b.body;
+        for _ in 0..16 {
+            match cur {
+                Core::Var(v) => match bodies.get(v.as_str()) {
+                    Some(next) => cur = next,
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        let n = value_arity(cur);
+        if n > 0 {
+            arity.insert(b.name.clone(), n);
+        }
+    }
+    drop(bodies);
+    let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
+    for b in binds.iter_mut() {
+        if is_rule_binding(&b.name) || b.name == ONE_SHOT || only.is_some_and(|o| !o.contains(&b.name)) {
+            continue;
+        }
+        // An INLINE function keeps the parameters it is written with: it is inlined when
+        // applied to them (as GHC inlines at the left side's arity), `(.) f g` say.
+        let pragma = matches!(rules.inlines.get(&b.name), Some((true, _)));
+        let mut local = HashMap::new();
+        if let Some(n) = expand_by_one(&b.body, &b.name, &arity, &mut local).filter(|_| !pragma) {
+            arity.insert(b.name.clone(), n + 1);
+            add_param(&mut b.body, &mut fresh);
+        }
+        // The local arities are by name: only where every binder is bound once.
+        if unique_binders(&b.body, &globals, &mut HashSet::new()) {
+            eta_locals(&mut b.body, &arity, &mut local, &mut fresh);
+        }
+    }
+    FRESH.store(fresh, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The parameters of `f = rhs` when it can take one more (see `eta_expand`).
+fn expand_by_one(rhs: &Core, f: &str, globals: &HashMap<String, usize>, local: &mut HashMap<String, usize>) -> Option<usize> {
+    let (ps, body) = params(rhs);
+    let n = ps.len();
+    if n == 0 {
+        return None;
+    }
+    // Recursive calls are taken to have the new parameter.
+    let prev = local.insert(f.to_string(), n + 1);
+    let k = cheap_arity(body, globals, local);
+    match prev {
+        Some(p) => local.insert(f.to_string(), p),
+        None => local.remove(f),
+    };
+    (k >= 1 && k != BOTTOM).then_some(n)
+}
+
+/// `\xs -> body` (through `oneShot` markers) as `\xs -> \e -> body e`.
+fn add_param(rhs: &mut Core, fresh: &mut u64) {
+    let mut cur = rhs;
+    loop {
+        if matches!(cur, Core::App(f, a) if matches!(&**f, Core::Var(v) if v == ONE_SHOT) && matches!(**a, Core::Lam(..))) {
+            let Core::App(_, a) = cur else { unreachable!() };
+            cur = &mut **a;
+        }
+        match cur {
+            Core::Lam(_, b) => cur = &mut **b,
+            _ => break,
+        }
+    }
+    *fresh += 1;
+    let e = format!("eta~{fresh}");
+    let body = take(cur);
+    *cur = Core::Lam(e.clone(), Box::new(Core::App(Box::new(body), Box::new(Core::Var(e)))));
+}
+
+/// Eta-expansion of the let-bound functions of an expression.
+fn eta_locals(c: &mut Core, globals: &HashMap<String, usize>, local: &mut HashMap<String, usize>, fresh: &mut u64) {
+    match c {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            eta_locals(f, globals, local, fresh);
+            eta_locals(a, globals, local, fresh);
+        }
+        Core::Lam(_, b) => eta_locals(b, globals, local, fresh),
+        Core::Let(binds, body) => {
+            for (x, r) in binds.iter() {
+                // A function, or a partial application (`return ()`).
+                let n = match value_arity(r) {
+                    0 => cheap_arity(r, globals, local),
+                    n => n,
+                };
+                if n > 0 && n != BOTTOM {
+                    local.insert(x.clone(), n);
+                }
+            }
+            for (x, r) in binds.iter_mut() {
+                if let Some(n) = expand_by_one(r, x, globals, local) {
+                    local.insert(x.clone(), n + 1);
+                    add_param(r, fresh);
+                }
+                eta_locals(r, globals, local, fresh);
+            }
+            eta_locals(body, globals, local, fresh);
+        }
+        Core::Case(s, _, alts) => {
+            eta_locals(s, globals, local, fresh);
+            for a in alts {
+                let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                eta_locals(b, globals, local, fresh);
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| eta_locals(a, globals, local, fresh)),
+    }
+}
+
+/// How many arguments an expression takes after only cheap work (`BOTTOM` when it fails):
+/// 0 when it does any real work first (a call, a case of a call, a let of a thunk).
+fn cheap_arity(e: &Core, globals: &HashMap<String, usize>, local: &HashMap<String, usize>) -> usize {
+    let arity_of = |v: &str| local.get(v).or_else(|| globals.get(v)).copied().unwrap_or(0);
+    match e {
+        Core::Fail(_) => BOTTOM,
+        Core::Lam(_, b) => cheap_arity(b, globals, local).saturating_add(1),
+        Core::Var(v) => arity_of(v),
+        Core::App(..) => {
+            if let Some(l) = one_shot_lambda(e) {
+                return cheap_arity(l, globals, local);
+            }
+            // The head first (a saturated call does work), then the arguments.
+            let mut n = 0;
+            let mut h = e;
+            while let Core::App(f, _) = h {
+                n += 1;
+                h = f;
+            }
+            let Core::Var(f) = h else { return 0 };
+            let k = arity_of(f).saturating_sub(n);
+            if k == 0 {
+                return 0;
+            }
+            let mut h = e;
+            while let Core::App(f, a) = h {
+                if !is_cheap_value(a, globals, local) {
+                    return 0;
+                }
+                h = f;
+            }
+            k
+        }
+        Core::Let(bs, body) => {
+            if bs.iter().all(|(_, r)| is_cheap_value(r, globals, local)) {
+                cheap_arity(body, globals, local)
+            } else {
+                0
+            }
+        }
+        Core::Case(s, _, alts) => {
+            let cheap = match &**s {
+                Core::Var(_) => true,
+                Core::Prim(p, args) => is_total_prim(p, args),
+                _ => false,
+            };
+            if !cheap {
+                return 0;
+            }
+            alts.iter()
+                .map(|a| {
+                    let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                    cheap_arity(b, globals, local)
+                })
+                .min()
+                .unwrap_or(BOTTOM)
+        }
+        Core::Lit(_) | Core::Con(..) | Core::Prim(..) => 0,
+    }
+}
+
+/// An expression whose evaluation does no work worth sharing: an atom, a constructor of atoms,
+/// or a function value (after cheap work).
+fn is_cheap_value(e: &Core, globals: &HashMap<String, usize>, local: &HashMap<String, usize>) -> bool {
+    match e {
+        _ if is_atom(e) => true,
+        Core::Lit(_) => true,
+        Core::Con(_, args) => args.iter().all(is_atom),
+        _ => {
+            let k = cheap_arity(e, globals, local);
+            k >= 1 && k != BOTTOM
+        }
+    }
+}
+
+/// A global bound to a constructor application with fields that are not atoms (a dictionary
+/// with a default method, say) gets those fields as globals of their own, `g%f<i>`: then the
+/// global is known (see `pass`), and cases of it select their field, as they do for
+/// dictionaries of atoms. A top-level binding is as lazy and shared as the field was.
+fn float_con_fields(binds: &mut Vec<TopBind>) {
+    let mut extra = Vec::new();
+    for b in binds.iter_mut() {
+        if is_rule_binding(&b.name) {
+            continue;
+        }
+        let Core::Con(_, fields) = &mut b.body else { continue };
+        for (i, f) in fields.iter_mut().enumerate() {
+            if is_atom(f) {
+                continue;
+            }
+            let name = format!("{}%f{i}", b.name);
+            extra.push(TopBind { name: name.clone(), body: std::mem::replace(f, Core::Var(name)) });
+        }
+    }
+    binds.extend(extra);
+}
+
 fn strip_one_shot(c: &mut Core) {
     match c {
         Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
@@ -101,6 +327,9 @@ fn strip_one_shot(c: &mut Core) {
 
 /// One simplifier pass over the bindings (`only`: just those).
 fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<String>>) {
+    if std::env::var_os("HSC_NO_ETA").is_none() {
+        eta_expand(binds, only, rules);
+    }
     let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
     let direct: HashMap<&str, &Core> = binds.iter().map(|b| (b.name.as_str(), &b.body)).collect();
     // Globals that are (aliases of) constructor applications to atoms, and global aliases.
@@ -592,6 +821,15 @@ impl Simp<'_> {
     /// is not an atom, so that it is not copied).
     fn app_of_case(&mut self, c: &mut Core) -> bool {
         let Core::App(f, _) = c else { return false };
+        // `(seq a f) x` is `seq a (f x)`: both evaluate `a`, then `f`, then apply it.
+        if matches!(&**f, Core::Prim(p, args) if p == "seq" && args.len() == 2) {
+            let Core::App(f, a) = take(c) else { unreachable!() };
+            let Core::Prim(p, mut args) = *f else { unreachable!() };
+            let g = args.pop().expect("two arguments");
+            args.push(Core::App(Box::new(g), a));
+            *c = Core::Prim(p, args);
+            return true;
+        }
         if !matches!(**f, Core::Case(..)) {
             return false;
         }
