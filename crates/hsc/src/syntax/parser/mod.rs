@@ -103,6 +103,50 @@ pub fn parse_rules(toks: Vec<Token>, exts: &Extensions) -> Vec<crate::syntax::as
     out
 }
 
+/// Parses the body of a top-level `{-# INLINE #-}` or `{-# NOINLINE #-}` pragma (lexed):
+/// `[CONLIKE] [activation] name`. Anything else is ignored (pragmas are optimisations).
+pub fn parse_inline(toks: &[Token], inline: bool) -> Option<crate::syntax::ast::InlinePragma> {
+    use crate::syntax::ast::{Activation, InlinePragma, QName};
+    let toks: Vec<&Token> = toks.iter().filter(|t| t.tok != Tok::Eof).collect();
+    let mut i = 0;
+    if matches!(toks.first().map(|t| &t.tok), Some(Tok::ConId(c)) if c == "CONLIKE") {
+        i += 1;
+    }
+    let mut activation = Activation::Always;
+    if matches!(toks.get(i).map(|t| &t.tok), Some(Tok::Special('['))) {
+        let before = matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::Res(ROp::Tilde)))
+            || matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::VarSym(s)) if s == "~");
+        let j = if before { i + 2 } else { i + 1 };
+        match (toks.get(j).map(|t| &t.tok), toks.get(j + 1).map(|t| &t.tok)) {
+            (Some(Tok::Int(n)), Some(Tok::Special(']'))) => {
+                let n: u32 = n.parse().ok()?;
+                activation = if before { Activation::Before(n) } else { Activation::From(n) };
+                i = j + 2;
+            }
+            (Some(Tok::Special(']')), _) if before => {
+                activation = Activation::Never;
+                i = j + 1;
+            }
+            _ => return None,
+        }
+    }
+    let loc = Loc { line: toks.get(i)?.line, col: toks.get(i)?.col };
+    let name = match toks.get(i..)? {
+        [t] => match &t.tok {
+            Tok::VarId(v) => QName::unqual(v.clone()),
+            Tok::QVarId(q, v) => QName { qual: Some(q.clone()), name: v.clone() },
+            _ => return None,
+        },
+        [o, t, c] if o.tok == Tok::Special('(') && c.tok == Tok::Special(')') => match &t.tok {
+            Tok::VarSym(v) => QName::unqual(v.clone()),
+            Tok::QVarSym(q, v) => QName { qual: Some(q.clone()), name: v.clone() },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(InlinePragma { name, inline, activation, loc })
+}
+
 fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax::ast::Rule> {
     use crate::syntax::ast::{Activation, Rule};
     let loc = Loc { line: toks[0].line, col: toks[0].col };
@@ -646,6 +690,7 @@ impl Parser {
             decls: group_binds(decls),
             loc,
             rules: Vec::new(),
+            inlines: Vec::new(),
         })
     }
 

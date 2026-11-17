@@ -18,6 +18,10 @@ use super::{Alt, Core, Lit, TopBind};
 
 /// The largest body (in nodes, under its parameters) of a global function that is inlined.
 const INLINE_SIZE: usize = 40;
+/// The same for a function with an (active) INLINE pragma: GHC inlines those whatever their
+/// size; this bounds the code a pragma can multiply (an inlined body is simplified again, so
+/// INLINE functions calling INLINE functions compound).
+const INLINE_PRAGMA_SIZE: usize = 120;
 /// The rounds of rewriting of one binding.
 const ROUNDS: usize = 8;
 
@@ -45,7 +49,10 @@ pub fn simplify(binds: &mut [TopBind]) {
     // mention, which are not inlined while rules may still need to see them (phases 2 and 1).
     // HSC_NO_RULES: without them (to compare, or to rule them out).
     let enabled = std::env::var_os("HSC_NO_RULES").is_none();
-    let rules = if enabled { Rules::new(extract_rules(binds)) } else { Rules { by_head: HashMap::new(), protected: HashSet::new() } };
+    let mut rules = if enabled { Rules::new(extract_rules(binds)) } else { Rules { by_head: HashMap::new(), protected: HashSet::new(), inlines: HashMap::new() } };
+    if std::env::var_os("HSC_NO_INLINE_PRAGMAS").is_none() {
+        rules.inlines = extract_inlines(binds);
+    }
     // The passes are GHC's phases 2, 1 and 0: the second inlines the bodies the first
     // simplified; the last cleans up after the calls by value.
     pass(binds, 2, &rules, None);
@@ -130,7 +137,14 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
     let mut templates: HashMap<String, (usize, Core)> = HashMap::new();
     for b in binds.iter() {
         let (arity, inner) = lambdas(&b.body);
-        if arity == 0 || size(inner, INLINE_SIZE + 1) > INLINE_SIZE || mentions(&b.body, &b.name) {
+        // An INLINE pragma inlines a larger body, in its phases only; NOINLINE allows inlining
+        // in its phases only.
+        let limit = match rules.inlines.get(&b.name) {
+            Some((true, act)) if act.active(phase) => INLINE_PRAGMA_SIZE,
+            Some((_, act)) if !act.active(phase) => 0,
+            _ => INLINE_SIZE,
+        };
+        if arity == 0 || size(inner, limit + 1) > limit || mentions(&b.body, &b.name) {
             continue;
         }
         if is_rule_binding(&b.name) || b.name == ONE_SHOT || (phase > 0 && rules.protected.contains(&b.name)) {
@@ -343,6 +357,16 @@ impl Simp<'_> {
                         return;
                     }
                 }
+                // A total primitive whose result is not used: dropped.
+                if let (Core::Prim(p, args), [Alt::Default(body)]) = (&**s, &alts[..]) {
+                    if is_total_prim(p, args) && !mentions(body, binder) {
+                        let Some(Alt::Default(body)) = alts.pop() else { unreachable!() };
+                        *c = body;
+                        self.changed = true;
+                        self.expr(c);
+                        return;
+                    }
+                }
                 // `case e as u of _ -> u` is `e`.
                 if matches!(&alts[..], [Alt::Default(Core::Var(v))] if v == binder) {
                     *c = take(s);
@@ -433,6 +457,10 @@ impl Simp<'_> {
                     self.changed = true;
                 } else if let Some(v) = fold(p, args) {
                     *c = Core::Lit(Lit::Int(v));
+                    self.changed = true;
+                    return;
+                } else if let Some(a) = identity(p, args) {
+                    *c = a;
                     self.changed = true;
                     return;
                 }
@@ -1334,7 +1362,7 @@ fn is_rule_binding(name: &str) -> bool {
 }
 
 /// When a rule is active, in the phases 2, 1, 0 (see `syntax::ast::Activation`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Act {
     Always,
     From(u32),
@@ -1355,19 +1383,59 @@ struct RuleDef {
 
 impl RuleDef {
     fn active(&self, phase: u32) -> bool {
-        match self.act {
+        self.act.active(phase)
+    }
+}
+
+impl Act {
+    fn active(self, phase: u32) -> bool {
+        match self {
             Act::Always => true,
             Act::From(n) => phase <= n,
             Act::Before(n) => phase > n,
             Act::Never => false,
         }
     }
+
+    /// The activation a marker name ends with (see `rename::activation_code`).
+    fn parse(code: &str) -> Option<Act> {
+        match code {
+            "A" => Some(Act::Always),
+            "N" => Some(Act::Never),
+            t if t.starts_with('F') => t[1..].parse().ok().map(Act::From),
+            t if t.starts_with('B') => t[1..].parse().ok().map(Act::Before),
+            _ => None,
+        }
+    }
+}
+
+/// The program's INLINE and NOINLINE pragmas, by function: INLINE (true) with the phases it
+/// inlines in, or NOINLINE with the phases the function may be inlined in as usual (from the
+/// marker bindings `$rule%inl<i>%<target>%<kind>%<activation>`, see `rename::inline_binding`).
+fn extract_inlines(binds: &[TopBind]) -> HashMap<String, (bool, Act)> {
+    let mut out = HashMap::new();
+    for b in binds {
+        let Some((_, rest)) = b.name.split_once(".$rule%inl") else { continue };
+        let mut parts = rest.rsplitn(3, '%');
+        let (Some(act), Some(kind), Some(target)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let Some(target) = target.split_once('%').map(|(_, t)| t) else { continue };
+        let Some(act) = Act::parse(act) else { continue };
+        match kind {
+            "I" => out.insert(target.to_string(), (true, act)),
+            // A plain NOINLINE (written without phases) is never inlined.
+            "N" => out.insert(target.to_string(), (false, if act == Act::Always { Act::Never } else { act })),
+            _ => None,
+        };
+    }
+    out
 }
 
 /// The rules by the function their left sides apply, and every global those sides mention.
 struct Rules {
     by_head: HashMap<String, Vec<RuleDef>>,
     protected: HashSet<String>,
+    /// INLINE and NOINLINE pragmas (see `extract_inlines`).
+    inlines: HashMap<String, (bool, Act)>,
 }
 
 impl Rules {
@@ -1382,7 +1450,7 @@ impl Rules {
             }
             by_head.entry(r.head.clone()).or_default().push(r);
         }
-        Rules { by_head, protected }
+        Rules { by_head, protected, inlines: HashMap::new() }
     }
 }
 
@@ -1588,6 +1656,57 @@ fn fold(p: &str, args: &[Core]) -> Option<i64> {
         ">=#" => (a >= b) as i64,
         _ => return None,
     })
+}
+
+/// A primitive without effects that cannot fail, on atoms: its result unused, it can go.
+fn is_total_prim(p: &str, args: &[Core]) -> bool {
+    const TOTAL: &[&str] = &[
+        "+#", "-#", "*#", "andI#", "orI#", "xorI#", "notI#", "negateInt#", "==#", "/=#", "<#", "<=#", ">#", ">=#",
+        "plusWord#", "minusWord#", "timesWord#", "and#", "or#", "xor#", "not#", "eqWord#", "neWord#", "ltWord#",
+        "leWord#", "gtWord#", "geWord#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#", "geChar#", "ord#",
+        "int2Word#", "word2Int#", "uncheckedIShiftL#", "uncheckedIShiftRA#", "uncheckedIShiftRL#",
+        "uncheckedShiftL#", "uncheckedShiftRL#",
+    ];
+    let divides = matches!(p, "quotInt#" | "remInt#")
+        && matches!(args.get(1), Some(Core::Lit(Lit::Int(d))) if *d != 0 && *d != -1);
+    (TOTAL.contains(&p) || divides) && args.iter().all(is_atom)
+}
+
+/// An `Int#` or `Word#` primitive on atoms that answers one of them, or a literal, whatever
+/// the other is: `x +# 0#` is `x`, `andI# x 0#` is `0#`, `orI# x x` is `x`.
+fn identity(p: &str, args: &[Core]) -> Option<Core> {
+    let [a, b] = args else { return None };
+    let lit = |c: &Core| match c {
+        Core::Lit(Lit::Int(i)) => Some(*i),
+        _ => None,
+    };
+    let same = matches!((a, b), (Core::Var(x), Core::Var(y)) if x == y);
+    // `x op k`, either way round for the commutative ones.
+    let with = |k: i64, commutes: bool| -> Option<&Core> {
+        if lit(b) == Some(k) {
+            Some(a)
+        } else if commutes && lit(a) == Some(k) {
+            Some(b)
+        } else {
+            None
+        }
+    };
+    let zero = Core::Lit(Lit::Int(0));
+    match p {
+        "+#" | "plusWord#" | "orI#" | "or#" | "xorI#" | "xor#" if with(0, true).is_some() => with(0, true).cloned(),
+        "-#" | "minusWord#" | "uncheckedIShiftL#" | "uncheckedIShiftRA#" | "uncheckedIShiftRL#" | "uncheckedShiftL#" | "uncheckedShiftRL#"
+            if with(0, false).is_some() =>
+        {
+            with(0, false).cloned()
+        }
+        "*#" | "timesWord#" if with(1, true).is_some() => with(1, true).cloned(),
+        "*#" | "timesWord#" | "andI#" | "and#" if with(0, true).is_some() => Some(zero),
+        "andI#" | "and#" if with(-1, true).is_some() => with(-1, true).cloned(),
+        "orI#" | "or#" if with(-1, true).is_some() => Some(Core::Lit(Lit::Int(-1))),
+        "andI#" | "and#" | "orI#" | "or#" if same => Some(a.clone()),
+        "xorI#" | "xor#" | "-#" | "minusWord#" if same => Some(zero),
+        _ => None,
+    }
 }
 
 /// A variable or a number or character literal: passed and substituted as it is.
@@ -2204,7 +2323,7 @@ mod rule_tests {
     }
 
     fn rewrite_with(rules: Vec<RuleDef>, phase: u32, mut e: Core) -> Option<Core> {
-        let rules = Rules { by_head: rules.into_iter().fold(HashMap::new(), |mut m: HashMap<String, Vec<RuleDef>>, r| { m.entry(r.head.clone()).or_default().push(r); m }), protected: HashSet::new() };
+        let rules = Rules { by_head: rules.into_iter().fold(HashMap::new(), |mut m: HashMap<String, Vec<RuleDef>>, r| { m.entry(r.head.clone()).or_default().push(r); m }), protected: HashSet::new(), inlines: HashMap::new() };
         let (once, dead, known, aliases, templates) = (HashSet::new(), HashSet::new(), HashMap::new(), HashMap::new(), HashMap::new());
         let mut fresh = 0;
         let no_arities = HashMap::new();

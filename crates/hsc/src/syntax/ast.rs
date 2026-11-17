@@ -43,6 +43,17 @@ pub struct Module {
     pub loc: Loc,
     /// The module's rewrite rules (`{-# RULES #-}`): optimisations only, never needed for meaning.
     pub rules: Vec<Rule>,
+    /// Its top-level `{-# INLINE #-}` and `{-# NOINLINE #-}` pragmas (optimisations too).
+    pub inlines: Vec<InlinePragma>,
+}
+
+/// `{-# INLINE [activation] name #-}` (`inline`), or `NOINLINE` (not `inline`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlinePragma {
+    pub name: QName,
+    pub inline: bool,
+    pub activation: Activation,
+    pub loc: Loc,
 }
 
 /// A rewrite rule: `"name" [activation] forall binders . lhs = rhs`.

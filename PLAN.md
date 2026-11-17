@@ -434,7 +434,18 @@ The work:
      copying of its tree, generated code unchanged), strings 2,578 → 2,599 M (PR #60). Hosted,
      on a slower runner, every benchmark is within noise (geometric mean 0.99; none has a fused
      local loop). [Raw samples, conditions and graphs](bench/results/runtime-case-of-case.md).
-     Next: `INLINE [n]` phases; green threads; leaner frame prologues.
+     INLINE and NOINLINE pragmas now count: top-level ones (with phases, CONLIKE, on
+     operators) become private marker bindings `$rule%inl<i>%<target>%<kind>%<phases>`
+     (checked like rules, so they survive the module cache), read by the simplifier. An active
+     INLINE inlines bodies up to 120 nodes (GHC: any size), an inactive one or NOINLINE stops
+     inlining in its phases; plain NOINLINE never inlines (`HSC_NO_INLINE_PRAGMAS` turns them
+     off). Identities fold (`x +# 0#`, `andI# x 0#`, `orI# x x`, ...), and a total primitive
+     whose result is unused goes. Inline arithmetic no longer checks for a thread switch each
+     operation: a function's entry does (`hsc_yield`). sumloop's `mod` (`modInt#`, INLINE [0])
+     now inlines: 962 → 512 M instructions; fib 30.7 → 28.8 M, mapops 502 → 487 M, ioref
+     1,007 → 1,015 M, others within 0.3%.
+     Next: register allocation for raw values (sumloop still moves every intermediate through
+     its frame); green threads; leaner frame prologues.
 
 ### 2. Large projects
 
