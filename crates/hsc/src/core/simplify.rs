@@ -335,6 +335,24 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
     // Globals that are (aliases of) constructor applications to atoms, and global aliases.
     let mut known: HashMap<String, (String, Vec<Core>)> = HashMap::new();
     let mut aliases: HashMap<String, String> = HashMap::new();
+    // Globals that are literals (a boxed Int or Char is its number in Core: `maxInt`).
+    let literals: HashMap<String, Lit> = binds
+        .iter()
+        .filter_map(|b| {
+            // Through the boxing identity `(\x -> x) lit` of a constructor not simplified yet.
+            let mut e = &b.body;
+            while let Core::App(f, a) = e {
+                match &**f {
+                    Core::Lam(x, body) if matches!(&**body, Core::Var(y) if y == x) => e = a,
+                    _ => break,
+                }
+            }
+            match e {
+                Core::Lit(l @ (Lit::Int(_) | Lit::Char(_))) => Some((b.name.clone(), l.clone())),
+                _ => None,
+            }
+        })
+        .collect();
     for b in binds.iter() {
         let mut body = &b.body;
         for _ in 0..8 {
@@ -380,6 +398,7 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
         })
         .collect();
     let mut templates: HashMap<String, (usize, Core)> = HashMap::new();
+    let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
     for b in binds.iter() {
         let (arity, inner) = lambdas(&b.body);
         // An INLINE pragma inlines a larger body, in its phases only; NOINLINE allows inlining
@@ -413,9 +432,15 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
         let mut names = HashSet::new();
         if unique_binders(&b.body, &globals, &mut names) {
             templates.insert(b.name.clone(), (arity, b.body.clone()));
+        } else {
+            // A body not simplified yet may bind a name twice: a renamed copy is the template.
+            let mut copy = b.body.clone();
+            uniquify(&mut copy, &globals, &mut HashSet::new(), &mut HashMap::new(), &mut fresh);
+            if unique_binders(&copy, &globals, &mut HashSet::new()) {
+                templates.insert(b.name.clone(), (arity, copy));
+            }
         }
     }
-    let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
     for bind in binds.iter_mut() {
         if is_rule_binding(&bind.name) || only.is_some_and(|o| !o.contains(&bind.name)) {
             continue;
@@ -462,6 +487,7 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
                 dead: &dead,
                 pending: HashMap::new(),
                 known: &known,
+                literals: &literals,
                 aliases: &aliases,
                 templates: &templates,
                 this: &bind.name,
@@ -498,6 +524,8 @@ struct Simp<'a> {
     dead: &'a HashSet<String>,
     pending: HashMap<String, Core>,
     known: &'a HashMap<String, (String, Vec<Core>)>,
+    /// Globals that are literals.
+    literals: &'a HashMap<String, Lit>,
     aliases: &'a HashMap<String, String>,
     templates: &'a HashMap<String, (usize, Core)>,
     /// The binding being simplified (never inlined into itself).
@@ -994,6 +1022,14 @@ impl Simp<'_> {
 
     /// Beta reduction at the top of `c`: `(\x -> b) a`, and lets floated out of the function.
     fn reduce(&mut self, c: &mut Core) {
+        // `coerce e` is `e` (Core is untyped).
+        if matches!(c, Core::App(f, _) if matches!(&**f, Core::Var(v) if v == "GHC.Prim.coerce")) {
+            let Core::App(_, a) = take(c) else { unreachable!() };
+            *c = *a;
+            self.changed = true;
+            self.reduce(c);
+            return;
+        }
         let Core::App(f, _) = c else { return };
         // An applied `oneShot (\z -> e)`: the marker says nothing more, and the lambda reduces.
         if one_shot_lambda(f).is_some() {
@@ -1077,6 +1113,11 @@ impl Simp<'_> {
                     binds.push((binder.clone(), Core::Con(con, vars.into_iter().map(Core::Var).collect())));
                 }
                 Some(if binds.is_empty() { body } else { Core::Let(binds, Box::new(body)) })
+            }
+            Core::Var(v) if self.literals.contains_key(v.as_str()) => {
+                let l = self.literals[v.as_str()].clone();
+                **s = Core::Lit(l);
+                self.select(c)
             }
             Core::Lit(l @ (Lit::Int(_) | Lit::Char(_))) => {
                 let i = alts
@@ -1421,17 +1462,17 @@ fn drop_args(c: &mut Core, f: &str, constant: &[Option<String>]) {
 /// applied to atoms (partial applications), whose copies cost no repeated work.
 fn let_values(e: &Core, arity: &HashMap<String, usize>, moving: &HashSet<String>) -> HashSet<String> {
     // A lambda, or a global applied to fewer arguments than it takes (a partial application:
-    // no work), each argument a lambda or an atom that is not itself moving (whose work would
+    // no work), each argument a value itself or an atom that is not moving (whose work would
     // otherwise move along).
-    let is_value = |e: &Core| -> bool {
+    fn value(e: &Core, arity: &HashMap<String, usize>, moving: &HashSet<String>) -> bool {
         match e {
             Core::Lam(..) => true,
             Core::App(..) => {
                 let mut h = e;
                 let mut n = 0;
                 while let Core::App(f, a) = h {
-                    let ok = matches!(**a, Core::Lam(..))
-                        || (is_atom(a) && !matches!(&**a, Core::Var(v) if moving.contains(v.as_str())));
+                    let ok = (is_atom(a) && !matches!(&**a, Core::Var(v) if moving.contains(v.as_str())))
+                        || (!is_atom(a) && value(a, arity, moving));
                     if !ok {
                         return false;
                     }
@@ -1442,7 +1483,8 @@ fn let_values(e: &Core, arity: &HashMap<String, usize>, moving: &HashSet<String>
             }
             _ => false,
         }
-    };
+    }
+    let is_value = |e: &Core| value(e, arity, moving);
     fn go(e: &Core, is_value: &dyn Fn(&Core) -> bool, out: &mut HashSet<String>) {
         match e {
             Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
@@ -1835,6 +1877,22 @@ fn builtin_rules() -> Vec<RuleDef> {
             head: foldr.into(),
             args: vec![v("k%rule"), v("z%rule"), app(app(v("GHC.Internal.Base.augment"), v("g%rule")), v("xs%rule"))],
             rhs: app(app(v("g%rule"), v("k%rule")), app(app(app(v(foldr), v("k%rule")), v("z%rule")), v("xs%rule"))),
+        },
+        // GHC.List's "foldr2/left" (its `g` has a rank-2 type, which a rule binding cannot
+        // check): `zip [1 ..] ys` and the like fuse with their left list.
+        RuleDef {
+            name: "foldr2/left".into(),
+            act: Act::Always,
+            vars: vec!["k%rule".into(), "z%rule".into(), "g%rule".into(), "ys%rule".into()],
+            head: "GHC.Internal.List.foldr2".into(),
+            args: vec![v("k%rule"), v("z%rule"), app(v("GHC.Internal.Base.build"), v("g%rule")), v("ys%rule")],
+            rhs: app(
+                app(
+                    app(v("g%rule"), app(app(v("GHC.Internal.List.foldr2_left"), v("k%rule")), v("z%rule"))),
+                    Core::Lam("_%rule".into(), Box::new(v("z%rule"))),
+                ),
+                v("ys%rule"),
+            ),
         },
     ]
 }
@@ -2597,10 +2655,11 @@ mod rule_tests {
     fn rewrite_with(rules: Vec<RuleDef>, phase: u32, mut e: Core) -> Option<Core> {
         let rules = Rules { by_head: rules.into_iter().fold(HashMap::new(), |mut m: HashMap<String, Vec<RuleDef>>, r| { m.entry(r.head.clone()).or_default().push(r); m }), protected: HashSet::new(), inlines: HashMap::new() };
         let (once, dead, known, aliases, templates) = (HashSet::new(), HashSet::new(), HashMap::new(), HashMap::new(), HashMap::new());
+        let literals = HashMap::new();
         let mut fresh = 0;
         let no_arities = HashMap::new();
         let mut s = Simp {
-            once: &once, dead: &dead, pending: HashMap::new(), known: &known, aliases: &aliases, templates: &templates,
+            once: &once, dead: &dead, pending: HashMap::new(), known: &known, literals: &literals, aliases: &aliases, templates: &templates,
             this: "Test.x", rules: &rules, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
             fresh: &mut fresh, budget: 0, changed: false,
         };

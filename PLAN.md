@@ -57,11 +57,11 @@ join points, RULES and foldr/build fusion, oneShot, case-of-case, calls by value
 pragmas, eta-expansion, raw numbers in registers with constant division (PR #63), green
 threads: coroutines on one OS thread, safe foreign calls on worker threads (PR #64); list
 comprehensions desugared with foldr/build, coercions dropped, partial applications inlined
-(PR #65).
+(PR #65); `zip` fuses with enumerations ("foldr2/left" built in, PR #66).
 
 **Next:**
 - mvar: the MVar primitives and thread switches still go through the generic runtime.
-- Fusion of `zip` with enumerations (`foldr2`); less boxing and generic application (ioref).
+- Less boxing and generic application (ioref); `foldr2_left` still called, not inlined.
 - Leaner frame prologues (pointer locals are zeroed at every entry).
 - Strings: `[Char]` processing and `show`.
 - Compile time: real interface files; parallel module compilation.
