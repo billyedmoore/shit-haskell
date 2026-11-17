@@ -593,6 +593,12 @@ impl Simp<'_> {
     /// Beta reduction at the top of `c`: `(\x -> b) a`, and lets floated out of the function.
     fn reduce(&mut self, c: &mut Core) {
         let Core::App(f, _) = c else { return };
+        // An applied `oneShot (\z -> e)`: the marker says nothing more, and the lambda reduces.
+        if one_shot_lambda(f).is_some() {
+            let Core::App(_, lam) = take(f) else { unreachable!() };
+            **f = *lam;
+            self.changed = true;
+        }
         // The function of an application may itself be a redex, made by inlining.
         self.reduce(f);
         match &**f {
