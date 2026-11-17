@@ -277,6 +277,7 @@ impl<V> Sched<V> {
         self.waits.clear();
         self.stm_waiters.clear();
         self.in_foreign = 0;
+        self.returned.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// The running thread.
@@ -465,6 +466,8 @@ impl<V> Sched<V> {
     /// interruptibly, will raise it when it next runs, and the thrower continues. Otherwise the
     /// thrower is blocked until the target receives the exception: the caller switches.
     pub fn throw_to(&mut self, target: Tid, exc: V) -> Thrown {
+        // A foreign call that has returned is not interrupted (its worker may be in another one).
+        self.take_returned();
         let me = self.cur;
         let Some(t) = self.threads.get_mut(&target) else { return Thrown::Done };
         let blocked = match t.state {
@@ -711,8 +714,9 @@ impl<V> Sched<V> {
                             let wait = t.saturating_duration_since(Instant::now());
                             drop(cv.wait_timeout(guard, wait));
                         }
+                        // Woken now and then to see signals (a handler cannot notify).
                         None => {
-                            drop(cv.wait(guard));
+                            drop(cv.wait_timeout(guard, Duration::from_millis(10)));
                         }
                     }
                 }

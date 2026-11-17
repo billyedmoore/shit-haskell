@@ -286,8 +286,7 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             // SAFETY: fork has no arguments; the child continues on this thread alone.
             let pid = unsafe { fork() };
             if pid == 0 {
-                m.sched.only_current();
-                m.suspended.clear();
+                super::conc::after_fork(m);
                 let _ = m.apply_nested(action, &[0]);
                 if let Some(g) = m.rts_global("GHC.Internal.TopHandler.flushStdHandles") {
                     if let Some(f) = m.force(g) {

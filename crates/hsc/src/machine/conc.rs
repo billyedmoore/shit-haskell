@@ -231,15 +231,26 @@ fn worker() -> Option<Worker> {
                     (job.run)(job.a, job.b);
                     *job.errno = *__errno_location();
                 }
-                WORKERS.lock().unwrap_or_else(|e| e.into_inner()).push(back.clone());
+                // Back in the pool only once the caller is told (an exception thrown to the caller
+                // until then may still signal this OS thread, see `Sched::throw_to`).
                 let (list, cv) = &*job.returned;
                 list.lock().unwrap_or_else(|e| e.into_inner()).push(job.tid);
                 cv.notify_all();
+                WORKERS.lock().unwrap_or_else(|e| e.into_inner()).push(back.clone());
             }
         })
         .ok()?;
     let os_thread = idr.recv().ok()?;
     Some(Worker { jobs: tx, os_thread })
+}
+
+/// In the child of a `fork`: only the running thread exists, and no worker OS thread.
+pub fn after_fork(m: &mut Machine) {
+    m.sched.only_current();
+    m.suspended.clear();
+    let me = m.sched.current();
+    m.coros.map.retain(|t, _| *t == me);
+    WORKERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Runs the call in `*a` (an `Option<F>`) and leaves its result in `*b` (an `Option<R>`).
