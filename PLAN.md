@@ -446,6 +446,16 @@ The work:
      1,007 → 1,015 M, others within 0.3% (PR #61). Hosted: sumloop 60.9 → 35.9 ms, fib 6.9 →
      5.2 ms, ioref 104 → 108 ms, the rest within noise.
      [Raw samples, conditions and graphs](bench/results/runtime-inline-pragmas.md).
+     Eta-expansion: a function whose body is, after only cheap work (cases of variables and
+     of total primitives, lets of values, partial applications of known functions to cheap
+     values), a function in every alternative takes one more parameter (one per pass; not
+     functions with an INLINE pragma, which inline at their written arity). IO loops then
+     take the state token and `thenIO` inlines into them. As in GHC -O1 (not -O0), `seq` of
+     such a partial application no longer fails when the case would. Global constructor
+     bindings with fields that are not atoms (IO's Monad dictionary, whose `return` is a
+     default) get those fields as globals of their own, so method selection from them
+     resolves; and `(seq a f) x` is `seq a (f x)`. ioref 1,015 → 419 M instructions,
+     nqueens 353 → 282 M, mvar 185 → 169 M; strings +0.6%, others within 0.5%.
      Next: register allocation for raw values (sumloop still moves every intermediate through
      its frame); green threads; leaner frame prologues.
 
