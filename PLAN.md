@@ -16,7 +16,7 @@ the GitHub issues.
     Rust runtime: a copying GC, GHC's scheduling of threads, STM, and FFI.
 - **Driver:** GHC's command line and package databases, and `hsc-pkg` for the commands cabal
   uses; `cabal build/test -w <shims>/ghc` works.
-- **Corpus:** 243 differential tests for both back ends, compared with GHC.
+- **Corpus:** 244 differential tests for both back ends, compared with GHC.
 - **Boot libraries:** the vendored GHC sources (`libs/`). Their own test suites:
   - Pass: deepseq, directory, filepath, bytestring, exceptions, file-io.
   - unix passes 15 of 16 suites; the one failure fails the same way with GHC on this kernel.
@@ -403,10 +403,12 @@ The work:
      (done: the simplifier's passes are phases 2, 1, 0, functions the rules mention are not
      inlined before phase 0, "fold/build" and "foldr/augment" are built in, and on by default
      (`HSC_NO_RULES` turns them off). A match the right side uses once is substituted in
-     place, and a let-bound value (a lambda, or a global applied to atoms or lambdas) moves to
-     its one use even under a lambda, so fused code reduces:
-     `sum (map (\x -> x * x) [1 .. n])` becomes one loop over the integers, 944 → 625 M
-     instructions; nqueens 407 → 371 M, mapops 502 → 478 M, strings 2,638 → 2,703 M.)
+     place when its use is under no lambda but `build`'s or `augment`'s argument (which run
+     once), and a let-bound value (a lambda, or a global applied to fewer arguments than it
+     takes, none of them a moving local) moves to its one use even under a lambda, so fused
+     code reduces without repeating work: `sum (map (\x -> x * x) [1 .. n])` becomes one loop
+     over the integers, 944 → 625 M instructions; nqueens 407 → 371 M, mapops 502 → 478 M,
+     strings 2,638 → 2,549 M, ioref 1,135 → 1,076 M.)
   4. Next: eta-expand fused loops (a `foldl` fused through `foldr` returns a function per
      element), and `INLINE [n]` phase control where base relies on it.
 
