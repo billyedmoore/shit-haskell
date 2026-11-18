@@ -68,34 +68,36 @@ extern "C" {
     fn pthread_self() -> u64;
 }
 
-/// The C stack of a coroutine (reserved; the kernel commits it on use), with a guard page.
+/// A stack of a coroutine (its C stack, or its Haskell stack): reserved, committed by the kernel
+/// on use (so that many threads cost little), with a guard page at its low end.
 pub struct CStack {
     base: *mut u8,
+    len: usize,
 }
 
 impl CStack {
-    fn new() -> Option<CStack> {
+    fn new(len: usize) -> Option<CStack> {
         const PROT_RW: i32 = 3;
         const FLAGS: i32 = 0x02 | 0x20 | 0x4000 | 0x20000; // private, anonymous, no reserve, stack
         // SAFETY: a fresh anonymous mapping.
-        let base = unsafe { mmap(std::ptr::null_mut(), FORK_C_STACK, PROT_RW, FLAGS, -1, 0) };
+        let base = unsafe { mmap(std::ptr::null_mut(), len, PROT_RW, FLAGS, -1, 0) };
         if base.is_null() || base as isize == -1 {
             return None;
         }
         // SAFETY: the lowest page of the mapping becomes the guard.
         unsafe { mprotect(base, 4096, 0) };
-        Some(CStack { base })
+        Some(CStack { base, len })
     }
 
     fn top(&self) -> usize {
-        self.base as usize + FORK_C_STACK
+        self.base as usize + self.len
     }
 }
 
 impl Drop for CStack {
     fn drop(&mut self) {
         // SAFETY: the mapping made in `new`, no longer in use.
-        unsafe { munmap(self.base, FORK_C_STACK) };
+        unsafe { munmap(self.base, self.len) };
     }
 }
 
@@ -118,6 +120,8 @@ struct Start {
     mp: *mut Machine,
     id: Tid,
     slot: usize,
+    /// Its Haskell stack.
+    stack: CStack,
 }
 
 /// Continues on thread `next`'s coroutine; returns when this one (`me`) runs again.
@@ -139,9 +143,8 @@ unsafe fn swap_to(mp: *mut Machine, me: Tid, next: Tid) {
 extern "C" fn coro_main(arg: usize) {
     // SAFETY: `fork` made the argument; this coroutine runs with the machine to itself.
     unsafe {
-        let Start { mp, id, slot } = *Box::from_raw(arg as *mut Start);
+        let Start { mp, id, slot, stack } = *Box::from_raw(arg as *mut Start);
         (*mp).coros.dead.clear();
-        let mut stack: Vec<Word> = vec![0; FORK_STACK_WORDS];
         {
             let m = &mut *mp;
             let action = std::mem::replace(&mut m.stable[slot], 0);
@@ -154,7 +157,7 @@ extern "C" fn coro_main(arg: usize) {
             m.prim_failed = false;
             m.top = 0;
             // [state token][stop frame with no outer stack]
-            let end = stack.as_mut_ptr() as Word + (FORK_STACK_WORDS as Word) * 8;
+            let end = stack.top() as Word;
             let a = end - 24;
             m.stack_store(a, hsc_stop_ret as usize as Word);
             m.stack_store(a + 8, 0);
@@ -560,7 +563,7 @@ pub fn unwind_mask(m: &mut Machine, saved: Word) {
 
 /// Starts a Haskell thread: a coroutine that runs when the scheduler gives it the turn.
 fn fork(m: &mut Machine, action: Word) -> Word {
-    let Some(stack) = CStack::new() else {
+    let (Some(stack), Some(hstack)) = (CStack::new(FORK_C_STACK), CStack::new(FORK_STACK_WORDS * 8)) else {
         m.exc = m.error_value("cannot create a thread");
         return 0;
     };
@@ -568,7 +571,7 @@ fn fork(m: &mut Machine, action: Word) -> Word {
     // The action waits in the stable table until the thread starts (it is a root there).
     m.stable.push(action);
     let slot = m.stable.len() - 1;
-    let start = Box::into_raw(Box::new(Start { mp: m, id, slot })) as usize;
+    let start = Box::into_raw(Box::new(Start { mp: m, id, slot, stack: hstack })) as usize;
     // The registers `hsc_coro_swap` takes back first: r15, r14, r13 (the function), r12 (its
     // argument), rbx, rbp, then the return to `hsc_coro_start`, which finds the stack aligned.
     let sp = (stack.top() & !15) - 72;
