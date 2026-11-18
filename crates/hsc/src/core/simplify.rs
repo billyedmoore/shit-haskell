@@ -46,6 +46,7 @@ const FALSE: &str = "GHC.Types.False";
 
 pub fn simplify(binds: &mut Vec<TopBind>) {
     float_con_fields(binds);
+    float_closed_dicts(binds, 0);
     // The rewrite rules, taken before any pass changes their sides, and the functions they
     // mention, which are not inlined while rules may still need to see them (phases 2 and 1).
     // HSC_NO_RULES: without them (to compare, or to rule them out).
@@ -58,6 +59,7 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
     // simplified; the last cleans up after the calls by value.
     pass(binds, 2, &rules, None);
     pass(binds, 1, &rules, None);
+    float_closed_dicts(binds, 1);
     call_by_value(binds);
     pass(binds, 0, &rules, None);
     // Fusion in phase 0 makes local loops: their calls by value, and a clean-up of the
@@ -307,6 +309,108 @@ fn float_con_fields(binds: &mut Vec<TopBind>) {
         }
     }
     binds.extend(extra);
+}
+
+/// Class dictionaries built inside a function from globals only (a `Typeable (Maybe [Int])`,
+/// a `Show [Int]`) become top-level bindings, built once, as GHC floats constant evidence:
+/// otherwise each call builds the dictionary again (a TypeRep's fingerprint each time).
+fn float_closed_dicts(binds: &mut Vec<TopBind>, run: u32) {
+    let mut extra = Vec::new();
+    for b in binds.iter_mut() {
+        if is_rule_binding(&b.name) {
+            continue;
+        }
+        let mut n = 0;
+        // Each run names its globals apart (`f%dict0_0`, then `f%dict1_0`): deterministic, so
+        // that cached modules agree.
+        let owner = format!("{}%dict{run}_", b.name);
+        float_dicts_in(&mut b.body, &mut HashSet::new(), false, &owner, &mut n, &mut extra);
+    }
+    binds.extend(extra);
+}
+
+fn is_dict_con(name: &str) -> bool {
+    name.rsplit('.').next().is_some_and(|c| c.starts_with("D:"))
+}
+
+/// Whether `e` mentions any of `names`.
+fn mentions_any(e: &Core, names: &HashSet<String>) -> bool {
+    match e {
+        Core::Var(v) => names.contains(v.as_str()),
+        Core::Lit(_) | Core::Fail(_) => false,
+        Core::App(f, a) => mentions_any(f, names) || mentions_any(a, names),
+        Core::Lam(_, b) => mentions_any(b, names),
+        Core::Let(bs, body) => bs.iter().any(|(_, r)| mentions_any(r, names)) || mentions_any(body, names),
+        Core::Case(s, _, alts) => {
+            mentions_any(s, names)
+                || alts.iter().any(|a| match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => mentions_any(b, names),
+                })
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| mentions_any(a, names)),
+    }
+}
+
+fn float_dicts_in(c: &mut Core, locals: &mut HashSet<String>, in_lam: bool, owner: &str, n: &mut usize, extra: &mut Vec<TopBind>) {
+    match c {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            float_dicts_in(f, locals, in_lam, owner, n, extra);
+            float_dicts_in(a, locals, in_lam, owner, n, extra);
+        }
+        Core::Lam(x, b) => {
+            locals.insert(x.clone());
+            float_dicts_in(b, locals, true, owner, n, extra);
+        }
+        Core::Let(bs, body) => {
+            if in_lam {
+                // Repeatedly: a dictionary of the group that mentions no local (nor a binding
+                // of the group still here) moves out; its uses name the new global.
+                loop {
+                    let group: HashSet<String> = bs.iter().map(|(x, _)| x.clone()).collect();
+                    let Some(i) = bs.iter().position(|(_, r)| {
+                        matches!(r, Core::Con(k, _) if is_dict_con(k)) && !mentions_any(r, locals) && !mentions_any(r, &group)
+                    }) else {
+                        break;
+                    };
+                    let (x, rhs) = bs.remove(i);
+                    let global = format!("{owner}{n}");
+                    *n += 1;
+                    for (_, r) in bs.iter_mut() {
+                        crate::core::rename_var(r, &x, &global);
+                    }
+                    crate::core::rename_var(body, &x, &global);
+                    extra.push(TopBind { name: global, body: rhs });
+                }
+                if bs.is_empty() {
+                    *c = take(body);
+                    float_dicts_in(c, locals, in_lam, owner, n, extra);
+                    return;
+                }
+            }
+            for (x, _) in bs.iter() {
+                locals.insert(x.clone());
+            }
+            for (_, r) in bs.iter_mut() {
+                float_dicts_in(r, locals, in_lam, owner, n, extra);
+            }
+            float_dicts_in(body, locals, in_lam, owner, n, extra);
+        }
+        Core::Case(s, b, alts) => {
+            float_dicts_in(s, locals, in_lam, owner, n, extra);
+            locals.insert(b.clone());
+            for a in alts {
+                match a {
+                    Alt::Con(_, vs, e) => {
+                        locals.extend(vs.iter().cloned());
+                        float_dicts_in(e, locals, in_lam, owner, n, extra);
+                    }
+                    Alt::Lit(_, e) | Alt::Default(e) => float_dicts_in(e, locals, in_lam, owner, n, extra),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| float_dicts_in(a, locals, in_lam, owner, n, extra)),
+    }
 }
 
 fn strip_one_shot(c: &mut Core) {
