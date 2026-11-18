@@ -58,7 +58,8 @@ pragmas, eta-expansion, raw numbers in registers with constant division (PR #63)
 threads: coroutines on one OS thread, safe foreign calls on worker threads (PR #64); list
 comprehensions desugared with foldr/build, coercions dropped, partial applications inlined
 (PR #65); `zip` fuses with enumerations ("foldr2/left" built in, PR #66); `forM_`/`mapM_`
-fuse, and loops made in phase 0 take their state token (PR #68).
+fuse, and loops made in phase 0 take their state token (PR #68); the collector copies with
+raw pointers (PR #69).
 
 **Next:**
 - mvar: the MVar primitives and thread switches still go through the generic runtime.
@@ -66,7 +67,8 @@ fuse, and loops made in phase 0 take their state token (PR #68).
   resolve every alias of their heads); `foldr2_left` still called, not inlined.
 - ioref: the `(# s, () #)` pairs of each step are still built and taken apart.
 - Leaner frame prologues (pointer locals are zeroed at every entry).
-- Strings: `[Char]` processing and `show`.
+- Strings: a generational collector (each collection copies the whole live list again);
+  `[Char]` processing and `show`.
 - Compile time: real interface files; parallel module compilation.
 
 ### 2. Large projects
