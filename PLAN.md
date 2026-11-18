@@ -61,8 +61,7 @@ comprehensions desugared with foldr/build, coercions dropped, partial applicatio
 (PR #65); `zip` fuses with enumerations ("foldr2/left" built in, PR #66); `forM_`/`mapM_`
 fuse, and loops made in phase 0 take their state token (PR #68); the collector copies with
 raw pointers (PR #69); heap spaces use huge pages (PR #70);
-Integer primitives dispatched by number, big multiplications and `show` in one pass (PR #71); indirections followed inline, frame
-locals cleared 16 bytes at a time (PR #74).
+Integer primitives dispatched by number, big multiplications and `show` in one pass (PR #71); indirections followed inline (PR #74).
 
 **Next:**
 - mvar: the MVar primitives and thread switches still go through the generic runtime.
@@ -70,7 +69,8 @@ locals cleared 16 bytes at a time (PR #74).
   resolve every alias of their heads); `foldr2_left` still called, not inlined.
 - ioref: the `(# s, () #)` pairs of each step are still built and taken apart.
 - Leaner frame clearing: clearing only before a collection saved instructions but repeated
-  the stores at every slow path (binaries 7× larger, slower on the hosted runner).
+  the stores at every slow path (binaries 7× larger, slower on the hosted runner); 16-byte
+  stores split cache lines (`rbp` is only 8-byte aligned) and slowed ioref.
 - Strings: a generational collector (each collection copies the whole live list again);
   `[Char]` processing and `show`.
 - Compile time: real interface files; parallel module compilation.
