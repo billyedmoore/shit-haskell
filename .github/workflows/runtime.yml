@@ -79,7 +79,7 @@ jobs:
           python3 after/tools/runtimebench.py \
             --before "$GITHUB_WORKSPACE/before/target/release/hsc" \
             --after "$GITHUB_WORKSPACE/after/target/release/hsc" \
-            --ghc ghc --cpu "$cpu" --runs 3 \
+            --ghc ghc --cpu "$cpu" --runs 7 \
             --bench "$GITHUB_WORKSPACE/after/bench/progs" \
             --work "$RUNNER_TEMP/runtimebench"
           cat "$RUNNER_TEMP/runtimebench/chart.md" >> "$GITHUB_STEP_SUMMARY"
