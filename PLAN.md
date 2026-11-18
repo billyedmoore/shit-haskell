@@ -40,8 +40,9 @@ This file says where things stand and what comes next. History lives in git and
   wrapper). CI runs both.
 - Pull requests: CI green, a review, a rebase merge. Commit trailers name the model.
 - PR descriptions are short and plain: what changed, why, the headline number, a chart.
-- Speed PRs: before/after instruction counts and a chart; the hosted benchmark is checked
-  before merging and recorded in `bench/results/`.
+- Speed PRs: before/after instruction counts and a chart; the hosted benchmark (7 runs per
+  build: single runs there vary by up to 1.6×) is checked before merging and recorded in
+  `bench/results/`.
 - This file stays short: current state and next steps. A finished item gets a line at most.
 - Keep going until the roadmap is done; after an interruption, resume without waiting.
 
