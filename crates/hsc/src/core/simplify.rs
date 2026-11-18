@@ -62,7 +62,10 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
     pass(binds, 0, &rules, None);
     // Fusion in phase 0 makes local loops: their calls by value, and a clean-up of the
     // bindings that changed.
-    let changed = call_by_value(binds);
+    // Loops made in phase 0 (`eftIntFB` inlined into a fused consumer) take their extra
+    // parameters too (an IO loop its state token), in that clean-up.
+    let mut changed = if std::env::var_os("HSC_NO_ETA").is_none() { eta_expand(binds, None, &rules) } else { HashSet::new() };
+    changed.extend(call_by_value(binds));
     if !changed.is_empty() {
         pass(binds, 0, &rules, Some(&changed));
     }
@@ -82,7 +85,8 @@ const BOTTOM: usize = usize::MAX;
 /// where calls become saturated: an IO loop's `thenIO m (go xs)` becomes a call taking the
 /// state token). Repeating the cheap work for each application of a partial application loses
 /// nothing worth sharing. Globals and let-bound functions; one parameter per pass.
-fn eta_expand(binds: &mut [TopBind], only: Option<&HashSet<String>>, rules: &Rules) {
+fn eta_expand(binds: &mut [TopBind], only: Option<&HashSet<String>>, rules: &Rules) -> HashSet<String> {
+    let mut changed = HashSet::new();
     let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
     let bodies: HashMap<&str, &Core> = binds.iter().map(|b| (b.name.as_str(), &b.body)).collect();
     // Each global's parameters, through aliases.
@@ -112,6 +116,7 @@ fn eta_expand(binds: &mut [TopBind], only: Option<&HashSet<String>>, rules: &Rul
         // An INLINE function keeps the parameters it is written with: it is inlined when
         // applied to them (as GHC inlines at the left side's arity), `(.) f g` say.
         let pragma = matches!(rules.inlines.get(&b.name), Some((true, _)));
+        let before = fresh;
         let mut local = HashMap::new();
         if let Some(n) = expand_by_one(&b.body, &b.name, &arity, &mut local).filter(|_| !pragma) {
             arity.insert(b.name.clone(), n + 1);
@@ -121,8 +126,13 @@ fn eta_expand(binds: &mut [TopBind], only: Option<&HashSet<String>>, rules: &Rul
         if unique_binders(&b.body, &globals, &mut HashSet::new()) {
             eta_locals(&mut b.body, &arity, &mut local, &mut fresh);
         }
+        // Every new parameter takes a fresh name.
+        if fresh != before {
+            changed.insert(b.name.clone());
+        }
     }
     FRESH.store(fresh, std::sync::atomic::Ordering::Relaxed);
+    changed
 }
 
 /// The parameters of `f = rhs` when it can take one more (see `eta_expand`).
@@ -328,7 +338,7 @@ fn strip_one_shot(c: &mut Core) {
 /// One simplifier pass over the bindings (`only`: just those).
 fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<String>>) {
     if std::env::var_os("HSC_NO_ETA").is_none() {
-        eta_expand(binds, only, rules);
+        let _ = eta_expand(binds, only, rules);
     }
     let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
     let direct: HashMap<&str, &Core> = binds.iter().map(|b| (b.name.as_str(), &b.body)).collect();
@@ -935,7 +945,21 @@ impl Simp<'_> {
             (h, args)
         };
         let Core::Var(g) = head else { return false };
-        let Some(candidates) = self.rules.by_head.get(g.as_str()) else { return false };
+        // An alias of `foldr` (`foldr = List.foldr` in the list instance of Foldable, which
+        // `mapM_` and `forM_` use) is `foldr`, for "fold/build". (Not every alias: `length`
+        // fused that way makes a loop that needs call-arity analysis to take its accumulator.)
+        let mut g = g.as_str();
+        let mut target = g;
+        for _ in 0..8 {
+            match self.aliases.get(target) {
+                Some(next) => target = next.as_str(),
+                None => break,
+            }
+        }
+        if target == "GHC.Internal.Base.foldr" {
+            g = target;
+        }
+        let Some(candidates) = self.rules.by_head.get(g) else { return false };
         for rule in candidates {
             if !rule.active(self.phase) || args.len() < rule.args.len() {
                 continue;
