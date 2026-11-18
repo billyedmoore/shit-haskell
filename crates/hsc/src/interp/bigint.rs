@@ -65,15 +65,19 @@ fn mul_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
+    // The shorter operand in the outer loop: a big number times a small one is one pass.
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
     let mut out = vec![0u32; a.len() + b.len()];
-    for (i, &x) in a.iter().enumerate() {
+    for (i, &x) in short.iter().enumerate() {
+        let x = x as u64;
         let mut carry = 0u64;
-        for (j, &y) in b.iter().enumerate() {
-            let t = out[i + j] as u64 + x as u64 * y as u64 + carry;
-            out[i + j] = t as u32;
+        let row = &mut out[i..i + long.len()];
+        for (o, &y) in row.iter_mut().zip(long) {
+            let t = *o as u64 + x * y as u64 + carry;
+            *o = t as u32;
             carry = t >> 32;
         }
-        let mut k = i + b.len();
+        let mut k = i + long.len();
         while carry > 0 {
             let t = out[k] as u64 + carry;
             out[k] = t as u32;
@@ -306,12 +310,20 @@ impl BigInt {
         if self.mag.is_empty() {
             return "0".into();
         }
+        // Nine digits at a time: the magnitude divided by 10^9 in place (a constant divisor, so
+        // a multiplication), its top limb dropped when it becomes zero.
+        const CHUNK: u64 = 1_000_000_000;
         let mut chunks = Vec::new();
         let mut cur = self.mag.clone();
         while !cur.is_empty() {
-            let (q, r) = divrem_mag(&cur, &[1_000_000_000]);
-            chunks.push(r.first().copied().unwrap_or(0));
-            cur = q;
+            let mut rem = 0u64;
+            for limb in cur.iter_mut().rev() {
+                let v = (rem << 32) | *limb as u64;
+                *limb = (v / CHUNK) as u32;
+                rem = v % CHUNK;
+            }
+            chunks.push(rem as u32);
+            trim(&mut cur);
         }
         let mut s = String::new();
         if self.neg {

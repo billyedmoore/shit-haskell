@@ -77,6 +77,11 @@ const ORDINARY_NAMES: &[&str] = &[
     "newMutVar#", "readMutVar#", "writeMutVar#", "atomicModifyMutVar2#", "casMutVar#",
     "newMVar#", "takeMVar#", "readMVar#", "putMVar#", "tryTakeMVar#", "tryReadMVar#",
     "tryPutMVar#", "isEmptyMVar#",
+    // Integer arithmetic (an `Integer` accumulator calls these at every step).
+    "integerAdd", "integerSub", "integerMul", "integerNegate", "integerAbs", "integerSignum",
+    "integerEq", "integerLe", "integerLt", "integerQuot", "integerRem", "integerDiv", "integerMod",
+    "integerToInt", "integerAnd", "integerOr", "integerXor", "integerShiftL", "integerShiftR",
+    "integerToDouble", "integerGcd", "integerTestBit", "integerPopCount",
 ];
 
 pub(super) fn ordinary_name(name: &str) -> Option<&'static str> {
