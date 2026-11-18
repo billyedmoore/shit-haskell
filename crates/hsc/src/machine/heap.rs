@@ -73,6 +73,29 @@ pub fn pointer_fields(h: Word) -> (usize, usize) {
     }
 }
 
+extern "C" {
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+
+/// A zeroed semispace of `words` words. A large one is backed by huge pages where the kernel
+/// allows them on request (`madvise`): allocation streams through the whole space, and with
+/// 4 KB pages its first pass is mostly page faults.
+pub fn space(words: usize) -> Vec<Word> {
+    let mut v: Vec<Word> = vec![0; words];
+    const HUGE: usize = 2 << 20;
+    let bytes = words * 8;
+    if bytes >= 2 * HUGE {
+        let start = v.as_mut_ptr() as usize;
+        let aligned = (start + HUGE - 1) & !(HUGE - 1);
+        let end = (start + bytes) & !(HUGE - 1);
+        if end > aligned {
+            // SAFETY: a range inside the vector's own allocation; the advice changes no contents.
+            unsafe { madvise(aligned as *mut u8, end - aligned, 14) }; // MADV_HUGEPAGE
+        }
+    }
+    v
+}
+
 /// A heap with two semispaces. Allocation is by bumping `hp` towards `limit`.
 pub struct Heap {
     /// The space objects are allocated in.
@@ -96,7 +119,7 @@ pub struct Heap {
 impl Heap {
     pub fn new(words: usize) -> Heap {
         Heap {
-            from: vec![0; words],
+            from: space(words),
             to: Vec::new(),
             hp: 0,
             collections: 0,

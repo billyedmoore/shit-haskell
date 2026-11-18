@@ -63,7 +63,7 @@ fn copy(
     reached: &mut std::collections::HashSet<Word>,
     spare: Vec<Word>,
 ) -> (Vec<Word>, usize) {
-    let mut dst: Vec<Word> = if spare.len() >= capacity { spare } else { vec![0; capacity] };
+    let mut dst: Vec<Word> = if spare.len() >= capacity { spare } else { heap::space(capacity) };
     let mut c = Copier {
         src: src.as_mut_ptr(),
         base: src.as_ptr() as Word,
