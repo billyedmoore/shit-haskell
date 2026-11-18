@@ -142,7 +142,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
         }
         "integerPopCount" => {
             let a = big(m, 0)?;
-            int_value(m, popcount(&a) as i64)
+            int_value(m, popcount(&a))
         }
         "integerTestBit" => {
             let a = big(m, 0)?;

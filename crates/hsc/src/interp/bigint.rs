@@ -526,9 +526,11 @@ pub fn limb64(a: &BigInt, i: usize) -> u64 {
     lo | (hi << 32)
 }
 
-/// The number of one bits of the magnitude.
-pub fn popcount(a: &BigInt) -> usize {
-    a.mag.iter().map(|l| l.count_ones() as usize).sum()
+/// `popCount` of an Integer, as GHC's `integerPopCount#`: the one bits of the magnitude,
+/// negated for a negative value.
+pub fn popcount(a: &BigInt) -> i64 {
+    let n: i64 = a.mag.iter().map(|l| l.count_ones() as i64).sum();
+    if a.neg { -n } else { n }
 }
 
 /// Whether bit `n` of the two's-complement value is set.
@@ -628,6 +630,7 @@ mod bit_tests {
         assert_eq!(shift_right(&BigInt::from_i64(40), 3).to_i64(), Some(5));
         assert_eq!(bit_length(&BigInt::from_i64(1024)), 11);
         assert_eq!(popcount(&BigInt::from_i64(255)), 8);
+        assert_eq!(popcount(&BigInt::from_i64(-255)), -8);
         assert!(test_bit(&BigInt::from_i64(-1), 100));
         assert!(!test_bit(&BigInt::from_i64(4), 0));
         assert!(test_bit(&BigInt::from_i64(4), 2));

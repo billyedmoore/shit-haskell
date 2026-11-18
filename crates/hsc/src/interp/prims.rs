@@ -580,7 +580,7 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             let n = int(rt, &args[1])?.max(0) as usize;
             Ok(bool_value(test_bit(&*integer(rt, &args[0])?, n)))
         }
-        "integerPopCount" => int_v(popcount(&*integer(rt, &args[0])?) as i64),
+        "integerPopCount" => int_v(popcount(&*integer(rt, &args[0])?)),
         "integerLog2" => int_v(bit_length(&*integer(rt, &args[0])?) as i64 - 1),
         "integerGcd" => integer_v(integer(rt, &args[0])?.gcd(&*integer(rt, &args[1])?)),
         // (mantissa, exponent) with value mantissa * 2^exponent, the mantissa having 53 bits.
