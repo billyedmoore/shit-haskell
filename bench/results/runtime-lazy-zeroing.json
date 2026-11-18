@@ -1,0 +1,927 @@
+{
+  "runs": 7,
+  "warmups": 1,
+  "cpu": 0,
+  "programs": {
+    "fib": {
+      "source": "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/fib.hs",
+      "source_sha256": "08002aa1da74b1339ab86a6b30639778c2c832990517f362963fec789c0164fc",
+      "builds": {
+        "Before": [
+          "/home/runner/work/shit-haskell/shit-haskell/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/fib.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/fib/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/fib/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/shit-haskell/shit-haskell/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/fib.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/fib/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/fib/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/fib.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/fib.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/fib/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/fib/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/fib/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.007109135000064271,
+          0.005766736999930799,
+          0.00539121500003148,
+          0.005741649000015059,
+          0.005548239000063404,
+          0.005766235000010056,
+          0.0056014780000168685
+        ],
+        "After": [
+          0.005690673999993123,
+          0.006020200999955705,
+          0.005834792999962701,
+          0.005285015999902498,
+          0.00578713400000197,
+          0.006622716000038054,
+          0.006876599999941391
+        ],
+        "GHC -O0": [
+          0.03227230899994993,
+          0.03055518899998333,
+          0.029422173000057228,
+          0.028771697000024687,
+          0.03268791499999679,
+          0.02979539900002237,
+          0.0288954579999654
+        ],
+        "GHC -O1": [
+          0.005116481999948519,
+          0.005253969000023062,
+          0.004561333999959061,
+          0.0042638679999527085,
+          0.004381147000003693,
+          0.00511570000003303,
+          0.005359154999950988
+        ]
+      },
+      "medians": {
+        "Before": 0.005741649000015059,
+        "After": 0.005834792999962701,
+        "GHC -O0": 0.02979539900002237,
+        "GHC -O1": 0.00511570000003303
+      },
+      "best": {
+        "Before": 0.00539121500003148,
+        "After": 0.005285015999902498,
+        "GHC -O0": 0.028771697000024687,
+        "GHC -O1": 0.0042638679999527085
+      },
+      "target": 0.004604130000029727
+    },
+    "integer": {
+      "source": "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/integer.hs",
+      "source_sha256": "cf3dbfdb8ecb586373c975be8a524b23b2db321f001d8160938d718df871a261",
+      "builds": {
+        "Before": [
+          "/home/runner/work/shit-haskell/shit-haskell/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/integer.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/integer/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/integer/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/shit-haskell/shit-haskell/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/integer.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/integer/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/integer/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/integer.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/integer.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/integer/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/integer/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/integer/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.019347161000041524,
+          0.014910761000010098,
+          0.014516624999941996,
+          0.02157865699996364,
+          0.02153180900006646,
+          0.01906582599997364,
+          0.013736759999915193
+        ],
+        "After": [
+          0.015150559000062458,
+          0.01544125099997018,
+          0.014518117999955393,
+          0.019171363000054953,
+          0.015820529000052375,
+          0.022523739999996906,
+          0.016296356999987438
+        ],
+        "GHC -O0": [
+          0.009421905999943192,
+          0.009225729999911891,
+          0.007422644000030232,
+          0.007270549999930154,
+          0.007626004000030662,
+          0.009600760000012087,
+          0.007564169000033871
+        ],
+        "GHC -O1": [
+          0.008403674999954092,
+          0.007195840999997927,
+          0.00765197199996237,
+          0.0078038760000254115,
+          0.007540544999983467,
+          0.007478488999936417,
+          0.007627135999996426
+        ]
+      },
+      "medians": {
+        "Before": 0.01906582599997364,
+        "After": 0.015820529000052375,
+        "GHC -O0": 0.007626004000030662,
+        "GHC -O1": 0.007627135999996426
+      },
+      "best": {
+        "Before": 0.013736759999915193,
+        "After": 0.014518117999955393,
+        "GHC -O0": 0.007270549999930154,
+        "GHC -O1": 0.007195840999997927
+      },
+      "target": 0.006864422399996783
+    },
+    "ioref": {
+      "source": "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/ioref.hs",
+      "source_sha256": "53021d094730b853b550abeb88844f0052a4a5ebfb703314a1987a681d4f27e3",
+      "builds": {
+        "Before": [
+          "/home/runner/work/shit-haskell/shit-haskell/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/ioref.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/ioref/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/ioref/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/shit-haskell/shit-haskell/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/ioref.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/ioref/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/ioref/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/ioref.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/ioref.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/ioref/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/ioref/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/ioref/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.04870883600005982,
+          0.03593097000009493,
+          0.037014559999988705,
+          0.03466440700003659,
+          0.03568189500003882,
+          0.03500267799995527,
+          0.03559223800004929
+        ],
+        "After": [
+          0.03457347899995966,
+          0.045808663000002525,
+          0.03595778900000823,
+          0.034622570000010455,
+          0.03527026699998714,
+          0.0352626029999783,
+          0.03482859299992924
+        ],
+        "GHC -O0": [
+          0.08299427800000103,
+          0.07530137300000206,
+          0.0760051670000621,
+          0.07627431899993553,
+          0.08031798100000742,
+          0.0752418630000875,
+          0.08032153700003164
+        ],
+        "GHC -O1": [
+          0.007944120000047405,
+          0.008310709000056704,
+          0.0076646159999427255,
+          0.007891729999983,
+          0.009181745999967461,
+          0.009426723000046877,
+          0.008357698999930108
+        ]
+      },
+      "medians": {
+        "Before": 0.03568189500003882,
+        "After": 0.0352626029999783,
+        "GHC -O0": 0.07627431899993553,
+        "GHC -O1": 0.008310709000056704
+      },
+      "best": {
+        "Before": 0.03466440700003659,
+        "After": 0.03457347899995966,
+        "GHC -O0": 0.0752418630000875,
+        "GHC -O1": 0.0076646159999427255
+      },
+      "target": 0.007479638100051034
+    },
+    "mapops": {
+      "source": "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mapops.hs",
+      "source_sha256": "28cad5d704b9bb3dba3b25dc1643620ee816573c5a707e1a39fe82551a2c75fb",
+      "builds": {
+        "Before": [
+          "/home/runner/work/shit-haskell/shit-haskell/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mapops.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mapops/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mapops/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/shit-haskell/shit-haskell/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mapops.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mapops/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mapops/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mapops.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mapops.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/mapops/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/mapops/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/mapops/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.0844387329999563,
+          0.06441762600002221,
+          0.06654516399999011,
+          0.06424497299997256,
+          0.07485655799996493,
+          0.06372774900000877,
+          0.06444470700000693
+        ],
+        "After": [
+          0.06561222400000588,
+          0.06469038399995952,
+          0.0663402520000318,
+          0.06699060500000087,
+          0.0636893460000465,
+          0.07599673499998971,
+          0.06400928400000794
+        ],
+        "GHC -O0": [
+          0.09353473999999551,
+          0.09377454799994211,
+          0.09456462200000715,
+          0.09407588999999916,
+          0.10298853599999802,
+          0.0976119459999154,
+          0.09355914600007509
+        ],
+        "GHC -O1": [
+          0.051016547000017454,
+          0.054451463999953376,
+          0.056920249999961925,
+          0.04963725400000385,
+          0.05039862400008133,
+          0.05087432099992384,
+          0.050778832999981205
+        ]
+      },
+      "medians": {
+        "Before": 0.06444470700000693,
+        "After": 0.06561222400000588,
+        "GHC -O0": 0.09407588999999916,
+        "GHC -O1": 0.05087432099992384
+      },
+      "best": {
+        "Before": 0.06372774900000877,
+        "After": 0.0636893460000465,
+        "GHC -O0": 0.09353473999999551,
+        "GHC -O1": 0.04963725400000385
+      },
+      "target": 0.045786888899931454
+    },
+    "mvar": {
+      "source": "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mvar.hs",
+      "source_sha256": "962c02cb54d3c696a395a5c6ad14b2aae8ae0288eff8a82a7c5610ed23e12476",
+      "builds": {
+        "Before": [
+          "/home/runner/work/shit-haskell/shit-haskell/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mvar.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mvar/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mvar/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/shit-haskell/shit-haskell/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mvar.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mvar/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mvar/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mvar.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/mvar.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/mvar/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/mvar/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/mvar/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.0314271940000026,
+          0.04511838700000226,
+          0.04107999000007112,
+          0.039446150999992824,
+          0.03031036100003348,
+          0.04068476300005841,
+          0.04331889900004171
+        ],
+        "After": [
+          0.04441988400003538,
+          0.031716964999986885,
+          0.030301724000082686,
+          0.04151257800003805,
+          0.03188846499995179,
+          0.03104754599996795,
+          0.040385424000078274
+        ],
+        "GHC -O0": [
+          0.017624143000034564,
+          0.02428976299995611,
+          0.01707965699995384,
+          0.01884627399999772,
+          0.022243845000048168,
+          0.01650448400005189,
+          0.020318020999980035
+        ],
+        "GHC -O1": [
+          0.008974559999956,
+          0.009578777000001537,
+          0.007774950999987595,
+          0.008745742999963113,
+          0.010263586000064606,
+          0.009595739000019421,
+          0.008073889000002055
+        ]
+      },
+      "medians": {
+        "Before": 0.04068476300005841,
+        "After": 0.03188846499995179,
+        "GHC -O0": 0.01884627399999772,
+        "GHC -O1": 0.008974559999956
+      },
+      "best": {
+        "Before": 0.03031036100003348,
+        "After": 0.030301724000082686,
+        "GHC -O0": 0.01650448400005189,
+        "GHC -O1": 0.007774950999987595
+      },
+      "target": 0.0080771039999604
+    },
+    "nqueens": {
+      "source": "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/nqueens.hs",
+      "source_sha256": "edabd75358c3459032449238e04ea0300bf11c4e0e88214cb5a0abd47ce3d8dc",
+      "builds": {
+        "Before": [
+          "/home/runner/work/shit-haskell/shit-haskell/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/nqueens.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/nqueens/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/nqueens/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/shit-haskell/shit-haskell/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/nqueens.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/nqueens/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/nqueens/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/nqueens.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/nqueens.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/nqueens/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/nqueens/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/nqueens/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.012859060000096179,
+          0.013260575000003882,
+          0.01556982700003573,
+          0.016315609999992375,
+          0.015840537000030963,
+          0.012850885000034395,
+          0.011989064000090366
+        ],
+        "After": [
+          0.011981399999967834,
+          0.012884998999993513,
+          0.016921598999942944,
+          0.015988675000016883,
+          0.014229266000029384,
+          0.011898363000000245,
+          0.016590817999940555
+        ],
+        "GHC -O0": [
+          0.03284214600000723,
+          0.030829472000050373,
+          0.04336596499990719,
+          0.04154457000004186,
+          0.03274212799999532,
+          0.030987418999984584,
+          0.03947915599997032
+        ],
+        "GHC -O1": [
+          0.0047217079999199996,
+          0.005145685999991656,
+          0.005647839999937787,
+          0.006101163000039378,
+          0.004670541999985289,
+          0.004957401999945432,
+          0.004762364999919555
+        ]
+      },
+      "medians": {
+        "Before": 0.013260575000003882,
+        "After": 0.014229266000029384,
+        "GHC -O0": 0.03284214600000723,
+        "GHC -O1": 0.004957401999945432
+      },
+      "best": {
+        "Before": 0.011989064000090366,
+        "After": 0.011898363000000245,
+        "GHC -O0": 0.030829472000050373,
+        "GHC -O1": 0.004670541999985289
+      },
+      "target": 0.004461661799950889
+    },
+    "strings": {
+      "source": "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/strings.hs",
+      "source_sha256": "647fe482371f314f4d08c8ab29c97e865356d90cbd550f937c656779fd657617",
+      "builds": {
+        "Before": [
+          "/home/runner/work/shit-haskell/shit-haskell/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/strings.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/strings/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/strings/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/shit-haskell/shit-haskell/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/strings.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/strings/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/strings/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/strings.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/strings.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/strings/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/strings/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/strings/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.2676660439999523,
+          0.26972274299998844,
+          0.2696280850000221,
+          0.27246470800002953,
+          0.2686741229999825,
+          0.274855529999968,
+          0.281067003999965
+        ],
+        "After": [
+          0.26819685800001025,
+          0.26900822600009633,
+          0.2698385490000419,
+          0.27007516799994846,
+          0.2903551690000086,
+          0.2800815139999031,
+          0.2766212459999906
+        ],
+        "GHC -O0": [
+          0.10350508900000932,
+          0.10332545300002494,
+          0.10494738800002779,
+          0.1023184810001112,
+          0.1101353610000615,
+          0.1109659510000256,
+          0.10386177099996985
+        ],
+        "GHC -O1": [
+          0.13423315099998945,
+          0.13483444600001349,
+          0.13806158300008065,
+          0.13775024199992458,
+          0.14580397299994274,
+          0.14456115400003,
+          0.1371483890000036
+        ]
+      },
+      "medians": {
+        "Before": 0.26972274299998844,
+        "After": 0.27007516799994846,
+        "GHC -O0": 0.10386177099996985,
+        "GHC -O1": 0.13775024199992458
+      },
+      "best": {
+        "Before": 0.2676660439999523,
+        "After": 0.26819685800001025,
+        "GHC -O0": 0.1023184810001112,
+        "GHC -O1": 0.13423315099998945
+      },
+      "target": 0.12397521779993213
+    },
+    "sumloop": {
+      "source": "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/sumloop.hs",
+      "source_sha256": "29196ab96b01fada51cade9573a660be0677e2d509ad238ecde747dd09979712",
+      "builds": {
+        "Before": [
+          "/home/runner/work/shit-haskell/shit-haskell/before/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/sumloop.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/sumloop/Before",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/sumloop/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/shit-haskell/shit-haskell/after/target/release/hsc",
+          "-v0",
+          "-fforce-recomp",
+          "--native",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/sumloop.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/sumloop/After",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/sumloop/After/program"
+        ],
+        "GHC -O0": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O0",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/sumloop.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O0",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/usr/local/.ghcup/ghc/9.12.2/bin/ghc-9.12.2",
+          "-v0",
+          "-fforce-recomp",
+          "-O1",
+          "/home/runner/work/shit-haskell/shit-haskell/after/bench/progs/sumloop.hs",
+          "-outputdir",
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O1",
+          "-o",
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O1/program"
+        ]
+      },
+      "commands": {
+        "Before": [
+          "/home/runner/work/_temp/runtimebench/sumloop/Before/program"
+        ],
+        "After": [
+          "/home/runner/work/_temp/runtimebench/sumloop/After/program"
+        ],
+        "GHC -O0": [
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O0/program"
+        ],
+        "GHC -O1": [
+          "/home/runner/work/_temp/runtimebench/sumloop/GHC--O1/program"
+        ]
+      },
+      "results": {
+        "Before": [
+          0.02143739899997854,
+          0.021859863999907247,
+          0.031083869999974922,
+          0.020752436999941892,
+          0.0220407530000557,
+          0.03403415699995094,
+          0.03492918000006284
+        ],
+        "After": [
+          0.020942175000072893,
+          0.034936657000002924,
+          0.03544620399998166,
+          0.021821578999947633,
+          0.03931529999999839,
+          0.0347548629999892,
+          0.034543252999924334
+        ],
+        "GHC -O0": [
+          0.331725997000035,
+          0.3444055400000252,
+          0.3416086610000093,
+          0.33365849900008016,
+          0.3404203930000449,
+          0.3486385290000271,
+          0.33923884400007864
+        ],
+        "GHC -O1": [
+          0.016098117999945316,
+          0.01668540600007873,
+          0.015783546999955433,
+          0.01595036000003347,
+          0.01627764499994555,
+          0.015572618999954102,
+          0.01587623699992946
+        ]
+      },
+      "medians": {
+        "Before": 0.0220407530000557,
+        "After": 0.0347548629999892,
+        "GHC -O0": 0.3404203930000449,
+        "GHC -O1": 0.01595036000003347
+      },
+      "best": {
+        "Before": 0.020752436999941892,
+        "After": 0.020942175000072893,
+        "GHC -O0": 0.331725997000035,
+        "GHC -O1": 0.015572618999954102
+      },
+      "target": 0.014355324000030123
+    }
+  }
+}
