@@ -18,18 +18,18 @@ This file says where things stand and what comes next. History lives in git and
 - **Projects:** ShellCheck and its ~45 dependencies match the GHC build. hlint's dependencies
   build up to ghc-lib-parser.
 - **Speed:** compile times are close to GHC's (ghc-lib-parser cold ≈ 28 s, warm ≈ 1.4 s).
-  Generated code is ~3.3× slower than `ghc -O1` (geometric mean, PR #66's hosted run):
+  Generated code is ~3.1× slower than `ghc -O1` (geometric mean, PR #68's hosted run):
 
   | program | × GHC -O1 | × GHC -O0 |
   |---|---:|---:|
-  | fib | 1.3 | 0.16 |
-  | mapops | 1.9 | 1.04 |
-  | sumloop | 2.0 | 0.10 |
-  | integer | 3.0 | 2.69 |
-  | nqueens | 3.6 | 0.55 |
-  | strings | 4.1 | 5.48 |
-  | mvar | 6.3 | 2.98 |
-  | ioref | 11.0 | 0.99 |
+  | fib | 1.2 | 0.27 |
+  | mapops | 2.0 | 1.17 |
+  | sumloop | 2.0 | 0.15 |
+  | integer | 3.1 | 2.73 |
+  | nqueens | 3.8 | 0.63 |
+  | strings | 4.3 | 5.52 |
+  | mvar | 4.7 | 2.35 |
+  | ioref | 7.4 | 0.95 |
 
 ## Working rules
 
