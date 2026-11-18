@@ -275,8 +275,33 @@ pub(crate) fn sized_alias(name: &str) -> Option<(&'static str, Option<&'static s
     None
 }
 
+/// A SmallArray# primitive's Array# twin (the same object in both runtimes). GHC.Prim imports
+/// the twins directly; code compiled before it did names the small ones.
+pub fn small_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "newSmallArray#" => "newArray#",
+        "readSmallArray#" => "readArray#",
+        "writeSmallArray#" => "writeArray#",
+        "sizeofSmallArray#" => "sizeofArray#",
+        "sizeofSmallMutableArray#" => "sizeofMutableArray#",
+        "indexSmallArray#" => "indexArray#",
+        "unsafeFreezeSmallArray#" => "unsafeFreezeArray#",
+        "unsafeThawSmallArray#" => "unsafeThawArray#",
+        "copySmallArray#" => "copyArray#",
+        "copySmallMutableArray#" => "copyMutableArray#",
+        "cloneSmallArray#" => "cloneArray#",
+        "cloneSmallMutableArray#" => "cloneMutableArray#",
+        "freezeSmallArray#" => "freezeArray#",
+        "thawSmallArray#" => "thawArray#",
+        _ => return None,
+    })
+}
+
 /// Runs a GHC primitive by name, or answers None when it is not one of them.
 pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
+    if let Some(twin) = small_alias(name) {
+        return Some(super::prims::call(rt, twin, args));
+    }
     if let Some((base, narrow)) = sized_alias(name) {
         return Some(match super::prims::call(rt, base, args) {
             Ok(v) => match narrow {
@@ -586,8 +611,18 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
             unit_value()
         }),
         "sizeofArray#" | "sizeofMutableArray#" => array_len(rt, &args[0]).map(|n| Value::Int(n as i64)),
+        "getSizeofSmallMutableArray#" => array_len(rt, &args[0]).and_then(|n| state_result(Value::Int(n as i64))),
+        "shrinkSmallMutableArray#" => match (rt.force(&args[0]), rt.force(&args[1])) {
+            (Ok(Value::Vec(v)), Ok(Value::Int(n))) => {
+                v.borrow_mut().truncate(n.max(0) as usize);
+                Ok(unit_value())
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
+            _ => Err(RtError::Fail("internal: shrinkSmallMutableArray#".into())),
+        },
         "unsafeFreezeArray#" | "unsafeThawArray#" => rt.force(&args[0]).and_then(state_result),
-        "freezeArray#" | "thawArray#" => copy_array(rt, &args[0], &args[1], &args[2]).and_then(state_result),
+        "freezeArray#" | "thawArray#" | "cloneMutableArray#" => copy_array(rt, &args[0], &args[1], &args[2]).and_then(state_result),
+        "cloneArray#" => copy_array(rt, &args[0], &args[1], &args[2]),
         "copyArray#" | "copyMutableArray#" => copy_into(rt, args).map(|_| unit_value()),
 
         // ----- evaluation, masking, exceptions -----

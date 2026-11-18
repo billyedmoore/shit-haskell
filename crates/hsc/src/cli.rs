@@ -568,6 +568,9 @@ fn empty_object(path: &Path) -> Result<(), String> {
 pub fn compile(o: &Opts) -> Result<i32, String> {
     // C inputs go to the C compiler.
     let c_inputs: Vec<&String> = o.inputs.iter().filter(|i| is_c_input(i) || i.ends_with(".cmm")).collect();
+    let any_c = !c_inputs.is_empty();
+    // Their objects are linked into the program, as GHC does (`ghc Main.hs cbits.c`).
+    let mut c_objects: Vec<String> = Vec::new();
     for c in &c_inputs {
         // A C file's object keeps its path under the output directory (`cbits/a.c` gives
         // `odir/cbits/a.o`), as GHC places it.
@@ -590,6 +593,8 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
             .arg(c.as_str())
             .arg("-o")
             .arg(&out)
+            // Position independent: the interpreter loads C objects as a shared library.
+            .arg("-fPIC")
             .args(&o.c_opts)
             .args(o.flags.iter().filter(|f| f.starts_with("-I") || f.starts_with("-D")))
             // The RTS headers (HsFFI.h), as GHC passes its own include directory.
@@ -599,10 +604,18 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
         if !st.success() {
             return Ok(1);
         }
+        c_objects.push(out.display().to_string());
     }
+    let with_objects;
+    let o = if c_objects.is_empty() || o.no_link {
+        o
+    } else {
+        with_objects = Opts { inputs: o.inputs.iter().cloned().chain(c_objects).collect(), ..o.clone() };
+        &with_objects
+    };
     let hs_inputs: Vec<&String> = o.inputs.iter().filter(|i| !is_c_input(i) && !i.ends_with(".cmm") && !i.ends_with(".o") && !i.ends_with(".a")).collect();
     if hs_inputs.is_empty() {
-        if c_inputs.is_empty() {
+        if !any_c {
             return Err("no input files".into());
         }
         return Ok(0);

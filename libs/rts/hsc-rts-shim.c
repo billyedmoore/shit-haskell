@@ -94,3 +94,10 @@ __attribute__((weak)) void hs_hpc_module(char *modName, StgWord32 modCount, StgW
     (void)modName; (void)modCount; (void)modHashNo; (void)tixArr;
 }
 __attribute__((weak)) HpcModuleInfo *hs_hpc_rootModule(void) { return 0; }
+
+/* GHC's RTS settings and the CAF flag, which ghc-lib-parser's C helpers read and set: storage
+   here, nothing in hsc's runtime reads them. */
+#include <stdbool.h>
+__attribute__((weak)) RTS_FLAGS RtsFlags;
+__attribute__((weak)) bool keepCAFs;
+__attribute__((weak)) void setKeepCAFs(void) { keepCAFs = true; }

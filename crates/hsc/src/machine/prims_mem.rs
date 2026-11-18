@@ -128,6 +128,22 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let n = heap::size_of(m.heap_get(a, 0)) as i64;
             int_value(m, n)
         }
+        "getSizeofSmallMutableArray#" => {
+            let Some(a) = force_arg(m, 0) else { return Some(0) };
+            let n = heap::size_of(m.heap_get(a, 0)) as i64;
+            let v = int_value(m, n);
+            state_pair(m, v)
+        }
+        // The array's header is given the smaller size: the words after it are never read again
+        // (the collector copies an object by its header).
+        "shrinkSmallMutableArray#" => {
+            let (Some(_), Some(n)) = (force_arg(m, 0), int_arg(m, 1)) else { return Some(0) };
+            let a = m.args[0];
+            let h = m.heap_get(a, 0);
+            let n = (n.max(0) as u32).min(heap::size_of(h));
+            m.heap_set(a, heap::header(heap::kind_of(h), n, heap::aux_of(h)));
+            unit(m)
+        }
         "unsafeFreezeArray#" | "unsafeThawArray#" | "unsafeFreezeByteArray#" | "unsafeThawByteArray#" => {
             let Some(a) = force_arg(m, 0) else { return Some(0) };
             state_pair(m, a)
@@ -359,7 +375,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let Some(v) = force_arg(m, 0) else { return Some(0) };
             state_pair_rooted(m, v)
         }
-        _ => return element_access(m, name),
+        _ => return atomic_access(m, name).or_else(|| element_access(m, name)),
     };
     Some(r)
 }
@@ -404,6 +420,129 @@ fn element(name: &str) -> Option<(usize, &'static str)> {
         "Addr" | "StablePtr" => (8, "addr"),
         _ => return None,
     })
+}
+
+/// The atomic operations on byte arrays, addresses and arrays. Threads switch only between
+/// primitives, so each is a plain read and write.
+fn atomic_access(m: &mut Machine, name: &str) -> Option<Word> {
+    // The raw address of argument 0: a byte array's element `i` (of `width` bytes) or an address.
+    fn place(m: &mut Machine, indexed: bool, width: usize) -> Option<*mut u8> {
+        let i = if indexed { int_arg(m, 1)? } else { 0 };
+        force_arg(m, 0)?;
+        if indexed {
+            return Some((m.args[0] + 8 + (i * width as i64) as Word) as *mut u8);
+        }
+        let (b, o) = (m.heap_get(m.args[0], 1), m.heap_get(m.args[0], 2) as i64);
+        Some(if b == 0 { o as *mut u8 } else { (b as i64 + 8 + o) as *mut u8 })
+    }
+    fn load(p: *mut u8, width: usize) -> u64 {
+        let mut buf = [0u8; 8];
+        // SAFETY: the element lies within live memory the program addresses.
+        unsafe { std::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), width) };
+        u64::from_le_bytes(buf)
+    }
+    fn store(p: *mut u8, width: usize, v: u64) {
+        // SAFETY: as for `load`.
+        unsafe { std::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), p, width) };
+    }
+    fn mask(width: usize, v: u64) -> u64 {
+        if width == 8 { v } else { v & ((1u64 << (8 * width)) - 1) }
+    }
+    // `fetch<Op>IntArray# a i v` and `fetch<Op>WordAddr# p v`: the old value.
+    let fetch = name.strip_prefix("fetch").and_then(|r| {
+        r.strip_suffix("IntArray#").map(|op| (op, true)).or_else(|| r.strip_suffix("WordAddr#").map(|op| (op, false)))
+    });
+    if let Some((op, indexed)) = fetch {
+        // The numbers first: forcing one may collect, which would move the array.
+        let v = int_arg(m, if indexed { 2 } else { 1 })? as u64;
+        let p = place(m, indexed, 8)?;
+        let old = load(p, 8);
+        let new = match op {
+            "Add" => old.wrapping_add(v),
+            "Sub" => old.wrapping_sub(v),
+            "And" => old & v,
+            "Nand" => !(old & v),
+            "Or" => old | v,
+            "Xor" => old ^ v,
+            _ => return None,
+        };
+        store(p, 8, new);
+        let r = int_value(m, old as i64);
+        return Some(state_pair(m, r));
+    }
+    // Compare and swap on bytes: the value before.
+    let cas = match name {
+        "casIntArray#" | "casInt64Array#" => Some((8, true)),
+        "casInt32Array#" => Some((4, true)),
+        "casInt16Array#" => Some((2, true)),
+        "casInt8Array#" => Some((1, true)),
+        "atomicCasWordAddr#" | "atomicCasWord64Addr#" => Some((8, false)),
+        "atomicCasWord32Addr#" => Some((4, false)),
+        "atomicCasWord16Addr#" => Some((2, false)),
+        "atomicCasWord8Addr#" => Some((1, false)),
+        _ => None,
+    };
+    if let Some((width, indexed)) = cas {
+        let k = if indexed { 2 } else { 1 };
+        let (old, new) = (int_arg(m, k)? as u64, int_arg(m, k + 1)? as u64);
+        let p = place(m, indexed, width)?;
+        let cur = load(p, width);
+        if cur == mask(width, old) {
+            store(p, width, new);
+        }
+        // Signed elements read back signed.
+        let shift = 64 - 8 * width as u32;
+        let prev = if indexed { ((cur << shift) as i64) >> shift } else { cur as i64 };
+        let r = int_value(m, prev);
+        return Some(state_pair(m, r));
+    }
+    match name {
+        "atomicReadIntArray#" | "atomicReadWordAddr#" => {
+            let p = place(m, name.ends_with("IntArray#"), 8)?;
+            let r = int_value(m, load(p, 8) as i64);
+            Some(state_pair(m, r))
+        }
+        "atomicWriteIntArray#" | "atomicWriteWordAddr#" => {
+            let indexed = name.ends_with("IntArray#");
+            let v = int_arg(m, if indexed { 2 } else { 1 })?;
+            let p = place(m, indexed, 8)?;
+            store(p, 8, v as u64);
+            Some(unit(m))
+        }
+        "atomicExchangeWordAddr#" => {
+            let v = int_arg(m, 1)?;
+            let p = place(m, false, 8)?;
+            let old = load(p, 8);
+            store(p, 8, v as u64);
+            let r = int_value(m, old as i64);
+            Some(state_pair(m, r))
+        }
+        // `casArray# a i old new`: (# s, 0#, new #) when the element was `old` (the same object),
+        // else (# s, 1#, the element #).
+        "casArray#" | "casSmallArray#" => {
+            force_arg(m, 0)?;
+            let i = int_arg(m, 1)? as Word;
+            let (a, old, new) = (m.args[0], m.args[2], m.args[3]);
+            let slot = a + 8 + 8 * i;
+            let failed = m.heap_get(slot, 0) != old;
+            if !failed {
+                m.heap_set(slot, new);
+            }
+            let f = int_value(m, failed as i64);
+            // The allocation may have moved the array: the element is read again.
+            let v = m.heap_get(m.args[0] + 8 + 8 * i, 0);
+            Some(con_value(m, "Builtin.(,,)", 3, &[0, f, v]))
+        }
+        // `atomicSwapMutVar# r v`: the old contents.
+        "atomicSwapMutVar#" => {
+            force_arg(m, 0)?;
+            let r = m.args[0];
+            let old = m.heap_get(r, 1);
+            m.heap_set(r + 8, m.args[1]);
+            Some(state_pair(m, old))
+        }
+        _ => None,
+    }
 }
 
 /// `index/read/write <Elem>Array#` and `<Elem>OffAddr#`. Arguments are forced first; then the bytes

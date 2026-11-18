@@ -1297,10 +1297,17 @@ impl<'a> Renamer<'a> {
     }
 
     /// Binds and renames a local declaration group in the current (already pushed) scope.
-    fn local_decls(&mut self, decls: Vec<Decl>) -> RR<Vec<Decl>> {
+    fn local_decls(&mut self, mut decls: Vec<Decl>) -> RR<Vec<Decl>> {
         let mut seen: HashSet<String> = HashSet::new();
         if self.locals.is_empty() {
             self.push();
+        }
+        // `T{..}` binds the fields it does not name: spelled out, so that they are in scope in
+        // the whole group.
+        for d in decls.iter_mut() {
+            if let Decl::PatBind { pat, .. } = d {
+                self.expand_wildcards(pat);
+            }
         }
         for d in &decls {
             match d {
@@ -2034,6 +2041,66 @@ impl<'a> Renamer<'a> {
         out
     }
 
+    /// Record wildcards (of constructors and record pattern synonyms) as named field puns.
+    fn expand_wildcards(&mut self, p: &mut Pat) {
+        match p {
+            Pat::Rec { con, fields, dotdot, loc } => {
+                for (_, sub) in fields.iter_mut() {
+                    if let Some(s) = sub {
+                        self.expand_wildcards(s);
+                    }
+                }
+                if !*dotdot {
+                    return;
+                }
+                let loc = *loc;
+                let labels: Vec<String> = match self.value_ref(con, loc, true).ok().and_then(|q| self.patsyn_of(&q)) {
+                    Some(def) => def.names.clone(),
+                    None => {
+                        let Ok(entity) = self.lookup_entity(con, loc) else { return };
+                        entity.fields.iter().map(|f| iface::field_label(f).to_string()).collect()
+                    }
+                };
+                for label in labels {
+                    if !fields.iter().any(|(q, _)| q.name == label) {
+                        fields.push((QName::unqual(label), None));
+                    }
+                }
+                *dotdot = false;
+            }
+            Pat::View(_, inner, _) | Pat::As(_, inner, _) | Pat::Lazy(inner, _) | Pat::Bang(inner, _) | Pat::Sig(inner, _, _) => {
+                self.expand_wildcards(inner)
+            }
+            Pat::Con(_, ps, _) | Pat::Tuple(ps, _) | Pat::List(ps, _) => ps.iter_mut().for_each(|x| self.expand_wildcards(x)),
+            Pat::OpChain(items, _) => {
+                for it in items {
+                    if let PatOpItem::Operand(x) = it {
+                        self.expand_wildcards(x);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The children `T (..)` exports: those of T in scope, however they were imported
+    /// (`import M (C, m)` brings class C and its method m in separately).
+    fn children_in_scope(&self, e: &Entity) -> Vec<Entity> {
+        let mut out = e.subs.clone();
+        for c in self.all_children(e) {
+            if out.iter().any(|o| o.global == c.global) {
+                continue;
+            }
+            let has = |l: &Vec<Entity>| l.iter().any(|x| x.global == c.global);
+            let scoped = self.vals.get(c.occ()).is_some_and(has)
+                || self.qvals.iter().any(|((_, occ), l)| occ == c.occ() && has(l));
+            if scoped {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     fn compute_exports(&self, exports: &Option<Vec<IEItem>>, loc: Loc) -> RR<Vec<Entity>> {
         let Some(items) = exports else {
             return Ok(self.own.clone());
@@ -2072,9 +2139,9 @@ impl<'a> Renamer<'a> {
                     let mut with_subs = e.clone();
                     with_subs.subs = match subs {
                         Subs::None => Vec::new(),
-                        Subs::All => e.subs.clone(),
+                        Subs::All => self.children_in_scope(&e),
                         Subs::AllPlus(extra) => {
-                            let mut all = e.subs.clone();
+                            let mut all = self.children_in_scope(&e);
                             for n in extra {
                                 if let Ok(s) = self.lookup_global(&QName::unqual(n.clone()), Ns::Value) {
                                     all.push(s);

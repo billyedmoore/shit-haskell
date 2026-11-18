@@ -717,6 +717,30 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
             Value::Bytes(b) => Ok(io_result(Value::Int(b.borrow().len() as i64))),
             _ => Err(RtError::Fail("internal: size of a non-array".into())),
         },
+        _ if atomic_width(name).is_some() => atomic(rt, name, args),
+        "casArray#" | "casSmallArray#" => match rt.force(&args[0])? {
+            Value::Vec(v) => {
+                let i = int(rt, &args[1])? as usize;
+                let cur = v.borrow()[i].clone();
+                // The same object: the same cell, or the same evaluated value.
+                let same = Rc::ptr_eq(&cur, &args[2]) || same_value(rt, &cur, &args[2]);
+                if same {
+                    v.borrow_mut()[i] = args[3].clone();
+                }
+                let now = v.borrow()[i].clone();
+                let flag = Rc::new(RefCell::new(Thunk::Done(Value::Int(i64::from(!same)))));
+                Ok(Value::Con(Rc::new(super::ConVal { name: "Builtin.(,,)", args: vec![super::prims_conc::unit_cell(), flag, now] })))
+            }
+            _ => Err(RtError::Fail(format!("internal: {name} of a non-array"))),
+        },
+        "atomicSwapMutVar#" => match rt.force(&args[0])? {
+            Value::Ref(r) => {
+                // The old contents stay unevaluated.
+                let old = std::mem::replace(&mut *r.borrow_mut(), args[1].clone());
+                Ok(Value::Con(Rc::new(super::ConVal { name: "Builtin.(,)", args: vec![super::prims_conc::unit_cell(), old] })))
+            }
+            _ => Err(RtError::Fail("internal: atomicSwapMutVar# of a non-variable".into())),
+        },
         _ if element_access(name).is_some() => {
             let (access, elem) = element_access(name).unwrap_or(("", ""));
             let (size, kind) = element_spec(elem).unwrap_or((8, "int"));
@@ -1204,4 +1228,105 @@ fn write_element(bytes: &mut [u8], at: usize, size: usize, kind: &str, v: &Value
             *slot = (bits >> (8 * k)) as u8;
         }
     }
+}
+
+/// Two cells holding the same evaluated object (the interpreter has no object identity for
+/// values copied between cells; pointer-equal constructors compare equal).
+fn same_value(rt: &Runtime, a: &Cell, b: &Cell) -> bool {
+    match (rt.force(a), rt.force(b)) {
+        (Ok(Value::Con(x)), Ok(Value::Con(y))) => Rc::ptr_eq(&x, &y),
+        _ => false,
+    }
+}
+
+/// The element width (and whether the target is an indexed byte array) of an atomic primitive.
+fn atomic_width(name: &str) -> Option<(usize, bool)> {
+    if let Some(r) = name.strip_prefix("fetch") {
+        if r.ends_with("IntArray#") {
+            return Some((8, true));
+        }
+        if r.ends_with("WordAddr#") {
+            return Some((8, false));
+        }
+    }
+    Some(match name {
+        "casIntArray#" | "casInt64Array#" | "atomicReadIntArray#" | "atomicWriteIntArray#" => (8, true),
+        "casInt32Array#" => (4, true),
+        "casInt16Array#" => (2, true),
+        "casInt8Array#" => (1, true),
+        "atomicCasWordAddr#" | "atomicCasWord64Addr#" | "atomicReadWordAddr#" | "atomicWriteWordAddr#"
+        | "atomicExchangeWordAddr#" => (8, false),
+        "atomicCasWord32Addr#" => (4, false),
+        "atomicCasWord16Addr#" => (2, false),
+        "atomicCasWord8Addr#" => (1, false),
+        _ => return None,
+    })
+}
+
+/// The atomic operations on byte arrays and addresses: plain reads and writes (one thread runs
+/// primitives at a time).
+fn atomic(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
+    let (width, indexed) = atomic_width(name).unwrap_or((8, true));
+    let off = if indexed { int(rt, &args[1])? as usize * width } else { 0 };
+    let k = if indexed { 2 } else { 1 };
+    let target = rt.force(&args[0])?;
+    let access = |f: &mut dyn FnMut(&mut [u8])| -> Result<(), RtError> {
+        match &target {
+            Value::Bytes(b) => f(&mut b.borrow_mut()[off..]),
+            Value::Addr(b, o) => f(&mut b.borrow_mut()[o + off..]),
+            // SAFETY: a raw machine address the program was given by C code.
+            Value::Int(p) if *p != 0 => f(unsafe { std::slice::from_raw_parts_mut((*p as usize + off) as *mut u8, width) }),
+            _ => return Err(RtError::Fail(format!("internal: {name} on an unsupported value"))),
+        }
+        Ok(())
+    };
+    let load = |b: &[u8]| -> u64 { (0..width).rev().fold(0u64, |v, j| (v << 8) | b[j] as u64) };
+    let store = |b: &mut [u8], v: u64| (0..width).for_each(|j| b[j] = (v >> (8 * j)) as u8);
+    let arg = |j: usize| -> Result<u64, RtError> { Ok(int(rt, &args[j])? as u64) };
+    let mut old = 0u64;
+    if let Some(op) = name.strip_prefix("fetch").and_then(|r| r.strip_suffix("IntArray#").or_else(|| r.strip_suffix("WordAddr#"))) {
+        let v = arg(k)?;
+        access(&mut |b| {
+            old = load(b);
+            let new = match op {
+                "Add" => old.wrapping_add(v),
+                "Sub" => old.wrapping_sub(v),
+                "And" => old & v,
+                "Nand" => !(old & v),
+                "Or" => old | v,
+                _ => old ^ v,
+            };
+            store(b, new);
+        })?;
+        return Ok(io_result(Value::Int(old as i64)));
+    }
+    if name.starts_with("atomicRead") {
+        access(&mut |b| old = load(b))?;
+        return Ok(io_result(Value::Int(old as i64)));
+    }
+    if name.starts_with("atomicWrite") {
+        let v = arg(k)?;
+        access(&mut |b| store(b, v))?;
+        return Ok(unit_value());
+    }
+    if name == "atomicExchangeWordAddr#" {
+        let v = arg(k)?;
+        access(&mut |b| {
+            old = load(b);
+            store(b, v);
+        })?;
+        return Ok(io_result(Value::Int(old as i64)));
+    }
+    // Compare and swap: the value before.
+    let (expect, new) = (arg(k)?, arg(k + 1)?);
+    let m = if width == 8 { u64::MAX } else { (1u64 << (8 * width)) - 1 };
+    access(&mut |b| {
+        old = load(b);
+        if old == expect & m {
+            store(b, new);
+        }
+    })?;
+    let shift = 64 - 8 * width as u32;
+    let prev = if indexed { ((old << shift) as i64) >> shift } else { old as i64 };
+    Ok(io_result(Value::Int(prev)))
 }
