@@ -18,7 +18,8 @@ This file says where things stand and what comes next. History lives in git and
 - **Projects:** ShellCheck and its ~45 dependencies match the GHC build. hlint's dependencies
   build up to ghc-lib-parser.
 - **Speed:** compile times are close to GHC's (ghc-lib-parser cold ≈ 28 s, warm ≈ 1.4 s).
-  Generated code is ~2.2× slower than `ghc -O1` (geometric mean, PR #74's hosted run):
+  Generated code is ~2.2× slower than `ghc -O1` (geometric mean, PR #74's hosted run);
+  speed work resumes after the projects, diagnostics and usability items below:
 
   | program | × GHC -O1 | × GHC -O0 |
   |---|---:|---:|
@@ -48,46 +49,43 @@ This file says where things stand and what comes next. History lives in git and
 
 ## Roadmap, in order
 
-### 1. Speed
+### 1. Large projects
 
-**Target:** generated programs at most 0.9× `ghc -O1` time on `bench/` and the large projects'
-test suites, and never slower than `ghc -O0`. Compile times comparable to GHC's.
+More real programs built with their own build systems and compared with their GHC builds:
+hlint (then its tests), cabal-install, pandoc, aeson, megaparsec, lens, and in the end GHC
+itself. Alongside: text (plugin), binary (PolyKinds), time (speed). Language features come as
+these need them: Template Haskell `[d| |]`, type and pattern splices, `reify` of classes;
+PolyKinds and kind inference; Arrows.
+
+### 2. Diagnostics
+
+Error and warning messages match GHC's text (`difftest --diag`), `-W` flags included.
+
+### 3. Usability
+
+The command line behaves like GHC's: `--help`, `--version`/`--info`, clear errors for unknown
+flags, and `-O0`/`-O1`/`-O2` meaning different things (`-O0` compiles fast, `-O2` optimises
+hardest).
+
+### 4. Speed
+
+**Target:** generated programs at most 0.75× `ghc -O2` time on `bench/` and the large
+projects' test suites. Compile times comparable to GHC's. (Today: ~2.2× `ghc -O1`.)
 
 **Done so far (details in `bench/results/`):** direct calls, unboxed workers and raw returns,
 join points, RULES and foldr/build fusion, oneShot, case-of-case, calls by value, INLINE
-pragmas, eta-expansion, raw numbers in registers with constant division (PR #63), green
-threads: coroutines on one OS thread, safe foreign calls on worker threads (PR #64); list
-comprehensions desugared with foldr/build, coercions dropped, partial applications inlined
-(PR #65); `zip` fuses with enumerations ("foldr2/left" built in, PR #66); `forM_`/`mapM_`
-fuse, and loops made in phase 0 take their state token (PR #68); the collector copies with
-raw pointers (PR #69); heap spaces use huge pages (PR #70);
-Integer primitives dispatched by number, big multiplications and `show` in one pass (PR #71); indirections followed inline (PR #74).
+pragmas, eta-expansion, raw numbers in registers (#63), green threads (#64), fused
+comprehensions, `zip` and `forM_` (#65, #66, #68), a faster collector and huge pages (#69,
+#70), faster Integer (#71), inline indirections (#74).
 
 **Next:**
+- ioref: `seq` as a case and case-of-case past failing alternatives remove the per-step
+  `(# s, () #)` pairs (branch `mvar-fast`, untested).
 - mvar: the MVar primitives and thread switches still go through the generic runtime.
-- Call arity, so that fused `length`/`sum` loops take their accumulator (then rules may
-  resolve every alias of their heads); `foldr2_left` still called, not inlined.
-- ioref: the `(# s, () #)` pairs of each step are still built and taken apart.
-- Leaner frame clearing: clearing only before a collection saved instructions but repeated
-  the stores at every slow path (binaries 7× larger, slower on the hosted runner); 16-byte
-  stores split cache lines (`rbp` is only 8-byte aligned) and slowed ioref.
-- Strings: a generational collector (each collection copies the whole live list again);
-  `[Char]` processing and `show`.
+- Call arity, so that fused `length`/`sum` loops take their accumulator.
+- Leaner frame clearing (clearing only before a collection made binaries 7× larger).
+- Strings: a generational collector; `[Char]` processing and `show`.
 - Compile time: real interface files; parallel module compilation.
-
-### 2. Large projects
-
-Each built with its own build system and compared with its GHC build: hlint (then its tests),
-cabal-install, pandoc, GHC itself. Alongside: text (plugin), binary (PolyKinds), time (speed).
-
-### 3. Language surface
-
-As projects need them: Template Haskell `[d| |]`, type and pattern splices, `reify` of classes;
-PolyKinds and kind inference; Arrows.
-
-### 4. Diagnostics
-
-Error messages match GHC's text (`difftest --diag`).
 
 ### 5. Independence
 
