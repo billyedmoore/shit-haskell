@@ -1258,6 +1258,10 @@ impl Gen {
                 for (a, s) in args.iter().zip(&params) {
                     self.load(a, p, "%rcx");
                     self.emit(&format!("movq %rcx, {}", p.slot(*s)));
+                    // Written now (a later argument's load could call the runtime).
+                    if s & RAW == 0 {
+                        self.written.insert(*s);
+                    }
                 }
                 self.emit(&format!("jmp {l}"));
             }
@@ -1312,6 +1316,9 @@ impl Gen {
                 }
             }
         }
+        // Each alternative starts from what was written before the branch (the failure path
+        // below clears the rest for its runtime call, but only on that path).
+        let written = self.written.clone();
         if !has_default {
             // Diagnostic: the scrutinee is left in the record for the failure's message.
             self.emit(&format!("movq {}, %rax", p.slot(bslot)));
@@ -1327,7 +1334,6 @@ impl Gen {
             let fail_msg = format!("Non-exhaustive patterns in case [{}]", names.join(" | "));
             self.fail(&fail_msg, p);
         }
-        let written = self.written.clone();
         for (a, l) in alts.iter().zip(&labels) {
             self.put_label(l);
             self.written = written.clone();
@@ -2439,10 +2445,28 @@ mod liveness_tests {
         )
     }
 
+    /// The code of `e` in a frame whose one local (slot 3) is already written, so that only the
+    /// clearing of dead slots shows (see `locals_are_cleared_before_a_return_address_only` for the
+    /// clearing of unwritten locals).
     fn gen(e: &SExpr, mode: Mode) -> String {
         let mut g = Gen::new();
+        g.written.insert(3);
         g.expr(e, Pos { f: Frame { s: 4, a: 2, r: 0 }, mode, pushed: 0 });
         g.out
+    }
+
+    #[test]
+    fn locals_are_cleared_before_a_return_address_only() {
+        let p = Pos { f: Frame { s: 5, a: 2, r: 0 }, mode: Mode::Tail, pushed: 0 };
+        // A tail call clears nothing: the frame is gone before the callee runs.
+        let mut g = Gen::new();
+        g.expr(&SExpr::App(Atom::Slot(1), vec![Atom::Slot(2)]), p);
+        assert!(!g.out.contains("movq $0,"), "{}", g.out);
+        // A call in a scrutinee clears the two unwritten locals (slots 3 and 4) first.
+        let mut g = Gen::new();
+        g.expr(&case_of_call(vec![Atom::Slot(1), Atom::Slot(2)]), p);
+        let before_push = g.out.split("subq $8, %rbp").next().unwrap();
+        assert_eq!(before_push.matches("movq $0,").count(), 2, "{}", g.out);
     }
 
     #[test]
