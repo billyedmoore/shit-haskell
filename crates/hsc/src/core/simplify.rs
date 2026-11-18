@@ -84,7 +84,8 @@ const BOTTOM: usize = usize::MAX;
 /// parameter, `f = \xs -> \e -> body e` (the simplifier then pushes `e` into the alternatives,
 /// where calls become saturated: an IO loop's `thenIO m (go xs)` becomes a call taking the
 /// state token). Repeating the cheap work for each application of a partial application loses
-/// nothing worth sharing. Globals and let-bound functions; one parameter per pass.
+/// nothing worth sharing. Globals and let-bound functions; one parameter per call (each pass
+/// starts with one, and phase 0 is followed by another).
 fn eta_expand(binds: &mut [TopBind], only: Option<&HashSet<String>>, rules: &Rules) -> HashSet<String> {
     let mut changed = HashSet::new();
     let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
@@ -956,7 +957,7 @@ impl Simp<'_> {
                 None => break,
             }
         }
-        if target == "GHC.Internal.Base.foldr" {
+        if target == "GHC.Internal.Base.foldr" && !self.rules.by_head.contains_key(g) {
             g = target;
         }
         let Some(candidates) = self.rules.by_head.get(g) else { return false };
