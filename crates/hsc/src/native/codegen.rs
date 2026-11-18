@@ -545,24 +545,9 @@ impl Gen {
         self.put_label(label);
         // R1 is the closure; the arguments are above the new frame (they were pushed by the caller).
         self.emit(&format!("subq ${}, %rbp", 8 * (f.s - f.a) as i64));
-        // The pointer locals start empty for the collector; raw slots are not read by it. They
-        // are next to each other: cleared two at a time (an SSE register; nothing is live in one
-        // at a body's entry).
-        let (first, end) = (f.a + 1, f.s - f.r);
-        if end > first + 1 {
-            self.emit("xorps %xmm0, %xmm0");
-        }
-        let mut k = first;
-        while k < end {
-            if k + 1 < end {
-                // Slots k and k+1 are the words at off(k) and off(k) + 8.
-                debug_assert_eq!(f.off(k + 1), f.off(k) + 8);
-                self.emit(&format!("movups %xmm0, {}(%rbp)", f.off(k)));
-                k += 2;
-            } else {
-                self.emit(&format!("movq $0, {}(%rbp)", f.off(k)));
-                k += 1;
-            }
+        // The pointer locals start empty for the collector; raw slots are not read by it.
+        for k in (f.a + 1)..(f.s - f.r) {
+            self.emit(&format!("movq $0, {}(%rbp)", f.off(k)));
         }
         self.emit(&format!("movq %r14, {}(%rbp)", f.off(0)));
         // A worker's raw parameters arrive as numbers in their argument slots: they move to raw
