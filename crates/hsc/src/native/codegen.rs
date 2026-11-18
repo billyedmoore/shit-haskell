@@ -173,6 +173,8 @@ pub struct Gen {
     cache: Vec<Cached>,
     /// The raw slots each expression of the body being generated uses (sorted; by address).
     raw_uses: HashMap<*const SExpr, Vec<u32>>,
+    /// The pointer locals the code generated so far has written on its path (see `zero_unwritten`).
+    written: std::collections::HashSet<u32>,
 }
 
 /// A raw slot's number held in a register; `dirty` when the slot itself may not have it yet.
@@ -371,6 +373,7 @@ impl Gen {
             join_uses: HashMap::new(),
             cache: Vec::new(),
             raw_uses: HashMap::new(),
+            written: std::collections::HashSet::new(),
         }
     }
 
@@ -545,10 +548,9 @@ impl Gen {
         self.put_label(label);
         // R1 is the closure; the arguments are above the new frame (they were pushed by the caller).
         self.emit(&format!("subq ${}, %rbp", 8 * (f.s - f.a) as i64));
-        // The pointer locals start empty for the collector; raw slots are not read by it.
-        for k in (f.a + 1)..(f.s - f.r) {
-            self.emit(&format!("movq $0, {}(%rbp)", f.off(k)));
-        }
+        // The pointer locals are not cleared here: only before something can collect, and only
+        // those not written by then (`zero_unwritten`).
+        self.written.clear();
         self.emit(&format!("movq %r14, {}(%rbp)", f.off(0)));
         // A worker's raw parameters arrive as numbers in their argument slots: they move to raw
         // slots, and the argument slots are emptied, before anything can collect.
@@ -584,7 +586,9 @@ impl Gen {
             for c in &cached {
                 self.emit(&format!("movq {}, {}", c.reg, p.slot(c.slot)));
             }
+            let written = self.written.clone();
             self.rt_call("hsc_yield", p, 0);
+            self.written = written;
             self.emit("testq %rax, %rax");
             self.emit("jnz hsc_raise_pending");
             for c in &cached {
@@ -719,6 +723,16 @@ impl Gen {
             SExpr::App(f, args) => tail && plain(f) && args.iter().all(plain),
             SExpr::CallWorker(_, args) => tail && args.iter().all(plain),
             _ => false,
+        }
+    }
+
+    /// Clears the frame's pointer locals not written on this path yet (the collector reads every
+    /// pointer local of a frame; an unwritten one holds whatever the stack held before).
+    fn zero_unwritten(&mut self, p: Pos) {
+        for k in (p.f.a + 1)..(p.f.s - p.f.r) {
+            if self.written.insert(k) {
+                self.emit(&format!("movq $0, {}", p.slot(k)));
+            }
         }
     }
 
@@ -951,6 +965,7 @@ impl Gen {
             }
         }
         let snapshot = self.cache.clone();
+        let written = self.written.clone();
         match alts.last() {
             Some(SAlt::Default(body)) => self.expr(body, p),
             _ => self.fail("Non-exhaustive patterns in case", p),
@@ -959,6 +974,7 @@ impl Gen {
             if let SAlt::Lit(Lit::Int(0 | 1), body) = a {
                 self.put_label(l);
                 self.cache = snapshot.clone();
+                self.written = written.clone();
                 self.expr(body, p);
             }
         }
@@ -1032,6 +1048,7 @@ impl Gen {
                 for (slot, c) in binds {
                     self.emit(&format!("leaq {}(%rax), %rcx", 8 * off));
                     self.emit(&format!("movq %rcx, {}", p.slot(*slot)));
+                    self.written.insert(*slot);
                     offs.push(off);
                     off += closure_words(c);
                 }
@@ -1081,6 +1098,7 @@ impl Gen {
                     }
                 }
                 let snapshot = self.cache.clone();
+                let written = self.written.clone();
                 match alts.last() {
                     Some(SAlt::Default(body)) => self.expr(body, p),
                     _ => self.fail("Non-exhaustive patterns in case", p),
@@ -1089,6 +1107,7 @@ impl Gen {
                     if let SAlt::Lit(_, body) = a {
                         self.put_label(l);
                         self.cache = snapshot.clone();
+                        self.written = written.clone();
                         self.expr(body, p);
                     }
                 }
@@ -1103,13 +1122,19 @@ impl Gen {
                         let ready = self.label("ready");
                         let eval = self.label("eval");
                         let value = self.label("value");
+                        // An indirection (an updated thunk, as a captured variable often is) is
+                        // followed here: only a thunk needs the evaluation.
+                        let check = self.label("chk");
                         self.load(a, p, "%r14");
+                        self.put_label(&check);
                         self.emit("testq %r14, %r14");
                         self.emit(&format!("je {value}"));
                         self.emit(&format!("cmpb ${THUNK}, (%r14)"));
                         self.emit(&format!("je {eval}"));
                         self.emit(&format!("cmpb ${IND}, (%r14)"));
-                        self.emit(&format!("je {eval}"));
+                        self.emit(&format!("jne {value}"));
+                        self.emit("movq 8(%r14), %r14");
+                        self.emit(&format!("jmp {check}"));
                         // A value: as on the slow path, its slot is cleared when nothing uses it
                         // after (only here: the slow path loads the slot again).
                         self.put_label(&value);
@@ -1142,6 +1167,12 @@ impl Gen {
                     }
                     _ => None,
                 };
+                // What the path wrote before the scrutinee (the fast path to `ready` skips what
+                // follows), then the locals cleared for the scrutinee's code, which may collect
+                // with this frame below its return address.
+                let written_before = self.written.clone();
+                self.zero_unwritten(p);
+                let written_push = self.written.clone();
                 // Push the return address (its frame is this body's, above it).
                 self.emit("subq $8, %rbp");
                 self.emit(&format!("leaq {cont}(%rip), %rax"));
@@ -1160,6 +1191,9 @@ impl Gen {
                 let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
                 self.put_label(&cont);
                 self.emit("addq $8, %rbp");
+                // Returned to: the frame is as it was at the push; at `ready` (reached also by
+                // the fast path) only as it was before.
+                self.written = if ready.is_some() { written_before.clone() } else { written_push.clone() };
                 if raw_binder {
                     // A cell (the runtime's answer, or the evaluated variable): its number goes to
                     // the raw binder. An inline primitive stored it already and continues after.
@@ -1189,6 +1223,7 @@ impl Gen {
                     self.put_label(&ready);
                 }
                 self.emit(&format!("movq %r14, {}", p.slot(*bslot)));
+                self.written.insert(*bslot);
                 self.alts(alts, *bslot, p);
             }
             SExpr::Closure(c) => {
@@ -1208,7 +1243,12 @@ impl Gen {
                 let mut uses = std::collections::HashSet::new();
                 self.slot_uses(code, &mut uses);
                 self.join_uses.insert(*id, uses);
+                // The join point's code runs after jumps from anywhere in the body: what was
+                // written before it, and its parameters.
+                let written = self.written.clone();
                 self.expr(body, p);
+                self.written = written;
+                self.written.extend(params.iter().copied().filter(|k| k & RAW == 0));
                 self.put_label(&l);
                 self.expr(code, p);
             }
@@ -1287,13 +1327,16 @@ impl Gen {
             let fail_msg = format!("Non-exhaustive patterns in case [{}]", names.join(" | "));
             self.fail(&fail_msg, p);
         }
+        let written = self.written.clone();
         for (a, l) in alts.iter().zip(&labels) {
             self.put_label(l);
+            self.written = written.clone();
             match a {
                 SAlt::Con(_, slots, body) => {
                     for (i, s) in slots.iter().enumerate() {
                         self.emit(&format!("movq {}(%r14), %rcx", 8 * (i + 1)));
                         self.emit(&format!("movq %rcx, {}", p.slot(*s)));
+                        self.written.insert(*s);
                     }
                     self.expr(body, p);
                 }
@@ -1416,7 +1459,10 @@ impl Gen {
         self.emit("cmpq %r13, %rax");
         self.emit(&format!("jbe {ok}"));
         self.emit(&format!("movq ${words}, %rsi"));
+        // The locals cleared on this (rare) path are not cleared on the other.
+        let written = self.written.clone();
         self.rt_call("hsc_gc", p, 1);
+        self.written = written;
         self.put_label(&ok);
         self.emit("movq %r12, %rax");
         self.emit(&format!("leaq {}(%r12), %r12", 8 * words));
@@ -1958,6 +2004,9 @@ impl Gen {
     /// when a return address is on top).
     fn rt_call(&mut self, name: &str, p: Pos, nargs: usize) {
         let _ = nargs;
+        // The collector may run (or another thread, which may collect): the frame's pointer
+        // locals must hold pointers or zero.
+        self.zero_unwritten(p);
         let top = if p.pushed == 0 { p.f.size_word() } else { 0 };
         self.emit(&format!("movq %r12, {}(%rbx)", mach::HP));
         if top > i32::MAX as u64 {
