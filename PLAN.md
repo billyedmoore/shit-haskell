@@ -60,7 +60,7 @@ comprehensions desugared with foldr/build, coercions dropped, partial applicatio
 (PR #65); `zip` fuses with enumerations ("foldr2/left" built in, PR #66); `forM_`/`mapM_`
 fuse, and loops made in phase 0 take their state token (PR #68); the collector copies with
 raw pointers (PR #69); heap spaces use huge pages (PR #70);
-Integer primitives dispatched by number, big multiplications and `show` in one pass (PR #71).
+Integer primitives dispatched by number, big multiplications and `show` in one pass (PR #71); bodies 16-byte aligned (PR #72).
 
 **Next:**
 - mvar: the MVar primitives and thread switches still go through the generic runtime.

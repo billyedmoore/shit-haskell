@@ -456,6 +456,10 @@ impl Gen {
         let symbols = std::env::var_os("HSC_DEBUG").is_some();
         let mut n = 0usize;
         while let Some((label, c, name)) = g.pending.pop() {
+            // Each body starts on a 16-byte boundary (as C compilers place functions): a loop is
+            // a body jumping to its own start, and where an unaligned one falls changes from
+            // build to build, and its speed with it.
+            g.out.push_str("    .p2align 4\n");
             let symbol = symbols.then(|| {
                 n += 1;
                 let clean: String = name.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }).collect();
