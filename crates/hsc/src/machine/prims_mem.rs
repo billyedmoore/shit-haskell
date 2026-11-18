@@ -522,6 +522,8 @@ fn atomic_access(m: &mut Machine, name: &str) -> Option<Word> {
         "casArray#" | "casSmallArray#" => {
             force_arg(m, 0)?;
             let i = int_arg(m, 1)? as Word;
+            // Forcing may have used up the room reserved for the result.
+            m.reserve(8);
             let (a, old, new) = (m.args[0], m.args[2], m.args[3]);
             let slot = a + 8 + 8 * i;
             let failed = m.heap_get(slot, 0) != old;
@@ -539,7 +541,7 @@ fn atomic_access(m: &mut Machine, name: &str) -> Option<Word> {
             let r = m.args[0];
             let old = m.heap_get(r, 1);
             m.heap_set(r + 8, m.args[1]);
-            Some(state_pair(m, old))
+            Some(state_pair_rooted(m, old))
         }
         _ => None,
     }
