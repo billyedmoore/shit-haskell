@@ -75,9 +75,10 @@ fn copy(
         pinned: Pinned { map: pinned, bounds },
         reached,
     };
-    // SAFETY: `src` and `dst` are distinct live buffers; every object copied lies in `src` (its
-    // header gives its size) and `dst` has room for all live data (the caller sizes it and
-    // `Copier::evacuate` checks).
+    // SAFETY: `src` and `dst` are distinct live buffers, and `dst` is not resized while copying.
+    // Every object reached lies wholly in `src`, as its header says (the heap's invariant: a
+    // corrupt header would now read out of bounds rather than panic), and `dst` has room for
+    // all live data (the caller sizes it and `Copier::evacuate` checks).
     unsafe {
         for r in roots.iter_mut() {
             *r = c.evacuate(*r);
@@ -91,7 +92,7 @@ fn copy(
             let (first, count) = heap::pointer_fields(h);
             for i in first..first + count {
                 let f = obj.add(i);
-                // Pointers in `dst` are into `src` (the from-space), never into `dst`, until copied.
+                // The fields not scanned yet point into `src` (or outside the heap).
                 *f = c.evacuate(*f);
             }
             scan += total;
@@ -131,9 +132,8 @@ impl Copier<'_> {
     #[inline(always)]
     unsafe fn evacuate(&mut self, v: Word) -> Word {
         if v.wrapping_sub(self.base) >= self.span {
-            // A pinned object stays where it is (it holds no pointers); it is only marked as reached.
-            if v >= self.pinned.bounds.0 && v <= self.pinned.bounds.1 && self.pinned.map.contains_key(&v) {
-                self.reached.insert(v);
+            if v >= self.pinned.bounds.0 && v <= self.pinned.bounds.1 {
+                self.pin(v);
             }
             return v;
         }
@@ -167,6 +167,14 @@ impl Copier<'_> {
         *from = kind::FORWARD as Word;
         *from.add(1) = new_addr;
         new_addr
+    }
+
+    /// A pinned object stays where it is (it holds no pointers); it is only marked as reached.
+    #[cold]
+    fn pin(&mut self, v: Word) {
+        if self.pinned.map.contains_key(&v) {
+            self.reached.insert(v);
+        }
     }
 
     /// An indirection at `from`: what it points to is evacuated, and it forwards there.
@@ -245,5 +253,35 @@ mod tests {
         collect(&mut heap, &mut roots, 1000);
         assert!(heap.from.len() >= 1000);
         assert_eq!(sum_list(&heap, roots[0]), (0..10u64).sum());
+    }
+
+    #[test]
+    fn indirections_are_shortened_and_shared_objects_copied_once() {
+        let mut heap = Heap::new(4096);
+        let int = heap.try_alloc(2, heap::header(kind::INT, 1, 0)).unwrap();
+        heap.set_word(int, 1, 42);
+        // A chain of three indirections to the INT, and one that points to itself.
+        let mut ind = int;
+        for _ in 0..3 {
+            let i = heap.try_alloc(2, heap::header(kind::IND, 1, 0)).unwrap();
+            heap.set_word(i, 1, ind);
+            ind = i;
+        }
+        let selfish = heap.try_alloc(2, heap::header(kind::IND, 1, 0)).unwrap();
+        heap.set_word(selfish, 1, selfish);
+        // A pair holding the chain twice, and the INT also as a root of its own.
+        let pair = heap.try_alloc(3, heap::header(kind::CON, 2, 0)).unwrap();
+        heap.set_word(pair, 1, ind);
+        heap.set_word(pair, 2, ind);
+        let mut roots = [pair, int, selfish, ind];
+        collect(&mut heap, &mut roots, 0);
+        let (pair, int, selfish, ind) = (roots[0], roots[1], roots[2], roots[3]);
+        assert_eq!(ind, int, "an indirection root goes straight to its value");
+        assert_eq!(heap.word(pair, 1), int);
+        assert_eq!(heap.word(pair, 2), int);
+        assert_eq!(heap.word(int, 1), 42);
+        assert_eq!(heap.word(selfish, 1), selfish);
+        // The pair, the INT and the self-indirection: 7 words, nothing copied twice.
+        assert_eq!(heap.hp, 7);
     }
 }
