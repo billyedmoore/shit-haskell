@@ -585,22 +585,22 @@ foreign import prim "cloneMutableArray#" cloneMutableArray# :: MutableArray# s a
 foreign import prim "freezeArray#" freezeArray# :: MutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, Array# a_levpoly #)
 foreign import prim "thawArray#" thawArray# :: Array# a_levpoly -> Int# -> Int# -> State# s -> (# State# s, MutableArray# s a_levpoly #)
 foreign import prim "casArray#" casArray# :: MutableArray# s a_levpoly -> Int# -> a_levpoly -> a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
-foreign import prim "newSmallArray#" newSmallArray# :: Int# -> a_levpoly -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
+foreign import prim "newArray#" newSmallArray# :: Int# -> a_levpoly -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
 foreign import prim "shrinkSmallMutableArray#" shrinkSmallMutableArray# :: SmallMutableArray# s a_levpoly -> Int# -> State# s -> State# s
-foreign import prim "readSmallArray#" readSmallArray# :: SmallMutableArray# s a_levpoly -> Int# -> State# s -> (# State# s, a_levpoly #)
-foreign import prim "writeSmallArray#" writeSmallArray# :: SmallMutableArray# s a_levpoly -> Int# -> a_levpoly -> State# s -> State# s
-foreign import prim "sizeofSmallArray#" sizeofSmallArray# :: SmallArray# a_levpoly -> Int#
-foreign import prim "sizeofSmallMutableArray#" sizeofSmallMutableArray# :: SmallMutableArray# s a_levpoly -> Int#
+foreign import prim "readArray#" readSmallArray# :: SmallMutableArray# s a_levpoly -> Int# -> State# s -> (# State# s, a_levpoly #)
+foreign import prim "writeArray#" writeSmallArray# :: SmallMutableArray# s a_levpoly -> Int# -> a_levpoly -> State# s -> State# s
+foreign import prim "sizeofArray#" sizeofSmallArray# :: SmallArray# a_levpoly -> Int#
+foreign import prim "sizeofMutableArray#" sizeofSmallMutableArray# :: SmallMutableArray# s a_levpoly -> Int#
 foreign import prim "getSizeofSmallMutableArray#" getSizeofSmallMutableArray# :: SmallMutableArray# s a_levpoly -> State# s -> (# State# s, Int# #)
-foreign import prim "indexSmallArray#" indexSmallArray# :: SmallArray# a_levpoly -> Int# -> (# a_levpoly #)
-foreign import prim "unsafeFreezeSmallArray#" unsafeFreezeSmallArray# :: SmallMutableArray# s a_levpoly -> State# s -> (# State# s, SmallArray# a_levpoly #)
-foreign import prim "unsafeThawSmallArray#" unsafeThawSmallArray# :: SmallArray# a_levpoly -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
-foreign import prim "copySmallArray#" copySmallArray# :: SmallArray# a_levpoly -> Int# -> SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> State# s
-foreign import prim "copySmallMutableArray#" copySmallMutableArray# :: SmallMutableArray# s a_levpoly -> Int# -> SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> State# s
-foreign import prim "cloneSmallArray#" cloneSmallArray# :: SmallArray# a_levpoly -> Int# -> Int# -> SmallArray# a_levpoly
-foreign import prim "cloneSmallMutableArray#" cloneSmallMutableArray# :: SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
-foreign import prim "freezeSmallArray#" freezeSmallArray# :: SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallArray# a_levpoly #)
-foreign import prim "thawSmallArray#" thawSmallArray# :: SmallArray# a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
+foreign import prim "indexArray#" indexSmallArray# :: SmallArray# a_levpoly -> Int# -> (# a_levpoly #)
+foreign import prim "unsafeFreezeArray#" unsafeFreezeSmallArray# :: SmallMutableArray# s a_levpoly -> State# s -> (# State# s, SmallArray# a_levpoly #)
+foreign import prim "unsafeThawArray#" unsafeThawSmallArray# :: SmallArray# a_levpoly -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
+foreign import prim "copyArray#" copySmallArray# :: SmallArray# a_levpoly -> Int# -> SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> State# s
+foreign import prim "copyMutableArray#" copySmallMutableArray# :: SmallMutableArray# s a_levpoly -> Int# -> SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> State# s
+foreign import prim "cloneArray#" cloneSmallArray# :: SmallArray# a_levpoly -> Int# -> Int# -> SmallArray# a_levpoly
+foreign import prim "cloneMutableArray#" cloneSmallMutableArray# :: SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
+foreign import prim "freezeArray#" freezeSmallArray# :: SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallArray# a_levpoly #)
+foreign import prim "thawArray#" thawSmallArray# :: SmallArray# a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
 foreign import prim "casSmallArray#" casSmallArray# :: SmallMutableArray# s a_levpoly -> Int# -> a_levpoly -> a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
 foreign import prim "newByteArray#" newByteArray# :: Int# -> State# s -> (# State# s, MutableByteArray# s #)
 foreign import prim "newPinnedByteArray#" newPinnedByteArray# :: Int# -> State# s -> (# State# s, MutableByteArray# s #)

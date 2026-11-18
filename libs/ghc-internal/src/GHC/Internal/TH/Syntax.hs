@@ -193,7 +193,8 @@ instance Quasi IO where
   -- hsc: splices run in IO, so a failure is an exception the handler replaces.
   qRecover h m          = m `catch` \e -> const h (e :: SomeException)
   qGetPackageRoot       = badIO "getProjectRoot"
-  qAddDependentFile _   = badIO "addDependentFile"
+  -- hsc: dependent files only matter for recompilation checks, which cabal does.
+  qAddDependentFile _   = pure ()
   qAddTempFile _        = badIO "addTempFile"
   qAddTopDecls _        = badIO "addTopDecls"
   qAddForeignFilePath _ _ = badIO "addForeignFilePath"

@@ -188,6 +188,9 @@ fn dispatch_ordinary(m: &mut Machine, name: &str, nargs: usize) -> Word {
 fn finish_ordinary(m: &mut Machine, name: &str, nargs: usize) -> Word {
     match () {
         _ if std::mem::take(&mut m.prim_failed) => 0,
+        _ if crate::interp::prims_ghc::small_alias(name).is_some() => {
+            run(m, crate::interp::prims_ghc::small_alias(name).expect("an alias"), nargs)
+        }
         _ => match crate::interp::prims_ghc::sized_alias(name) {
             // Int64#, Word64# and the sized Int/Word operations: the base operation, narrowed.
             Some((base, narrow)) => {
