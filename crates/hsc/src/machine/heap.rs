@@ -73,24 +73,32 @@ pub fn pointer_fields(h: Word) -> (usize, usize) {
     }
 }
 
+#[cfg(target_os = "linux")]
 extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
-/// A zeroed semispace of `words` words. A large one is backed by huge pages where the kernel
-/// allows them on request (`madvise`): allocation streams through the whole space, and with
-/// 4 KB pages its first pass is mostly page faults.
+/// A zeroed semispace of `words` words. On Linux a large one is backed by huge pages where the
+/// kernel allows them on request: allocation streams through the whole space, and with 4 KB
+/// pages its first pass is mostly page faults.
 pub fn space(words: usize) -> Vec<Word> {
+    #[allow(unused_mut)]
     let mut v: Vec<Word> = vec![0; words];
-    const HUGE: usize = 2 << 20;
-    let bytes = words * 8;
-    if bytes >= 2 * HUGE {
-        let start = v.as_mut_ptr() as usize;
-        let aligned = (start + HUGE - 1) & !(HUGE - 1);
-        let end = (start + bytes) & !(HUGE - 1);
-        if end > aligned {
-            // SAFETY: a range inside the vector's own allocation; the advice changes no contents.
-            unsafe { madvise(aligned as *mut u8, end - aligned, 14) }; // MADV_HUGEPAGE
+    #[cfg(target_os = "linux")]
+    {
+        const MADV_HUGEPAGE: i32 = 14;
+        const HUGE: usize = 2 << 20;
+        let bytes = words * 8;
+        if bytes >= 2 * HUGE {
+            let start = v.as_mut_ptr() as usize;
+            let aligned = (start + HUGE - 1) & !(HUGE - 1);
+            let end = (start + bytes) & !(HUGE - 1);
+            if end > aligned {
+                // SAFETY: a range inside the vector's allocation, which stays the allocator's to
+                // free or reuse: the advice changes no contents and only affects how the kernel
+                // backs those pages.
+                unsafe { madvise(aligned as *mut u8, end - aligned, MADV_HUGEPAGE) };
+            }
         }
     }
     v
