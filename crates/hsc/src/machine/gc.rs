@@ -64,26 +64,40 @@ fn copy(
     spare: Vec<Word>,
 ) -> (Vec<Word>, usize) {
     let mut dst: Vec<Word> = if spare.len() >= capacity { spare } else { vec![0; capacity] };
-    let mut free = 0usize;
-    let base = src.as_ptr() as Word;
-    let limit = base + (src.len() as Word) * 8;
-    let pin = Pinned { map: pinned, bounds };
-    for r in roots.iter_mut() {
-        *r = evacuate(src, &mut dst, &mut free, *r, base, limit, &pin, reached);
-    }
-    // Cheney scan: the copied objects, in the order they were copied, give up their pointers.
-    let mut scan = 0usize;
-    while scan < free {
-        let h = dst[scan];
-        let total = heap::total_words(h);
-        let (first, count) = heap::pointer_fields(h);
-        for i in first..first + count {
-            let v = dst[scan + i];
-            // Pointers in `dst` are into `src` (the from-space), never into `dst`, until copied.
-            dst[scan + i] = evacuate(src, &mut dst, &mut free, v, base, limit, &pin, reached);
+    let mut c = Copier {
+        src: src.as_mut_ptr(),
+        base: src.as_ptr() as Word,
+        span: (src.len() as Word) * 8,
+        dst: dst.as_mut_ptr(),
+        dst_base: dst.as_ptr() as Word,
+        cap: dst.len(),
+        free: 0,
+        pinned: Pinned { map: pinned, bounds },
+        reached,
+    };
+    // SAFETY: `src` and `dst` are distinct live buffers; every object copied lies in `src` (its
+    // header gives its size) and `dst` has room for all live data (the caller sizes it and
+    // `Copier::evacuate` checks).
+    unsafe {
+        for r in roots.iter_mut() {
+            *r = c.evacuate(*r);
         }
-        scan += total;
+        // Cheney scan: the copied objects, in the order they were copied, give up their pointers.
+        let mut scan = 0usize;
+        while scan < c.free {
+            let obj = c.dst.add(scan);
+            let h = *obj;
+            let total = heap::total_words(h);
+            let (first, count) = heap::pointer_fields(h);
+            for i in first..first + count {
+                let f = obj.add(i);
+                // Pointers in `dst` are into `src` (the from-space), never into `dst`, until copied.
+                *f = c.evacuate(*f);
+            }
+            scan += total;
+        }
     }
+    let free = c.free;
     (dst, free)
 }
 
@@ -93,49 +107,79 @@ struct Pinned<'a> {
     bounds: (Word, Word),
 }
 
-/// Copies the object `v` (if it is a pointer into the source space) into `dst`, leaving a
-/// forwarding pointer in the source, and returns its new address. Anything else is unchanged.
-#[allow(clippy::too_many_arguments)]
-fn evacuate(
-    src: &mut [Word],
-    dst: &mut Vec<Word>,
-    free: &mut usize,
-    v: Word,
+/// The state of one copy: the source space (`span` bytes from `base`), the destination and its
+/// first free word.
+struct Copier<'a> {
+    src: *mut Word,
     base: Word,
-    limit: Word,
-    pinned: &Pinned,
-    reached: &mut std::collections::HashSet<Word>,
-) -> Word {
-    if v < base || v >= limit {
-        // A pinned object stays where it is (it holds no pointers); it is only marked as reached.
-        if v >= pinned.bounds.0 && v <= pinned.bounds.1 && pinned.map.contains_key(&v) {
-            reached.insert(v);
+    span: Word,
+    dst: *mut Word,
+    dst_base: Word,
+    cap: usize,
+    free: usize,
+    pinned: Pinned<'a>,
+    reached: &'a mut std::collections::HashSet<Word>,
+}
+
+impl Copier<'_> {
+    /// Copies the object `v` (if it is a pointer into the source space) into the destination,
+    /// leaving a forwarding pointer in the source, and returns its new address. Anything else is
+    /// unchanged. An indirection (an updated thunk) is replaced by what it points to.
+    ///
+    /// # Safety
+    /// As for `copy`.
+    #[inline(always)]
+    unsafe fn evacuate(&mut self, v: Word) -> Word {
+        if v.wrapping_sub(self.base) >= self.span {
+            // A pinned object stays where it is (it holds no pointers); it is only marked as reached.
+            if v >= self.pinned.bounds.0 && v <= self.pinned.bounds.1 && self.pinned.map.contains_key(&v) {
+                self.reached.insert(v);
+            }
+            return v;
         }
-        return v;
-    }
-    let from_index = ((v - base) / 8) as usize;
-    let h = src[from_index];
-    if heap::kind_of(h) == kind::FORWARD {
-        return src[from_index + 1];
-    }
-    // An indirection (an updated thunk) is replaced by what it points to.
-    if heap::kind_of(h) == kind::IND {
-        let target = src[from_index + 1];
-        if target != v {
-            let new_addr = evacuate(src, dst, free, target, base, limit, pinned, reached);
-            src[from_index] = kind::FORWARD as Word;
-            src[from_index + 1] = new_addr;
-            return new_addr;
+        let from = self.src.add(((v - self.base) / 8) as usize);
+        let h = *from;
+        let k = heap::kind_of(h);
+        if k == kind::FORWARD {
+            return *from.add(1);
         }
+        if k == kind::IND && *from.add(1) != v {
+            return self.indirection(from);
+        }
+        let total = heap::total_words(h);
+        let at = self.free;
+        assert!(at + total <= self.cap, "internal: collector out of room");
+        let to = self.dst.add(at);
+        match total {
+            2 => {
+                *to = h;
+                *to.add(1) = *from.add(1);
+            }
+            3 => {
+                *to = h;
+                *to.add(1) = *from.add(1);
+                *to.add(2) = *from.add(2);
+            }
+            _ => std::ptr::copy_nonoverlapping(from, to, total),
+        }
+        self.free = at + total;
+        let new_addr = self.dst_base + (at as Word) * 8;
+        *from = kind::FORWARD as Word;
+        *from.add(1) = new_addr;
+        new_addr
     }
-    let total = heap::total_words(h);
-    let new_index = *free;
-    dst[new_index..new_index + total].copy_from_slice(&src[from_index..from_index + total]);
-    *free += total;
-    let new_addr = dst.as_ptr() as Word + (new_index as Word) * 8;
-    src[from_index] = kind::FORWARD as Word;
-    src[from_index + 1] = new_addr;
-    new_addr
+
+    /// An indirection at `from`: what it points to is evacuated, and it forwards there.
+    ///
+    /// # Safety
+    /// As for `copy`.
+    #[inline(never)]
+    unsafe fn indirection(&mut self, from: *mut Word) -> Word {
+        let new_addr = self.evacuate(*from.add(1));
+        *from = kind::FORWARD as Word;
+        *from.add(1) = new_addr;
+        new_addr
+    }
 }
 
 #[cfg(test)]
