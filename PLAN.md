@@ -67,7 +67,12 @@ The command line behaves like GHC's: `--help`, `--version`/`--info`, clear error
 flags, and `-O0`/`-O1`/`-O2` meaning different things (`-O0` compiles fast, `-O2` optimises
 hardest).
 
-### 4. Speed
+### 4. Independence
+
+Nothing reads GHC's files or runs its tools; both corpora pass with `ghc` off `PATH`. gcc, as
+and ld stay as assembler and linker.
+
+### 5. Speed
 
 **Target:** generated programs at most 0.75× `ghc -O2` time on `bench/` and the large
 projects' test suites. Compile times comparable to GHC's. (Today: ~2.2× `ghc -O1`.)
@@ -86,8 +91,3 @@ comprehensions, `zip` and `forM_` (#65, #66, #68), a faster collector and huge p
 - Leaner frame clearing (clearing only before a collection made binaries 7× larger).
 - Strings: a generational collector; `[Char]` processing and `show`.
 - Compile time: real interface files; parallel module compilation.
-
-### 5. Independence
-
-Nothing reads GHC's files or runs its tools; both corpora pass with `ghc` off `PATH`. gcc, as
-and ld stay as assembler and linker.
