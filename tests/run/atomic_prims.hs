@@ -57,3 +57,7 @@ main = do
   _ <- atomicSwapIORef ref 5
   old <- atomicSwapIORef ref 6
   readIORef ref >>= \v -> print (old, v)
+  -- A failed casArray# does not evaluate the element.
+  MA arr2 <- IO $ \s -> case newArray# 1# (error "element") s of (# s', a #) -> (# s', MA a #)
+  f <- IO $ \s -> case casArray# arr2 0# "x" "y" s of (# s', fl, _ #) -> (# s', I# fl #)
+  print f

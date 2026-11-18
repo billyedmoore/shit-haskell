@@ -1,2 +1,4 @@
 /target
 /ref
+# Objects of C files tests compile next to their sources.
+/tests/**/*.o

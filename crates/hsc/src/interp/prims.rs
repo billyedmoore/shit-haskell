@@ -723,7 +723,7 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 let i = int(rt, &args[1])? as usize;
                 let cur = v.borrow()[i].clone();
                 // The same object: the same cell, or the same evaluated value.
-                let same = Rc::ptr_eq(&cur, &args[2]) || same_value(rt, &cur, &args[2]);
+                let same = Rc::ptr_eq(&cur, &args[2]) || same_value(&cur, &args[2]);
                 if same {
                     v.borrow_mut()[i] = args[3].clone();
                 }
@@ -1230,11 +1230,11 @@ fn write_element(bytes: &mut [u8], at: usize, size: usize, kind: &str, v: &Value
     }
 }
 
-/// Two cells holding the same evaluated object (the interpreter has no object identity for
-/// values copied between cells; pointer-equal constructors compare equal).
-fn same_value(rt: &Runtime, a: &Cell, b: &Cell) -> bool {
-    match (rt.force(a), rt.force(b)) {
-        (Ok(Value::Con(x)), Ok(Value::Con(y))) => Rc::ptr_eq(&x, &y),
+/// Two cells holding the same evaluated constructor (values are copied between cells, so the
+/// cells may differ). Nothing is evaluated: GHC compares pointers.
+fn same_value(a: &Cell, b: &Cell) -> bool {
+    match (&*a.borrow(), &*b.borrow()) {
+        (Thunk::Done(Value::Con(x)), Thunk::Done(Value::Con(y))) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
