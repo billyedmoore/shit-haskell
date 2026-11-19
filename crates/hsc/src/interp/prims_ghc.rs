@@ -758,10 +758,9 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         },
         "finalizeWeak#" => (|| match rt.force(&args[0])? {
             Value::Con(w) => {
-                let alive = match weak_id(rt, &w) {
-                    Some(i) => rt.weaks.borrow_mut()[i].finalize(),
-                    None => false,
-                };
+                let fins = weak_id(rt, &w).and_then(|i| rt.weaks.borrow_mut()[i].finalize());
+                let alive = fins.is_some();
+                crate::ccall::run_c_finalizers(fins.unwrap_or_default());
                 match w.args.get(1) {
                     Some(fin) if alive && w.args.len() == 3 && !is_unit(rt, fin) => Ok(Value::Con(Rc::new(super::ConVal {
                         name: "Builtin.(,,)",

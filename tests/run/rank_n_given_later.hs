@@ -35,8 +35,16 @@ nested = do
     (Right [Left b] : _) -> return (show (b :: B))
     _ -> return "other"
 
+withShow2 :: Show e => (Show e => r) -> e -> r
+withShow2 r _ = r
+
+-- No signature: the wanted `Show t` is the given's, solved from it (and `t` generalised).
+foo y = withShow2 (show y) y
+bar y = withShow2 (show [y]) y
+
 main :: IO ()
 main = do
+  putStrLn (foo (3 :: Int) ++ bar 'c')
   r <- tryIt (return 'x') :: IO [Either Int Char]
   print r
   nested >>= putStrLn

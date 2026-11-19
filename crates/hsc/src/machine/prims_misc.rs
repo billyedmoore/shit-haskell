@@ -129,10 +129,9 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
         "finalizeWeak#" => {
             let _ = force_arg(m, 0)?;
             let w = m.args[0];
-            let alive = match weak_index(m, w) {
-                Some(i) => m.weaks[i].finalize(),
-                None => false,
-            };
+            let fins = weak_index(m, w).and_then(|i| m.weaks[i].finalize());
+            let alive = fins.is_some();
+            crate::ccall::run_c_finalizers(fins.unwrap_or_default());
             let fin = m.heap_get(w, 2);
             let u = unit(m);
             if !alive || fin == 0 {
