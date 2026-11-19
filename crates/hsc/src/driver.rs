@@ -1842,7 +1842,23 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let prog = crate::native::stg::Lowering::program(&binds, numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
-    std::fs::write(&asm, text).map_err(|e| e.to_string())?;
+    std::fs::write(&asm, &text).map_err(|e| e.to_string())?;
+    // The assembler of a large program needs much memory (1.4 GB for cabal-install's 760 MB of
+    // assembly): the text and the lowered program are freed first, or the machine runs short (the
+    // assembly then took an hour instead of 40 s).
+    drop(text);
+    drop(prog);
+    drop(binds);
+    // The allocator keeps freed memory for reuse; given back, the assembler has it (with the swap
+    // full, the kernel otherwise evicts the assembler's own pages, which it reads back endlessly).
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: malloc_trim only returns free heap memory to the system.
+        unsafe { malloc_trim(0) };
+    }
     timing::add("codegen", t);
     let t_link = std::time::Instant::now();
     let run = |args: &[&str]| -> Result<(), String> {

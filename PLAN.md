@@ -17,8 +17,7 @@ This file says where things stand and what comes next. History lives in git and
   binary 141/142 (needs PolyKinds); time times out; text needs a GHC plugin.
 - **Projects:** ShellCheck and its ~45 dependencies match the GHC build. hlint builds and
   matches its GHC build on its own and ShellCheck's sources and passes its 956 tests (~11× slower).
-  cabal-install builds and matches its GHC build on `--help`, `check` and the solver (~9× slower;
-  its native link takes ~1 h, next to fix).
+  cabal-install builds and matches its GHC build on `--help`, `check` and the solver (~9× slower).
 - **Speed:** compile times are close to GHC's (ghc-lib-parser cold ≈ 28 s, warm ≈ 1.4 s).
   Generated code is ~2.2× slower than `ghc -O1` (geometric mean, PR #74's hosted run);
   speed work resumes after the projects, diagnostics and usability items below:
@@ -51,30 +50,54 @@ This file says where things stand and what comes next. History lives in git and
 
 ## Roadmap, in order
 
-### 1. Large projects
+Big leaps first: work that finds or removes many problems at once comes before one-project,
+one-fix iterations.
 
-More real programs built with their own build systems and compared with their GHC builds:
-cabal-install's link time and test suite, then pandoc, aeson, megaparsec, lens, and in the end GHC
-itself. Alongside: text (plugin), binary (PolyKinds), time (speed). Language features come as
-these need them: Template Haskell `[d| |]`, type and pattern splices, `reify` of classes;
-PolyKinds and kind inference; Arrows.
+### 1. Coverage at scale
 
-### 2. Diagnostics
+- A Hackage sweep: build the most-used packages (a Stackage snapshot's top few hundred) with
+  hsc next to their GHC builds, unattended, and rank the failures by how many packages each
+  blocks; fix from the top. Results recorded in `bench/sweep/`.
+- GHC's own testsuite through difftest, for a conformance score.
+- Known gaps it will rank: PolyKinds and kind inference (binary), Template Haskell `[d| |]`,
+  type and pattern splices, `reify` of classes, `foreign import "dynamic"`, collector-run
+  finalizers, Arrows, text's plugin.
+
+### 2. Native code per module
+
+Each module's native code compiled once and cached as an object; a link only links. Today a
+link regenerates the whole program (cabal-install: 760 MB of assembly, a 228 MB binary against
+GHC's 58 MB) and needs memory a small machine lacks. Smaller generated code alongside.
+
+### 3. Speed of real programs
+
+Real programs run 9–17× slower than their GHC builds (hlint, cabal-install), against ~2× on
+`bench/`. Their time goes to primitives called through the runtime with boxed results,
+dictionaries passed at run time, and `Integer` conversions. Next: primitives compiled inline
+on unboxed values, specialisation of overloaded functions across modules, `fromIntegral` at
+known types without `Integer`. Measured on hlint's and cabal-install's own workloads.
+
+### 4. Large projects
+
+cabal-install's test suite, then pandoc, aeson, megaparsec, lens, and in the end GHC itself;
+text, binary and time alongside (most gaps found by the sweep first).
+
+### 5. Diagnostics
 
 Error and warning messages match GHC's text (`difftest --diag`), `-W` flags included.
 
-### 3. Usability
+### 6. Usability
 
 The command line behaves like GHC's: `--help`, `--version`/`--info`, clear errors for unknown
 flags, and `-O0`/`-O1`/`-O2` meaning different things (`-O0` compiles fast, `-O2` optimises
 hardest).
 
-### 4. Independence
+### 7. Independence
 
 Nothing reads GHC's files or runs its tools; both corpora pass with `ghc` off `PATH`. gcc, as
 and ld stay as assembler and linker.
 
-### 5. Speed
+### 8. Speed target
 
 **Target:** generated programs at most 0.75× `ghc -O2` time on `bench/` and the large
 projects' test suites. Compile times comparable to GHC's. (Today: ~2.2× `ghc -O1`.)
