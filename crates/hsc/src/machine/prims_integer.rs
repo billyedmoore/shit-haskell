@@ -83,7 +83,6 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let ord = a.cmp_value(&b);
             let t = match name {
                 "integerEq" => ord == std::cmp::Ordering::Equal,
-                "integerEq" => ord == std::cmp::Ordering::Equal,
                 "integerLt" => ord == std::cmp::Ordering::Less,
                 _ => ord != std::cmp::Ordering::Greater,
             };

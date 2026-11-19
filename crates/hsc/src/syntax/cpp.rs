@@ -192,7 +192,7 @@ impl Preprocessor {
                 .strip_prefix('#')
                 .map(|d| split_word(d.trim_start()).0)
                 .filter(|w| DIRECTIVES.contains(w));
-            if let Some(word) = directive_word {
+            if directive_word.is_some() {
                 {
                     let directive = trimmed[1..].trim_start();
                     let (word, rest) = split_word(directive);

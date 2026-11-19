@@ -106,7 +106,7 @@ impl Checker {
         let (head, args) = t.split_apps();
         let head = head.clone();
         let args: Vec<Ty> = args.into_iter().cloned().collect();
-        let mut wanted_rep = |this: &mut Self, ty: Ty, work: &mut Vec<Wanted>| -> Core {
+        let wanted_rep = |this: &mut Self, ty: Ty, work: &mut Vec<Wanted>| -> Core {
             let ev = this.fresh_name("tya");
             work.push(Wanted { pred: Pred { class: TYPEABLE_CLASS.into(), args: vec![ty] }, ev: ev.clone(), loc });
             this.typeable_rep_of(&ev, &class)
@@ -608,6 +608,21 @@ impl Checker {
     /// Functional-dependency improvement: when the determining arguments of a predicate match an
     /// instance, the determined arguments are unified with the instance's.
     pub fn improve(&mut self, p: &Pred) -> TR<()> {
+        self.improve_own(p)?;
+        // The superclasses' dependencies improve it too (megaparsec's `MonadParsecDbg e s m`, whose
+        // superclass `MonadParsec e s m` has `m -> e s`): their arguments are the predicate's.
+        let mut supers = Vec::new();
+        self.superclass_closure(p, &mut supers, 0);
+        for q in supers.into_iter().skip(1) {
+            if self.class(&q.class).is_some_and(|i| !i.fundeps.is_empty()) {
+                self.improve_own(&q)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Improvement by the dependencies of the predicate's own class.
+    fn improve_own(&mut self, p: &Pred) -> TR<()> {
         let fundeps = match self.class(&p.class) {
             Some(info) if !info.fundeps.is_empty() => info.fundeps.clone(),
             _ => return Ok(()),
@@ -1202,22 +1217,48 @@ impl Checker {
 
     /// The type opposite unification variable `m` in a solved coercion with both sides headed
     /// by the same constructor, if any. Coercions without variables left are dropped.
-    fn coercible_partner(&mut self, m: u32) -> Option<Ty> {
-        fn walk(c: &Checker, a: &Ty, b: &Ty, m: u32) -> Option<Ty> {
+    pub(super) fn coercible_partner(&mut self, m: u32) -> Option<Ty> {
+        // Through a newtype, its representation (containers' `coerce intersections`, from
+        // `NonEmpty (Set t) -> Set t` to `NonEmpty (Intersection a) -> Intersection a`: `t` is
+        // `a` under `Set`). GHC needs the parameter's role to be nominal there; a program it
+        // accepts gets the same answer.
+        fn walk(c: &Checker, a: &Ty, b: &Ty, m: u32, depth: usize) -> Option<Ty> {
             let (a, b) = (c.metas.prune(a), c.metas.prune(b));
             match (&a, &b) {
                 (Ty::Meta(x), Ty::Meta(y)) if x == y => None,
                 (Ty::Meta(x), _) if *x == m && !c.occurs_meta(m, &b) => Some(b.clone()),
                 (_, Ty::Meta(y)) if *y == m && !c.occurs_meta(m, &a) => Some(a.clone()),
-                (Ty::App(f1, x1), Ty::App(f2, x2)) if c.same_head(&a, &b) => walk(c, f1, f2, m).or_else(|| walk(c, x1, x2, m)),
+                (Ty::App(f1, x1), Ty::App(f2, x2)) if c.same_head(&a, &b) => {
+                    walk(c, f1, f2, m, depth).or_else(|| walk(c, x1, x2, m, depth))
+                }
+                _ if depth < 8 => match (c.newtype_unwrap(&a), c.newtype_unwrap(&b)) {
+                    (Some(u), _) => walk(c, &u, &b, m, depth + 1),
+                    (None, Some(u)) => walk(c, &a, &u, m, depth + 1),
+                    _ => None,
+                },
                 _ => None,
             }
         }
         let pairs = std::mem::take(&mut self.coercions);
         let kept: Vec<(Ty, Ty)> = pairs.into_iter().filter(|(a, b)| self.has_metas(a) || self.has_metas(b)).collect();
-        let found = kept.iter().find_map(|(a, b)| if self.same_head(a, b) { walk(self, a, b, m) } else { None });
+        let found = kept.iter().find_map(|(a, b)| walk(self, a, b, m, 0));
         self.coercions = kept;
         found
+    }
+
+    /// The representation of a saturated newtype application (its field's type at the arguments).
+    fn newtype_unwrap(&self, t: &Ty) -> Option<Ty> {
+        let t = self.metas.zonk(t);
+        let (head, args) = t.split_apps();
+        let Ty::Con(name) = head else { return None };
+        let con = self.env.tycons.get(name)?.cons.first()?;
+        let d = self.env.datacons.get(con)?;
+        if !d.newtype || d.scheme.nvars as usize != args.len() || !d.scheme.preds.is_empty() {
+            return None;
+        }
+        let (field, _) = d.scheme.ty.as_fun()?;
+        let args: Vec<Ty> = args.into_iter().cloned().collect();
+        Some(super::types::subst_gen(field, &args))
     }
 
     /// Whether two types are applications of the same type constructor (after pruning).

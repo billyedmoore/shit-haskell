@@ -98,6 +98,9 @@ impl Parser {
             | Tok::Int(_)
             | Tok::Char(_)
             | Tok::Str(_) => true,
+            // StarIsType: `*` is `Type`, an argument too (reflection's `Proxy (a * b)` is
+            // `Proxy (a Type b)`, as GHC reads it).
+            Tok::VarSym(s) => s == "*" && self.exts.is_on("StarIsType"),
             // A tick before a constructor operator is an infix promoted operator, not an argument.
             Tok::Special('\'') => !matches!(self.peek_raw(1), Tok::ConSym(_)),
             _ => false,
@@ -120,6 +123,10 @@ impl Parser {
                 QName::unqual(s)
             }
             Tok::Res(ROp::Tilde) => QName::unqual("~"),
+            // A qualified operator (`Eq.~~`, boring's `a Eq.~~ b =>`); the equalities `~` and `~~` are built in,
+            // whatever module names it.
+            Tok::QVarSym(_, s) if s == "~" || s == "~~" => QName::unqual(s),
+            Tok::QVarSym(m, s) => QName { qual: Some(m), name: s },
             // DataKinds: a promoted infix constructor `':+:`.
             Tok::Special('\'') if matches!(self.peek_raw(1), Tok::ConSym(_)) => {
                 let Tok::ConSym(s) = self.peek_raw(1).clone() else { return None };
@@ -208,10 +215,10 @@ impl Parser {
                     _ => self.unexpected(),
                 }
             }
-            // StarIsType: `*` is the kind of types.
+            // StarIsType: `*` is the kind of types, GHC.Types' `Type` whatever the module imports.
             Tok::VarSym(s) if s == "*" && self.exts.is_on("StarIsType") => {
                 self.bump();
-                Ok(Type::Con(QName::unqual("Type"), loc))
+                Ok(Type::Con(QName { qual: Some("%G:GHC.Types".into()), name: "Type".into() }, loc))
             }
             Tok::Int(s) => {
                 self.bump();
@@ -279,6 +286,8 @@ impl Parser {
                 let op_name = match self.tok().clone() {
                     Tok::ConSym(s) | Tok::VarSym(s) if self.real() => Some(QName::unqual(s)),
                     Tok::QConSym(m, s) if self.real() => Some(QName { qual: Some(m), name: s }),
+                    Tok::QVarSym(_, s) if self.real() && (s == "~" || s == "~~") => Some(QName::unqual(s)),
+                    Tok::QVarSym(m, s) if self.real() => Some(QName { qual: Some(m), name: s }),
                     Tok::Res(ROp::Tilde) if self.real() => Some(QName::unqual("~")),
                     _ => None,
                 };

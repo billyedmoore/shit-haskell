@@ -48,7 +48,7 @@ fn bool_int(m: &mut Machine, b: bool) -> Word {
 
 /// Common binary Int operations, classified once under program-local primitive IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum IntOp { Add, Sub, Mul, Eq, Ne, Lt, Le, Gt, Ge }
+pub(crate) enum IntOp { Add, Sub, Mul, Eq, Ne, Lt, Le, Gt, Ge }
 
 impl IntOp {
     pub(super) fn classify(name: &str) -> Option<Self> {

@@ -129,7 +129,7 @@ fn inline_binding(i: usize, target: &str, p: &crate::syntax::ast::InlinePragma) 
 }
 
 fn rule_binding(i: usize, r: crate::syntax::ast::Rule) -> Decl {
-    use crate::syntax::ast::{Activation, Body, Clause, Expr, Pat, Rhs};
+    use crate::syntax::ast::{Body, Clause, Expr, Pat, Rhs};
     let act = activation_code(r.activation);
     let pats = r
         .binders

@@ -2068,7 +2068,7 @@ fn extract_rules(binds: &[TopBind]) -> Vec<RuleDef> {
             cur = *inner;
         }
         // `let k = arg in ..`: the clause's names for its parameters.
-        while let Core::Let(bs, body) = &cur {
+        while let Core::Let(bs, _) = &cur {
             match &bs[..] {
                 [(x, Core::Var(y))] if vars.contains(y) => {
                     let (x, y) = (x.clone(), y.clone());

@@ -117,7 +117,7 @@ impl Machine {
         let words = std::env::var("HSC_HEAP_WORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(HEAP_WORDS);
         // At least room for the program's global closures and some slack, whatever was asked.
         let words = words.max(4 * prog.globals.len() + (1 << 14));
-        let mut heap = Heap::new(words);
+        let heap = Heap::new(words);
         let base = heap.addr(0);
         let limit = base + (words as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];

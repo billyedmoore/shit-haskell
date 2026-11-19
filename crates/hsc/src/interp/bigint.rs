@@ -118,16 +118,6 @@ fn shl_mag(a: &[u32], n: usize) -> Vec<u32> {
     out
 }
 
-fn shr1_mag(a: &mut Vec<u32>) {
-    let mut carry = 0u32;
-    for x in a.iter_mut().rev() {
-        let new_carry = *x & 1;
-        *x = (*x >> 1) | (carry << 31);
-        carry = new_carry;
-    }
-    trim(a);
-}
-
 /// Truncated division of magnitudes: Knuth's algorithm D (one quotient limb per step).
 fn divrem_mag(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
     if cmp_mag(a, b) == Ordering::Less {
@@ -564,6 +554,16 @@ mod tests {
         (quot, rem)
     }
 
+    fn shr1_mag(a: &mut Vec<u32>) {
+        let mut carry = 0u32;
+        for x in a.iter_mut().rev() {
+            let new_carry = *x & 1;
+            *x = (*x >> 1) | (carry << 31);
+            carry = new_carry;
+        }
+        trim(a);
+    }
+
     #[test]
     fn algorithm_d_matches_binary_division() {
         let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -576,7 +576,7 @@ mod tests {
         // Limbs drawn from edge values and random ones, so normalisation, the qhat correction
         // and the add-back step are all exercised.
         let edges = [0u32, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_fffe, 0xffff_ffff];
-        let mut limb = |r: u64| if r % 3 == 0 { edges[(r >> 8) as usize % edges.len()] } else { (r >> 16) as u32 };
+        let limb = |r: u64| if r % 3 == 0 { edges[(r >> 8) as usize % edges.len()] } else { (r >> 16) as u32 };
         for _ in 0..4000 {
             let la = 1 + (next() % 9) as usize;
             let lb = 1 + (next() % 6) as usize;

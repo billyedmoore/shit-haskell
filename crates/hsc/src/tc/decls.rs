@@ -518,7 +518,7 @@ impl Checker {
 
         // Field selectors: one per distinct field name.
         let mut seen: Vec<String> = Vec::new();
-        for (_, occs, field_tys, _) in &per_con {
+        for (_, occs, _, _) in &per_con {
             for (pos, f) in occs.iter().enumerate() {
                 if seen.contains(f) {
                     continue;
@@ -1247,40 +1247,43 @@ impl Checker {
                         // parameters of the dictionary field, passed on to the default.
                         let own: Vec<String> = mscheme.preds.iter().skip(1).map(|_| self.fresh_name("dm")).collect();
                         if let Some(ds) = info.default_schemes.get(mkey) {
-                            let mut args: Vec<Ty> = head.clone();
-                            while args.len() < ds.nvars as usize {
-                                args.push(self.metas.fresh(self.level));
+                            // The default's own context is solved at the method's type: its
+                            // variables rigid, its own dictionaries given (basement's `default
+                            // scale :: (Enum n, IsNatural n) => ..` for `scale :: IsNatural n =>
+                            // ..`: `Enum n` is a superclass of the given `IsNatural n`).
+                            let mut margs: Vec<Ty> = head.clone();
+                            for i in info.nparams..mscheme.nvars {
+                                let name = mscheme.names.get(i as usize).cloned().unwrap_or_else(|| "m".into());
+                                margs.push(self.metas.fresh_skolem(&name));
                             }
-                            let class_level = |t: &Ty| -> bool {
-                                fn ok(t: &Ty, n: u32) -> bool {
-                                    match t {
-                                        Ty::Gen(i) => *i < n,
-                                        Ty::App(f, x) => ok(f, n) && ok(x, n),
-                                        _ => true,
-                                    }
-                                }
-                                ok(t, info.nparams as u32)
-                            };
-                            let mut used = vec![false; own.len()];
+                            let mark = self.givens.len();
+                            for (q, d) in mscheme.preds.iter().skip(1).zip(&own) {
+                                let pred = super::types::subst_gen_pred(q, &margs);
+                                self.add_given(super::Given { pred, ev: Core::Var(d.clone()) });
+                            }
+                            let mut dargs: Vec<Ty> = head.clone();
+                            while dargs.len() < ds.nvars as usize {
+                                dargs.push(self.metas.fresh(self.level));
+                            }
+                            let mty = super::types::subst_gen(&mscheme.ty, &margs);
+                            let dty = super::types::subst_gen(&ds.ty, &dargs);
+                            if let Err(e) = self.unify_at(&dty, &mty) {
+                                self.givens.truncate(mark);
+                                return Err(e);
+                            }
+                            let mut wanted = Vec::new();
                             for p in ds.preds.iter().skip(1) {
-                                if !p.args.iter().all(|a| class_level(a)) {
-                                    let j = mscheme
-                                        .preds
-                                        .iter()
-                                        .skip(1)
-                                        .enumerate()
-                                        .position(|(j, q)| !used[j] && q.class == p.class);
-                                    if let Some(j) = j {
-                                        used[j] = true;
-                                        core = Core::App(Box::new(core), Box::new(Core::Var(own[j].clone())));
-                                        continue;
-                                    }
-                                }
-                                let pred = super::types::subst_gen_pred(p, &args);
+                                let pred = super::types::subst_gen_pred(p, &dargs);
                                 let ev = self.fresh_name("dd");
-                                self.wanted.push(super::Wanted { pred, ev: ev.clone(), loc: id.loc });
+                                wanted.push(super::Wanted { pred, ev: ev.clone(), loc: id.loc });
                                 core = Core::App(Box::new(core), Box::new(Core::Var(ev)));
                             }
+                            let solved = self.solve(wanted);
+                            self.givens.truncate(mark);
+                            let (binds, residual) = solved?;
+                            // What the method's context does not give is the instance's to give.
+                            self.wanted.extend(residual);
+                            core = super::expr::wrap_let(binds, core);
                         }
                         if own.is_empty() || !info.default_schemes.contains_key(mkey) {
                             // A default without its own signature takes the method's dictionaries itself.

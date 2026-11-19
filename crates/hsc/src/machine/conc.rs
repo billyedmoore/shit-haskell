@@ -20,6 +20,9 @@ use super::{Machine, ARG_SLOTS};
 use crate::sched::{Interrupt, Thrown, Tid, WaitKind, PREEMPT};
 use std::sync::atomic::Ordering;
 
+// The generated code takes the machine record by pointer and reads only its leading words (see
+// `Machine`); the heap inside it is never touched from assembly.
+#[allow(improper_ctypes)]
 extern "C" {
     fn hsc_enter(m: *mut Machine, closure: Word) -> i32;
     fn hsc_stop_ret();

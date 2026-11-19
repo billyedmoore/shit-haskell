@@ -1534,7 +1534,7 @@ impl Checker {
 
     // ----- desugaring to AST ------------------------------------------------
 
-    fn desugar_do(&mut self, stmts: &[Stmt], loc: Loc) -> TR<Expr> {
+    fn desugar_do(&mut self, stmts: &[Stmt], _loc: Loc) -> TR<Expr> {
         let Some((first, rest)) = stmts.split_first() else {
             return self.err("Empty 'do' block");
         };

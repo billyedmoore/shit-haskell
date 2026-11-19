@@ -37,11 +37,6 @@ fn int_arg(m: &mut Machine, k: usize) -> Option<i64> {
 /// The size from which GHC allocates byte arrays pinned (a large object: 3276 bytes on 64 bits).
 const LARGE_BYTES: i64 = 3277;
 
-/// The address of the bytes of a byte array object, plus an offset: where element reads go.
-fn data_ptr(m: &Machine, bytes: Word) -> Word {
-    bytes + 8
-}
-
 /// Runs a memory primitive, if `name` is one.
 pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
     let r = match name {

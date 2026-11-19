@@ -7,7 +7,7 @@ use super::{Checker, TR};
 use crate::syntax::ast::{Loc, Type};
 
 #[derive(Debug, PartialEq)]
-enum Match {
+pub(super) enum Match {
     Yes,
     No,
     /// Not decidable yet: an unsolved variable or a rigid variable is in the way.

@@ -3,7 +3,7 @@
 //! free variables, or globals. Arguments and constructor fields are atoms (variables or literals);
 //! anything else is allocated as a thunk.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::core::{Alt, Core, Lit, TopBind};
 
@@ -360,7 +360,6 @@ enum Ctx {
 }
 
 pub struct Lowering {
-    globals: HashSet<String>,
     index: HashMap<String, u32>,
     /// The stack of bodies being lowered: the innermost is last.
     bodies: Vec<Body>,
@@ -394,7 +393,6 @@ impl Lowering {
     pub fn program(binds: &[TopBind], numeric: &NumericParams) -> SProgram {
         let index: HashMap<String, u32> = binds.iter().enumerate().map(|(i, b)| (b.name.clone(), i as u32)).collect();
         let mut lw = Lowering {
-            globals: index.keys().cloned().collect(),
             index: index.clone(),
             bodies: Vec::new(),
             pending: Vec::new(),

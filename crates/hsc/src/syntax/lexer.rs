@@ -469,9 +469,19 @@ impl Lexer {
                 Tok::QVarSym(q, sym)
             });
         }
+        // UnicodeSyntax: `∀` is `forall`, `★` is `*` (a kind).
+        match sym.as_str() {
+            "∀" => return Ok(Tok::VarId("forall".into())),
+            "★" => return Ok(Tok::VarSym("*".into())),
+            _ => {}
+        }
         let rop = match sym.as_str() {
             ".." => Some(ROp::DotDot),
-            "::" => Some(ROp::DColon),
+            // UnicodeSyntax's forms of the reserved operators.
+            "::" | "∷" => Some(ROp::DColon),
+            "←" => Some(ROp::LArrow),
+            "→" => Some(ROp::RArrow),
+            "⇒" => Some(ROp::DArrow),
             "=" => Some(ROp::Eq),
             "\\" => Some(ROp::Backslash),
             "|" => Some(ROp::Bar),
@@ -507,13 +517,6 @@ impl Lexer {
             self.bump();
         }
         run
-    }
-
-    /// Skips the MagicHash suffix of a literal (`3#`, `3##`, `'c'#`, `"s"#`).
-    fn skip_hashes(&mut self) {
-        while self.peek(0) == Some('#') && !self.peek(1).is_some_and(is_symbol) {
-            self.bump();
-        }
     }
 
     fn lex_number(&mut self) -> Result<Tok, LexError> {
