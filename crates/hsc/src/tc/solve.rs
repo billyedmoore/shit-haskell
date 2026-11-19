@@ -1177,11 +1177,18 @@ impl Checker {
                     progress = true;
                     continue;
                 }
-                if !preds_on_m.iter().any(|p| is_numeric_class(&p.class)) {
+                // OverloadedStrings: a type that `IsString` constrains defaults to `String`, as GHC
+                // defaults it (`putQ "text"` in a splice).
+                let string_like = self.overloaded_strings && preds_on_m.iter().any(|p| p.class == "GHC.Internal.Data.String.IsString");
+                if !string_like && !preds_on_m.iter().any(|p| is_numeric_class(&p.class)) {
                     continue;
                 }
-                for cand in DEFAULT_CANDIDATES {
-                    let cand_ty = Ty::con(cand);
+                let cands: Vec<Ty> = if string_like {
+                    vec![Ty::app(Ty::con(super::types::LIST), Ty::con("GHC.Types.Char"))]
+                } else {
+                    DEFAULT_CANDIDATES.iter().map(|c| Ty::con(c)).collect()
+                };
+                for cand_ty in cands {
                     // Typeable holds at every candidate (its evidence is built, not declared).
                     let ok = preds_on_m.iter().all(|p| {
                         if p.class == TYPEABLE_CLASS {

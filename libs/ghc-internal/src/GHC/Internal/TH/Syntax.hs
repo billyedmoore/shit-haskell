@@ -72,7 +72,7 @@ import GHC.Internal.Control.Monad.Fix
 import GHC.Internal.Control.Exception
 import GHC.Internal.Num
 import GHC.Internal.IO.Unsafe
-import GHC.Internal.List (dropWhile, break, replicate, reverse, last, lookup, filter)
+import GHC.Internal.List (dropWhile, break, replicate, reverse, last, lookup, filter, zipWith)
 import GHC.Internal.MVar
 import GHC.Internal.IO.Exception
 import GHC.Internal.Unicode
@@ -187,7 +187,7 @@ instance Quasi IO where
   qReify                = hscReify
   qReifyFixity          = hscReifyFixity
   qReifyType _          = badIO "reifyFixity"
-  qReifyInstances _ _   = badIO "reifyInstances"
+  qReifyInstances       = hscReifyInstances
   qReifyRoles           = hscReifyRoles
   qReifyAnnotations _   = badIO "reifyAnnotations"
   qReifyModule _        = badIO "reifyModule"
@@ -308,6 +308,31 @@ hscReifyFixity (Name (OccName occ) flavour) = do
   pure (case [f | e@(_, _, f) <- table, matches e] of
           (f : _) -> Just f
           [] -> Nothing)
+
+-- | hsc: the instances of a class (as 'reify' has them) whose heads unify with the types.
+hscReifyInstances :: Name -> [Type] -> IO [InstanceDec]
+hscReifyInstances n tys = do
+  info <- hscReify n
+  case info of
+    ClassI _ insts -> pure [d | d@(InstanceD _ _ hd _) <- insts, matches (headArgs hd)]
+    _ -> pure []
+  where
+    matches args = length args == length tys && and (zipWith unifiesTH args tys)
+    headArgs (AppT f a) = headArgs f ++ [a]
+    headArgs _ = []
+
+-- | Whether two types may be the same (variables match anything; names by their base).
+unifiesTH :: Type -> Type -> Bool
+unifiesTH (VarT _) _ = True
+unifiesTH _ (VarT _) = True
+unifiesTH (SigT a _) b = unifiesTH a b
+unifiesTH a (SigT b _) = unifiesTH a b
+unifiesTH (ParensT a) b = unifiesTH a b
+unifiesTH a (ParensT b) = unifiesTH a b
+unifiesTH (AppT a b) (AppT c d) = unifiesTH a c && unifiesTH b d
+unifiesTH (ConT a) (ConT b) = nameBase a == nameBase b
+unifiesTH (PromotedT a) (PromotedT b) = nameBase a == nameBase b
+unifiesTH a b = a == b
 
 -- | hsc: a type's roles, from its reified declaration: representational for each parameter
 -- (roles are not inferred here; 'coerce' is not role-checked).
