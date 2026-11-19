@@ -92,6 +92,8 @@ pub struct Machine {
     /// The module that ran each ordinary primitive (0 not yet; see `prims::run_ordinary`).
     pub ordinary_module: Vec<u8>,
     pub(super) int_prims: Vec<Option<prims_num::IntOp>>,
+    /// How each C call primitive ran the first time (see `prims::run_ccall`).
+    pub(super) ccall_plans: Vec<prims::CPlan>,
 }
 
 /// The tables the generated program provides (see `native::codegen`).
@@ -118,7 +120,17 @@ impl Machine {
         let limit = base + (words as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
         let int_prims = prog.prim_names.iter().map(|name| prims_num::IntOp::classify(name)).collect();
-        let ordinary_prims: Vec<Option<&'static str>> = prog.prim_names.iter().map(|name| prims::ordinary_name(name)).collect();
+        // Every primitive but a C call takes the ordinary path, which remembers the module that
+        // ran it (the names live as long as the program).
+        let ordinary_prims: Vec<Option<&'static str>> = prog
+            .prim_names
+            .iter()
+            .map(|name| {
+                prims::ordinary_name(name)
+                    .or_else(|| crate::ccall::parse(name).is_none().then(|| &*Box::leak(name.clone().into_boxed_str())))
+            })
+            .collect();
+        let ccall_plans = vec![prims::CPlan::Unknown; prog.prim_names.len()];
         let ordinary_count = ordinary_prims.len();
         let mut m = Box::new(Machine {
             hp: base,
@@ -152,6 +164,7 @@ impl Machine {
             ordinary_module: vec![0; ordinary_count],
             ordinary_prims,
             int_prims,
+            ccall_plans,
             bodies: entry::DiagnosticBodies::default(),
         });
         m.stack = stack;
