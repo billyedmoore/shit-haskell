@@ -48,23 +48,34 @@ def done():
     return seen
 
 
+FAILED = re.compile(r"Failed to build ([A-Za-z0-9][A-Za-z0-9-]*-\d+(?:\.\d+)*)")
+
+
 def first_error(log):
     """The package that failed and the first error's message (a few lines), from a cabal log."""
     failed = None
-    m = re.search(r"Failed to build ([^\s]+?)(?:\.| \(|\s)", log)
+    m = FAILED.search(log)
     if m:
         failed = m.group(1)
     elif "Could not resolve dependencies" in log or "cannot satisfy" in log:
         return "(solver)", "could not resolve dependencies"
     lines = log.splitlines()
     for i, line in enumerate(lines):
-        if re.search(r":\d+:\d+(-\d+)?: error:|^\S+: error:|: error: \[", line):
+        if re.search(r"(:\d+:\d+|:\(\d+,\d+\)-\(\d+,\d+\)).*: error:|: error: \[|^\S+: error:", line):
             msg = [lines[i].split("error:", 1)[1].strip()] + [l.strip() for l in lines[i + 1:i + 4] if l.strip()]
             return failed, " ".join(m for m in msg if m)[:300]
     for line in lines:
-        if "rror" in line or "unknown primitive" in line or "panicked" in line:
+        if re.search(r"\berror\b|unknown primitive|panicked|Uncaught exception", line, re.IGNORECASE) and not re.match(
+            r"\s*(Error: \[Cabal-|Compiling|Building|Preprocessing|Configuring)", line
+        ):
             return failed, line.strip()[:300]
     return failed, (lines[-1].strip()[:300] if lines else "")
+
+
+def building(log):
+    """The package being built last in a log (for a build that ran out of time)."""
+    names = re.findall(r"(?:Building|Configuring|Preprocessing) library (?:'[^']*' )?for ([A-Za-z0-9-]+-\d+(?:\.\d+)*)", log)
+    return names[-1] if names else None
 
 
 def build(pkg, compiler, ghc_shim, timeout):
@@ -81,20 +92,24 @@ def build(pkg, compiler, ghc_shim, timeout):
     if compiler == "hsc":
         env["HSC_NATIVE"] = "1"
     start = time.time()
+    # Its own process group: on a timeout the compilers cabal started stop with it.
+    p = subprocess.Popen(cmd, cwd=d, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     try:
-        p = subprocess.run(cmd, cwd=d, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-        log, code = p.stdout.decode("utf-8", "replace"), p.returncode
-    except subprocess.TimeoutExpired as e:
-        log, code = (e.stdout or b"").decode("utf-8", "replace"), "timeout"
+        out, _ = p.communicate(timeout=timeout)
+        log, code = out.decode("utf-8", "replace"), p.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, 9)
+        out, _ = p.communicate()
+        log, code = out.decode("utf-8", "replace"), "timeout"
     secs = round(time.time() - start)
     with open(os.path.join(WORK, "logs", f"{pkg}-{compiler}.log"), "w", encoding="utf-8") as f:
         f.write(log)
     shutil.rmtree(d, ignore_errors=True)
     r = {"package": pkg, "compiler": compiler, "ok": code == 0, "seconds": secs}
     if code == "timeout":
-        r.update(failed=pkg, error="timeout")
+        r.update(failed=building(log) or pkg, error="timeout")
     elif code != 0:
-        if "Unknown target" in log or "does not have any libraries" in log or "no library" in log.lower():
+        if "Unknown target" in log or "does not have any libraries" in log:
             r.update(failed=None, error="no library")
         else:
             failed, err = first_error(log)

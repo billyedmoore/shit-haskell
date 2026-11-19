@@ -46,34 +46,55 @@ def latest_cabal_files(index, wanted):
 
 
 def dependencies(cabal_text):
-    """The package names the build-depends fields of a .cabal file's libraries name (test suites,
-    benchmarks and executables left out: their test frameworks would make every package use
-    every other)."""
-    deps = set()
-    lines = cabal_text.splitlines()
-    in_library = False
+    """The package names the build-depends fields of a .cabal file's libraries name, with those of
+    the `common` stanzas they import (test suites, benchmarks and executables left out: their test
+    frameworks would make every package use every other)."""
+    # Comments are whole lines in .cabal files.
+    lines = [l for l in cabal_text.splitlines() if not l.lstrip().startswith("--")]
+    sections = []  # (kind, name, deps, imports)
     i = 0
     while i < len(lines):
-        section = re.match(r"([A-Za-z-]+)(\s|$)", lines[i])
-        if section and not lines[i][0].isspace():
-            in_library = section.group(1).lower() == "library"
-        m = re.match(r"(\s*)build-depends\s*:(.*)", lines[i], re.IGNORECASE)
-        if not m or not in_library:
+        line = lines[i]
+        header = re.match(r"([A-Za-z-]+)\s*(\S*)", line)
+        if header and line and not line[0].isspace():
+            sections.append((header.group(1).lower(), header.group(2), set(), []))
             i += 1
             continue
-        indent = len(m.group(1))
-        field = [m.group(2)]
+        field = re.match(r"(\s*)(build-depends|import)\s*:(.*)", line, re.IGNORECASE)
+        if not field or not sections:
+            i += 1
+            continue
+        indent = len(field.group(1))
+        text = [field.group(3)]
         i += 1
         # Continuation lines are indented more than the field name.
         while i < len(lines) and (not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > indent):
-            field.append(lines[i])
+            text.append(lines[i])
             i += 1
-        text = re.sub(r"--.*", "", " ".join(field))
-        for item in text.split(","):
+        joined = " ".join(text)
+        kind = field.group(2).lower()
+        for item in joined.split(","):
             n = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9-]*)", item)
             if n:
-                deps.add(n.group(1))
-    return deps
+                if kind == "import":
+                    sections[-1][3].append(n.group(1))
+                else:
+                    sections[-1][2].add(n.group(1))
+    common = {name: (deps, imports) for k, name, deps, imports in sections if k == "common"}
+
+    def with_imports(deps, imports, seen):
+        out = set(deps)
+        for name in imports:
+            if name in common and name not in seen:
+                seen.add(name)
+                out |= with_imports(*common[name], seen)
+        return out
+
+    result = set()
+    for k, _, deps, imports in sections:
+        if k == "library":
+            result |= with_imports(deps, imports, set())
+    return result
 
 
 def main():
