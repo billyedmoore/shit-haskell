@@ -48,6 +48,9 @@ pub struct Found {
     pub path: PathBuf,
     pub flags: Vec<String>,
     pub home: bool,
+    /// The package import directory it was found in (an interface's source may be elsewhere: a
+    /// copy of the text the interface holds).
+    pub pkg_dir: Option<PathBuf>,
 }
 
 /// The import directories of the packages in the global database (every one is exposed).
@@ -383,14 +386,14 @@ impl Driver {
         for ext in ["hs", "lhs"] {
             let p = d.join(format!("{stem}.{ext}"));
             if p.is_file() {
-                return Some(Found { path: p, flags: self.flags.clone(), home: true });
+                return Some(Found { path: p, flags: self.flags.clone(), home: true, pkg_dir: None });
             }
         }
         // A `.hsc` module is translated by hsc2hs first.
         let p = d.join(format!("{stem}.hsc"));
         if p.is_file() {
             if let Ok(hs) = crate::hsc2hs::translate(&p, &self.flags) {
-                return Some(Found { path: hs, flags: self.flags.clone(), home: true });
+                return Some(Found { path: hs, flags: self.flags.clone(), home: true, pkg_dir: None });
             }
         }
         None
@@ -433,18 +436,18 @@ impl Driver {
     fn find_in_package_dir(d: &Path, stem: &str) -> Option<Found> {
         if let Some((path, flags)) = read_interface(&d.join(format!("{stem}.hi"))) {
             if path.is_file() {
-                return Some(Found { path, flags, home: false });
+                return Some(Found { path, flags, home: false, pkg_dir: Some(d.to_path_buf()) });
             }
         }
         let p = d.join(format!("{stem}.hs"));
         if p.is_file() {
-            return Some(Found { path: p, flags: package_flags(d), home: false });
+            return Some(Found { path: p, flags: package_flags(d), home: false, pkg_dir: Some(d.to_path_buf()) });
         }
         let p = d.join(format!("{stem}.hsc"));
         if p.is_file() {
             let flags = package_flags(d);
             match crate::hsc2hs::translate(&p, &flags) {
-                Ok(hs) => return Some(Found { path: hs, flags, home: false }),
+                Ok(hs) => return Some(Found { path: hs, flags, home: false, pkg_dir: Some(d.to_path_buf()) }),
                 Err(e) => eprintln!("{e}"),
             }
         }
@@ -521,9 +524,13 @@ impl Driver {
     /// Points a package module's imports at its own package's modules: a module of the same name
     /// in the program (time-compat's `Data.Time.Calendar.Private` beside time's) is not the one
     /// it means. Such an import is loaded under an internal name, as a package-qualified one is.
-    fn resolve_own_package_imports(&mut self, m: &mut Module, path: &Path) {
-        let Some(dir) = self.pkg_dirs.iter().filter(|d| path.starts_with(d)).max_by_key(|d| d.as_os_str().len()).cloned() else {
-            return;
+    fn resolve_own_package_imports(&mut self, m: &mut Module, path: &Path, pkg_dir: Option<&Path>) {
+        let dir = match pkg_dir {
+            Some(d) => d.to_path_buf(),
+            None => match self.pkg_dirs.iter().filter(|d| path.starts_with(d)).max_by_key(|d| d.as_os_str().len()) {
+                Some(d) => d.clone(),
+                None => return,
+            },
         };
         for imp in &mut m.imports {
             if imp.package.is_some() || imp.module == m.name || self.renamed.contains_key(&imp.module) {
@@ -702,7 +709,7 @@ impl Driver {
             return Err(format!("Module imports form a cycle: {}", self.loading.join(" -> ")));
         }
         let found = self.find_module(module).ok_or_else(|| format!("Could not find module ‘{module}’"))?;
-        let (path, flags, home) = (found.path, found.flags, found.home);
+        let (path, flags, home, pkg_dir) = (found.path, found.flags, found.home, found.pkg_dir);
         // A package module brings the package's C sources into the program.
         let c_flags: Vec<String> = flags.iter().filter(|f| f.starts_with("-I") || f.starts_with("-D") || f.starts_with("-cc-option=")).cloned().collect();
         for f in &c_flags {
@@ -766,7 +773,7 @@ impl Driver {
         if home {
             self.resolve_home_wired_imports(&mut parsed);
         } else {
-            self.resolve_own_package_imports(&mut parsed, &path);
+            self.resolve_own_package_imports(&mut parsed, &path, pkg_dir.as_deref());
         }
         // The GHC packages compile with NoImplicitPrelude as a package default (their cabal files).
         let path_text = path.to_string_lossy();
@@ -1458,6 +1465,29 @@ mod cache_tests {
         assert!(d.checker.env.tycons["A.T"].cons.is_empty());
         d.load("A").unwrap();
         assert_eq!(d.checker.env.tycons["A.T"].cons, ["A.T"]);
+    }
+
+    #[test]
+    fn packages_hidden_modules_of_one_name_stay_apart() {
+        // Two installed packages each with a hidden `Compat` (cryptohash-sha256's and resolv's),
+        // whose sources exist only as the interfaces' text: each package's module sees its own.
+        let src = Sources::new();
+        let (p1, p2) = (Sources::new(), Sources::new());
+        let iface = |pkg: &Sources, module: &str, text: &str| {
+            let path = src.0.join(format!("{module}.hs"));
+            std::fs::write(&path, text).unwrap();
+            write_interface(&pkg.0.join(format!("{module}.hi")), module, &path, &path, &["-XNoImplicitPrelude".into()]).unwrap();
+            std::fs::remove_file(&path).unwrap();
+        };
+        iface(&p1, "Compat", "module Compat (one) where\ndata One = One\none :: One\none = One\n");
+        iface(&p1, "Hash", "module Hash (h) where\nimport Compat (one)\nh = one\n");
+        iface(&p2, "Compat", "module Compat (two) where\ndata Two = Two\ntwo :: Two\ntwo = Two\n");
+        iface(&p2, "Resolv", "module Resolv (r) where\nimport Compat (two)\nr = two\n");
+        for order in [[&p1, &p2], [&p2, &p1]] {
+            let mut d = Driver::new(Vec::new(), order.iter().map(|p| p.0.clone()).collect(), Vec::new());
+            d.load("Hash").unwrap();
+            d.load("Resolv").unwrap();
+        }
     }
 
     #[test]

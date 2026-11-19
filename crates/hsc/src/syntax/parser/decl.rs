@@ -122,6 +122,14 @@ impl Parser {
             return Ok(Decl::Sig { names, ty, loc });
         }
         let lhs = self.infix_expr()?;
+        // `(a, b) :: t = e`: a pattern binding with a signature pattern.
+        if self.at_res(ROp::DColon) {
+            self.bump();
+            let ty = self.sigtype()?;
+            let pat = self.expr_to_pat(lhs)?;
+            let rhs = self.rhs(ROp::Eq)?;
+            return Ok(Decl::PatBind { pat: Pat::Sig(Box::new(pat), ty, loc), rhs, loc });
+        }
         let rhs = self.rhs(ROp::Eq)?;
         self.make_binding(lhs, rhs, loc)
     }
@@ -381,11 +389,28 @@ impl Parser {
     }
 
     /// The constructors and deriving clauses of a data declaration whose head is parsed.
-    fn data_body(&mut self, newtype: bool, context: Vec<Type>, name: String, tyvars: Vec<TyVarBind>, loc: Loc) -> PResult<Decl> {
+    fn data_body(&mut self, newtype: bool, context: Vec<Type>, name: String, mut tyvars: Vec<TyVarBind>, loc: Loc) -> PResult<Decl> {
         if self.at_res(ROp::DColon) {
-            // Kind signature: accepted and ignored for now.
+            // Kind signature: each argument of its arrows is one more parameter (`data F :: Type
+            // -> Type where ...` has one), named so that no source variable clashes. A data
+            // instance's parameters are its head's variables, so it keeps those.
             self.bump();
-            self.sigtype()?;
+            let kind = self.sigtype()?;
+            if !name.starts_with("R:") {
+                let mut k = &kind;
+                while let Type::Forall(_, body) = k {
+                    k = body;
+                }
+                while let Type::Fun(arg, res) = k {
+                    // A kind variable (PolyKinds) is left to inference.
+                    let kind = match &**arg {
+                        Type::Var(..) => None,
+                        a => Some(a.clone()),
+                    };
+                    tyvars.push(TyVarBind { name: format!("k%{}", tyvars.len()), kind });
+                    k = res;
+                }
+            }
         }
         let mut cons = Vec::new();
         if self.at_res(ROp::Eq) {

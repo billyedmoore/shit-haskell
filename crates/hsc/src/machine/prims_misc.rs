@@ -76,29 +76,86 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             let n = int_value(m, 1);
             state_pair(m, n)
         }
-        // A C finalizer is attached (weak pointers are never collected here, so it never runs):
-        // the answer is 1, attached.
-        "addCFinalizerToWeak#" => {
-            let n = int_value(m, 1);
-            state_pair(m, n)
-        }
+        // Weak pointers are never collected here, so a finalizer runs only when the program
+        // finalizes the pointer (`finalizeWeak#`, as `finalizeForeignPtr` does). A weak object is
+        // REF-shaped: its value and its Haskell finalizer (0 for none), the index of its state
+        // (`Machine::weaks`) in the header.
         "mkWeakNoFinalizer#" | "mkWeak#" => {
-            // The weak pointer is the key's value, kept alive: a REF-shaped object holding the value.
-            let v = m.args[1];
-            let w = m.alloc(2);
-            m.heap_set(w, heap::header(kind::REF, 1, 0));
+            let id = m.weaks.len() as u32;
+            m.weaks.push(Default::default());
+            let w = m.alloc(3);
+            let (v, fin) = (m.args[1], if name == "mkWeak#" { m.args[2] } else { 0 });
+            m.heap_set(w, heap::header(kind::REF, 2, id));
             m.heap_set(w + 8, v);
+            m.heap_set(w + 16, fin);
             state_pair(m, w)
         }
         "deRefWeak#" => {
             let Some(_) = force_arg(m, 0) else { return Some(0) };
             let w = m.args[0];
-            let v = m.heap_get(w, 1);
-            let just = con_value(m, "GHC.Internal.Maybe.Just", 1, &[v]);
+            if weak_state(m, w).is_some_and(|s| s.dead) {
+                let u = unit(m);
+                let t = int_value(m, 0);
+                return Some(con_value(m, "Builtin.(,,)", 3, &[0, t, u]));
+            }
+            // The value itself: `deRefWeak` makes the `Just`.
             let t = int_value(m, 1);
-            con_value(m, "Builtin.(,,)", 3, &[0, t, just])
+            let v = m.heap_get(m.args[0], 1);
+            con_value(m, "Builtin.(,,)", 3, &[0, t, v])
+        }
+        "addCFinalizerToWeak#" => {
+            let (fb, fo) = super::prims_ffi::addr_arg(m, 0)?;
+            let (pb, po) = super::prims_ffi::addr_arg(m, 1)?;
+            let has_env = super::prims_ffi::int_arg(m, 2)? != 0;
+            let (eb, eo) = super::prims_ffi::addr_arg(m, 3)?;
+            let _ = force_arg(m, 4)?;
+            let w = m.args[4];
+            let entry = (
+                super::prims_ffi::raw(fb, fo) as u64,
+                super::prims_ffi::raw(pb, po) as u64,
+                has_env,
+                super::prims_ffi::raw(eb, eo) as u64,
+            );
+            let added = match weak_index(m, w) {
+                Some(i) if !m.weaks[i].dead => {
+                    m.weaks[i].c_finalizers.push(entry);
+                    1
+                }
+                _ => 0,
+            };
+            let n = int_value(m, added);
+            state_pair(m, n)
+        }
+        "finalizeWeak#" => {
+            let _ = force_arg(m, 0)?;
+            let w = m.args[0];
+            let alive = match weak_index(m, w) {
+                Some(i) => m.weaks[i].finalize(),
+                None => false,
+            };
+            let fin = m.heap_get(w, 2);
+            let u = unit(m);
+            if !alive || fin == 0 {
+                let t = int_value(m, 0);
+                con_value(m, "Builtin.(,,)", 3, &[0, t, u])
+            } else {
+                let fin = m.heap_get(m.args[0], 2);
+                let t = int_value(m, 1);
+                con_value(m, "Builtin.(,,)", 3, &[0, t, fin])
+            }
         }
         _ => return None,
     };
     Some(r)
+}
+
+/// The index of a weak object's state (`Machine::weaks`), if it is one.
+fn weak_index(m: &Machine, w: Word) -> Option<usize> {
+    let h = m.heap_get(w, 0);
+    let i = heap::aux_of(h) as usize;
+    (heap::kind_of(h) == kind::REF && heap::size_of(h) == 2 && i < m.weaks.len()).then_some(i)
+}
+
+fn weak_state(m: &Machine, w: Word) -> Option<&crate::ccall::WeakState> {
+    weak_index(m, w).map(|i| &m.weaks[i])
 }

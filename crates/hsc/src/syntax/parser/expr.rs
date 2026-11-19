@@ -227,6 +227,28 @@ impl Parser {
                 self.bump();
                 Ok(Expr::IPVar(name, loc))
             }
+            Tok::VarId(s) if s == "static" && self.real() && self.exts.is_on("StaticPointers") => {
+                // `static e`: a pointer to the closed `e`, keyed by the module and the form's
+                // number in it (see GHC.Internal.StaticPtr.mkStaticPtr#; `%ThisModule` is the
+                // module's name, filled in by the renamer).
+                self.bump();
+                // GHC's source location of the form is its body's.
+                let at = self.loc();
+                let body = self.aexp_postfix()?;
+                let n = self.static_count;
+                self.static_count += 1;
+                let var = |q: &str, name: &str| Expr::Var(QName { qual: Some(q.into()), name: name.into() }, loc);
+                let int = |i: usize| Expr::Lit(Lit::Int(i.to_string()), loc);
+                let args = [
+                    Expr::Lit(Lit::Str("main".into()), loc),
+                    var("%ThisModule", "name"),
+                    int(n),
+                    int(at.line as usize),
+                    int(at.col as usize),
+                    body,
+                ];
+                Ok(args.into_iter().fold(var("%G:GHC.Internal.StaticPtr", "mkStaticPtr#"), |f, a| Expr::App(Box::new(f), Box::new(a))))
+            }
             Tok::VarId(s) if s == "mdo" && self.real() && self.exts.is_on("RecursiveDo") => {
                 self.bump();
                 let mut stmts = self.block(|p| p.stmt())?;
@@ -564,14 +586,15 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Wild(loc))
             }
+            // `~p` and `!p` take an atomic pattern, a record pattern `K{..}` included.
             Tok::Res(ROp::Tilde) => {
                 self.bump();
-                let inner = self.aexp()?;
+                let inner = self.aexp_postfix()?;
                 Ok(Expr::LazyPat(Box::new(inner), loc))
             }
             Tok::VarSym(s) if s == "!" => {
                 self.bump();
-                let inner = self.aexp()?;
+                let inner = self.aexp_postfix()?;
                 Ok(Expr::BangPat(Box::new(inner), loc))
             }
             Tok::Special('(') => self.paren_expr(loc),

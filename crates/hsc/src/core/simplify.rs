@@ -614,8 +614,13 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
                 continue;
             }
         }
+        // HSC_SLOW_SIMPLIFY=<ms>: names each binding whose simplification takes longer, with its
+        // size before and after (to find the binding a slow build spends its time on).
+        let slow = std::env::var("HSC_SLOW_SIMPLIFY").ok().and_then(|v| v.parse::<u128>().ok());
+        let started = std::time::Instant::now();
+        let size_before = if slow.is_some() { size(&bind.body, usize::MAX) } else { 0 };
         // HSC_TRACE_SIMPLIFY=<global>: that binding before simplification and after each round.
-        constant_args(&mut bind.body, &globals);
+        constant_args_in(&mut bind.body, &globals);
         let trace = std::env::var("HSC_TRACE_SIMPLIFY").ok().filter(|t| *t == bind.name);
         if trace.is_some() {
             eprintln!("== start\n{}", super::pretty::show(&bind.body));
@@ -671,6 +676,12 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
             }
             if !s.changed {
                 break;
+            }
+        }
+        if let Some(ms) = slow {
+            let took = started.elapsed().as_millis();
+            if took >= ms {
+                eprintln!("simplify: {} took {took} ms, size {size_before} -> {}", bind.name, size(&bind.body, usize::MAX));
             }
         }
     }
@@ -1114,7 +1125,9 @@ impl Simp<'_> {
                 continue;
             }
             let vars: HashSet<&str> = rule.vars.iter().map(String::as_str).collect();
-            let mut sub: HashMap<String, Core> = HashMap::new();
+            // The matches are borrowed: a rule that fails after matching a large argument (each
+            // `>>=` of a derived Read's chain of fields) copied it, quadratic in the chain.
+            let mut sub: HashMap<String, &Core> = HashMap::new();
             let mut bound = Vec::new();
             if !rule.args.iter().zip(&args).all(|(p, e)| match_core(p, e, &vars, &mut sub, &mut bound)) {
                 continue;
@@ -1130,7 +1143,7 @@ impl Simp<'_> {
             freshen(&mut rhs, &tag, &mut HashMap::new());
             let mut lets = Vec::new();
             for v in &rule.vars {
-                let e = sub.remove(v).expect("matched");
+                let e = sub.remove(v).expect("matched").clone();
                 // An atom, or an expression the right side uses once (its lambdas are those of
                 // `build`'s argument, called once): in place, so later rules see it.
                 if is_atom(&e) || (occurrences_of(&rhs, v) == 1 && one_shot_use(&rhs, v, false)) {
@@ -1435,36 +1448,131 @@ fn bang_lets(c: &mut Core) -> bool {
 /// dictionaries of a local polymorphic function used at one type): `let f = \d x -> e in .. f
 /// D a ..` becomes `let f = \x -> e[d := D] in .. f a ..`. Recursive calls may pass the
 /// parameter itself. Every use of `f` must be a call with the parameter's argument.
-fn constant_args(c: &mut Core, globals: &HashSet<String>) {
+/// The calls of a binding's local functions, found by one walk (its binders are unique), and the
+/// parameters already replaced by globals: a use's argument named by one of those stands for the
+/// global. Walking each `let`'s body for its own calls took time quadratic in the nesting
+/// (cabal-install's Main, thousands of nested local functions).
+struct Uses {
+    calls: HashMap<String, Vec<Option<Vec<Option<String>>>>>,
+    replaced: HashMap<String, String>,
+}
+
+fn constant_args_in(c: &mut Core, globals: &HashSet<String>) {
+    let mut candidates = HashSet::new();
+    let_functions(c, &mut candidates);
+    if candidates.is_empty() {
+        return;
+    }
+    let mut calls = HashMap::new();
+    uses_of(c, &candidates, &mut calls);
+    let mut uses = Uses { calls, replaced: HashMap::new() };
+    constant_args(c, globals, &mut uses);
+}
+
+/// The binders of single-binding `let`s whose right side is a function.
+fn let_functions(c: &Core, out: &mut HashSet<String>) {
     match c {
         Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
         Core::App(f, a) => {
-            constant_args(f, globals);
-            constant_args(a, globals);
+            let_functions(f, out);
+            let_functions(a, out);
         }
-        Core::Lam(_, b) => constant_args(b, globals),
+        Core::Lam(_, b) => let_functions(b, out),
         Core::Let(binds, body) => {
-            for (_, r) in binds.iter_mut() {
-                constant_args(r, globals);
+            if let [(f, Core::Lam(..))] = binds.as_slice() {
+                out.insert(f.clone());
             }
-            constant_args(body, globals);
-            if binds.len() == 1 {
-                specialise_let(binds, body, globals);
-            }
+            binds.iter().for_each(|(_, r)| let_functions(r, out));
+            let_functions(body, out);
         }
         Core::Case(s, _, alts) => {
-            constant_args(s, globals);
+            let_functions(s, out);
             for a in alts {
                 match a {
-                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => constant_args(b, globals),
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => let_functions(b, out),
                 }
             }
         }
-        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| constant_args(a, globals)),
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| let_functions(a, out)),
     }
 }
 
-fn specialise_let(binds: &mut [(String, Core)], body: &mut Core, globals: &HashSet<String>) {
+/// Every use of the candidates in `e`: a call (its arguments' variable names, None for others)
+/// where the candidate heads an application, else None.
+fn uses_of(e: &Core, candidates: &HashSet<String>, out: &mut HashMap<String, Vec<Option<Vec<Option<String>>>>>) {
+    match e {
+        Core::Var(v) => {
+            if candidates.contains(v) {
+                out.entry(v.clone()).or_default().push(None);
+            }
+        }
+        Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(..) => {
+            let mut args = Vec::new();
+            let mut head = e;
+            while let Core::App(g, a) = head {
+                args.push(&**a);
+                head = g;
+            }
+            args.reverse();
+            match head {
+                Core::Var(v) if candidates.contains(v) => {
+                    let call = args.iter().map(|a| match a { Core::Var(x) => Some(x.clone()), _ => None }).collect();
+                    out.entry(v.clone()).or_default().push(Some(call));
+                }
+                other => uses_of(other, candidates, out),
+            }
+            for a in args {
+                uses_of(a, candidates, out);
+            }
+        }
+        Core::Lam(_, b) => uses_of(b, candidates, out),
+        Core::Let(binds, body) => {
+            binds.iter().for_each(|(_, r)| uses_of(r, candidates, out));
+            uses_of(body, candidates, out);
+        }
+        Core::Case(s, _, alts) => {
+            uses_of(s, candidates, out);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => uses_of(b, candidates, out),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| uses_of(a, candidates, out)),
+    }
+}
+
+fn constant_args(c: &mut Core, globals: &HashSet<String>, uses: &mut Uses) {
+    match c {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            constant_args(f, globals, uses);
+            constant_args(a, globals, uses);
+        }
+        Core::Lam(_, b) => constant_args(b, globals, uses),
+        Core::Let(binds, body) => {
+            for (_, r) in binds.iter_mut() {
+                constant_args(r, globals, uses);
+            }
+            constant_args(body, globals, uses);
+            if binds.len() == 1 {
+                specialise_let(binds, body, globals, uses);
+            }
+        }
+        Core::Case(s, _, alts) => {
+            constant_args(s, globals, uses);
+            for a in alts {
+                match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => constant_args(b, globals, uses),
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| constant_args(a, globals, uses)),
+    }
+}
+
+fn specialise_let(binds: &mut [(String, Core)], body: &mut Core, globals: &HashSet<String>, uses: &mut Uses) {
     let (f, rhs) = &binds[0];
     let params: Vec<String> = {
         let mut ps = Vec::new();
@@ -1480,9 +1588,19 @@ fn specialise_let(binds: &mut [(String, Core)], body: &mut Core, globals: &HashS
     }
     // Every use: the variable names of its arguments (None for a non-variable), or None when
     // the use is not the head of a call.
-    let mut calls: Vec<Option<Vec<Option<String>>>> = Vec::new();
-    calls_of(rhs, f, &mut calls);
-    calls_of(body, f, &mut calls);
+    // A parameter replaced by a global since the walk is that global now.
+    let now = |v: &String| -> String {
+        let mut v = v;
+        while let Some(g) = uses.replaced.get(v) {
+            v = g;
+        }
+        v.clone()
+    };
+    let calls: Vec<Option<Vec<Option<String>>>> = uses
+        .calls
+        .get(f)
+        .map(|cs| cs.iter().map(|c| c.as_ref().map(|args| args.iter().map(|a| a.as_ref().map(&now)).collect())).collect())
+        .unwrap_or_default();
     if calls.is_empty() || calls.iter().any(|c| c.is_none()) {
         return;
     }
@@ -1523,6 +1641,7 @@ fn specialise_let(binds: &mut [(String, Core)], body: &mut Core, globals: &HashS
     for (x, k) in lams.iter().zip(&constant) {
         if let Some(g) = k {
             subst(&mut inner, x, &Core::Var(g.clone()));
+            uses.replaced.insert(x.clone(), g.clone());
         }
     }
     for (x, k) in lams.into_iter().zip(&constant).rev() {
@@ -1533,50 +1652,6 @@ fn specialise_let(binds: &mut [(String, Core)], body: &mut Core, globals: &HashS
     *rhs = inner;
     drop_args(rhs, &f, &constant);
     drop_args(body, &f, &constant);
-}
-
-/// The uses of `f` in `e` (see `specialise_let`).
-fn calls_of(e: &Core, f: &str, out: &mut Vec<Option<Vec<Option<String>>>>) {
-    match e {
-        Core::Var(v) => {
-            if v == f {
-                out.push(None);
-            }
-        }
-        Core::Lit(_) | Core::Fail(_) => {}
-        Core::App(..) => {
-            let mut args = Vec::new();
-            let mut head = e;
-            while let Core::App(g, a) = head {
-                args.push(&**a);
-                head = g;
-            }
-            args.reverse();
-            match head {
-                Core::Var(v) if v == f => {
-                    out.push(Some(args.iter().map(|a| match a { Core::Var(x) => Some(x.clone()), _ => None }).collect()));
-                }
-                other => calls_of(other, f, out),
-            }
-            for a in args {
-                calls_of(a, f, out);
-            }
-        }
-        Core::Lam(_, b) => calls_of(b, f, out),
-        Core::Let(binds, body) => {
-            binds.iter().for_each(|(_, r)| calls_of(r, f, out));
-            calls_of(body, f, out);
-        }
-        Core::Case(s, _, alts) => {
-            calls_of(s, f, out);
-            for a in alts {
-                match a {
-                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => calls_of(b, f, out),
-                }
-            }
-        }
-        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| calls_of(a, f, out)),
-    }
 }
 
 /// Removes, from every call of `f`, the arguments at the positions `constant` marks. A spine
@@ -2072,11 +2147,11 @@ fn builtin_rules() -> Vec<RuleDef> {
 
 /// Matches a rule's argument pattern against an expression: the rule's variables match
 /// anything (the same expression at each occurrence), lambdas up to the names they bind.
-fn match_core(
+fn match_core<'e>(
     p: &Core,
-    e: &Core,
+    e: &'e Core,
     vars: &HashSet<&str>,
-    sub: &mut HashMap<String, Core>,
+    sub: &mut HashMap<String, &'e Core>,
     bound: &mut Vec<(String, String)>,
 ) -> bool {
     match (p, e) {
@@ -2086,9 +2161,9 @@ fn match_core(
                 return false;
             }
             match sub.get(v.as_str()) {
-                Some(prev) => prev == e,
+                Some(prev) => *prev == e,
                 None => {
-                    sub.insert(v.clone(), e.clone());
+                    sub.insert(v.clone(), e);
                     true
                 }
             }

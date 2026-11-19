@@ -100,6 +100,8 @@ pub struct Runtime {
     pub prog_name: String,
     /// The stable pointers: a StablePtr# is the index of its cell here (0 is no pointer).
     pub stable: RefCell<Vec<Option<Cell>>>,
+    /// The weak pointers' states, by the index a weak value carries (see `prims_ghc`).
+    pub weaks: RefCell<Vec<crate::ccall::WeakState>>,
     /// The constructor of `Ratio` in this program: the mini Prelude's or the real base's.
     pub ratio_con: &'static str,
     /// The RTS's named pointer slots (`getOrSet…Store`), by name.
@@ -211,6 +213,7 @@ impl Runtime {
             index: prog.index,
             prog_name,
             stable: RefCell::new(vec![None]),
+            weaks: RefCell::new(Vec::new()),
             ffi_slots: RefCell::new(std::collections::HashMap::new()),
             ratio_con: if prog_has_real_base { "GHC.Internal.Real.:%" } else { "Base.:%" },
         }

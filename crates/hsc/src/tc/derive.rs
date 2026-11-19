@@ -520,8 +520,12 @@ fn derive_ord(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
     let module = checker.module.clone();
     let x = checker.fresh_name("x");
     let y = checker.fresh_name("y");
+    // The tag of `y`, found once before the case on `x`: a case on it in every alternative made
+    // the instance quadratic in the number of constructors (SPDX's LicenseId has about 600).
+    // `compare` evaluates both arguments in every alternative, so only the order changes.
+    let tag_y = checker.fresh_name("tag");
     let mut alts: Vec<Alt> = Vec::new();
-    for c in &dd.cons {
+    for (index, c) in dd.cons.iter().enumerate() {
         let n = arity(c);
         let a = fresh_vars(checker, "a", n);
         let b = fresh_vars(checker, "b", n);
@@ -598,8 +602,13 @@ fn derive_ord(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
                         body: Body::Plain(app(
                             base_var("compareInt#", loc),
                             vec![
-                                tag_of_prim(dd, &module, local(&x, loc), loc),
-                                tag_of_prim(dd, &module, local(&y, loc), loc),
+                                Expr::Lit(Lit::Prim(crate::syntax::token::PrimLit::Int(index.to_string())), loc),
+                                // One constructor: `y`'s tag is 0 too (no binding of it).
+                                if dd.cons.len() > 1 {
+                                    local(&tag_y, loc)
+                                } else {
+                                    Expr::Lit(Lit::Prim(crate::syntax::token::PrimLit::Int("0".into())), loc)
+                                },
                             ],
                         )),
                         wheres: Vec::new(),
@@ -619,6 +628,15 @@ fn derive_ord(checker: &mut Checker, dd: &DataDecl) -> Vec<Decl> {
         base_con("EQ", loc)
     } else {
         Expr::Case(Box::new(local(&x, loc)), alts, loc)
+    };
+    let body = if dd.cons.len() > 1 {
+        Expr::Case(
+            Box::new(tag_of_prim(dd, &module, local(&y, loc), loc)),
+            vec![Alt { pat: Pat::Bang(Box::new(Pat::Var(tag_y, loc)), loc), rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() }, loc }],
+            loc,
+        )
+    } else {
+        body
     };
     vec![fun("compare", vec![clause(vec![Pat::Var(x, loc), Pat::Var(y, loc)], body, loc)], loc)]
 }

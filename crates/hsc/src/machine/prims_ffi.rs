@@ -42,7 +42,7 @@ fn errno() -> i64 {
 }
 
 /// An integer argument: a plain `Int#`, or a box around one (`I32#` and the like).
-fn int_arg(m: &mut Machine, k: usize) -> Option<i64> {
+pub(super) fn int_arg(m: &mut Machine, k: usize) -> Option<i64> {
     let v = force_arg(m, k)?;
     let v = unbox(m, v)?;
     Some(m.heap_get(v, 1) as i64)
@@ -61,7 +61,7 @@ fn unbox(m: &mut Machine, v: Word) -> Option<Word> {
 }
 
 /// The address behind a pointer argument: its byte array and offset (`Ptr` wraps an `Addr#`).
-fn addr_arg(m: &mut Machine, k: usize) -> Option<(Word, i64)> {
+pub(super) fn addr_arg(m: &mut Machine, k: usize) -> Option<(Word, i64)> {
     let v = force_arg(m, k)?;
     let v = unbox(m, v)?;
     // A byte array passed itself (an unsafe call's `ByteArray#` or `MutableByteArray#`
@@ -79,7 +79,7 @@ fn addr_arg(m: &mut Machine, k: usize) -> Option<(Word, i64)> {
 }
 
 /// The raw address of a byte position (bytes object data plus offset).
-fn raw(bytes: Word, off: i64) -> *mut u8 {
+pub(super) fn raw(bytes: Word, off: i64) -> *mut u8 {
     if bytes == 0 {
         // An address without an array is a raw machine address (null for the null address).
         return off as *mut u8;
