@@ -55,9 +55,12 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
             })?;
         }
     }
-    // Names end in `#` only with MagicHash.
-    let lexed = if !exts.is_on("MagicHash") && src.contains('#') {
-        lexer::lex_with(src, false).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?
+    // Names end in `#` only with MagicHash; Unicode symbols are reserved ones only with
+    // UnicodeSyntax (the first lexing assumed MagicHash on and UnicodeSyntax off).
+    let magic = exts.is_on("MagicHash");
+    let unicode = exts.is_on("UnicodeSyntax");
+    let lexed = if (!magic && src.contains('#')) || (unicode && !src.is_ascii()) {
+        lexer::lex_with(src, magic, unicode).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?
     } else {
         lexed
     };
@@ -66,7 +69,7 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     // the source lexed again.
     let lexed = if exts.is_on("QuasiQuotes") {
         match rewrite_quasiquotes(src, th_quotes) {
-            Some(rewritten) => lexer::lex_with(&rewritten, exts.is_on("MagicHash")).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
+            Some(rewritten) => lexer::lex_with(&rewritten, magic, unicode).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
             None => lexed,
         }
     } else {
@@ -88,7 +91,7 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     })?;
     // Rewrite rules: each pragma's body is lexed on its own, at the pragma's lines.
     for p in rule_pragmas {
-        let Ok(lexed) = lexer::lex_with(&p.body, exts.is_on("MagicHash")) else { continue };
+        let Ok(lexed) = lexer::lex_with(&p.body, magic, unicode) else { continue };
         let tokens: Vec<token::Token> = lexed
             .tokens
             .into_iter()
@@ -101,7 +104,7 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
         module.rules.extend(parser::parse_rules(tokens, &exts));
     }
     for p in inline_pragmas {
-        let Ok(lexed) = lexer::lex_with(&p.body, exts.is_on("MagicHash")) else { continue };
+        let Ok(lexed) = lexer::lex_with(&p.body, magic, unicode) else { continue };
         let tokens: Vec<token::Token> = lexed.tokens.into_iter().map(|mut t| {
             t.line += p.line - 1;
             t.end_line += p.line - 1;

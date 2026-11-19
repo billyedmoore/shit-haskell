@@ -1241,7 +1241,9 @@ impl Checker {
         }
         let pairs = std::mem::take(&mut self.coercions);
         let kept: Vec<(Ty, Ty)> = pairs.into_iter().filter(|(a, b)| self.has_metas(a) || self.has_metas(b)).collect();
-        let found = kept.iter().find_map(|(a, b)| walk(self, a, b, m, 0));
+        // Only pairs of one type constructor's applications (a bare variable against a type is
+        // ambiguous in GHC); newtypes are looked through inside them.
+        let found = kept.iter().find_map(|(a, b)| if self.same_head(a, b) { walk(self, a, b, m, 0) } else { None });
         self.coercions = kept;
         found
     }
