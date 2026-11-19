@@ -15,3 +15,4 @@ main :: IO ()
 main = do
   print (natVal (Proxy :: Proxy (Head (Reverse '[1, 2, 3] '[]))))
   print (natVal (Proxy :: Proxy (Head (7 : '[]))))
+  print (natVal (Proxy :: Proxy (Head (7 : 8 : '[]))), natVal (Proxy :: Proxy (Head (9 ': 8 ': '[]))))

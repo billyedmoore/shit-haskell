@@ -81,6 +81,21 @@ pub const QUASI_QUOTE: &str = "hsc'quasiquote";
 
 /// Puts the expressions the splices produced in place of their placeholders.
 pub fn fill_splices(m: &mut Module, results: &[Expr]) {
+    // A splice module whose splices contain splices of their own is filled too (the nested
+    // ones): its printers name its own splices, whose placeholders share the names.
+    let mut printers = Vec::new();
+    m.decls.retain(|d| {
+        let keep = !matches!(d, Decl::Fun { name, .. } if name.starts_with("hsc'print"));
+        if !keep {
+            printers.push(d.clone());
+        }
+        keep
+    });
+    fill_splices_in(m, results);
+    m.decls.extend(printers);
+}
+
+fn fill_splices_in(m: &mut Module, results: &[Expr]) {
     walk_decls(&mut m.decls, &mut |e: &mut Expr| {
         if let Expr::Var(q, _) = e {
             if q.qual.is_none() {
@@ -115,7 +130,14 @@ pub fn decl_splice_module(m: &Module, before: Vec<Decl>, body: Expr, loc: Loc, t
 pub fn splice_setup(exts: &[String], fixities: &[(String, String, crate::syntax::ast::Assoc, u8)], loc: Loc) -> Expr {
     let str = |x: &str| Expr::Lit(Lit::Str(x.to_string()), loc);
     let syn = |n: &str| Expr::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: n.into() }, loc);
-    let names = Expr::List(exts.iter().map(|e| str(e)).collect(), loc);
+    // TH's `Extension` constructors spell some names as GHC's command line does not.
+    let th_name = |e: &str| match e {
+        "GeneralisedNewtypeDeriving" => "GeneralizedNewtypeDeriving".to_string(),
+        "CPP" => "Cpp".to_string(),
+        "Rank2Types" => "RankNTypes".to_string(),
+        other => other.to_string(),
+    };
+    let names = Expr::List(exts.iter().map(|e| str(&th_name(e))).collect(), loc);
     let fix = Expr::List(
         fixities
             .iter()

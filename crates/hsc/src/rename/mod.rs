@@ -188,6 +188,8 @@ pub fn rename_module(
             .collect(),
     };
     rn.fixities.insert(GName::new(BUILTIN, ":"), (Assoc::Right, 5));
+    // The promoted cons in types (`x ': xs`, or `x : xs` with DataKinds) associates as `:` does.
+    rn.fixities.insert(GName::new(BUILTIN, "':"), (Assoc::Right, 5));
     rn.run(m, implicit_prelude)
 }
 
