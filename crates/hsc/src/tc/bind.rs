@@ -493,6 +493,8 @@ impl Checker {
             }
         }
         let outer_wanted = std::mem::take(&mut self.wanted);
+        // The variables made while checking the body (only those may take this signature's types).
+        let first_meta = self.metas.subst.len() as u32;
         let body = self.fun_clauses(clauses, &ty, key)?;
         self.scoped.truncate(scope_mark);
         let wanted = std::mem::replace(&mut self.wanted, outer_wanted);
@@ -510,7 +512,7 @@ impl Checker {
                 self.metas.free_metas(a, &mut ms);
             }
             for m in ms {
-                if !matches!(self.metas.prune(&Ty::Meta(m)), Ty::Meta(x) if x == m) {
+                if m < first_meta || !matches!(self.metas.prune(&Ty::Meta(m)), Ty::Meta(x) if x == m) {
                     continue;
                 }
                 if let Some(t) = self.coercible_partner(m) {

@@ -11,7 +11,7 @@ This file says where things stand and what comes next. History lives in git and
   type and data families, rank-N types. An interpreter (Template Haskell, `runghc`) and a
   native x86-64 back end with a Rust runtime (copying GC, threads, STM, FFI).
 - **Driver:** GHC's command line and package databases; `hsc-pkg`; `cabal build/test -w` works.
-- **Corpus:** 284 differential tests, both back ends, all passing.
+- **Corpus:** 285 differential tests, both back ends, all passing.
 - **Boot libraries:** deepseq, directory, filepath, bytestring, exceptions, file-io pass their
   suites; unix 15/16 and os-string 14/16 (same failures as GHC); parsec 3/4 (a timing test);
   binary 141/142 (needs PolyKinds); time times out; text needs a GHC plugin.

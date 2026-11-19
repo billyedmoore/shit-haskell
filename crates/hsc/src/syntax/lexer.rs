@@ -107,12 +107,13 @@ const ASCII_ESCAPES: &[(&str, u32)] = &[
 ];
 
 pub fn lex(src: &str) -> Result<Lexed, LexError> {
-    lex_with(src, true)
+    lex_with(src, true, false)
 }
 
 /// Lexes a module; without `magic_hash` (MagicHash off) a name does not take a `#` suffix, so
-/// that `(# q, r#)` closes its unboxed tuple.
-pub fn lex_with(src: &str, magic_hash: bool) -> Result<Lexed, LexError> {
+/// that `(# q, r#)` closes its unboxed tuple. With `unicode` (UnicodeSyntax), `∷ ⇒ → ← ∀ ★` are
+/// the reserved symbols they stand for; without it they are ordinary operators.
+pub fn lex_with(src: &str, magic_hash: bool, unicode: bool) -> Result<Lexed, LexError> {
     let mut lx = Lexer {
         chars: src.chars().collect(),
         pos: 0,
@@ -121,6 +122,7 @@ pub fn lex_with(src: &str, magic_hash: bool) -> Result<Lexed, LexError> {
         pragmas: Vec::new(),
         toks: Vec::new(),
         magic_hash,
+        unicode,
     };
     lx.run()?;
     Ok(Lexed {
@@ -137,6 +139,8 @@ struct Lexer {
     pragmas: Vec<Pragma>,
     toks: Vec<Token>,
     magic_hash: bool,
+    /// UnicodeSyntax: the Unicode forms of reserved symbols are those symbols.
+    unicode: bool,
 }
 
 impl Lexer {
@@ -469,19 +473,24 @@ impl Lexer {
                 Tok::QVarSym(q, sym)
             });
         }
-        // UnicodeSyntax: `∀` is `forall`, `★` is `*` (a kind).
-        match sym.as_str() {
-            "∀" => return Ok(Tok::VarId("forall".into())),
-            "★" => return Ok(Tok::VarSym("*".into())),
-            _ => {}
-        }
+        // UnicodeSyntax: `∀` is `forall`, `★` is `*` (a kind), and the arrows and colons the
+        // reserved operators.
+        let sym = if self.unicode {
+            match sym.as_str() {
+                "∀" => return Ok(Tok::VarId("forall".into())),
+                "★" => "*".to_string(),
+                "∷" => "::".to_string(),
+                "←" => "<-".to_string(),
+                "→" => "->".to_string(),
+                "⇒" => "=>".to_string(),
+                _ => sym,
+            }
+        } else {
+            sym
+        };
         let rop = match sym.as_str() {
             ".." => Some(ROp::DotDot),
-            // UnicodeSyntax's forms of the reserved operators.
-            "::" | "∷" => Some(ROp::DColon),
-            "←" => Some(ROp::LArrow),
-            "→" => Some(ROp::RArrow),
-            "⇒" => Some(ROp::DArrow),
+            "::" => Some(ROp::DColon),
             "=" => Some(ROp::Eq),
             "\\" => Some(ROp::Backslash),
             "|" => Some(ROp::Bar),
