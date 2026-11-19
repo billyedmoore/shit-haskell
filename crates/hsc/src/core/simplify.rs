@@ -45,8 +45,8 @@ const TRUE: &str = "GHC.Types.True";
 const FALSE: &str = "GHC.Types.False";
 
 pub fn simplify(binds: &mut Vec<TopBind>) {
-    float_con_fields(binds);
     float_closed_dicts(binds, 0);
+    float_con_fields(binds);
     // The rewrite rules, taken before any pass changes their sides, and the functions they
     // mention, which are not inlined while rules may still need to see them (phases 2 and 1).
     // HSC_NO_RULES: without them (to compare, or to rule them out).
@@ -329,6 +329,50 @@ fn float_closed_dicts(binds: &mut Vec<TopBind>, run: u32) {
     binds.extend(extra);
 }
 
+/// Renames the free occurrences of `from`: not under a binder of the same name (names are not
+/// yet unique before the first pass).
+fn rename_free(c: &mut Core, from: &str, to: &str) {
+    match c {
+        Core::Var(v) => {
+            if v == from {
+                *v = to.to_string();
+            }
+        }
+        Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            rename_free(f, from, to);
+            rename_free(a, from, to);
+        }
+        Core::Lam(x, b) => {
+            if x != from {
+                rename_free(b, from, to);
+            }
+        }
+        Core::Let(bs, body) => {
+            if bs.iter().all(|(x, _)| x != from) {
+                bs.iter_mut().for_each(|(_, r)| rename_free(r, from, to));
+                rename_free(body, from, to);
+            }
+        }
+        Core::Case(sc, b, alts) => {
+            rename_free(sc, from, to);
+            if b != from {
+                for a in alts {
+                    match a {
+                        Alt::Con(_, vs, e) => {
+                            if !vs.iter().any(|v| v == from) {
+                                rename_free(e, from, to);
+                            }
+                        }
+                        Alt::Lit(_, e) | Alt::Default(e) => rename_free(e, from, to),
+                    }
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| rename_free(a, from, to)),
+    }
+}
+
 fn is_dict_con(name: &str) -> bool {
     name.rsplit('.').next().is_some_and(|c| c.starts_with("D:"))
 }
@@ -377,9 +421,9 @@ fn float_dicts_in(c: &mut Core, locals: &mut HashSet<String>, in_lam: bool, owne
                     let global = format!("{owner}{n}");
                     *n += 1;
                     for (_, r) in bs.iter_mut() {
-                        crate::core::rename_var(r, &x, &global);
+                        rename_free(r, &x, &global);
                     }
-                    crate::core::rename_var(body, &x, &global);
+                    rename_free(body, &x, &global);
                     extra.push(TopBind { name: global, body: rhs });
                 }
                 if bs.is_empty() {
