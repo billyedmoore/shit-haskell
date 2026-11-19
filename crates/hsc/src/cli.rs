@@ -792,7 +792,13 @@ fn build_program(
             None => exe.with_file_name(format!(".{name}.hsc-deps")),
         }
     };
-    let mut key = format!("hsc {VERSION} {}\nnative {}\n", env!("CARGO_PKG_VERSION"), o.native);
+    // HSC_DEBUG builds keep symbols: a different executable.
+    let mut key = format!(
+        "hsc {VERSION} {}\nnative {}\ndebug {}\n",
+        env!("CARGO_PKG_VERSION"),
+        o.native,
+        std::env::var_os("HSC_DEBUG").is_some()
+    );
     for f in &o.flags {
         key.push_str(&format!("flag {f}\n"));
     }

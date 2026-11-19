@@ -138,7 +138,19 @@ impl Checker {
                 let mk = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTypeableLit#".into());
                 Core::App(Box::new(Core::App(Box::new(mk), Box::new(Core::Lit(crate::core::Lit::Int(sort))))), Box::new(s))
             }
-            // A constructor applied to arguments: its representation applied to theirs.
+            // A constructor applied to arguments: its representation applied to theirs. The
+            // constructor's own representation is wanted separately: that evidence is closed, so it
+            // is built once at top level, not at each use under a `Typeable a` given (which builds
+            // a `TyCon`, hashing its names).
+            Ty::Con(c) if !args.is_empty() && self.typeable_tycon(c).2 >= args.len() => {
+                let mut rep = wanted_rep(self, Ty::Con(c.clone()), work);
+                for a in args {
+                    let ra = wanted_rep(self, a, work);
+                    let app = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrApp".into());
+                    rep = Core::App(Box::new(Core::App(Box::new(app), Box::new(rep))), Box::new(ra));
+                }
+                rep
+            }
             Ty::Con(c) => {
                 let (modl, name, arity) = self.typeable_tycon(c);
                 // Plain String literals: the module may have OverloadedStrings on.

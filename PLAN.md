@@ -11,12 +11,12 @@ This file says where things stand and what comes next. History lives in git and
   type and data families, rank-N types. An interpreter (Template Haskell, `runghc`) and a
   native x86-64 back end with a Rust runtime (copying GC, threads, STM, FFI).
 - **Driver:** GHC's command line and package databases; `hsc-pkg`; `cabal build/test -w` works.
-- **Corpus:** 265 differential tests, both back ends, all passing.
+- **Corpus:** 266 differential tests, both back ends, all passing.
 - **Boot libraries:** deepseq, directory, filepath, bytestring, exceptions, file-io pass their
   suites; unix 15/16 and os-string 14/16 (same failures as GHC); parsec 3/4 (a timing test);
   binary 141/142 (needs PolyKinds); time times out; text needs a GHC plugin.
 - **Projects:** ShellCheck and its ~45 dependencies match the GHC build. hlint builds and
-  runs (not yet compared with its GHC build).
+  runs, but too slowly to compare on large inputs yet (Typeable reps now built once, PR #78).
 - **Speed:** compile times are close to GHC's (ghc-lib-parser cold ≈ 28 s, warm ≈ 1.4 s).
   Generated code is ~2.2× slower than `ghc -O1` (geometric mean, PR #74's hosted run);
   speed work resumes after the projects, diagnostics and usability items below:

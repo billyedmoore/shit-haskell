@@ -260,29 +260,17 @@ instance Storable Fingerprint where
   peek = peekFingerprint
   poke = pokeFingerprint
 
--- peek/poke in fixed BIG-endian 128-bit format
+-- peek/poke in fixed BIG-endian 128-bit format. hsc targets little-endian x86-64 only: each half
+-- is one byte-swapped Word64 (the same bytes as GHC's byte loop, without a call per byte).
 peekFingerprint :: Ptr Fingerprint -> IO Fingerprint
 peekFingerprint p0 = do
-      let peekW64 :: Ptr Word8 -> Int -> Word64 -> IO Word64
-          peekW64 _  0  !i = return i
-          peekW64 !p !n !i = do
-                w8 <- peek p
-                peekW64 (p `plusPtr` 1) (n-1)
-                    ((i `shiftL` 8) .|. fromIntegral w8)
-
-      high <- peekW64 (castPtr p0) 8 0
-      low  <- peekW64 (castPtr p0 `plusPtr` 8) 8 0
-      return (Fingerprint high low)
+      high <- peekByteOff p0 0
+      low  <- peekByteOff p0 8
+      return (Fingerprint (byteSwap64 high) (byteSwap64 low))
 
 pokeFingerprint :: Ptr Fingerprint -> Fingerprint -> IO ()
 pokeFingerprint p0 (Fingerprint high low) = do
-      let pokeW64 :: Ptr Word8 -> Int -> Word64 -> IO ()
-          pokeW64 _ 0  _  = return ()
-          pokeW64 p !n !i = do
-                pokeElemOff p (n-1) (fromIntegral i)
-                pokeW64 p (n-1) (i `shiftR` 8)
-
-      pokeW64 (castPtr p0) 8 high
-      pokeW64 (castPtr p0 `plusPtr` 8) 8 low
+      pokeByteOff p0 0 (byteSwap64 high)
+      pokeByteOff p0 8 (byteSwap64 low)
 
 deriving newtype instance Storable (ConstPtr a)

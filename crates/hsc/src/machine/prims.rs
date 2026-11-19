@@ -133,6 +133,82 @@ fn run_module(m: &mut Machine, module: u8, name: &str, nargs: usize) -> Option<W
     }
 }
 
+/// How a C call primitive runs, found by its first call: the name is parsed and the C function
+/// looked up (dlsym) once, not at each call.
+#[derive(Clone)]
+pub enum CPlan {
+    Unknown,
+    /// A safe call of this C function (other threads run meanwhile).
+    Safe(std::rc::Rc<CCall>, usize),
+    /// The runtime's own version of the function.
+    Own(std::rc::Rc<CCall>),
+    /// An address import's address.
+    Addr(u64),
+    /// An unsafe call of this C function.
+    Generic(std::rc::Rc<CCall>, usize),
+}
+
+pub struct CCall {
+    sig: String,
+    ret: char,
+    sym: String,
+    safe: bool,
+    interruptible: bool,
+}
+
+/// A C call primitive by its program-local id (see `CPlan`).
+pub fn run_ccall(m: &mut Machine, id: usize, nargs: usize) -> Word {
+    m.prim_failed = false;
+    match m.ccall_plans[id].clone() {
+        CPlan::Safe(c, f) => {
+            return super::prims_ffi::generic_call(m, f as *mut std::ffi::c_void, &c.sig, c.ret, true, c.interruptible).unwrap_or(0);
+        }
+        CPlan::Generic(c, f) => return super::prims_ffi::generic(m, f as *mut std::ffi::c_void, &c.sig, c.ret, c.safe).unwrap_or(0),
+        CPlan::Addr(a) => return super::prims_ffi::address_value(m, a),
+        CPlan::Own(c) => {
+            if let Some(r) = super::prims_ffi::run(m, &c.sym, nargs) {
+                return r;
+            }
+            if std::mem::take(&mut m.prim_failed) {
+                return 0;
+            }
+        }
+        CPlan::Unknown => {}
+    }
+    // The first call (or an own version that declined): as `run`, recording what ran.
+    let name = m.prog.prim_names[id].clone();
+    let Some((sig, ret, sym)) = crate::ccall::parse(&name) else { return run(m, &name, nargs) };
+    let c = std::rc::Rc::new(CCall {
+        sig: sig.to_string(),
+        ret,
+        sym: sym.to_string(),
+        safe: crate::ccall::is_safe(&name),
+        interruptible: crate::ccall::is_interruptible(&name),
+    });
+    if c.safe {
+        if let Some(f) = crate::ccall::resolve(&name) {
+            m.ccall_plans[id] = CPlan::Safe(c.clone(), f as usize);
+            return super::prims_ffi::generic_call(m, f, &c.sig, c.ret, true, c.interruptible).unwrap_or(0);
+        }
+    }
+    if let Some(r) = super::prims_ffi::run(m, &c.sym, nargs) {
+        m.ccall_plans[id] = CPlan::Own(c);
+        return r;
+    }
+    if std::mem::take(&mut m.prim_failed) {
+        return 0;
+    }
+    if let Some(a) = crate::ccall::address_import(&name) {
+        m.ccall_plans[id] = CPlan::Addr(a);
+        return super::prims_ffi::address_value(m, a);
+    }
+    if let Some(f) = crate::ccall::resolve(&name) {
+        m.ccall_plans[id] = CPlan::Generic(c.clone(), f as usize);
+        return super::prims_ffi::generic(m, f, &c.sig, c.ret, c.safe).unwrap_or(0);
+    }
+    run(m, &c.sym, nargs)
+}
+
 /// Runs a primitive operation on the arguments in the record. Answers the result object, or 0 with
 /// the exception raised.
 pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {

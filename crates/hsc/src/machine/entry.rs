@@ -190,7 +190,6 @@ pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
     // SAFETY: generated code passes the machine record.
     let m = unsafe { &mut *mp };
     let ordinary = m.ordinary_prims[id as usize];
-    let name = ordinary.is_none().then(|| m.prog.prim_names[id as usize].clone());
     // A primitive builds its result from several allocations, holding the earlier objects in Rust
     // locals; a collection between them would move those objects. So the collection happens before
     // it runs, and the room it needs is reserved then.
@@ -200,7 +199,7 @@ pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
         op.run(m)
     } else { match ordinary {
         Some(name) => super::prims::run_ordinary(m, id as usize, name, nargs),
-        None => super::prims::run(m, name.as_deref().unwrap(), nargs),
+        None => super::prims::run_ccall(m, id as usize, nargs),
     }};
     // Generated code takes a primitive's result as a value: a thunk (a result that is a variable of
     // the program, not yet evaluated) is evaluated here first.
