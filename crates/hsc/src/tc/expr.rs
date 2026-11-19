@@ -943,8 +943,8 @@ impl Checker {
     }
 
     /// The wanteds of an argument checked under dictionaries `preds` (parameters `dparams`) that
-    /// wait for those dictionaries' types: a wanted of the class of a given whose type has unknown
-    /// parts, and an implication that itself waits. Each becomes an implication `preds => wanted`
+    /// wait for those dictionaries' types: a wanted of known type of the class of a given whose type
+    /// has unknown parts, and an implication that itself waits. Each becomes an implication `preds => wanted`
     /// pushed to the enclosing wanteds, and its evidence that implication's applied to `dparams`.
     /// Answers the wanteds solved now and the evidence bindings of those that wait.
     fn defer_under(&mut self, inner: Vec<Wanted>, preds: &[Pred], dparams: &[String]) -> (Vec<Wanted>, Vec<(String, Core)>) {
@@ -960,10 +960,13 @@ impl Checker {
         let mut binds = Vec::new();
         for w in inner {
             let quantified = w.pred.class == super::solve::QUANTIFIED_CLASS;
+            // A wanted whose own type is not known yet is solved now as before (from these givens,
+            // or generalised): `foo y = withShow (show y) y` without a signature wants `Show t` of
+            // the given `Show t`. Only a known one (`Throws RootUpdated`) waits for the givens.
             let waits = if quantified {
                 self.quantified_waits(&w.pred)
             } else {
-                open.contains(&w.pred.class)
+                open.contains(&w.pred.class) && !w.pred.args.iter().any(|a| self.has_metas(a))
             };
             if !waits {
                 now.push(w);

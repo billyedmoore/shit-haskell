@@ -348,29 +348,35 @@ pub struct WeakState {
 }
 
 impl WeakState {
-    /// Marks the weak pointer dead and runs its C finalizers, the last added first (as GHC's
-    /// list, built by consing, runs them). Answers whether it was alive.
-    pub fn finalize(&mut self) -> bool {
+    /// Marks the weak pointer dead. Answers its C finalizers when it was alive (None when already
+    /// dead), to run with `run_c_finalizers` once the runtime's table is no longer borrowed: a
+    /// finalizer may call back into Haskell.
+    pub fn finalize(&mut self) -> Option<Vec<(u64, u64, bool, u64)>> {
         if self.dead {
-            return false;
+            return None;
         }
         self.dead = true;
-        for (f, p, has_env, env) in self.c_finalizers.drain(..).rev() {
-            if f == 0 {
-                continue;
-            }
-            // SAFETY: the program declared the function's type as a C finalizer (`FinalizerPtr`
-            // or `FinalizerEnvPtr`).
-            unsafe {
-                if has_env {
-                    let g: extern "C" fn(u64, u64) = std::mem::transmute(f as usize);
-                    g(env, p);
-                } else {
-                    let g: extern "C" fn(u64) = std::mem::transmute(f as usize);
-                    g(p);
-                }
+        Some(std::mem::take(&mut self.c_finalizers))
+    }
+}
+
+/// Runs a weak pointer's C finalizers, the last added first (as GHC's list, built by consing,
+/// runs them).
+pub fn run_c_finalizers(fins: Vec<(u64, u64, bool, u64)>) {
+    for (f, p, has_env, env) in fins.into_iter().rev() {
+        if f == 0 {
+            continue;
+        }
+        // SAFETY: the program declared the function's type as a C finalizer (`FinalizerPtr` or
+        // `FinalizerEnvPtr`).
+        unsafe {
+            if has_env {
+                let g: extern "C" fn(u64, u64) = std::mem::transmute(f as usize);
+                g(env, p);
+            } else {
+                let g: extern "C" fn(u64) = std::mem::transmute(f as usize);
+                g(p);
             }
         }
-        true
     }
 }
