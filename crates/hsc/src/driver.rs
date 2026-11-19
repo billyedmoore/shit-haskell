@@ -982,7 +982,8 @@ impl Driver {
             m.decls.splice(..i, before.decls.iter().cloned());
             let imported = self.quoted_data(&[&body], &m.name);
             let table = crate::th::reify_table(&before.decls, &m.name, &imported, loc);
-            let smod = crate::th::decl_splice_module(m, before.decls, body, loc, table, &path.display().to_string());
+            let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(&before.decls, &m.name, &imported), loc);
+            let smod = crate::th::decl_splice_module(m, before.decls, body, loc, table, setup, &path.display().to_string());
             let mark = self.binds.len();
             let user_module = self.checker.user_module;
             self.compile_module(smod, exts.clone(), path)?;
@@ -1096,6 +1097,42 @@ impl Driver {
         out
     }
 
+    /// The fixities a splice's `reifyFixity` answers from: the module's own (its declarations so
+    /// far) and those of the modules whose types it may reify.
+    fn splice_fixities(
+        &self,
+        own: &[Decl],
+        module: &str,
+        imported: &[(String, crate::syntax::ast::DataDecl)],
+    ) -> Vec<(String, String, crate::syntax::ast::Assoc, u8)> {
+        let mut out = Vec::new();
+        fn walk(ds: &[Decl], module: &str, out: &mut Vec<(String, String, crate::syntax::ast::Assoc, u8)>) {
+            for d in ds {
+                match d {
+                    Decl::Fixity { assoc, prec, ops, .. } => {
+                        out.extend(ops.iter().map(|op| (module.to_string(), op.clone(), *assoc, *prec)));
+                    }
+                    Decl::Many(inner) => walk(inner, module, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(own, module, &mut out);
+        let mut modules: Vec<&str> = imported.iter().map(|(m, _)| m.as_str()).collect();
+        modules.sort();
+        modules.dedup();
+        for m in modules {
+            if let Some(iface) = self.ifaces.get(m) {
+                for (g, (assoc, prec)) in &iface.fixities {
+                    if g.module == m {
+                        out.push((m.to_string(), g.name.clone(), *assoc, *prec));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The expression splices of a module. Those after a declaration splice may refer to the
     /// declarations of the groups before it (the first `groups_end`): they are compiled with
     /// those, under the module's own name.
@@ -1130,8 +1167,14 @@ impl Driver {
         let bodies: Vec<&crate::syntax::ast::Expr> = splices.iter().map(|s| &s.body).collect();
         let imported = self.quoted_data(&bodies, &m.name);
         let table = crate::th::reify_table(&earlier, &m.name, &imported, first);
-        let mut smod = crate::th::splice_module(m, &splices, &name, table, &path.display().to_string());
+        let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(&earlier, &m.name, &imported), first);
+        let mut smod = crate::th::splice_module(m, &splices, &name, table, setup, &path.display().to_string());
         smod.decls.splice(0..0, earlier);
+        // Splices and quasi-quotations inside a splice's body run first, as in GHC (path's
+        // `$(TH.lift ([OsPath.pstr|.|] <> ..))`).
+        if crate::th::has_splices(&smod) {
+            self.expand_expr_splices(&mut smod, exts, path, 0)?;
+        }
         let user_module = self.checker.user_module;
         let mark = self.binds.len();
         self.compile_module(smod, exts.clone(), path)?;

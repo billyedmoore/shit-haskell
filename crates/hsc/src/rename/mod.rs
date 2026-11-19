@@ -77,6 +77,8 @@ pub struct Renamer<'a> {
     module: String,
     ifaces: &'a BTreeMap<String, Iface>,
     fixities: HashMap<GName, (Assoc, u8)>,
+    /// Fixities declared for local operators (`where infixl 3 <!>`), by their unique local name.
+    local_fixities: HashMap<String, (Assoc, u8)>,
     vals: HashMap<String, Vec<Entity>>,
     types: HashMap<String, Vec<Entity>>,
     qvals: HashMap<(String, String), Vec<Entity>>,
@@ -169,6 +171,7 @@ pub fn rename_module(
         module: m.name.clone(),
         ifaces,
         fixities,
+        local_fixities: HashMap::new(),
         vals: HashMap::new(),
         types: HashMap::new(),
         qvals: HashMap::new(),
@@ -797,6 +800,11 @@ impl<'a> Renamer<'a> {
         if q.name.starts_with('?') {
             return Ok(q.clone());
         }
+        // DataKinds: an unticked `:` in a type is the promoted list cons (optics-core's
+        // `Reverse (x : xs) acc`); no type can have that name.
+        if q.qual.is_none() && q.name == ":" {
+            return Ok(QName { qual: Some(BUILTIN.to_string()), name: "':".to_string() });
+        }
         // A promoted data constructor (DataKinds) is looked up among the values; its global
         // name keeps the tick so that it is distinct from a type of the same name.
         if let Some(bare) = q.name.strip_prefix('\'') {
@@ -847,7 +855,7 @@ impl<'a> Renamer<'a> {
                 .get(&GName::new(m.clone(), q.name.clone()))
                 .copied()
                 .unwrap_or((Assoc::Left, 9)),
-            None => (Assoc::Left, 9),
+            None => self.local_fixities.get(&q.name).copied().unwrap_or((Assoc::Left, 9)),
         }
     }
 
@@ -1334,6 +1342,24 @@ impl<'a> Renamer<'a> {
                     }
                 }
                 _ => {}
+            }
+        }
+        // The group's fixity declarations, for its operators.
+        for d in &decls {
+            if let Decl::Fixity { assoc, prec, ops, loc } = d {
+                for op in ops {
+                    match self.locals.last().and_then(|l| l.get(op)).cloned() {
+                        Some(u) => {
+                            self.local_fixities.insert(u, (*assoc, *prec));
+                        }
+                        None => {
+                            return Err(RnError {
+                                loc: *loc,
+                                msg: format!("The fixity signature for ‘{op}’ lacks an accompanying binding"),
+                            })
+                        }
+                    }
+                }
             }
         }
         let mut out = Vec::with_capacity(decls.len());

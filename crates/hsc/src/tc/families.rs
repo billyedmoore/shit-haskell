@@ -307,8 +307,14 @@ impl Checker {
         let info: &FamilyInfo = self.env.families.get(&name)?;
         let arity = info.arity;
         let args: Vec<Ty> = args.iter().map(|a| self.metas.zonk(a)).collect();
-        for eqn in &info.equations {
-            let FamEqn { nvars, args: pats, rhs, kinds } = eqn;
+        // A class's defaults come after the instances' own equations, and only when none of
+        // those might still match (an argument not known yet).
+        let mut undecided = false;
+        for eqn in info.equations.iter().filter(|e| !e.default).chain(info.equations.iter().filter(|e| e.default)) {
+            if eqn.default && undecided {
+                return None;
+            }
+            let FamEqn { nvars, args: pats, rhs, kinds, .. } = eqn;
             let mut sub: Vec<Option<Ty>> = vec![None; *nvars as usize];
             let mut result = Match::Yes;
             for (k, (p, a)) in pats.iter().zip(&args[..arity]).enumerate() {
@@ -348,7 +354,10 @@ impl Checker {
                 // An equation that might still match blocks the later ones of a closed family; an
                 // open family's instances are compatible, so another that matches gives the answer.
                 Match::Stuck if info.closed => return None,
-                Match::Stuck => continue,
+                Match::Stuck => {
+                    undecided = true;
+                    continue;
+                }
                 Match::No => continue,
             }
         }
@@ -514,6 +523,11 @@ impl Checker {
 
     /// Adds an equation to a family, converting its patterns and right-hand side.
     pub fn add_family_equation(&mut self, name: &str, args: &[Type], rhs: &Type, loc: Loc) -> TR<()> {
+        self.add_family_equation_as(name, args, rhs, loc, false)
+    }
+
+    /// An equation, `default` for a class's default of an associated type (see `FamEqn`).
+    pub fn add_family_equation_as(&mut self, name: &str, args: &[Type], rhs: &Type, loc: Loc, default: bool) -> TR<()> {
         self.loc = loc;
         if !self.env.families.contains_key(name) {
             return self.err(format!("‘{}’ is not a type family", super::types::unqualify(name)));
@@ -555,6 +569,7 @@ impl Checker {
             args: pats,
             rhs: rhs_ty,
             kinds,
+            default,
         };
         if let Some(info) = self.env.families.get_mut(name) {
             info.equations.push(eqn);

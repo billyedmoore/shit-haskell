@@ -876,7 +876,8 @@ impl Parser {
         })
     }
 
-    /// A record field's type, which may carry a strictness mark.
+    /// A record field's type, which may carry a strictness mark (`!`, or a laziness mark `~`:
+    /// time-manager's `handleKeyRef :: ~(IORef ..)` under StrictData).
     fn field_type(&mut self) -> PResult<Field> {
         if self.at_varsym("!") {
             self.bump();
@@ -884,6 +885,9 @@ impl Parser {
                 ty: self.sigtype()?,
                 strict: true,
             });
+        }
+        if self.at_res(ROp::Tilde) {
+            self.bump();
         }
         Ok(Field {
             ty: self.sigtype()?,
@@ -969,7 +973,7 @@ impl Parser {
                 }
                 self.expect_res(ROp::DColon)?;
                 let strict = self.at_varsym("!");
-                if strict {
+                if strict || self.at_res(ROp::Tilde) {
                     self.bump();
                 }
                 let fty = self.sigtype()?;

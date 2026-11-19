@@ -571,6 +571,9 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
     let any_c = !c_inputs.is_empty();
     // Their objects are linked into the program, as GHC does (`ghc Main.hs cbits.c`).
     let mut c_objects: Vec<String> = Vec::new();
+    // The include directories of the packages in scope, as GHC passes them to the C compiler
+    // (unix-compat's cbits include unix's HsUnixConfig.h).
+    let pkg_includes: Vec<PathBuf> = if any_c { package_dirs(o).map(|(_, inc, _)| inc).unwrap_or_default() } else { Vec::new() };
     for c in &c_inputs {
         // A C file's object keeps its path under the output directory (`cbits/a.c` gives
         // `odir/cbits/a.o`), as GHC places it.
@@ -597,6 +600,7 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
             .arg("-fPIC")
             .args(&o.c_opts)
             .args(o.flags.iter().filter(|f| f.starts_with("-I") || f.starts_with("-D")))
+            .args(pkg_includes.iter().map(|d| format!("-I{}", d.display())))
             // The RTS headers (HsFFI.h), as GHC passes its own include directory.
             .arg(format!("-I{}", driver::default_lib_dir().join("include").display()))
             .status()
