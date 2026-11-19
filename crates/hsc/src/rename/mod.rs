@@ -1527,6 +1527,7 @@ impl<'a> Renamer<'a> {
                     }
                 }
             }
+            Expr::Var(q, loc) if q.qual.as_deref() == Some("%ThisModule") => Expr::Lit(Lit::Str(self.module.clone()), loc),
             Expr::Var(q, loc) => Expr::Var(self.value_ref(&q, loc, false)?, loc),
             Expr::Con(q, loc) => {
                 let cq = self.value_ref(&q, loc, true)?;
@@ -2566,7 +2567,7 @@ fn pat_to_expr(p: &Pat) -> Option<Expr> {
         Pat::Var(v, loc) => Expr::Var(QName::unqual(v.clone()), *loc),
         Pat::Lit(l, loc) => Expr::Lit(l.clone(), *loc),
         Pat::NegLit(l, loc) => Expr::App(
-            Box::new(Expr::Var(QName { qual: Some(BASE.into()), name: "negate".into() }, *loc)),
+            Box::new(Expr::Var(QName { qual: Some("%Base".into()), name: "negate".into() }, *loc)),
             Box::new(Expr::Lit(l.clone(), *loc)),
         ),
         Pat::Con(q, args, loc) => {

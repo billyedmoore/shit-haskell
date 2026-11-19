@@ -722,19 +722,73 @@ fn call_state(rt: &Runtime, name: &str, args: &[Cell]) -> Option<RR> {
         "isMutableByteArrayPinned#" | "isByteArrayPinned#" => Ok(Value::Int(1)),
 
         // ----- weak pointers: the runtime has no garbage collector, so a weak pointer keeps its value and
-        // its finalizer never runs -----
-        "mkWeak#" => Ok(state_result_value(con_value("GHC.Weak.Weak", vec![cell_value_of(&args[1])]))),
-        "mkWeakNoFinalizer#" => Ok(state_result_value(con_value("GHC.Weak.Weak", vec![cell_value_of(&args[1])]))),
+        // its finalizers run only when the program finalizes it (`finalizeWeak#`). A weak value holds
+        // its value, its Haskell finalizer (unit for none) and the index of its state (`Runtime::weaks`).
+        "mkWeak#" | "mkWeakNoFinalizer#" => {
+            let id = {
+                let mut ws = rt.weaks.borrow_mut();
+                ws.push(Default::default());
+                ws.len() as i64 - 1
+            };
+            let fin = if name == "mkWeak#" { args[2].clone() } else { unit_cell() };
+            let w = Value::Con(Rc::new(super::ConVal {
+                name: "GHC.Weak.Weak",
+                args: vec![
+                    args[1].clone(),
+                    fin,
+                    super::new_cell(super::Thunk::Done(Value::Int(id))),
+                ],
+            }));
+            Ok(state_result_value(w))
+        }
         "deRefWeak#" => match rt.force(&args[0]) {
             Ok(Value::Con(w)) => {
+                if weak_id(rt, &w).is_some_and(|i| rt.weaks.borrow()[i].dead) {
+                    return Some(Ok(con_value("Builtin.(,,)", vec![unit_value(), Value::Int(0), unit_value()])));
+                }
+                // The value itself: `deRefWeak` makes the `Just`.
                 let v = w.args.first().cloned().unwrap_or_else(unit_cell);
-                rt.force(&v).map(|val| con_value("Builtin.(,,)", vec![unit_value(), Value::Int(1), val]))
+                Ok(Value::Con(Rc::new(super::ConVal {
+                    name: "Builtin.(,,)",
+                    args: vec![unit_cell(), super::new_cell(super::Thunk::Done(Value::Int(1))), v],
+                })))
             }
             Ok(_) => Err(RtError::Fail("internal: deRefWeak# of a non-weak".into())),
             Err(e) => Err(e),
         },
-        "finalizeWeak#" => Ok(con_value("Builtin.(,,)", vec![unit_value(), Value::Int(0), unit_value()])),
-        "addCFinalizerToWeak#" => Ok(state_result_value(Value::Int(1))),
+        "finalizeWeak#" => (|| match rt.force(&args[0])? {
+            Value::Con(w) => {
+                let alive = match weak_id(rt, &w) {
+                    Some(i) => rt.weaks.borrow_mut()[i].finalize(),
+                    None => false,
+                };
+                match w.args.get(1) {
+                    Some(fin) if alive && w.args.len() == 3 && !is_unit(rt, fin) => Ok(Value::Con(Rc::new(super::ConVal {
+                        name: "Builtin.(,,)",
+                        args: vec![unit_cell(), super::new_cell(super::Thunk::Done(Value::Int(1))), fin.clone()],
+                    }))),
+                    _ => Ok(con_value("Builtin.(,,)", vec![unit_value(), Value::Int(0), unit_value()])),
+                }
+            }
+            _ => Err(RtError::Fail("internal: finalizeWeak# of a non-weak".into())),
+        })(),
+        "addCFinalizerToWeak#" => (|| {
+            let f = super::ffi::raw_word(rt, &args[0])?;
+            let p = super::ffi::raw_word(rt, &args[1])?;
+            let has_env = int(rt, &args[2])? != 0;
+            let env = super::ffi::raw_word(rt, &args[3])?;
+            let added = match rt.force(&args[4])? {
+                Value::Con(w) => match weak_id(rt, &w) {
+                    Some(i) if !rt.weaks.borrow()[i].dead => {
+                        rt.weaks.borrow_mut()[i].c_finalizers.push((f, p, has_env, env));
+                        1
+                    }
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            Ok(state_result_value(Value::Int(added)))
+        })(),
 
         // ----- stable pointers: an index into the runtime's table -----
         "makeStablePtr#" => {
@@ -858,11 +912,6 @@ fn state_result_value(v: Value) -> Value {
     io_result_of(v)
 }
 
-/// A cell holding the value of an argument, shared with the argument.
-fn cell_value_of(c: &Cell) -> Value {
-    Value::Ref(Rc::new(RefCell::new(c.clone())))
-}
-
 /// A pair value whose second component is the given cell.
 fn pair_cells_value(a: Cell, b: Cell) -> Value {
     pair_cells(a, b)
@@ -967,4 +1016,20 @@ fn catch_prim(rt: &Runtime, args: &[Cell]) -> RR {
         let action = rt.apply(handler, cell_of(exc))?;
         rt.apply(action, args[2].clone())
     })
+}
+
+/// The index of a weak value's state (`Runtime::weaks`), if it carries one.
+fn weak_id(rt: &Runtime, w: &super::ConVal) -> Option<usize> {
+    if w.args.len() != 3 {
+        return None;
+    }
+    match rt.force(&w.args[2]) {
+        Ok(Value::Int(i)) if (i as usize) < rt.weaks.borrow().len() => Some(i as usize),
+        _ => None,
+    }
+}
+
+/// Whether a cell holds unit (a weak pointer without a Haskell finalizer).
+fn is_unit(rt: &Runtime, c: &Cell) -> bool {
+    matches!(&*c.borrow(), super::Thunk::Done(Value::Con(k)) if k.name.ends_with("()") && k.args.is_empty()) && rt.force(c).is_ok()
 }

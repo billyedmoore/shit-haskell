@@ -61,6 +61,8 @@ pub struct Machine {
     pub con_ids: std::collections::HashMap<String, u32>,
     /// Extra roots the runtime keeps (stable pointers and similar), by index.
     pub stable: Vec<Word>,
+    /// The weak pointers' states, by the index in a weak object's header (see `prims_misc`).
+    pub weaks: Vec<crate::ccall::WeakState>,
     /// The scheduler of the Haskell threads; the values it holds are roots.
     pub sched: crate::sched::Sched<Word>,
     /// The registers of the threads waiting for their turn (their roots), by thread.
@@ -148,6 +150,7 @@ impl Machine {
             prog,
             con_ids: std::collections::HashMap::new(),
             stable: vec![0],
+            weaks: Vec::new(),
             tid: 1,
             sched: crate::sched::Sched::new(conc::SLICE_MS),
             suspended: crate::sched::IntMap::default(),

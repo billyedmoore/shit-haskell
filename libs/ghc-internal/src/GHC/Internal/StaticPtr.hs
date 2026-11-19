@@ -45,6 +45,7 @@ module GHC.Internal.StaticPtr
   , staticPtrInfo
   , staticPtrKeys
   , IsStatic(..)
+  , mkStaticPtr#
   ) where
 
 import GHC.Internal.Data.Typeable       (Typeable)
@@ -52,7 +53,7 @@ import GHC.Internal.Foreign.C.Types     (CInt(..))
 import GHC.Internal.Foreign.Marshal.Array (allocaArray, peekArray, withArray)
 import GHC.Internal.Base
 import GHC.Internal.Ptr             (Ptr(..), nullPtr)
-import GHC.Internal.Fingerprint     (Fingerprint(..))
+import GHC.Internal.Fingerprint     (Fingerprint(..), fingerprintString)
 import GHC.Internal.Real
 import GHC.Internal.Word            (Word64(..))
 import GHC.Internal.Text.Show
@@ -104,6 +105,13 @@ class IsStatic p where
 -- | @since base-4.9.0.0
 instance IsStatic StaticPtr where
     fromStaticPtr = id
+
+-- | Compiler support (hsc): the value of @static e@, the module's @n@th static form, at
+-- @(line, col)@. The key is GHC's: the fingerprint of @unit:module:n@.
+mkStaticPtr# :: (IsStatic p, Typeable a) => [Char] -> [Char] -> Int -> Int -> Int -> a -> p a
+mkStaticPtr# unit modl n line col v
+  | Fingerprint (W64# w0) (W64# w1) <- fingerprintString (unit ++ ":" ++ modl ++ ":" ++ show n)
+  = fromStaticPtr (StaticPtr w0 w1 (StaticPtrInfo unit modl (line, col)) v)
 
 -- | Miscellaneous information available for debugging purposes.
 data StaticPtrInfo = StaticPtrInfo

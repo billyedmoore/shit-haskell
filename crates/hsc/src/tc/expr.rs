@@ -396,10 +396,18 @@ impl Checker {
         }
         // Lambdas are checked after the other arguments: their parameter types are often fixed
         // by those, and a GADT pattern in a lambda must not fix them first.
+        // An argument checked under dictionaries (`(Throws e => IO a) -> (e -> IO a) -> ..`) comes
+        // last: its dictionaries' types are often fixed by the other arguments, and its wanted
+        // constraints are solved by them when it is checked.
+        let constrained = |tc: &Self, p: &Ty| match tc.metas.prune(p) {
+            Ty::Qual(ps, _) | Ty::Forall(_, ps, _) => !ps.is_empty(),
+            _ => false,
+        };
         let mut checked: Vec<Option<Core>> = (0..spine.len()).map(|_| None).collect();
-        for lambdas in [false, true] {
+        for pass in 0..3 {
             for (i, (a, p)) in spine.iter().zip(&params).enumerate() {
-                if matches!(a, Expr::Lam(..)) == lambdas {
+                let rank = if constrained(self, p) { 2 } else if matches!(a, Expr::Lam(..)) { 1 } else { 0 };
+                if rank == pass && checked[i].is_none() {
                     checked[i] = Some(self.check_arg(a, p)?);
                 }
             }
@@ -919,7 +927,12 @@ impl Checker {
                 return Err(e);
             }
         };
-        let (binds, residual) = self.solve(inner)?;
+        // A dictionary whose type is not known yet (`tryChecked $ tryChecked $ act`, its exception
+        // types fixed by later uses of the result): the wanteds it may solve wait, as implications
+        // `preds => wanted` solved with the enclosing binding's (see `defer_under`).
+        let (inner, deferred) = self.defer_under(inner, preds, &dparams);
+        let (mut binds, residual) = self.solve(inner)?;
+        binds.extend(deferred);
         self.wanted.extend(residual);
         self.givens.truncate(givens_len);
         let mut core = wrap_let(binds, ca);
@@ -927,6 +940,52 @@ impl Checker {
             core = Core::Lam(d, Box::new(core));
         }
         Ok(core)
+    }
+
+    /// The wanteds of an argument checked under dictionaries `preds` (parameters `dparams`) that
+    /// wait for those dictionaries' types: a wanted of the class of a given whose type has unknown
+    /// parts, and an implication that itself waits. Each becomes an implication `preds => wanted`
+    /// pushed to the enclosing wanteds, and its evidence that implication's applied to `dparams`.
+    /// Answers the wanteds solved now and the evidence bindings of those that wait.
+    fn defer_under(&mut self, inner: Vec<Wanted>, preds: &[Pred], dparams: &[String]) -> (Vec<Wanted>, Vec<(String, Core)>) {
+        let open: Vec<String> = preds
+            .iter()
+            .filter(|p| p.args.iter().any(|a| self.has_metas(a)))
+            .map(|p| p.class.clone())
+            .collect();
+        if open.is_empty() {
+            return (inner, Vec::new());
+        }
+        let mut now = Vec::new();
+        let mut binds = Vec::new();
+        for w in inner {
+            let quantified = w.pred.class == super::solve::QUANTIFIED_CLASS;
+            let waits = if quantified {
+                self.quantified_waits(&w.pred)
+            } else {
+                open.contains(&w.pred.class)
+            };
+            if !waits {
+                now.push(w);
+                continue;
+            }
+            let (ctx, head) = match self.metas.zonk(&w.pred.args[0]) {
+                Ty::Forall(ids, c, h) if quantified && ids.is_empty() => {
+                    (preds.iter().cloned().chain(c.iter().cloned()).collect::<Vec<_>>(), (*h).clone())
+                }
+                _ if quantified => {
+                    now.push(w);
+                    continue;
+                }
+                _ => (preds.to_vec(), Ty::apps(Ty::con(&w.pred.class), w.pred.args.clone())),
+            };
+            let ev = self.fresh_name("qd");
+            let pred = Pred { class: super::solve::QUANTIFIED_CLASS.into(), args: vec![Ty::Forall(Vec::new(), ctx, std::rc::Rc::new(head))] };
+            self.wanted.push(Wanted { pred, ev: ev.clone(), loc: w.loc });
+            let applied = dparams.iter().fold(Core::Var(ev), |f, d| Core::App(Box::new(f), Box::new(Core::Var(d.clone()))));
+            binds.push((w.ev, applied));
+        }
+        (now, binds)
     }
 
     pub fn inst_var_explicit(&mut self, name: &str, scheme: &Scheme, loc: Loc, explicit: &[Ty]) -> (Core, Ty) {

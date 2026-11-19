@@ -512,6 +512,14 @@ impl Checker {
                         };
                         binds.push((w.ev.clone(), ev));
                     }
+                    // `HasExceptionContext` (the `SomeException` constructor's) with no binding:
+                    // the empty context, as GHC defaults it.
+                    None if pred.class == "?exceptionContext"
+                        && self.env.values.contains_key("GHC.Internal.Exception.Context.emptyExceptionContext") =>
+                    {
+                        self.unify_at(&Ty::con("GHC.Internal.Exception.Context.ExceptionContext"), &pred.args[0])?;
+                        binds.push((w.ev.clone(), Core::Var("GHC.Internal.Exception.Context.emptyExceptionContext".into())));
+                    }
                     None => residual.push(Wanted { pred, ..w }),
                 }
                 continue;
@@ -526,6 +534,12 @@ impl Checker {
                         residual.push(Wanted { pred, ..w });
                         continue;
                     }
+                }
+                // An implication whose context's types are not known yet (see
+                // `Checker::defer_under`) waits for them.
+                if self.quantified_waits(&pred) {
+                    residual.push(Wanted { pred, ..w });
+                    continue;
                 }
                 let ev = self.solve_quantified(&pred, w.loc)?;
                 binds.push((w.ev.clone(), ev));
@@ -686,6 +700,15 @@ impl Checker {
 
     /// Solves a wanted quantified constraint: the evidence is `\ctx-dicts -> evidence of the head`,
     /// the head solved with fresh rigid variables and the context as givens.
+    /// Whether a wanted implication (no variables of its own) has a context with types not known
+    /// yet: it is solved once they are.
+    pub(super) fn quantified_waits(&self, pred: &Pred) -> bool {
+        match self.metas.zonk(&pred.args[0]) {
+            Ty::Forall(ids, ctx, _) => ids.is_empty() && ctx.iter().any(|p| p.args.iter().any(|a| self.has_metas(a))),
+            _ => false,
+        }
+    }
+
     fn solve_quantified(&mut self, pred: &Pred, loc: crate::syntax::ast::Loc) -> TR<Core> {
         self.with_application_scope(|tc| tc.solve_quantified_body(pred, loc))
     }

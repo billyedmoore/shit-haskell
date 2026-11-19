@@ -65,6 +65,27 @@ fn addr_of(rt: &Runtime, c: &Cell) -> Result<(Buf, usize), RtError> {
     }
 }
 
+/// The machine address a pointer argument stands for (a raw address, or a position in a buffer).
+pub fn raw_word(rt: &Runtime, c: &Cell) -> Result<u64, RtError> {
+    let v = rt.force(c)?;
+    let inner = match v {
+        Value::Con(con) if con.name == "GHC.Internal.Ptr.Ptr" || con.name == "GHC.Internal.Ptr.FunPtr" => match con.args.first() {
+            Some(f) => rt.force(&f.clone())?,
+            None => return Ok(0),
+        },
+        other => other,
+    };
+    Ok(match inner {
+        Value::Int(i) => i as u64,
+        Value::Addr(b, off) => {
+            let vec = b.borrow();
+            if vec.is_empty() && off == 0 { 0 } else { vec.as_ptr() as u64 + off as u64 }
+        }
+        Value::Bytes(b) => b.borrow().as_ptr() as u64,
+        _ => 0,
+    })
+}
+
 /// An integer argument: a plain Int, or a sized box (`I32#` and the like) around one.
 fn int_of(rt: &Runtime, c: &Cell) -> Result<i64, RtError> {
     match rt.force(c)? {
