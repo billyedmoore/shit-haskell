@@ -226,18 +226,19 @@ impl Checker {
                 }
             }
         }
-        let mut instance_eqs: Vec<&Decl> = Vec::new();
+        // Instances' equations, and classes' defaults for their associated types (tried last).
+        let mut instance_eqs: Vec<(&Decl, bool)> = Vec::new();
         for d in decls {
             match d {
-                Decl::TypeInstance { .. } => instance_eqs.push(d),
-                Decl::Instance(id) => instance_eqs.extend(id.decls.iter().filter(|x| matches!(x, Decl::TypeInstance { .. }))),
-                Decl::Class(cd) => instance_eqs.extend(cd.decls.iter().filter(|x| matches!(x, Decl::TypeInstance { .. }))),
+                Decl::TypeInstance { .. } => instance_eqs.push((d, false)),
+                Decl::Instance(id) => instance_eqs.extend(id.decls.iter().filter(|x| matches!(x, Decl::TypeInstance { .. })).map(|x| (x, false))),
+                Decl::Class(cd) => instance_eqs.extend(cd.decls.iter().filter(|x| matches!(x, Decl::TypeInstance { .. })).map(|x| (x, true))),
                 _ => {}
             }
         }
-        for d in instance_eqs {
+        for (d, default) in instance_eqs {
             if let Decl::TypeInstance { name, equation, .. } = d {
-                self.add_family_equation(&global_tycon_name(name), &equation.args, &equation.rhs, equation.loc)?;
+                self.add_family_equation_as(&global_tycon_name(name), &equation.args, &equation.rhs, equation.loc, default)?;
             }
         }
 

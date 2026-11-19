@@ -125,6 +125,11 @@ impl Extensions {
         self.on.contains(name)
     }
 
+    /// The extensions on, by name.
+    pub fn names(&self) -> Vec<String> {
+        self.on.iter().cloned().collect()
+    }
+
     /// Applies one `LANGUAGE` item or `-X` flag. Returns an error for unknown names.
     pub fn apply(&mut self, item: &str) -> Result<(), String> {
         let item = item.trim();

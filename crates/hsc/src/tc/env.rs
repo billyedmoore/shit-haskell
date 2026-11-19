@@ -269,6 +269,9 @@ pub struct FamEqn {
     /// The kind each pattern is annotated with (`(s :: Sizing)`), as the name of a type: the
     /// equations of a poly-kinded family can differ only in the kinds of their arguments.
     pub kinds: Vec<Option<String>>,
+    /// A class's default for an associated type (`type Arg e = ()` in the class): it applies
+    /// only where no instance's own equation does, so it is tried after them.
+    pub default: bool,
 }
 
 #[derive(Clone, Debug)]

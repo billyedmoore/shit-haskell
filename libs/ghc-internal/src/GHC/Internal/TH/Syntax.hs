@@ -72,7 +72,7 @@ import GHC.Internal.Control.Monad.Fix
 import GHC.Internal.Control.Exception
 import GHC.Internal.Num
 import GHC.Internal.IO.Unsafe
-import GHC.Internal.List (dropWhile, break, replicate, reverse, last)
+import GHC.Internal.List (dropWhile, break, replicate, reverse, last, lookup, filter)
 import GHC.Internal.MVar
 import GHC.Internal.IO.Exception
 import GHC.Internal.Unicode
@@ -80,6 +80,9 @@ import qualified GHC.Types as Kind (Type)
 #endif
 import GHC.Internal.ForeignSrcLang
 import GHC.Internal.LanguageExtensions
+import GHC.Internal.Unsafe.Coerce (unsafeCoerce)
+import GHC.Types (Any)
+import GHC.Internal.Enum (Bounded (..), Enum (..))
 
 -----------------------------------------------------
 --
@@ -182,10 +185,10 @@ instance Quasi IO where
 
   qLookupName _ _       = badIO "lookupName"
   qReify                = hscReify
-  qReifyFixity _        = badIO "reifyFixity"
+  qReifyFixity          = hscReifyFixity
   qReifyType _          = badIO "reifyFixity"
   qReifyInstances _ _   = badIO "reifyInstances"
-  qReifyRoles _         = badIO "reifyRoles"
+  qReifyRoles           = hscReifyRoles
   qReifyAnnotations _   = badIO "reifyAnnotations"
   qReifyModule _        = badIO "reifyModule"
   qReifyConStrictness _ = badIO "reifyConStrictness"
@@ -200,10 +203,10 @@ instance Quasi IO where
   qAddForeignFilePath _ _ = badIO "addForeignFilePath"
   qAddModFinalizer _    = badIO "addModFinalizer"
   qAddCorePlugin _      = badIO "addCorePlugin"
-  qGetQ                 = badIO "getQ"
-  qPutQ _               = badIO "putQ"
-  qIsExtEnabled _       = badIO "isExtEnabled"
-  qExtsEnabled          = badIO "extsEnabled"
+  qGetQ                 = hscGetQ
+  qPutQ                 = hscPutQ
+  qIsExtEnabled e       = fmap (e `elem`) hscExtsEnabled
+  qExtsEnabled          = hscExtsEnabled
   qPutDoc _ _           = badIO "putDoc"
   qGetDoc _             = badIO "getDoc"
 
@@ -279,6 +282,59 @@ hscReify n@(Name (OccName occ) flavour) = do
   case [i | e@(_, _, i) <- table, matches e] of
     (i : _) -> pure i
     [] -> fail ("\8216" ++ occ ++ "\8217 is not in scope at a reify")
+
+-- | hsc: the extensions on in the module being compiled, by name, set before a splice runs.
+{-# NOINLINE hscExtensions #-}
+hscExtensions :: IORef [String]
+hscExtensions = unsafePerformIO (newIORef [])
+
+hscExtsEnabled :: IO [Extension]
+hscExtsEnabled = do
+  names <- readIORef hscExtensions
+  pure [e | e <- [minBound .. maxBound], show e `elem` names]
+
+-- | hsc: the fixities 'reifyFixity' answers from (module, occurrence, fixity), set before a
+-- splice runs; a name without one has the default fixity (`Nothing`), as in GHC.
+{-# NOINLINE hscFixities #-}
+hscFixities :: IORef [(String, String, Fixity)]
+hscFixities = unsafePerformIO (newIORef [])
+
+hscReifyFixity :: Name -> IO (Maybe Fixity)
+hscReifyFixity (Name (OccName occ) flavour) = do
+  table <- readIORef hscFixities
+  let matches (m, o, _) = o == occ && case flavour of
+        NameG _ _ (ModName m') -> m == m'
+        _ -> True
+  pure (case [f | e@(_, _, f) <- table, matches e] of
+          (f : _) -> Just f
+          [] -> Nothing)
+
+-- | hsc: a type's roles, from its reified declaration: representational for each parameter
+-- (roles are not inferred here; 'coerce' is not role-checked).
+hscReifyRoles :: Name -> IO [Role]
+hscReifyRoles n = do
+  info <- hscReify n
+  case info of
+    TyConI (DataD _ _ tvs _ _ _) -> pure (map (const RepresentationalR) tvs)
+    TyConI (NewtypeD _ _ tvs _ _ _) -> pure (map (const RepresentationalR) tvs)
+    TyConI (TySynD _ tvs _) -> pure (map (const RepresentationalR) tvs)
+    _ -> fail ("reifyRoles: " ++ show n ++ " is not a type constructor")
+
+-- | hsc: the state 'getQ' and 'putQ' keep across the splices of a module, by type.
+{-# NOINLINE hscQState #-}
+hscQState :: IORef [(TypeRep, Any)]
+hscQState = unsafePerformIO (newIORef [])
+
+hscGetQ :: forall a. Typeable a => IO (Maybe a)
+hscGetQ = do
+  st <- readIORef hscQState
+  pure (fmap unsafeCoerce (lookup (typeRep (Proxy :: Proxy a)) st))
+
+hscPutQ :: forall a. Typeable a => a -> IO ()
+hscPutQ x = do
+  st <- readIORef hscQState
+  writeIORef hscQState ((rep, unsafeCoerce x) : filter (\(r, _) -> r /= rep) st)
+  where rep = typeRep (Proxy :: Proxy a)
 
 -- | hsc: where the splice that is running is, set by the compiler before it runs the splice.
 {-# NOINLINE hscLocation #-}

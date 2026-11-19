@@ -435,7 +435,7 @@ bin_struct!(DataCon { name, tycon, tag, arity, scheme, fields, newtype, strict }
 bin_struct!(Synonym { nparams, rhs });
 bin_struct!(ClassInfo { name, nparams, supers, methods, defaults, default_schemes, dict_con, fundeps });
 bin_struct!(InstInfo { class, nvars, ctx, head, dict, kinds });
-bin_struct!(FamEqn { nvars, args, rhs, kinds });
+bin_struct!(FamEqn { nvars, args, rhs, kinds, default });
 bin_struct!(FamilyInfo { arity, closed, equations, injective });
 
 bin_enum!(CLit { 0 => Integer(a), 1 => Int(a), 2 => Double(a), 3 => Frac(a), 4 => Char(a), 5 => Str(a), 6 => Addr(a) });
@@ -733,7 +733,7 @@ mod tests {
     use super::*;
 
     fn equation(name: &str) -> FamEqn {
-        FamEqn { nvars: 0, args: vec![Ty::con(name)], rhs: Ty::con(name), kinds: Vec::new() }
+        FamEqn { nvars: 0, args: vec![Ty::con(name)], rhs: Ty::con(name), kinds: Vec::new(), default: false }
     }
 
     fn base_env() -> (Env, EnvMap<Kind>) {

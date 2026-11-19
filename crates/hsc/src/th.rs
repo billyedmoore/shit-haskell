@@ -98,16 +98,41 @@ pub fn fill_splices(m: &mut Module, results: &[Expr]) {
 
 /// The module the splices of `m` are compiled in: `m`'s imports, and one binding per splice
 /// that runs it (`unsafePerformIO (runQ splice)`, an `Exp`).
-pub fn splice_module(m: &Module, splices: &[Splice], name: &str, table: Expr, file: &str) -> Module {
+pub fn splice_module(m: &Module, splices: &[Splice], name: &str, table: Expr, setup: Expr, file: &str) -> Module {
     let exp = Type::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Exp".into() }, m.loc);
-    splice_module_at(m.imports.clone(), Vec::new(), splices, name, exp, table, (file, &m.name))
+    splice_module_at(m.imports.clone(), Vec::new(), splices, name, exp, table, setup, (file, &m.name))
 }
 
 /// The module a declaration splice runs in: the module's name and imports, the declarations
 /// before the splice, and the splice (a `[Dec]`).
-pub fn decl_splice_module(m: &Module, before: Vec<Decl>, body: Expr, loc: Loc, table: Expr, file: &str) -> Module {
+pub fn decl_splice_module(m: &Module, before: Vec<Decl>, body: Expr, loc: Loc, table: Expr, setup: Expr, file: &str) -> Module {
     let decs = Type::List(Box::new(Type::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Dec".into() }, loc)), loc);
-    splice_module_at(m.imports.clone(), before, &[Splice { body, loc }], &m.name, decs, table, (file, &m.name))
+    splice_module_at(m.imports.clone(), before, &[Splice { body, loc }], &m.name, decs, table, setup, (file, &m.name))
+}
+
+/// The IO action that sets, before a splice runs, the extensions on in the module (for
+/// `isExtEnabled`) and the fixities `reifyFixity` answers from (module, operator, assoc, prec).
+pub fn splice_setup(exts: &[String], fixities: &[(String, String, crate::syntax::ast::Assoc, u8)], loc: Loc) -> Expr {
+    let str = |x: &str| Expr::Lit(Lit::Str(x.to_string()), loc);
+    let syn = |n: &str| Expr::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: n.into() }, loc);
+    let names = Expr::List(exts.iter().map(|e| str(e)).collect(), loc);
+    let fix = Expr::List(
+        fixities
+            .iter()
+            .map(|(m, op, assoc, prec)| {
+                let dir = syn(match assoc {
+                    crate::syntax::ast::Assoc::Left => "InfixL",
+                    crate::syntax::ast::Assoc::Right => "InfixR",
+                    crate::syntax::ast::Assoc::None => "InfixN",
+                });
+                let f = app(app(syn("Fixity"), lit_int(&prec.to_string(), loc)), dir);
+                Expr::Tuple(vec![Some(str(m)), Some(str(op)), Some(f)], loc)
+            })
+            .collect(),
+        loc,
+    );
+    let write = |var: &str, v: Expr| app(app(th_var("GHC.Internal.IORef", "writeIORef", loc), th_var("GHC.Internal.TH.Syntax", var, loc)), v);
+    app(app(th_var("GHC.Internal.Base", ">>", loc), write("hscExtensions", names)), write("hscFixities", fix))
 }
 
 /// The type names quoted (`''T`) in the splices: the types of other modules `reify` may be asked about.
@@ -128,7 +153,7 @@ pub fn quoted_types(splices: &[&Expr]) -> Vec<QName> {
 }
 
 /// `at` is the file and module the splices are in, for `location`.
-fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice], name: &str, result: Type, table: Expr, at: (&str, &str)) -> Module {
+fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice], name: &str, result: Type, table: Expr, setup: Expr, at: (&str, &str)) -> Module {
     let module_loc = splices.first().map_or(Loc::default(), |s| s.loc);
     let mut decls = before;
     for (i, s) in splices.iter().enumerate() {
@@ -145,7 +170,10 @@ fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice],
         let set_loc = app(app(th_var("GHC.Internal.IORef", "writeIORef", loc), th_var("GHC.Internal.TH.Syntax", "hscLocation", loc)), here);
         let run = app(
             th_var("GHC.Internal.IO.Unsafe", "unsafePerformIO", loc),
-            app(app(then(), set_table), app(app(then(), set_loc), app(th_var("GHC.Internal.TH.Syntax", "runQ", loc), s.body.clone()))),
+            app(
+                app(then(), setup.clone()),
+                app(app(then(), set_table), app(app(then(), set_loc), app(th_var("GHC.Internal.TH.Syntax", "runQ", loc), s.body.clone()))),
+            ),
         );
         let typed = Expr::Sig(Box::new(run), result.clone(), loc);
         decls.push(Decl::Fun {
