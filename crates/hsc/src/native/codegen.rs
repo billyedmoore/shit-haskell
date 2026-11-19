@@ -341,9 +341,6 @@ fn operand_kind(prim: &str) -> u8 {
 /// A slot use that stands for every slot (nothing may be cleared).
 const ALL_LIVE: u32 = u32::MAX;
 
-/// Argument registers for the calls into the runtime (rdi carries the machine record).
-const RT_ARGS: [&str; 5] = ["%rsi", "%rdx", "%rcx", "%r8", "%r9"];
-
 impl Gen {
     fn new() -> Gen {
         Gen {
@@ -1324,15 +1321,6 @@ impl Gen {
         self.emit("jmp hsc_raise_pending");
     }
 
-    fn push_args(&mut self, n: usize) {
-        if n > 0 {
-            self.emit(&format!("subq ${}, %rbp", 8 * n));
-        }
-        for i in 0..n {
-            self.emit(&format!("movq {}, {}(%rbp)", arg_reg(i), 8 * i));
-        }
-    }
-
     /// Loads an atom into a register.
     fn load(&mut self, a: &Atom, p: Pos, reg: &str) {
         match a {
@@ -1997,12 +1985,6 @@ fn lit_text(l: &Lit) -> (u64, String) {
         Lit::Str(s) => (5, s.clone()),
         Lit::Addr(s) => (6, s.clone()),
     }
-}
-
-/// The register holding the i-th argument while arguments are assembled.
-fn arg_reg(i: usize) -> String {
-    const REGS: [&str; 8] = ["%r8", "%r9", "%r10", "%r11", "%rsi", "%rdi", "%rdx", "%rax"];
-    REGS[i.min(7)].to_string()
 }
 
 fn escape(s: &str) -> String {

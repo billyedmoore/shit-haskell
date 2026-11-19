@@ -349,7 +349,7 @@ impl Q<'_, '_> {
             Type::Con(q, _) => match (q.qual.as_deref(), q.name.as_str()) {
                 (_, "->") => self.lib("arrowT"),
                 (_, "[]") => self.lib("listT"),
-                (_, "()") | (Some("Builtin"), "()") => app(self.lib("tupleT"), Expr::Lit(Lit::Int("0".into()), self.loc)),
+                (_, "()") => app(self.lib("tupleT"), Expr::Lit(Lit::Int("0".into()), self.loc)),
                 (_, n) if n.starts_with('\'') => {
                     let bare = QName { qual: q.qual.clone(), name: n[1..].to_string() };
                     app(self.lib("promotedT"), self.name(&bare, "mkNameG_d"))

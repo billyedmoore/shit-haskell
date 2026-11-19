@@ -58,12 +58,6 @@ pub fn force_arg(m: &mut Machine, i: usize) -> Option<Word> {
     Some(v)
 }
 
-/// The value of an `Int#`-like argument.
-fn int_arg(m: &mut Machine, i: usize) -> Option<i64> {
-    let v = force_arg(m, i)?;
-    Some(int_of(m, v))
-}
-
 /// Common ordinary primitives, classified once when the program starts. Names outside this
 /// bounded set retain the general dispatcher (including all encoded foreign calls).
 const ORDINARY_NAMES: &[&str] = &[

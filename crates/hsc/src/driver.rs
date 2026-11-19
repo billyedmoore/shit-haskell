@@ -186,7 +186,7 @@ pub fn read_interface(path: &Path) -> Option<(PathBuf, Vec<String>)> {
     let _time = timing::scope("interfaces");
     let bytes = std::fs::read(path).ok()?;
     let mut pos = 0usize;
-    let mut line = |pos: &mut usize| -> Option<String> {
+    let line = |pos: &mut usize| -> Option<String> {
         let rest = bytes.get(*pos..)?;
         let end = rest.iter().position(|&b| b == b'\n')?;
         let l = String::from_utf8_lossy(&rest[..end]).into_owned();

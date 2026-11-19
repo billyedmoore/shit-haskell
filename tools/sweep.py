@@ -62,7 +62,12 @@ def first_error(log):
     lines = log.splitlines()
     for i, line in enumerate(lines):
         if re.search(r"(:\d+:\d+|:\(\d+,\d+\)-\(\d+,\d+\)).*: error:|: error: \[|^\S+: error:", line):
-            msg = [lines[i].split("error:", 1)[1].strip()] + [l.strip() for l in lines[i + 1:i + 4] if l.strip()]
+            msg = [lines[i].split("error:", 1)[1].strip()]
+            for l in lines[i + 1:i + 4]:
+                # The message ends where cabal's own lines (or the next error) begin.
+                if not l.strip() or re.match(r"\s*(Error: \[|Failed to build|\S+:\d+:\d+)", l):
+                    break
+                msg.append(l.strip())
             return failed, " ".join(m for m in msg if m)[:300]
     for line in lines:
         if re.search(r"\berror\b|unknown primitive|panicked|Uncaught exception", line, re.IGNORECASE) and not re.match(
@@ -157,13 +162,13 @@ def report():
     groups = {}
     for p in sorted(tried - hsc_ok):
         r = rs[(p, "hsc")]
-        key = (r.get("failed") or p, normalise(r.get("error", "")))
-        groups.setdefault(key, []).append(p)
-    print("| blocks | failing package | first error | e.g. |")
+        groups.setdefault(r.get("failed") or p, []).append(p)
+    print("| blocks | failing package | first error | blocked |")
     print("|---:|---|---|---|")
-    for (failed, err), blocked in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        example = rs[(blocked[0], "hsc")].get("error", "")[:120].replace("|", "\\|")
-        print(f"| {len(blocked)} | {failed} | {example} | {', '.join(blocked[:4])} |")
+    for failed, blocked in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        own = rs.get((blocked[0], "hsc"), {})
+        err = own.get("error", "")[:140].replace("|", "\\|")
+        print(f"| {len(blocked)} | {failed} | {err} | {', '.join(blocked[:6])}{' …' if len(blocked) > 6 else ''} |")
 
 
 def main():

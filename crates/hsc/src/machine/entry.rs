@@ -5,6 +5,9 @@ use super::heap::{self, kind, Word};
 use super::{Machine, Program, ARG_SLOTS};
 use crate::native::codegen::frame;
 
+// The generated code takes the machine record by pointer and reads only its leading words (see
+// `Machine`); the heap inside it is never touched from assembly.
+#[allow(improper_ctypes)]
 extern "C" {
     /// The entry of a program: runs the closure in %rsi with the arguments on the stack. Returns 0
     /// when the continuation (the stop frame) is reached, 1 when an exception unwound to it.

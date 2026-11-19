@@ -34,7 +34,10 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
             })?;
         }
     }
-    for p in &lexed.pragmas {
+    // Only the file header's pragmas (before the first token) name extensions, as in GHC: one later
+    // in the file is ignored (base16's stray `{-# LANGUAGE lenientLoop #-}`).
+    let header_end = lexed.tokens.first().map(|t| (t.line, t.col));
+    for p in lexed.pragmas.iter().filter(|p| header_end.is_none_or(|end| (p.line, p.col) < end)) {
         let items: Vec<String> = match p.name.as_str() {
             "LANGUAGE" => p.body.split(',').map(|s| s.trim().to_string()).collect(),
             "OPTIONS_GHC" => p

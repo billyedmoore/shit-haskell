@@ -498,7 +498,34 @@ impl Checker {
         let wanted = std::mem::replace(&mut self.wanted, outer_wanted);
         self.level = outer_level;
 
-        let (ev_binds, residual) = self.solve(wanted)?;
+        let (mut ev_binds, mut residual) = self.solve(wanted)?;
+        // A variable that a coercion relates to a type of this signature is that type, solved
+        // under the signature's givens (containers' `sconcat = coerce intersections`: its `Ord t`
+        // is the given `Ord a`). Defaulting at the top level would come too late for them.
+        let mut fixed = false;
+        for w in &residual {
+            let p = self.metas_zonk_pred(&w.pred);
+            let mut ms = Vec::new();
+            for a in &p.args {
+                self.metas.free_metas(a, &mut ms);
+            }
+            for m in ms {
+                if !matches!(self.metas.prune(&Ty::Meta(m)), Ty::Meta(x) if x == m) {
+                    continue;
+                }
+                if let Some(t) = self.coercible_partner(m) {
+                    if mentions(&t, &skolems) {
+                        self.metas.subst[m as usize] = Some(t);
+                        fixed = true;
+                    }
+                }
+            }
+        }
+        if fixed {
+            let (more, rest) = self.solve(residual)?;
+            ev_binds.extend(more);
+            residual = rest;
+        }
         for w in residual {
             let p = self.metas_zonk_pred(&w.pred);
             let mentions_skolem = p.args.iter().any(|a| mentions(a, &skolems));

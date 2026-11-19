@@ -788,7 +788,9 @@ impl Parser {
             self.bump();
             if self.at_special('(') {
                 let name = self.paren_op()?;
-                return Ok(IEItem::Thing { name, subs: Subs::None });
+                // `type (-.->)(..)`: a type operator with its constructors (sop-core).
+                let subs = self.subs()?;
+                return Ok(IEItem::Thing { name, subs });
             }
         }
         if self.at_varid("pattern") && matches!(self.peek_raw(1), Tok::ConId(_) | Tok::QConId(..)) {

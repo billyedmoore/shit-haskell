@@ -389,10 +389,6 @@ fn instance(module: &str, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_l
     } else {
         dd.tyvars.iter().collect()
     };
-    let module_qname = |n: &str| QName {
-        qual: Some(BASE.into()),
-        name: n.into(),
-    };
     let head_ty = kept.iter().fold(
         Type::Con(
             QName {
@@ -1584,15 +1580,69 @@ fn map_fn(checker: &mut Checker, t: &Type, last: &str, f: &str, loc: Loc) -> Opt
             let pat = Pat::Tuple(names.iter().map(|n| Pat::Var(n.clone(), loc)).collect(), loc);
             Some(Expr::Lam(vec![pat], Box::new(Expr::Tuple(comps.into_iter().map(Some).collect(), loc)), loc))
         }
-        Type::Fun(a, b) if !mentions(a, last) => {
+        // A function: its argument mapped back (`co_map_fn`), its result forward. The parameter
+        // in an argument's argument (`(a -> f b) -> f t`, profunctors' `Baz`) is covariant again.
+        Type::Fun(a, b) => {
             let g = checker.fresh_name("g");
             let x = checker.fresh_name("x");
-            let mb = map_fn(checker, b, last, f, loc);
-            let body = match mb {
-                Some(m) => app(m, vec![app(local(&g, loc), vec![local(&x, loc)])]),
-                None => app(local(&g, loc), vec![local(&x, loc)]),
+            let arg = match co_map_fn(checker, a, last, f, loc) {
+                Some(c) => app(c, vec![local(&x, loc)]),
+                None => local(&x, loc),
+            };
+            let call = app(local(&g, loc), vec![arg]);
+            let body = match map_fn(checker, b, last, f, loc) {
+                Some(m) => app(m, vec![call]),
+                None => call,
             };
             Some(Expr::Lam(vec![Pat::Var(g, loc)], Box::new(Expr::Lam(vec![Pat::Var(x, loc)], Box::new(body), loc)), loc))
+        }
+        _ => None,
+    }
+}
+
+/// The contravariant counterpart of `map_fn`: for a type in which the last parameter occurs only
+/// contravariantly (an argument of a function), a function from `t[b]` back to `t[a]` through
+/// `f :: a -> b`; `None` when the type does not mention the parameter.
+fn co_map_fn(checker: &mut Checker, t: &Type, last: &str, f: &str, loc: Loc) -> Option<Expr> {
+    if !mentions(t, last) {
+        return None;
+    }
+    match t {
+        Type::Forall(_, body) | Type::Qual(_, body) => co_map_fn(checker, body, last, f, loc),
+        // `h :: A[b] -> B[b]` becomes `\x -> co_B (h (map_A x)) :: A[a] -> B[a]`.
+        Type::Fun(a, b) => {
+            let h = checker.fresh_name("h");
+            let x = checker.fresh_name("x");
+            let arg = match map_fn(checker, a, last, f, loc) {
+                Some(m) => app(m, vec![local(&x, loc)]),
+                None => local(&x, loc),
+            };
+            let call = app(local(&h, loc), vec![arg]);
+            let body = match co_map_fn(checker, b, last, f, loc) {
+                Some(c) => app(c, vec![call]),
+                None => call,
+            };
+            Some(Expr::Lam(vec![Pat::Var(h, loc)], Box::new(Expr::Lam(vec![Pat::Var(x, loc)], Box::new(body), loc)), loc))
+        }
+        Type::App(g, arg) if !mentions(g, last) => {
+            let inner = co_map_fn(checker, arg, last, f, loc)?;
+            Some(app(base_var("fmap", loc), vec![inner]))
+        }
+        Type::List(e, _) => {
+            let inner = co_map_fn(checker, e, last, f, loc)?;
+            Some(app(base_var("fmap", loc), vec![inner]))
+        }
+        Type::Tuple(ts, _) => {
+            let names = fresh_vars(checker, "t", ts.len());
+            let mut comps = Vec::new();
+            for (ty, n) in ts.iter().zip(&names) {
+                comps.push(match co_map_fn(checker, ty, last, f, loc) {
+                    Some(m) => app(m, vec![local(n, loc)]),
+                    None => local(n, loc),
+                });
+            }
+            let pat = Pat::Tuple(names.iter().map(|n| Pat::Var(n.clone(), loc)).collect(), loc);
+            Some(Expr::Lam(vec![pat], Box::new(Expr::Tuple(comps.into_iter().map(Some).collect(), loc)), loc))
         }
         _ => None,
     }

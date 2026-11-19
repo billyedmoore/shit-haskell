@@ -959,7 +959,7 @@ fn collapse(mut items: Vec<OpItem>, loc: Loc) -> Expr {
 fn stmt_binders(stmts: &[Stmt]) -> Vec<String> {
     use crate::rename::pat_vars;
     let mut out: Vec<String> = Vec::new();
-    let mut add = |name: String, out: &mut Vec<String>| {
+    let add = |name: String, out: &mut Vec<String>| {
         if !out.contains(&name) {
             out.push(name);
         }

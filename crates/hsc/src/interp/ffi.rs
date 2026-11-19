@@ -106,24 +106,6 @@ fn errno() -> i64 {
 /// The size of the stat buffer the RTS accessors read: x86-64's `struct stat`.
 const STAT_SIZE: i64 = 144;
 
-/// ENOENT, for a stat that failed without a usable errno.
-fn libc_enoent() -> i64 {
-    2
-}
-
-fn errno_or(fallback: i64) -> i64 {
-    let e = errno();
-    if e == 0 { fallback } else { e }
-}
-
-fn write_u64(data: &mut [u8], at: usize, v: u64) {
-    data[at..at + 8].copy_from_slice(&v.to_le_bytes());
-}
-
-fn write_u32(data: &mut [u8], at: usize, v: u32) {
-    data[at..at + 4].copy_from_slice(&v.to_le_bytes());
-}
-
 /// An integer field of a stat buffer, at a byte offset, `width` bytes wide.
 fn stat_field(rt: &Runtime, c: &Cell, at: usize, width: usize) -> RR {
     let (buf, off) = addr_of(rt, c)?;

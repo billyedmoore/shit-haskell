@@ -476,7 +476,6 @@ pub fn show_ty(m: &Metas, t: &Ty) -> String {
                     Ty::Bound(i) => format!("b{i}"),
                     Ty::Forall(..) => "(forall)".to_string(),
                     Ty::Qual(..) => "(constrained)".to_string(),
-                    Ty::Qual(..) => "(qualified)".to_string(),
                     Ty::App(..) => unreachable!("split_apps returns a non-application head"),
                 };
                 for a in &args {
