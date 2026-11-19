@@ -131,19 +131,26 @@ pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char, 
 /// A C call by its signature; a safe call lets the other threads run, and an interruptible one
 /// can be woken by an exception thrown to the thread.
 pub fn generic_call(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char, safe: bool, interruptible: bool) -> Option<Word> {
-    let mut ints: Vec<u64> = Vec::new();
-    let mut floats: Vec<f64> = Vec::new();
-    let classes: Vec<char> = sig.chars().collect();
-    for (k, class) in classes.iter().enumerate() {
+    // Fixed arrays, not vectors: a call allocates nothing on the Rust heap (`ccall::call` takes 20
+    // integer and 8 floating arguments at most).
+    let (mut ints, mut ni) = ([0u64; 20], 0usize);
+    let (mut floats, mut nf) = ([0f64; 8], 0usize);
+    let mut nargs = 0;
+    for (k, class) in sig.chars().enumerate() {
+        nargs = k + 1;
         let v = force_arg(m, k)?;
         let v = unbox(m, v)?;
         let h = m.heap_get(v, 0);
         match class {
             'd' | 'f' => {
                 let x = if heap::kind_of(h) == kind::DOUBLE { f64::from_bits(m.heap_get(v, 1)) } else { m.heap_get(v, 1) as i64 as f64 };
-                floats.push(if *class == 'f' { crate::ccall::float_arg(x) } else { x });
+                if nf < floats.len() {
+                    floats[nf] = if class == 'f' { crate::ccall::float_arg(x) } else { x };
+                    nf += 1;
+                }
             }
-            _ => ints.push(match heap::kind_of(h) {
+            _ => {
+                let w = match heap::kind_of(h) {
                 kind::ADDR => raw(m.heap_get(v, 1), m.heap_get(v, 2) as i64) as u64,
                 kind::BYTES => v + 8,
                 kind::CON => {
@@ -151,15 +158,19 @@ pub fn generic_call(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: c
                     (m.con_name(v) == "GHC.Types.True") as u64
                 }
                 _ => m.heap_get(v, 1),
-            }),
+                };
+                if ni < ints.len() {
+                    ints[ni] = w;
+                    ni += 1;
+                }
+            }
         }
     }
-    // The arrays passed, for pointers the function answers into them (they move with the collector).
-    let pointer_args: Vec<usize> = (0..classes.len()).collect();
+    let (ints, floats) = (&ints[..ni], &floats[..nf]);
     // SAFETY: the foreign import declares the function's type; no collection happens during the call.
     // A safe call lets the other threads run meanwhile.
     let answer = if safe {
-        let a = super::conc::foreign_call(m, interruptible, || unsafe { crate::ccall::call(f, &ints, &floats, ret) });
+        let a = super::conc::foreign_call(m, interruptible, || unsafe { crate::ccall::call(f, ints, floats, ret) });
         // An exception thrown to the thread during the call is raised as it returns (its result
         // is dropped), as GHC raises it on resuming the thread.
         if super::conc::check(m) {
@@ -167,13 +178,18 @@ pub fn generic_call(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: c
         }
         a
     } else {
-        unsafe { crate::ccall::call(f, &ints, &floats, ret) }
+        unsafe { crate::ccall::call(f, ints, floats, ret) }
     };
     m.reserve(16);
     let value = match (answer, ret) {
         (_, 'v') => unit(m),
         (crate::ccall::Answer::Double(d), _) => super::prims_num::double_value(m, d),
-        (crate::ccall::Answer::Int(p), 'p') => addr_result(m, p as *mut u8, &pointer_args),
+        // A pointer answered into one of the arrays passed keeps that array (it moves with the
+        // collector).
+        (crate::ccall::Answer::Int(p), 'p') => {
+            let pointer_args: Vec<usize> = (0..nargs).collect();
+            addr_result(m, p as *mut u8, &pointer_args)
+        }
         (crate::ccall::Answer::Int(i), _) => int_value(m, i),
     };
     Some(state_pair(m, value))

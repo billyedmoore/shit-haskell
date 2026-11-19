@@ -16,7 +16,7 @@ This file says where things stand and what comes next. History lives in git and
   suites; unix 15/16 and os-string 14/16 (same failures as GHC); parsec 3/4 (a timing test);
   binary 141/142 (needs PolyKinds); time times out; text needs a GHC plugin.
 - **Projects:** ShellCheck and its ~45 dependencies match the GHC build. hlint builds and
-  runs, but too slowly to compare on large inputs yet (Typeable reps now built once, PR #78).
+  matches its GHC build on its own and ShellCheck's sources and passes its 956 tests (~11× slower).
 - **Speed:** compile times are close to GHC's (ghc-lib-parser cold ≈ 28 s, warm ≈ 1.4 s).
   Generated code is ~2.2× slower than `ghc -O1` (geometric mean, PR #74's hosted run);
   speed work resumes after the projects, diagnostics and usability items below:
@@ -52,7 +52,7 @@ This file says where things stand and what comes next. History lives in git and
 ### 1. Large projects
 
 More real programs built with their own build systems and compared with their GHC builds:
-hlint (then its tests), cabal-install, pandoc, aeson, megaparsec, lens, and in the end GHC
+cabal-install, pandoc, aeson, megaparsec, lens, and in the end GHC
 itself. Alongside: text (plugin), binary (PolyKinds), time (speed). Language features come as
 these need them: Template Haskell `[d| |]`, type and pattern splices, `reify` of classes;
 PolyKinds and kind inference; Arrows.
