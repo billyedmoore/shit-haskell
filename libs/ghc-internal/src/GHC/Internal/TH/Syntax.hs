@@ -320,7 +320,8 @@ hscReifyRoles n = do
     TyConI (TySynD _ tvs _) -> pure (map (const RepresentationalR) tvs)
     _ -> fail ("reifyRoles: " ++ show n ++ " is not a type constructor")
 
--- | hsc: the state 'getQ' and 'putQ' keep across the splices of a module, by type.
+-- | hsc: the state 'getQ' and 'putQ' keep, by type: across the splices that run together (a
+-- declaration splice, or a module's expression splices), not yet across separate runs.
 {-# NOINLINE hscQState #-}
 hscQState :: IORef [(TypeRep, Any)]
 hscQState = unsafePerformIO (newIORef [])

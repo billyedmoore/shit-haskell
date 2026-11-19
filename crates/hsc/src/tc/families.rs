@@ -139,7 +139,8 @@ impl Checker {
         }
         let args: Vec<Ty> = args.into_iter().cloned().collect();
         let extra = info.arity - args.len();
-        for eqn in &info.equations {
+        // (A class's default for an associated type is for its full applications.)
+        for eqn in info.equations.iter().filter(|e| !e.default) {
             if eqn.args.len() != info.arity {
                 continue;
             }
@@ -308,8 +309,13 @@ impl Checker {
         let arity = info.arity;
         let args: Vec<Ty> = args.iter().map(|a| self.metas.zonk(a)).collect();
         // A class's defaults come after the instances' own equations, and only when none of
-        // those might still match (an argument not known yet).
-        let mut undecided = false;
+        // those might still match: an argument not known yet, or a family application not
+        // reduced yet (it may still become one an instance's equation matches).
+        let mut undecided = args[..arity.min(args.len())].iter().any(|a| match a.split_apps().0 {
+            Ty::Meta(_) => true,
+            Ty::Con(c) => self.env.families.contains_key(c),
+            _ => false,
+        });
         for eqn in info.equations.iter().filter(|e| !e.default).chain(info.equations.iter().filter(|e| e.default)) {
             if eqn.default && undecided {
                 return None;

@@ -6,5 +6,8 @@ import Language.Haskell.TH.Syntax (lift)
 dotted :: String
 dotted = $(lift ([Q.str|.|] ++ "/" ++ [Q.str|x|]))
 
+shout :: String
+shout = $(lift ([Q.fn|!|] "hi"))
+
 main :: IO ()
-main = putStrLn dotted
+main = putStrLn dotted >> putStrLn shout
