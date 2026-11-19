@@ -981,7 +981,9 @@ impl Driver {
             self.expand_expr_splices(&mut before, exts, path, groups_end)?;
             m.decls.splice(..i, before.decls.iter().cloned());
             let imported = self.quoted_data(&[&body], &m.name);
-            let table = crate::th::reify_table(&before.decls, &m.name, &imported, loc);
+            let mut classes = self.quoted_classes(&[&body]);
+            classes.extend(self.quoted_types_closure(&[&body], &m.name).1);
+            let table = crate::th::reify_table(&before.decls, &m.name, &imported, classes, loc);
             let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(&before.decls, &m.name, &imported), loc);
             let smod = crate::th::decl_splice_module(m, before.decls, body, loc, table, setup, &path.display().to_string());
             let mark = self.binds.len();
@@ -1086,15 +1088,124 @@ impl Driver {
     /// The data types of other modules that splices quote by name (`''T`), which `reify` may be
     /// asked about: their declarations, with their modules.
     fn quoted_data(&self, bodies: &[&crate::syntax::ast::Expr], current: &str) -> Vec<(String, crate::syntax::ast::DataDecl)> {
-        let mut out: Vec<(String, crate::syntax::ast::DataDecl)> = Vec::new();
-        for q in crate::th::quoted_types(bodies) {
-            for (module, dd) in self.checker.env.data_decls.values() {
-                if dd.name == q.name && module != current && !out.iter().any(|(m, d)| m == module && d.name == dd.name) {
-                    out.push((module.clone(), dd.clone()));
+        self.quoted_types_closure(bodies, current).0
+    }
+
+    /// The types `reify` may be asked about in the splices: those they quote, and every type their
+    /// constructors' fields mention, transitively (th-reify-many walks them all): the data types
+    /// of other modules, and the `reify` entries of the synonyms and primitive types reached.
+    fn quoted_types_closure(
+        &self,
+        bodies: &[&crate::syntax::ast::Expr],
+        current: &str,
+    ) -> (Vec<(String, crate::syntax::ast::DataDecl)>, Vec<crate::syntax::ast::Expr>) {
+        use crate::syntax::ast::{ConFields, Type};
+        fn names(t: &Type, out: &mut Vec<String>) {
+            match t {
+                Type::Con(q, _) => out.push(q.name.clone()),
+                Type::App(f, a) | Type::Fun(f, a) => {
+                    names(f, out);
+                    names(a, out);
+                }
+                Type::List(e, _) => names(e, out),
+                Type::Tuple(ts, _) => ts.iter().for_each(|x| names(x, out)),
+                Type::Forall(_, b) | Type::Qual(_, b) => names(b, out),
+                Type::Sig(x, _) => names(x, out),
+                Type::OpChain(items, _) => {
+                    for it in items {
+                        match it {
+                            crate::syntax::ast::TypeOpItem::Operand(x) => names(x, out),
+                            crate::syntax::ast::TypeOpItem::Op(q, _) => out.push(q.name.clone()),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn ty_names(t: &crate::tc::types::Ty, out: &mut Vec<String>) {
+            use crate::tc::types::Ty;
+            match t {
+                Ty::Con(c) => out.push(crate::tc::types::unqualify(c).to_string()),
+                Ty::App(f, a) => {
+                    ty_names(f, out);
+                    ty_names(a, out);
+                }
+                _ => {}
+            }
+        }
+        let loc = bodies.first().map(|b| b.loc()).unwrap_or_default();
+        let mut work: Vec<String> = crate::th::quoted_types(bodies).into_iter().map(|q| q.name).collect();
+        // The types in the instance heads of quoted classes (`instance Lift Int8`) may be reified
+        // too (th-reify-many checks each type it meets against them).
+        for n in work.clone() {
+            for (key, _) in self.checker.env.classes.iter().filter(|(k, _)| crate::tc::types::unqualify(k) == n) {
+                for inst in self.checker.env.instances.for_class(key) {
+                    let mut more = Vec::new();
+                    inst.head.iter().for_each(|h| ty_names(h, &mut more));
+                    work.extend(more);
                 }
             }
         }
-        out
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<(String, crate::syntax::ast::DataDecl)> = Vec::new();
+        let mut extra = Vec::new();
+        while let Some(n) = work.pop() {
+            if !seen.insert(n.clone()) || seen.len() > 4000 {
+                continue;
+            }
+            let mut found = false;
+            for (module, dd) in self.checker.env.data_decls.values() {
+                if dd.name != n {
+                    continue;
+                }
+                found = true;
+                let mut fields = Vec::new();
+                for c in &dd.cons {
+                    match &c.fields {
+                        ConFields::Positional(fs) => fs.iter().for_each(|f| names(&f.ty, &mut fields)),
+                        ConFields::Record(groups) => groups.iter().for_each(|(_, f)| names(&f.ty, &mut fields)),
+                    }
+                }
+                work.extend(fields);
+                if module != current && !out.iter().any(|(m, d)| m == module && d.name == dd.name) {
+                    out.push((module.clone(), dd.clone()));
+                }
+            }
+            if found {
+                continue;
+            }
+            // A synonym (`String`), or a primitive type (`Int#`): entries of their own.
+            if let Some((key, syn)) = self.checker.env.synonyms.iter().find(|(k, _)| crate::tc::types::unqualify(k) == n) {
+                let module = key[..key.len() - n.len()].trim_end_matches('.').to_string();
+                if module != current {
+                    extra.push(crate::th::synonym_entry(&module, &n, syn, loc));
+                }
+                let mut more = Vec::new();
+                ty_names(&syn.rhs, &mut more);
+                work.extend(more);
+            } else if n.ends_with('#') {
+                extra.push(crate::th::prim_entry(&n, loc));
+            }
+        }
+        (out, extra)
+    }
+
+    /// The `reify` entries of the classes the splices quote (`''Lift`): `ClassI` with their
+    /// instances so far.
+    fn quoted_classes(&self, bodies: &[&crate::syntax::ast::Expr]) -> Vec<crate::syntax::ast::Expr> {
+        let loc = bodies.first().map(|b| b.loc()).unwrap_or_default();
+        let mut found: Vec<(String, &crate::tc::env::ClassInfo, Vec<&crate::tc::env::InstInfo>)> = Vec::new();
+        for q in crate::th::quoted_types(bodies) {
+            for (key, info) in self.checker.env.classes.iter() {
+                if crate::tc::types::unqualify(key) != q.name || found.iter().any(|(_, i, _)| i.name == info.name) {
+                    continue;
+                }
+                let module = key[..key.len() - q.name.len()].trim_end_matches('.').to_string();
+                let insts: Vec<&crate::tc::env::InstInfo> = self.checker.env.instances.for_class(key).collect();
+                found.push((module, info, insts));
+            }
+        }
+        crate::th::class_entries(&found, loc)
     }
 
     /// The fixities a splice's `reifyFixity` answers from: the module's own (its declarations so
@@ -1166,7 +1277,9 @@ impl Driver {
         let first = locs.first().copied().unwrap_or(m.loc);
         let bodies: Vec<&crate::syntax::ast::Expr> = splices.iter().map(|s| &s.body).collect();
         let imported = self.quoted_data(&bodies, &m.name);
-        let table = crate::th::reify_table(&earlier, &m.name, &imported, first);
+        let mut classes = self.quoted_classes(&bodies);
+        classes.extend(self.quoted_types_closure(&bodies, &m.name).1);
+        let table = crate::th::reify_table(&earlier, &m.name, &imported, classes, first);
         let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(&earlier, &m.name, &imported), first);
         let mut smod = crate::th::splice_module(m, &splices, &name, table, setup, &path.display().to_string());
         smod.decls.splice(0..0, earlier);

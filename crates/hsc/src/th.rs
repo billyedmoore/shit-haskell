@@ -1242,8 +1242,8 @@ fn rt_error_text(e: &crate::interp::RtError) -> String {
 /// each data type, `(module, name, TyConI (DataD ..))`, and for each of its constructors a
 /// `DataConI`. The declarations of the module being compiled are given as written (their names
 /// are quoted, so the splice module resolves them); those of other modules as renamed.
-pub fn reify_table(local: &[Decl], module: &str, imported: &[(String, DataDecl)], loc: Loc) -> Expr {
-    let mut entries = Vec::new();
+pub fn reify_table(local: &[Decl], module: &str, imported: &[(String, DataDecl)], classes: Vec<Expr>, loc: Loc) -> Expr {
+    let mut entries = classes;
     let mut locals = Vec::new();
     collect_data(local, &mut locals);
     for dd in locals {
@@ -1405,6 +1405,92 @@ impl Reify {
 /// The module run before a module's splices to give `reify` the types of its values: those of
 /// `module` the checker knows (the declarations before the splices, checked with them), each
 /// as `VarI name type Nothing`. It sets `hscReifyValues` when its one binding is forced.
+/// The `reify` entries of classes (`ClassI`, with the class's instances), for the classes a
+/// splice quotes: each class with its module and instances.
+pub fn class_entries(classes: &[(String, &crate::tc::env::ClassInfo, Vec<&crate::tc::env::InstInfo>)], loc: Loc) -> Vec<Expr> {
+    classes.iter().map(|(module, info, insts)| Reify { loc, global: Some(module.clone()) }.class_entry(module, info, insts)).collect()
+}
+
+/// The `reify` entry of a type synonym: `TyConI (TySynD name params rhs)`.
+pub fn synonym_entry(module: &str, occ: &str, syn: &crate::tc::env::Synonym, loc: Loc) -> Expr {
+    let r = Reify { loc, global: Some(module.to_string()) };
+    let params: Vec<String> = (0..syn.nparams).map(|i| format!("a{i}")).collect();
+    let tvs = params.iter().map(|n| app(app(app(r.syn("KindedTV"), r.mk_name(n)), r.syn("BndrReq")), r.syn("StarT"))).collect();
+    let dec = app(app(app(r.syn("TySynD"), r.own(true, occ)), Expr::List(tvs, loc)), r.tc_ty(&syn.rhs, &params));
+    Expr::Tuple(vec![Some(r.str(module)), Some(r.str(occ)), Some(app(r.syn("TyConI"), dec))], loc)
+}
+
+/// The `reify` entry of a primitive type (`Int#`): `PrimTyConI name 0 True`.
+pub fn prim_entry(occ: &str, loc: Loc) -> Expr {
+    let r = Reify { loc, global: Some("GHC.Prim".to_string()) };
+    let unlifted = Expr::Con(QName { qual: Some("%G:GHC.Types".into()), name: "True".into() }, loc);
+    let info = app(app(app(r.syn("PrimTyConI"), r.mk_name(occ)), lit_int("0", loc)), unlifted);
+    Expr::Tuple(vec![Some(r.str("GHC.Prim")), Some(r.str(occ)), Some(info)], loc)
+}
+
+impl Reify {
+    fn class_entry(&self, module: &str, info: &crate::tc::env::ClassInfo, insts: &[&crate::tc::env::InstInfo]) -> Expr {
+        let loc = self.loc;
+        let occ = crate::tc::types::unqualify(&info.name).to_string();
+        let params: Vec<String> = (0..info.nparams).map(|i| format!("a{i}")).collect();
+        let list = |xs: Vec<Expr>| Expr::List(xs, loc);
+        let tvs = params
+            .iter()
+            .map(|n| app(app(app(self.syn("KindedTV"), self.mk_name(n)), self.syn("BndrReq")), self.syn("StarT")))
+            .collect();
+        let supers = info.supers.iter().map(|p| self.tc_pred(p, &params)).collect();
+        let fundeps = info
+            .fundeps
+            .iter()
+            .map(|(from, to)| {
+                let names = |is: &Vec<usize>| list(is.iter().map(|&i| self.mk_name(&params[i])).collect());
+                app(app(self.syn("FunDep"), names(from)), names(to))
+            })
+            .collect();
+        // Each method's type as the class declares it: the class's variables free, the method's
+        // own quantified with its own context (the class predicate left out).
+        let sigs = info
+            .methods
+            .iter()
+            .map(|(m, sch)| {
+                let own: Vec<String> = (info.nparams..sch.nvars)
+                    .map(|i| sch.names.get(i as usize).cloned().unwrap_or_else(|| format!("m{i}")))
+                    .collect();
+                let names: Vec<String> = params.iter().cloned().chain(own.iter().cloned()).collect();
+                let body = self.tc_ty(&sch.ty, &names);
+                let ctx: Vec<Expr> = sch.preds.iter().skip(1).map(|p| self.tc_pred(p, &names)).collect();
+                let ty = if own.is_empty() && ctx.is_empty() {
+                    body
+                } else {
+                    let binders = own
+                        .iter()
+                        .map(|n| app(app(app(self.syn("KindedTV"), self.mk_name(n)), self.syn("SpecifiedSpec")), self.syn("StarT")))
+                        .collect();
+                    app(app(app(self.syn("ForallT"), list(binders)), list(ctx)), body)
+                };
+                app(app(self.syn("SigD"), self.global_name(false, m)), ty)
+            })
+            .collect();
+        let class_name = self.own(true, &occ);
+        let dec = app(app(app(app(app(self.syn("ClassD"), list(supers)), class_name), list(tvs)), list(fundeps)), list(sigs));
+        let nothing = Expr::Con(QName { qual: Some("%G:GHC.Internal.Maybe".into()), name: "Nothing".into() }, loc);
+        let instances = insts
+            .iter()
+            .map(|inst| {
+                let names: Vec<String> = (0..inst.nvars).map(|i| format!("t{i}")).collect();
+                let head = inst
+                    .head
+                    .iter()
+                    .fold(app(self.syn("ConT"), self.own(true, &occ)), |acc, h| app(app(self.syn("AppT"), acc), self.tc_ty(h, &names)));
+                let ctx = inst.ctx.iter().map(|p| self.tc_pred(p, &names)).collect();
+                app(app(app(app(self.syn("InstanceD"), nothing.clone()), list(ctx)), head), list(Vec::new()))
+            })
+            .collect();
+        let info_e = app(app(self.syn("ClassI"), dec), list(instances));
+        Expr::Tuple(vec![Some(self.str(module)), Some(self.str(&occ)), Some(info_e)], loc)
+    }
+}
+
 pub fn reify_values_module(values: &[(String, &crate::tc::types::Scheme)], module: &str, name: &str, loc: Loc) -> Module {
     let mut entries = Vec::new();
     for (occ, scheme) in values {
