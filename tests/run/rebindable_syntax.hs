@@ -1,6 +1,7 @@
 -- RebindableSyntax: literals, literal patterns, negation and `if` use the names in scope
 -- (basement's own `Integral` class with `fromInteger`, and its `ifThenElse`).
 {-# LANGUAGE RebindableSyntax #-}
+-- (RebindableSyntax implies NoImplicitPrelude: the imports below are all there is.)
 import Prelude hiding (fromInteger, negate, fromRational)
 import qualified Prelude as P
 

@@ -227,7 +227,7 @@ integerIsPowerOf2# n =
   else (# (# #) | #)
 
 integerSizeInBase# :: Word# -> Integer -> Word#
-integerSizeInBase# b n = plusWord# (integerLogBase# (integerFromWord# b) (integerAbs n)) 1##
+integerSizeInBase# b n = if integerIsZero n then 0## else plusWord# (integerLogBase# (integerFromWord# b) (integerAbs n)) 1##
 
 integerTake :: Word -> Integer -> Integer
 integerTake (W# n) i = integerAnd i (integerSub (integerShiftL# integerOne n) integerOne)
@@ -587,6 +587,10 @@ integerGcde# a b = case integerGcde a b of (g, x, y) -> (# g, x, y #)
 integerPowMod# :: Integer -> Integer -> Natural -> (# Natural | () #)
 integerPowMod# b e m
   | naturalIsZero m = (# | () #)
+  | naturalIsOne m = (# naturalZero | #)
+  | integerIsZero e = (# naturalOne | #)
+  | integerIsZero b = (# naturalZero | #)
+  | integerIsOne b = (# naturalOne | #)
   | integerIsNegative e = case integerRecipMod# b m of
       (# r | #) -> integerPowMod# (integerFromNatural r) (integerNegate e) m
       (# | u #) -> (# | u #)
@@ -604,7 +608,11 @@ integerRecipMod# a m
 
 -- | The integer of `sz` bytes at an address, most significant first when `e` is 1#.
 integerFromAddr# :: Word# -> Addr# -> Int# -> State# s -> (# State# s, Integer #)
-integerFromAddr# sz addr e s = (# s, go 0# integerZero #)
+integerFromAddr# sz addr e s = case go 0# integerZero of
+  -- Read now, while the memory is valid (forcing the result later could read freed memory).
+  IS i -> (# s, IS i #)
+  IP b -> (# s, IP b #)
+  IN b -> (# s, IN b #)
   where
     n = word2Int# sz
     byte i = word8ToWord# (indexWord8OffAddr# addr (case e of { 0# -> n -# 1# -# i; _ -> i }))

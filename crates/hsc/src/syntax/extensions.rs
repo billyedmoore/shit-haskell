@@ -174,6 +174,10 @@ impl Extensions {
             return Err(format!("Unsupported extension: {item}"));
         }
         let name = name.as_str();
+        // RebindableSyntax implies NoImplicitPrelude, as in GHC.
+        if enable && name == "RebindableSyntax" {
+            self.on.remove("ImplicitPrelude");
+        }
         if enable {
             self.on.insert(name.to_string());
             for implied in implied_by(name) {
