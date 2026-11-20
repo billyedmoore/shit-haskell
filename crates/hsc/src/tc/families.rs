@@ -309,9 +309,14 @@ impl Checker {
             self.env.tycons.get(c).map(|i| i.arity)
         };
         match arity {
-            Some(n) if args.len() == n => Some("Type".into()),
-            Some(_) => Some("->".into()),
-            None => None,
+            Some(n) if args.len() <= n => {
+                let mut k = "Type".to_string();
+                for _ in 0..(n - args.len()) {
+                    k = format!("->:{k}");
+                }
+                Some(k)
+            }
+            _ => None,
         }
     }
 
@@ -650,7 +655,16 @@ pub(super) fn annotated_kind_name(t: &Type) -> Option<String> {
     let Type::Sig(_, k) = t else { return None };
     fn go(k: &Type) -> Option<String> {
         match k {
-            Type::Con(q, _) => Some(super::convert::global_tycon_name(q)),
+            Type::Con(q, _) => {
+                let name = super::convert::global_tycon_name(q);
+                if name == "Constraint" || name.ends_with(".Constraint") {
+                    Some("GHC.Types.Constraint".into())
+                } else if name == "Type" || name.ends_with(".Type") || name.ends_with(".*") || name == "*" {
+                    Some("Type".into())
+                } else {
+                    Some(name)
+                }
+            }
             Type::Fun(_, res) => {
                 let tail = go(res).unwrap_or_else(|| "_".into());
                 Some(format!("->:{tail}"))

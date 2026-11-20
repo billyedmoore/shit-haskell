@@ -82,7 +82,13 @@ impl Checker {
                                 .instance_reps(&old.head, &old.kinds)
                                 .iter()
                                 .zip(self.instance_reps(&i.head, &i.kinds))
-                                .all(|(a, b)| a.is_none() || b.is_none() || *a == b)
+                                .all(|(a, b)| match (a, b) {
+                                    (Some(x), Some(y)) => match (x.strip_prefix("kind:"), y.strip_prefix("kind:")) {
+                                        (Some(kx), Some(ky)) => super::families::same_kind(kx, ky),
+                                        _ => *x == y,
+                                    },
+                                    _ => true,
+                                })
                     }
                 })
                 .cloned()

@@ -872,6 +872,7 @@ pub struct AltMark {
     givens: usize,
     skol: std::collections::HashMap<u32, Ty>,
     apps: HashMap<u32, (String, Ty)>,
+    skol_kinds: HashMap<u32, String>,
     outer: Vec<Wanted>,
     scoped: usize,
 }
@@ -891,6 +892,7 @@ impl Checker {
             givens: self.givens.len(),
             skol: self.metas.skol_binds.clone(),
             apps: self.skol_apps.clone(),
+            skol_kinds: self.skol_kinds.clone(),
             outer: std::mem::take(&mut self.wanted),
             scoped: self.scoped.len(),
         }
@@ -932,6 +934,7 @@ impl Checker {
         self.givens.truncate(mark.givens);
         self.metas.skol_binds = mark.skol;
         self.skol_apps = mark.apps;
+        self.skol_kinds = mark.skol_kinds;
         // Type variables that a pattern signature bound are in scope in its alternative only.
         self.scoped.truncate(mark.scoped);
         result
