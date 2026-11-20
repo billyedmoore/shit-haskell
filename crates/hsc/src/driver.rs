@@ -980,9 +980,9 @@ impl Driver {
             let mut before = Module { decls: m.decls[..i].to_vec(), ..m.clone() };
             self.expand_expr_splices(&mut before, exts, path, groups_end)?;
             m.decls.splice(..i, before.decls.iter().cloned());
-            let imported = self.quoted_data(&[&body], &m.name);
+            let (imported, reached) = self.quoted_types_closure(&[&body], &m.name);
             let mut classes = self.quoted_classes(&[&body]);
-            classes.extend(self.quoted_types_closure(&[&body], &m.name).1);
+            classes.extend(reached);
             let table = crate::th::reify_table(&before.decls, &m.name, &imported, classes, loc);
             let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(&before.decls, &m.name, &imported), loc);
             let smod = crate::th::decl_splice_module(m, before.decls, body, loc, table, setup, &path.display().to_string());
@@ -1087,22 +1087,25 @@ impl Driver {
 
     /// The data types of other modules that splices quote by name (`''T`), which `reify` may be
     /// asked about: their declarations, with their modules.
-    fn quoted_data(&self, bodies: &[&crate::syntax::ast::Expr], current: &str) -> Vec<(String, crate::syntax::ast::DataDecl)> {
-        self.quoted_types_closure(bodies, current).0
-    }
-
     /// The types `reify` may be asked about in the splices: those they quote, and every type their
     /// constructors' fields mention, transitively (th-reify-many walks them all): the data types
     /// of other modules, and the `reify` entries of the synonyms and primitive types reached.
+    /// Names are followed with their modules where known (a field of another module's type is
+    /// renamed; `IntMap.Key` is not `IntSet.Key`).
     fn quoted_types_closure(
         &self,
         bodies: &[&crate::syntax::ast::Expr],
         current: &str,
     ) -> (Vec<(String, crate::syntax::ast::DataDecl)>, Vec<crate::syntax::ast::Expr>) {
         use crate::syntax::ast::{ConFields, Type};
-        fn names(t: &Type, out: &mut Vec<String>) {
+        // A name to follow: its module when known, and its occurrence.
+        type Want = (Option<String>, String);
+        fn want(q: &crate::syntax::ast::QName) -> Want {
+            (q.qual.as_deref().map(|m| m.trim_start_matches("%G:").to_string()), q.name.clone())
+        }
+        fn names(t: &Type, out: &mut Vec<Want>) {
             match t {
-                Type::Con(q, _) => out.push(q.name.clone()),
+                Type::Con(q, _) => out.push(want(q)),
                 Type::App(f, a) | Type::Fun(f, a) => {
                     names(f, out);
                     names(a, out);
@@ -1115,17 +1118,21 @@ impl Driver {
                     for it in items {
                         match it {
                             crate::syntax::ast::TypeOpItem::Operand(x) => names(x, out),
-                            crate::syntax::ast::TypeOpItem::Op(q, _) => out.push(q.name.clone()),
+                            crate::syntax::ast::TypeOpItem::Op(q, _) => out.push(want(q)),
                         }
                     }
                 }
                 _ => {}
             }
         }
-        fn ty_names(t: &crate::tc::types::Ty, out: &mut Vec<String>) {
+        fn ty_names(t: &crate::tc::types::Ty, out: &mut Vec<Want>) {
             use crate::tc::types::Ty;
             match t {
-                Ty::Con(c) => out.push(crate::tc::types::unqualify(c).to_string()),
+                Ty::Con(c) => {
+                    let occ = crate::tc::types::unqualify(c);
+                    let m = c[..c.len() - occ.len()].trim_end_matches('.');
+                    out.push(((!m.is_empty()).then(|| m.to_string()), occ.to_string()));
+                }
                 Ty::App(f, a) => {
                     ty_names(f, out);
                     ty_names(a, out);
@@ -1133,31 +1140,56 @@ impl Driver {
                 _ => {}
             }
         }
+        let split = |key: &str| -> (String, String) {
+            let occ = crate::tc::types::unqualify(key).to_string();
+            (key[..key.len() - occ.len()].trim_end_matches('.').to_string(), occ)
+        };
+        // The data types and synonyms by occurrence, once.
+        let mut data: HashMap<&str, Vec<(&String, &crate::syntax::ast::DataDecl)>> = HashMap::new();
+        for (module, dd) in self.checker.env.data_decls.values() {
+            data.entry(dd.name.as_str()).or_default().push((module, dd));
+        }
+        let mut syns: HashMap<String, Vec<(String, &crate::tc::env::Synonym)>> = HashMap::new();
+        for (key, syn) in self.checker.env.synonyms.iter() {
+            let (m, occ) = split(key);
+            syns.entry(occ).or_default().push((m, syn));
+        }
         let loc = bodies.first().map(|b| b.loc()).unwrap_or_default();
-        let mut work: Vec<String> = crate::th::quoted_types(bodies).into_iter().map(|q| q.name).collect();
+        let mut work: Vec<Want> = crate::th::quoted_types(bodies)
+            .into_iter()
+            .map(|q| (q.qual.map(|m| m.trim_start_matches("%G:").to_string()), q.name))
+            .collect();
         // The types in the instance heads of quoted classes (`instance Lift Int8`) may be reified
-        // too (th-reify-many checks each type it meets against them).
-        for n in work.clone() {
+        // too (th-reify-many checks each type it meets against them); a few hundred at most.
+        let mut seeded = 0usize;
+        for (_, n) in work.clone() {
             for (key, _) in self.checker.env.classes.iter().filter(|(k, _)| crate::tc::types::unqualify(k) == n) {
                 for inst in self.checker.env.instances.for_class(key) {
-                    let mut more = Vec::new();
-                    inst.head.iter().for_each(|h| ty_names(h, &mut more));
-                    work.extend(more);
+                    if seeded >= 400 {
+                        break;
+                    }
+                    seeded += 1;
+                    inst.head.iter().for_each(|h| ty_names(h, &mut work));
                 }
             }
         }
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<Want> = std::collections::HashSet::new();
         let mut out: Vec<(String, crate::syntax::ast::DataDecl)> = Vec::new();
         let mut extra = Vec::new();
-        while let Some(n) = work.pop() {
-            if !seen.insert(n.clone()) || seen.len() > 4000 {
+        while let Some(want) = work.pop() {
+            if seen.len() > 4000 || !seen.insert(want.clone()) {
                 continue;
             }
+            let (module, n) = &want;
+            // The module named, if it has the name (a local declaration's qualifier may be an
+            // import's alias instead: then any module's).
+            let in_named = module.as_deref().is_some_and(|w| {
+                data.get(n.as_str()).into_iter().flatten().any(|(m, _)| m.as_str() == w)
+                    || syns.get(n).into_iter().flatten().any(|(m, _)| m == w)
+            });
+            let fits = |m: &str| !in_named || module.as_deref() == Some(m);
             let mut found = false;
-            for (module, dd) in self.checker.env.data_decls.values() {
-                if dd.name != n {
-                    continue;
-                }
+            for (m, dd) in data.get(n.as_str()).into_iter().flatten().filter(|(m, _)| fits(m)) {
                 found = true;
                 let mut fields = Vec::new();
                 for c in &dd.cons {
@@ -1167,24 +1199,18 @@ impl Driver {
                     }
                 }
                 work.extend(fields);
-                if module != current && !out.iter().any(|(m, d)| m == module && d.name == dd.name) {
-                    out.push((module.clone(), dd.clone()));
+                if m.as_str() != current && !out.iter().any(|(om, d)| om == *m && d.name == dd.name) {
+                    out.push(((*m).clone(), (*dd).clone()));
                 }
-            }
-            if found {
-                continue;
             }
             // A synonym (`String`), or a primitive type (`Int#`): entries of their own.
-            if let Some((key, syn)) = self.checker.env.synonyms.iter().find(|(k, _)| crate::tc::types::unqualify(k) == n) {
-                let module = key[..key.len() - n.len()].trim_end_matches('.').to_string();
-                if module != current {
-                    extra.push(crate::th::synonym_entry(&module, &n, syn, loc));
-                }
-                let mut more = Vec::new();
-                ty_names(&syn.rhs, &mut more);
-                work.extend(more);
-            } else if n.ends_with('#') {
-                extra.push(crate::th::prim_entry(&n, loc));
+            for (m, syn) in syns.get(n).into_iter().flatten().filter(|(m, _)| fits(m)) {
+                found = true;
+                extra.push(crate::th::synonym_entry(m, n, syn, loc));
+                ty_names(&syn.rhs, &mut work);
+            }
+            if !found && n.ends_with('#') {
+                extra.push(crate::th::prim_entry(n, loc));
             }
         }
         (out, extra)
@@ -1276,9 +1302,9 @@ impl Driver {
         let locs: Vec<crate::syntax::ast::Loc> = splices.iter().map(|s| s.loc).collect();
         let first = locs.first().copied().unwrap_or(m.loc);
         let bodies: Vec<&crate::syntax::ast::Expr> = splices.iter().map(|s| &s.body).collect();
-        let imported = self.quoted_data(&bodies, &m.name);
+        let (imported, reached) = self.quoted_types_closure(&bodies, &m.name);
         let mut classes = self.quoted_classes(&bodies);
-        classes.extend(self.quoted_types_closure(&bodies, &m.name).1);
+        classes.extend(reached);
         let table = crate::th::reify_table(&earlier, &m.name, &imported, classes, first);
         let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(&earlier, &m.name, &imported), first);
         let mut smod = crate::th::splice_module(m, &splices, &name, table, setup, &path.display().to_string());

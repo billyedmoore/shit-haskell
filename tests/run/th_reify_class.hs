@@ -19,4 +19,10 @@ main = do
     c <- reifyInstances ''Pretty [AppT ListT (ConT ''Char)]
     d <- isInstance ''Pretty [ConT ''Bool]
     e <- isInstance ''Pretty [AppT (ConT ''Box) (ConT ''Int)]
-    pure (LitE (StringL (show (length a, length b, length c, d, e)))))
+    f <- isInstance ''Pretty [AppT (ConT ''[]) (ConT ''Int)]
+    g <- isInstance ''Show [ConT ''String]
+    h <- isInstance ''Eq [AppT (AppT (TupleT 2) (ConT ''Int)) (ConT ''Bool)]
+    pure (LitE (StringL (show (length a, length b, length c, d, e, f, g, h)))))
+  putStrLn $(do
+    ClassI (ClassD _ _ [KindedTV _ _ k] _ _) _ <- reify ''Functor
+    pure (LitE (StringL (show k))))

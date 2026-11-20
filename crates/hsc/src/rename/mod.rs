@@ -1481,9 +1481,12 @@ impl<'a> Renamer<'a> {
                 let (fun, resolved) = if let (true, Some(m)) = (is_type, global) {
                     // A global name the compiler wrote (the reify table of a splice).
                     ("mkNameG_tc", Some((m, q.name.clone())))
-                } else if is_type && q.qual.is_none() && matches!(q.name.as_str(), "~" | "->") {
-                    // The built-in type operators: GHC names them in GHC.Types.
+                } else if is_type && q.qual.is_none() && matches!(q.name.as_str(), "~" | "->" | "[]") {
+                    // The built-in type operators and the list type: GHC names them in GHC.Types.
                     ("mkNameG_tc", Some(("GHC.Types".to_string(), q.name.clone())))
+                } else if is_type && q.qual.is_none() && (q.name == "()" || q.name.starts_with("(,")) {
+                    // Unit and the tuple types, in GHC.Tuple.
+                    ("mkNameG_tc", Some(("GHC.Tuple".to_string(), q.name.clone())))
                 } else if is_type {
                     let e = self.lookup_global(&q, Ns::Type).map_err(|c| {
                         if c.is_empty() {

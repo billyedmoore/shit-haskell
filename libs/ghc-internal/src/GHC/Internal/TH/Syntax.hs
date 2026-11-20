@@ -72,7 +72,7 @@ import GHC.Internal.Control.Monad.Fix
 import GHC.Internal.Control.Exception
 import GHC.Internal.Num
 import GHC.Internal.IO.Unsafe
-import GHC.Internal.List (dropWhile, break, replicate, reverse, last, lookup, filter, zipWith)
+import GHC.Internal.List (dropWhile, break, replicate, reverse, last, lookup, filter, zipWith, zip, init, drop, take)
 import GHC.Internal.MVar
 import GHC.Internal.IO.Exception
 import GHC.Internal.Unicode
@@ -309,30 +309,77 @@ hscReifyFixity (Name (OccName occ) flavour) = do
           (f : _) -> Just f
           [] -> Nothing)
 
--- | hsc: the instances of a class (as 'reify' has them) whose heads unify with the types.
+-- | hsc: the instances of a class (as 'reify' has them) whose heads match the types: the head's
+-- variables are bound consistently, the types' own variables match anything, and both sides are
+-- compared with synonyms expanded and the list, unit and tuple constructors in one form.
 hscReifyInstances :: Name -> [Type] -> IO [InstanceDec]
 hscReifyInstances n tys = do
   info <- hscReify n
+  table <- readIORef hscReifyTable
+  let syns = [(o, (tvs, rhs)) | (_, o, TyConI (TySynD _ tvs rhs)) <- table]
+      norm = normTH syns (10 :: Int)
+      tys' = map norm tys
   case info of
-    ClassI _ insts -> pure [d | d@(InstanceD _ _ hd _) <- insts, matches (headArgs hd)]
+    ClassI _ insts -> pure [d | d@(InstanceD _ _ hd _) <- insts, matches (map norm (headArgs hd)) tys']
     _ -> pure []
   where
-    matches args = length args == length tys && and (zipWith unifiesTH args tys)
+    matches args ts = length args == length ts && matchAll [] (zip args ts)
     headArgs (AppT f a) = headArgs f ++ [a]
     headArgs _ = []
 
--- | Whether two types may be the same (variables match anything; names by their base).
-unifiesTH :: Type -> Type -> Bool
-unifiesTH (VarT _) _ = True
-unifiesTH _ (VarT _) = True
-unifiesTH (SigT a _) b = unifiesTH a b
-unifiesTH a (SigT b _) = unifiesTH a b
-unifiesTH (ParensT a) b = unifiesTH a b
-unifiesTH a (ParensT b) = unifiesTH a b
-unifiesTH (AppT a b) (AppT c d) = unifiesTH a c && unifiesTH b d
-unifiesTH (ConT a) (ConT b) = nameBase a == nameBase b
-unifiesTH (PromotedT a) (PromotedT b) = nameBase a == nameBase b
-unifiesTH a b = a == b
+-- | A type in one form: synonyms expanded (to a depth), `[]`, `()` and tuples as their TH forms.
+normTH :: [(String, ([TyVarBndr BndrVis], Type))] -> Int -> Type -> Type
+normTH syns depth t = case spine t [] of
+  (ConT c, args)
+    | depth > 0, Just (tvs, rhs) <- lookup (nameBase c) syns, length args >= length tvs ->
+        let sub = zip (map bndrName tvs) args
+        in normTH syns (depth - 1) (foldl AppT (substTH sub rhs) (drop (length tvs) args))
+  (h, args) -> foldl AppT (normHead h) (map (normTH syns depth) args)
+  where
+    spine (AppT f a) as = spine f (a : as)
+    spine (SigT x _) as = spine x as
+    spine (ParensT x) as = spine x as
+    spine h as = (h, as)
+    normHead (ConT c) = case nameBase c of
+      "[]" -> ListT
+      "List" -> ListT
+      "()" -> TupleT 0
+      "Unit" -> TupleT 0
+      b | isTupleName b -> TupleT (length b - 1)
+      _ -> ConT c
+    normHead h = h
+    isTupleName ('(' : rest) = not (null rest) && all (== ',') (init rest) && last rest == ')'
+    isTupleName _ = False
+    bndrName (KindedTV v _ _) = v
+    bndrName (PlainTV v _) = v
+
+substTH :: [(Name, Type)] -> Type -> Type
+substTH sub (VarT v) = case lookup v sub of { Just t -> t; Nothing -> VarT v }
+substTH sub (AppT a b) = AppT (substTH sub a) (substTH sub b)
+substTH sub (SigT a k) = SigT (substTH sub a) k
+substTH sub (ParensT a) = ParensT (substTH sub a)
+substTH _ t = t
+
+-- | One-way matching of instance head arguments against types, binding the head's variables.
+matchAll :: [(Name, Type)] -> [(Type, Type)] -> Bool
+matchAll _ [] = True
+matchAll env ((p, t) : rest) = case (p, t) of
+  (VarT v, _) -> case lookup v env of
+    Just bound -> sameTH bound t && matchAll env rest
+    Nothing -> matchAll ((v, t) : env) rest
+  (_, VarT _) -> matchAll env rest
+  (AppT a b, AppT c d) -> matchAll env ((a, c) : (b, d) : rest)
+  (ConT a, ConT b) -> nameBase a == nameBase b && matchAll env rest
+  (PromotedT a, PromotedT b) -> nameBase a == nameBase b && matchAll env rest
+  _ -> p == t && matchAll env rest
+
+-- | Whether two types may be the same (their variables match anything).
+sameTH :: Type -> Type -> Bool
+sameTH (VarT _) _ = True
+sameTH _ (VarT _) = True
+sameTH (AppT a b) (AppT c d) = sameTH a c && sameTH b d
+sameTH (ConT a) (ConT b) = nameBase a == nameBase b
+sameTH a b = a == b
 
 -- | hsc: a type's roles, from its reified declaration: representational for each parameter
 -- (roles are not inferred here; 'coerce' is not role-checked).
