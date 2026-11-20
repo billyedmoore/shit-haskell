@@ -1371,7 +1371,7 @@ impl Driver {
         self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         let t = std::time::Instant::now();
-        let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot)
+        let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot, exts.is_on("RebindableSyntax"))
             .map_err(|e| located(e.loc, &e.msg))?;
         timing::add("rename", t);
         let t = std::time::Instant::now();

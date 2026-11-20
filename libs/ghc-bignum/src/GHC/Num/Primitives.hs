@@ -1,6 +1,6 @@
 {-# LANGUAGE MagicHash, NoImplicitPrelude #-}
 -- | The word primitives of ghc-bignum that other packages use.
-module GHC.Num.Primitives (wordLog2#, wordLogBase#, intLog2#) where
+module GHC.Num.Primitives (wordLog2#, wordLogBase#, intLog2#, wordSizeInBase#) where
 
 import GHC.Prim
 import GHC.Types
@@ -22,3 +22,8 @@ wordLogBase# base a = go 0## base
       _ -> case timesWord2# p base of
         (# 0##, p' #) -> go (plusWord# n 1##) p'
         _ -> plusWord# n 1##
+
+-- | The number of digits of a word in a base (0 for 0).
+wordSizeInBase# :: Word# -> Word# -> Word#
+wordSizeInBase# _ 0## = 0##
+wordSizeInBase# base w = plusWord# 1## (wordLogBase# base w)

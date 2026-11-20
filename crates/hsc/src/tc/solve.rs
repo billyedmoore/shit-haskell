@@ -503,7 +503,12 @@ impl Checker {
                         };
                         binds.push((w.ev.clone(), ev));
                     }
-                    None if pred.class == "?callStack" && self.env.values.contains_key("GHC.Internal.Stack.Types.emptyCallStack") => {
+                    // Any implicit parameter of type CallStack with no binding is the empty stack,
+                    // as in GHC (basement's `?callstack`).
+                    None if (pred.class == "?callStack"
+                        || matches!(self.metas.zonk(&pred.args[0]), Ty::Con(c) if c == "GHC.Internal.Stack.Types.CallStack"))
+                        && self.env.values.contains_key("GHC.Internal.Stack.Types.emptyCallStack") =>
+                    {
                         self.unify_at(&Ty::con("GHC.Internal.Stack.Types.CallStack"), &pred.args[0])?;
                         let empty = Core::Var("GHC.Internal.Stack.Types.emptyCallStack".into());
                         let ev = match site {

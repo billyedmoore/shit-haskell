@@ -11,7 +11,7 @@ This file says where things stand and what comes next. History lives in git and
   type and data families, rank-N types. An interpreter (Template Haskell, `runghc`) and a
   native x86-64 back end with a Rust runtime (copying GC, threads, STM, FFI).
 - **Driver:** GHC's command line and package databases; `hsc-pkg`; `cabal build/test -w` works.
-- **Corpus:** 294 differential tests, both back ends, all passing.
+- **Corpus:** 299 differential tests, both back ends, all passing.
 - **Boot libraries:** deepseq, directory, filepath, bytestring, exceptions, file-io pass their
   suites; unix 15/16 and os-string 14/16 (same failures as GHC); parsec 3/4 (a timing test);
   binary 141/142 (needs PolyKinds); time times out; text needs a GHC plugin.
@@ -59,12 +59,10 @@ one-fix iterations.
   hsc next to their GHC builds, unattended, and rank the failures by how many packages each
   blocks; fix from the top. Results recorded in `bench/sweep/`.
 - GHC's own testsuite through difftest, for a conformance score.
-- First sweep (top 177 of Stackage nightly): hsc built 138 of the 177 GHC builds; this batch
-  fixes the top blockers (profunctors, base16, basement, boring, transformers-base, sop-core,
-  containers 0.8, megaparsec, reflection); the next fixes time-manager, unix-compat, hspec-core,
-  http-api-data, optics-core, path and text-show's TH queries. Next: ghc-bignum's full API
-  (cborg, integer-gmp for crypton); re-run the sweep. TH `reify` of classes, `reifyInstances` and
-  IsString defaulting are done (th-orphans builds).
+- Sweep of the top 300 Stackage packages: hsc builds 245 of the 300 GHC builds (was 218). This
+  PR adds ghc-bignum's API, integer-gmp, RebindableSyntax and CallStack implicit parameters
+  (basement, memory, crypton, cborg build). Next, by packages blocked: reflection (lens),
+  optics-core, constraints, monad-control, some, sop-core.
 - Known gaps it will rank: PolyKinds and kind inference (binary), Template Haskell `[d| |]`,
   type and pattern splices, `foreign import "dynamic"`, collector-run
   finalizers, Arrows, text's plugin.

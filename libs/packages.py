@@ -19,6 +19,9 @@ PACKAGES = [
      ["-c-source=../cbits/SetEnv.c", "-c-source=../cbits/md5.c", "-c-source=../cbits/sysconf.c",
       "-c-source=../cbits/iconv.c"], ["ghc-bignum", "ghc-prim", "rts"]),
     ("base", "4.21.0.0", None, [], ["base/src"], [], ["ghc-internal", "ghc-prim", "ghc-bignum"]),
+    # GHC's compatibility package over ghc-bignum (crypton's default flag depends on it).
+    ("integer-gmp", "1.1", "src/libraries/integer-gmp", ["src", "LICENSE"], ["integer-gmp/src"],
+     ["-XHaskell2010", "-I../../include"], ["base", "ghc-prim", "ghc-bignum", "ghc-internal"]),
     ("deepseq", "1.5.1.0", "hackage/deepseq-1.5.1.0", ["Control", "LICENSE"], ["deepseq"],
      ["-XHaskell2010"], ["base", "ghc-prim"]),
     ("array", "0.5.8.0", "hackage/array-0.5.8.0", ["Data", "LICENSE"], ["array"], ["-XHaskell2010"], ["base"]),
