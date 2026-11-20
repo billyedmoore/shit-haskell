@@ -24,6 +24,12 @@ module GHC.Num.Integer (
     integerFromNatural, integerToNatural, integerToNaturalClamp, integerToNaturalThrow,
     integerToBigNatClamp, integerToBigNatSign, integerBigNat#, integerFromBigNat#,
     integerFromBigNatNeg, integerFromBigNatSign, integerToWordMaybe#,
+    -- GHC's API beyond the arithmetic (cborg, integer-gmp): sizes, bits, conversions to bytes
+    integerCheck#, integerFromAddr#, integerFromAddr, integerFromByteArray#, integerFromByteArray,
+    integerToAddr#, integerToAddr, integerToMutableByteArray#, integerToMutableByteArray,
+    integerFromBigNatNeg#, integerFromBigNatSign#, integerFromWordNeg#, integerFromWordSign#,
+    integerToBigNatClamp#, integerToBigNatSign#, integerGcde#, integerPowMod#, integerRecipMod#,
+    integerSignum#, integerLog2, integerLogBaseWord#, integerBit, integerEncodeDouble,
     naturalAdd, naturalAnd, naturalAndNot, naturalBit, naturalBit#, naturalCheck, naturalCheck#, naturalClearBit, naturalClearBit#, naturalCompare, naturalComplementBit, naturalComplementBit#, naturalEncodeDouble#, naturalEncodeFloat#, naturalEq, naturalEq#, naturalFromBigNat#, naturalFromWord, naturalFromWord#, naturalFromWord2#, naturalFromWordList, naturalGcd, naturalGe, naturalGe#, naturalGt, naturalGt#, naturalIsOne, naturalIsPowerOf2#, naturalIsZero, naturalLcm, naturalLe, naturalLe#, naturalLog2, naturalLog2#, naturalLogBase, naturalLogBase#, naturalLogBaseWord, naturalLogBaseWord#, naturalLt, naturalLt#, naturalMul, naturalNe, naturalNe#, naturalNegate, naturalOne, naturalOr, naturalPopCount, naturalPopCount#, naturalPowMod, naturalQuot, naturalQuotRem, naturalQuotRem#, naturalRem, naturalSetBit, naturalSetBit#, naturalShiftL, naturalShiftL#, naturalShiftR, naturalShiftR#, naturalSignum, naturalSizeInBase#, naturalSqr, naturalSub, naturalSubThrow, naturalSubUnsafe, naturalTestBit, naturalTestBit#, naturalToBigNat#, naturalToWord, naturalToWord#, naturalToWordClamp, naturalToWordClamp#, naturalToWordMaybe#, naturalXor, naturalZero
 ) where
 
@@ -532,3 +538,123 @@ naturalEncodeFloat# n e = double2Float# (naturalEncodeDouble# n e)
 
 naturalSizeInBase# :: Word# -> Natural -> Word#
 naturalSizeInBase# b n = integerSizeInBase# b (naturalToInteger n)
+
+
+-- ----- GHC's API beyond the arithmetic (cborg, integer-gmp), on the primitives above -----
+
+integerCheck# :: Integer -> Int#
+integerCheck# _ = 1#
+
+integerSignum# :: Integer -> Int#
+integerSignum# n = integerToInt# (integerSignum n)
+
+integerLog2 :: Integer -> Word
+integerLog2 n = W# (integerLog2# n)
+
+integerLogBaseWord# :: Word# -> Integer -> Word#
+integerLogBaseWord# b n = case integerLogBaseWord (W# b) n of W# w -> w
+
+integerBit :: Word -> Integer
+integerBit (W# w) = integerBit# w
+
+integerEncodeDouble :: Integer -> Int -> Double
+integerEncodeDouble m (I# e) = D# (integerEncodeDouble# m e)
+
+integerFromBigNatNeg# :: BigNat# -> Integer
+integerFromBigNatNeg# = integerFromBigNatNeg
+
+integerFromBigNatSign# :: Int# -> BigNat# -> Integer
+integerFromBigNatSign# = integerFromBigNatSign
+
+integerFromWordNeg# :: Word# -> Integer
+integerFromWordNeg# = integerFromWordNeg
+
+integerFromWordSign# :: Int# -> Word# -> Integer
+integerFromWordSign# 0# w = integerFromWord# w
+integerFromWordSign# _ w = integerFromWordNeg w
+
+integerToBigNatClamp# :: Integer -> BigNat#
+integerToBigNatClamp# = integerToBigNatClamp
+
+integerToBigNatSign# :: Integer -> (# Int#, BigNat# #)
+integerToBigNatSign# = integerToBigNatSign
+
+integerGcde# :: Integer -> Integer -> (# Integer, Integer, Integer #)
+integerGcde# a b = case integerGcde a b of (g, x, y) -> (# g, x, y #)
+
+-- | `b ^ e mod m`, or nothing when there is none (`m` zero, or `e` negative and `b` not
+-- invertible modulo `m`).
+integerPowMod# :: Integer -> Integer -> Natural -> (# Natural | () #)
+integerPowMod# b e m
+  | naturalIsZero m = (# | () #)
+  | integerIsNegative e = case integerRecipMod# b m of
+      (# r | #) -> integerPowMod# (integerFromNatural r) (integerNegate e) m
+      (# | u #) -> (# | u #)
+  | True = (# integerToNatural (integerPowMod b e (integerFromNatural m)) | #)
+
+integerRecipMod# :: Integer -> Natural -> (# Natural | () #)
+integerRecipMod# a m
+  | naturalIsZero m = (# | () #)
+  | True =
+      let mi = integerFromNatural m
+          (g, x, _) = integerGcde (integerMod a mi) mi
+      in if integerEq g integerOne && not (naturalIsOne m)
+           then (# integerToNatural (integerMod x mi) | #)
+           else (# | () #)
+
+-- | The integer of `sz` bytes at an address, most significant first when `e` is 1#.
+integerFromAddr# :: Word# -> Addr# -> Int# -> State# s -> (# State# s, Integer #)
+integerFromAddr# sz addr e s = (# s, go 0# integerZero #)
+  where
+    n = word2Int# sz
+    byte i = word8ToWord# (indexWord8OffAddr# addr (case e of { 0# -> n -# 1# -# i; _ -> i }))
+    go i acc = case i >=# n of
+      1# -> acc
+      _ -> go (i +# 1#) (integerAdd (integerShiftL# acc 8##) (integerFromWord# (byte i)))
+
+integerFromAddr :: Word# -> Addr# -> Int# -> IO Integer
+integerFromAddr sz addr e = IO (integerFromAddr# sz addr e)
+
+integerFromByteArray# :: Word# -> ByteArray# -> Word# -> Int# -> State# s -> (# State# s, Integer #)
+integerFromByteArray# sz ba off e s = (# s, integerFromByteArray sz ba off e #)
+
+integerFromByteArray :: Word# -> ByteArray# -> Word# -> Int# -> Integer
+integerFromByteArray sz ba off e = go 0# integerZero
+  where
+    n = word2Int# sz
+    o = word2Int# off
+    byte i = word8ToWord# (indexWord8Array# ba (o +# (case e of { 0# -> n -# 1# -# i; _ -> i })))
+    go i acc = case i >=# n of
+      1# -> acc
+      _ -> go (i +# 1#) (integerAdd (integerShiftL# acc 8##) (integerFromWord# (byte i)))
+
+-- | The bytes of an integer's magnitude (as few as it needs), written at an address, most
+-- significant first when `e` is 1#; answers their number.
+integerToAddr# :: Integer -> Addr# -> Int# -> State# s -> (# State# s, Word# #)
+integerToAddr# n addr e s0 = go 0# s0
+  where
+    m = integerAbs n
+    cnt = if integerIsZero m then 0# else word2Int# (integerSizeInBase# 256## m)
+    byteOf i = wordToWord8# (integerToWord# (integerAnd (integerShiftR# m (int2Word# (8# *# i))) (IS 255#)))
+    go i s = case i >=# cnt of
+      1# -> (# s, int2Word# cnt #)
+      _ -> case writeWord8OffAddr# addr (case e of { 0# -> i; _ -> cnt -# 1# -# i }) (byteOf i) s of
+        s' -> go (i +# 1#) s'
+
+integerToAddr :: Integer -> Addr# -> Int# -> IO Word
+integerToAddr n addr e = IO (\s -> case integerToAddr# n addr e s of (# s', w #) -> (# s', W# w #))
+
+integerToMutableByteArray# :: Integer -> MutableByteArray# s -> Word# -> Int# -> State# s -> (# State# s, Word# #)
+integerToMutableByteArray# n mba off e s0 = go 0# s0
+  where
+    m = integerAbs n
+    o = word2Int# off
+    cnt = if integerIsZero m then 0# else word2Int# (integerSizeInBase# 256## m)
+    byteOf i = wordToWord8# (integerToWord# (integerAnd (integerShiftR# m (int2Word# (8# *# i))) (IS 255#)))
+    go i s = case i >=# cnt of
+      1# -> (# s, int2Word# cnt #)
+      _ -> case writeWord8Array# mba (o +# (case e of { 0# -> i; _ -> cnt -# 1# -# i })) (byteOf i) s of
+        s' -> go (i +# 1#) s'
+
+integerToMutableByteArray :: Integer -> MutableByteArray# RealWorld -> Word# -> Int# -> IO Word
+integerToMutableByteArray n mba off e = IO (\s -> case integerToMutableByteArray# n mba off e s of (# s', w #) -> (# s', W# w #))

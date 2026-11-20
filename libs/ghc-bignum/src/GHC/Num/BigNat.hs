@@ -5,6 +5,14 @@ module GHC.Num.BigNat
   , bigNatZero, bigNatOne, bigNatZero#, bigNatOne#, bigNatIsZero, bigNatIsZero#
   , bigNatFromWord#, bigNatFromWord, bigNatToWord#, bigNatToWord
   , bigNatAnd, bigNatOr, bigNatXor, bigNatAdd, bigNatMul, bigNatEq, bigNatEq#, bigNatCompare
+  -- GHC's API beyond these (cborg, integer-gmp), through the integer primitives
+  , WordArray#, bigNatAddWord#, bigNatBit#, bigNatCheck#, bigNatClearBit#, bigNatCompareWord#
+  , bigNatComplementBit#, bigNatEqWord#, bigNatGtWord#, bigNatFromAddr#, bigNatFromByteArray#
+  , bigNatFromWord2#, bigNatFromWordArray, bigNatFromWordArray#, bigNatGcd, bigNatGcdWord#
+  , bigNatMulWord#, bigNatPopCount#, bigNatQuot, bigNatRem, bigNatQuotRem#, bigNatQuotRemWord#
+  , bigNatQuotWord#, bigNatRemWord#, bigNatSetBit#, bigNatTestBit#, bigNatShiftL#, bigNatShiftR#
+  , bigNatSizeInBase#, bigNatSizeInBase, bigNatSqr, bigNatSub, bigNatSubWord#, bigNatToAddr#
+  , bigNatToInt#, bigNatToMutableByteArray#
   ) where
 
 import GHC.Prim
@@ -86,3 +94,130 @@ bigNatEq# a b = if bigNatEq a b then 1# else 0#
 
 bigNatCompare :: BigNat# -> BigNat# -> Ordering
 bigNatCompare a b = integerCompare (integerFromBigNat# a) (integerFromBigNat# b)
+
+
+-- ----- GHC's API beyond the above (cborg, integer-gmp): each through the integer primitives -----
+
+-- | A bignum's words (GHC.Num.WordArray's name).
+type WordArray# = ByteArray#
+
+toI :: BigNat# -> Integer
+toI = integerFromBigNat#
+
+fromI :: Integer -> BigNat#
+fromI = integerToBigNatClamp
+
+bigNatAddWord# :: BigNat# -> Word# -> BigNat#
+bigNatAddWord# a w = fromI (integerAdd (toI a) (integerFromWord# w))
+
+bigNatMulWord# :: BigNat# -> Word# -> BigNat#
+bigNatMulWord# a w = fromI (integerMul (toI a) (integerFromWord# w))
+
+bigNatBit# :: Word# -> BigNat#
+bigNatBit# i = fromI (integerBit# i)
+
+bigNatCheck# :: BigNat# -> Int#
+bigNatCheck# _ = 1#
+
+bigNatTestBit# :: BigNat# -> Word# -> Int#
+bigNatTestBit# a n = integerTestBit# (toI a) n
+
+bigNatSetBit# :: BigNat# -> Word# -> BigNat#
+bigNatSetBit# a n = fromI (integerOr (toI a) (integerBit# n))
+
+bigNatClearBit# :: BigNat# -> Word# -> BigNat#
+bigNatClearBit# a n = case bigNatTestBit# a n of
+  0# -> a
+  _ -> fromI (integerXor (toI a) (integerBit# n))
+
+bigNatComplementBit# :: BigNat# -> Word# -> BigNat#
+bigNatComplementBit# a n = fromI (integerXor (toI a) (integerBit# n))
+
+bigNatCompareWord# :: BigNat# -> Word# -> Ordering
+bigNatCompareWord# a w = integerCompare (toI a) (integerFromWord# w)
+
+bigNatEqWord# :: BigNat# -> Word# -> Int#
+bigNatEqWord# a w = integerEq# (toI a) (integerFromWord# w)
+
+bigNatGtWord# :: BigNat# -> Word# -> Int#
+bigNatGtWord# a w = integerGt# (toI a) (integerFromWord# w)
+
+bigNatFromAddr# :: Word# -> Addr# -> Int# -> State# s -> (# State# s, BigNat# #)
+bigNatFromAddr# sz addr e s = case integerFromAddr# sz addr e s of (# s', i #) -> (# s', fromI i #)
+
+bigNatFromByteArray# :: Word# -> ByteArray# -> Word# -> Int# -> State# s -> (# State# s, BigNat# #)
+bigNatFromByteArray# sz ba off e s = (# s, fromI (integerFromByteArray sz ba off e) #)
+
+bigNatFromWord2# :: Word# -> Word# -> BigNat#
+bigNatFromWord2# h l = fromI (integerAdd (integerShiftL# (integerFromWord# h) 64##) (integerFromWord# l))
+
+-- | The bignum of the first `n` words of an array (least significant first).
+bigNatFromWordArray# :: WordArray# -> Word# -> BigNat#
+bigNatFromWordArray# wa n = fromI (go (word2Int# n -# 1#) integerZero)
+  where
+    go i acc = case i <# 0# of
+      1# -> acc
+      _ -> go (i -# 1#) (integerAdd (integerShiftL# acc 64##) (integerFromWord# (indexWordArray# wa i)))
+
+bigNatFromWordArray :: WordArray# -> Word# -> BigNat
+bigNatFromWordArray wa n = BN# (bigNatFromWordArray# wa n)
+
+bigNatGcd :: BigNat# -> BigNat# -> BigNat#
+bigNatGcd a b = fromI (integerGcd (toI a) (toI b))
+
+bigNatGcdWord# :: BigNat# -> Word# -> Word#
+bigNatGcdWord# a w = integerToWord# (integerGcd (toI a) (integerFromWord# w))
+
+bigNatPopCount# :: BigNat# -> Word#
+bigNatPopCount# a = int2Word# (integerPopCount# (toI a))
+
+bigNatQuot :: BigNat# -> BigNat# -> BigNat#
+bigNatQuot a b = fromI (integerQuot (toI a) (toI b))
+
+bigNatRem :: BigNat# -> BigNat# -> BigNat#
+bigNatRem a b = fromI (integerRem (toI a) (toI b))
+
+bigNatQuotRem# :: BigNat# -> BigNat# -> (# BigNat#, BigNat# #)
+bigNatQuotRem# a b = case integerQuotRem# (toI a) (toI b) of (# q, r #) -> (# fromI q, fromI r #)
+
+bigNatQuotWord# :: BigNat# -> Word# -> BigNat#
+bigNatQuotWord# a w = fromI (integerQuot (toI a) (integerFromWord# w))
+
+bigNatRemWord# :: BigNat# -> Word# -> Word#
+bigNatRemWord# a w = integerToWord# (integerRem (toI a) (integerFromWord# w))
+
+bigNatQuotRemWord# :: BigNat# -> Word# -> (# BigNat#, Word# #)
+bigNatQuotRemWord# a w = case integerQuotRem# (toI a) (integerFromWord# w) of (# q, r #) -> (# fromI q, integerToWord# r #)
+
+bigNatShiftL# :: BigNat# -> Word# -> BigNat#
+bigNatShiftL# a n = fromI (integerShiftL# (toI a) n)
+
+bigNatShiftR# :: BigNat# -> Word# -> BigNat#
+bigNatShiftR# a n = fromI (integerShiftR# (toI a) n)
+
+bigNatSizeInBase# :: Word# -> BigNat# -> Word#
+bigNatSizeInBase# b a = case bigNatIsZero# a of
+  1# -> 0##
+  _ -> integerSizeInBase# b (toI a)
+
+bigNatSizeInBase :: Word -> BigNat# -> Word
+bigNatSizeInBase (W# b) a = W# (bigNatSizeInBase# b a)
+
+bigNatSqr :: BigNat# -> BigNat#
+bigNatSqr a = fromI (integerSqr (toI a))
+
+-- | `a - b`, or nothing when it would be negative.
+bigNatSub :: BigNat# -> BigNat# -> (# (# #) | BigNat# #)
+bigNatSub a b = if integerLt (toI a) (toI b) then (# (# #) | #) else (# | fromI (integerSub (toI a) (toI b)) #)
+
+bigNatSubWord# :: BigNat# -> Word# -> (# (# #) | BigNat# #)
+bigNatSubWord# a w = bigNatSub a (fromI (integerFromWord# w))
+
+bigNatToAddr# :: BigNat# -> Addr# -> Int# -> State# s -> (# State# s, Word# #)
+bigNatToAddr# a = integerToAddr# (toI a)
+
+bigNatToInt# :: BigNat# -> Int#
+bigNatToInt# a = integerToInt# (toI a)
+
+bigNatToMutableByteArray# :: BigNat# -> MutableByteArray# s -> Word# -> Int# -> State# s -> (# State# s, Word# #)
+bigNatToMutableByteArray# a = integerToMutableByteArray# (toI a)

@@ -3,6 +3,7 @@
 hsc's failures by how many packages each blocks.
 
     tools/sweep.py run <rank file> <count> [--only ghc|hsc]   build the top <count> packages
+    tools/sweep.py run <rank file> <count> --retry            build again those hsc failed
     tools/sweep.py report                                      print the ranked failures
 
 The rank file is tools/sweep_rank.py's output. Each package is built from Hackage, with its
@@ -39,13 +40,15 @@ def shims():
     return os.path.join(d, "ghc")
 
 
-def done():
-    seen = set()
+def done(retry=False):
+    """The (package, compiler) builds recorded; with `retry`, hsc's failures are not (the last
+    record of a build counts)."""
+    last = {}
     if os.path.exists(RESULTS):
         for line in open(RESULTS, encoding="utf-8"):
             r = json.loads(line)
-            seen.add((r["package"], r["compiler"]))
-    return seen
+            last[(r["package"], r["compiler"])] = r
+    return {k for k, r in last.items() if not (retry and k[1] == "hsc" and not r["ok"])}
 
 
 FAILED = re.compile(r"Failed to build ([A-Za-z0-9][A-Za-z0-9-]*-\d+(?:\.\d+)*)")
@@ -122,7 +125,7 @@ def build(pkg, compiler, ghc_shim, timeout):
     return r
 
 
-def run(rank_file, count, only):
+def run(rank_file, count, only, retry=False):
     os.makedirs(os.path.join(WORK, "logs"), exist_ok=True)
     ghc_shim = shims()
     timeout = int(os.environ.get("SWEEP_TIMEOUT", "1800"))
@@ -131,7 +134,7 @@ def run(rank_file, count, only):
         parts = line.split()
         if len(parts) >= 2 and parts[1] not in SKIP:
             pkgs.append(parts[1])
-    seen = done()
+    seen = done(retry)
     for pkg in pkgs[:count]:
         for compiler in ["ghc", "hsc"]:
             if (only and compiler != only) or (pkg, compiler) in seen:
@@ -176,7 +179,7 @@ def main():
         only = None
         if "--only" in sys.argv:
             only = sys.argv[sys.argv.index("--only") + 1]
-        run(sys.argv[2], int(sys.argv[3]), only)
+        run(sys.argv[2], int(sys.argv[3]), only, "--retry" in sys.argv)
     else:
         report()
 

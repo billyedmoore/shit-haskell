@@ -77,6 +77,8 @@ pub struct Renamer<'a> {
     module: String,
     ifaces: &'a BTreeMap<String, Iface>,
     fixities: HashMap<GName, (Assoc, u8)>,
+    /// RebindableSyntax: literals, negation, `if` and literal patterns use the names in scope.
+    rebindable: bool,
     /// Fixities declared for local operators (`where infixl 3 <!>`), by their unique local name.
     local_fixities: HashMap<String, (Assoc, u8)>,
     vals: HashMap<String, Vec<Entity>>,
@@ -157,6 +159,7 @@ pub fn rename_module(
     ifaces: &BTreeMap<String, Iface>,
     implicit_prelude: bool,
     boot: bool,
+    rebindable: bool,
 ) -> RR<(Module, Iface)> {
     name_duplicate_fields(&mut m.decls);
     // Global names are unique, so the fixities of every loaded module can be merged. This
@@ -171,6 +174,7 @@ pub fn rename_module(
         module: m.name.clone(),
         ifaces,
         fixities,
+        rebindable,
         local_fixities: HashMap::new(),
         vals: HashMap::new(),
         types: HashMap::new(),
@@ -848,6 +852,21 @@ impl<'a> Renamer<'a> {
             }),
             Err(c) => Err(self.ambiguous(q, &c, loc)),
         }
+    }
+
+    /// RebindableSyntax: a numeric literal as `fromInteger (n :: Integer)` or `fromRational
+    /// (r :: Rational)` with the `fromInteger`/`fromRational` in scope (renamed already).
+    fn rebound_literal(&mut self, l: Lit, loc: Loc) -> RR<Expr> {
+        let integer = Type::Con(QName { qual: Some("GHC.Num.Integer".into()), name: "Integer".into() }, loc);
+        let (fun, ty) = match &l {
+            Lit::Frac(_) => (
+                "fromRational",
+                Type::App(Box::new(Type::Con(QName { qual: Some("GHC.Internal.Real".into()), name: "Ratio".into() }, loc)), Box::new(integer)),
+            ),
+            _ => ("fromInteger", integer),
+        };
+        let f = self.value_ref(&QName::unqual(fun), loc, false)?;
+        Ok(Expr::App(Box::new(Expr::Var(f, loc)), Box::new(Expr::Sig(Box::new(Expr::Lit(l, loc)), ty, loc))))
     }
 
     fn fixity_of(&self, q: &QName) -> (Assoc, u8) {
@@ -1582,6 +1601,7 @@ impl<'a> Renamer<'a> {
                     None => Expr::Con(cq, loc),
                 }
             }
+            Expr::Lit(l @ (Lit::Int(_) | Lit::Frac(_)), loc) if self.rebindable => self.rebound_literal(l, loc)?,
             Expr::Lit(l, loc) => Expr::Lit(l, loc),
             Expr::App(f, a) => Expr::App(Box::new(self.expr(*f)?), Box::new(self.expr(*a)?)),
             Expr::TyApp(e, t, loc) => Expr::TyApp(Box::new(self.expr(*e)?), self.ty(t)?, loc),
@@ -1601,6 +1621,12 @@ impl<'a> Renamer<'a> {
                 let body = self.expr(*body)?;
                 self.locals.truncate(depth);
                 Expr::Let(decls, Box::new(body), loc)
+            }
+            // RebindableSyntax: `if c then t else e` is `ifThenElse c t e`.
+            Expr::If(c, t, e, loc) if self.rebindable => {
+                let f = Expr::Var(self.value_ref(&QName::unqual("ifThenElse"), loc, false)?, loc);
+                let (c, t, e) = (self.expr(*c)?, self.expr(*t)?, self.expr(*e)?);
+                [c, t, e].into_iter().fold(f, |acc, x| Expr::App(Box::new(acc), Box::new(x)))
             }
             Expr::If(c, t, e, loc) => Expr::If(
                 Box::new(self.expr(*c)?),
@@ -1821,18 +1847,13 @@ impl<'a> Renamer<'a> {
                 Box::new(b),
             )
         };
-        let neg = |l: Loc, e: Expr| {
-            Expr::App(
-                Box::new(Expr::Var(
-                    QName {
-                        qual: Some(BASE.to_string()),
-                        name: "negate".into(),
-                    },
-                    l,
-                )),
-                Box::new(e),
-            )
+        // RebindableSyntax: the `negate` in scope.
+        let negate = if self.rebindable && toks.iter().any(|t| matches!(t, fixity::Tk::Neg(_))) {
+            self.value_ref(&QName::unqual("negate"), loc, false)?
+        } else {
+            QName { qual: Some(BASE.to_string()), name: "negate".into() }
         };
+        let neg = |l: Loc, e: Expr| Expr::App(Box::new(Expr::Var(negate.clone(), l)), Box::new(e));
         resolve(toks, &bin, &neg).map_err(|e| RnError {
             loc: if e.loc == Loc::default() { loc } else { e.loc },
             msg: e.msg,
@@ -1864,6 +1885,16 @@ impl<'a> Renamer<'a> {
         Ok(match p {
             Pat::Var(occ, loc) => Pat::Var(self.bind(&occ, loc, mode)?, loc),
             Pat::Wild(loc) => Pat::Wild(loc),
+            // RebindableSyntax: a numeric literal pattern is `((== lit) -> True)` with the names in
+            // scope (basement's `scaleEnum 0 _`, its own `fromInteger`).
+            Pat::Lit(l @ (Lit::Int(_) | Lit::Frac(_)), loc) if self.rebindable => {
+                let lit = Expr::Lit(l, loc);
+                self.pat(rebound_literal_pat(lit, loc), mode)?
+            }
+            Pat::NegLit(l @ (Lit::Int(_) | Lit::Frac(_)), loc) if self.rebindable => {
+                let lit = Expr::App(Box::new(Expr::Var(QName::unqual("negate"), loc)), Box::new(Expr::Lit(l, loc)));
+                self.pat(rebound_literal_pat(lit, loc), mode)?
+            }
             Pat::Lit(l, loc) => Pat::Lit(l, loc),
             Pat::NegLit(l, loc) => Pat::NegLit(l, loc),
             Pat::Con(q, args, loc) => {
@@ -2746,4 +2777,17 @@ fn pat_con_names(p: &Pat, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// A literal pattern under RebindableSyntax: the view `(\x -> x == lit) -> True`, before renaming
+/// (so that `==` and the literal are the ones in scope).
+fn rebound_literal_pat(lit: Expr, loc: Loc) -> Pat {
+    let x = "rebind%x".to_string();
+    let eq = Expr::OpChain(
+        vec![OpItem::Operand(Expr::Var(QName::unqual(x.clone()), loc)), OpItem::Op(QName::unqual("=="), loc), OpItem::Operand(lit)],
+        loc,
+    );
+    let test = Expr::Lam(vec![Pat::Var(x, loc)], Box::new(eq), loc);
+    let true_con = QName { qual: Some("%G:GHC.Types".into()), name: "True".into() };
+    Pat::View(Box::new(test), Box::new(Pat::Con(true_con, Vec::new(), loc)), loc)
 }
