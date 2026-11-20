@@ -96,10 +96,22 @@ impl Checker {
                     preds.extend(self.convert_context_item(c, tvs)?);
                 }
                 let body = self.convert_type(body, tvs)?;
-                if preds.is_empty() {
-                    body
-                } else {
-                    Ty::Qual(preds, std::rc::Rc::new(body))
+                match body {
+                    Ty::Qual(more, inner) => {
+                        preds.extend(more);
+                        if preds.is_empty() {
+                            (*inner).clone()
+                        } else {
+                            Ty::Qual(preds, inner)
+                        }
+                    }
+                    other => {
+                        if preds.is_empty() {
+                            other
+                        } else {
+                            Ty::Qual(preds, std::rc::Rc::new(other))
+                        }
+                    }
                 }
             }
             Type::OpChain(..) => return self.err("internal: unresolved type operator"),
@@ -125,14 +137,14 @@ impl Checker {
     /// Converts one item of a context into predicates: a class constraint, an implicit
     /// parameter, or a constraint synonym, which may stand for several.
     pub fn convert_context_item(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Vec<Pred>> {
-        // QuantifiedConstraints: `forall x. ctx => C t` in a signature's context is a predicate
-        // or an instance's context is a predicate holding that polymorphic type (see
-        // `solve::QUANTIFIED_CLASS`). Elsewhere (superclasses, constructor contexts) it is dropped.
-        if let Type::Forall(..) = t {
-            if !self.allow_quantified {
-                return Ok(Vec::new());
-            }
-            let ty = self.convert_type(t, tvs)?;
+        // QuantifiedConstraints: `forall x. ctx => C t` or `ctx => C t` in a context is a
+        // predicate holding that polymorphic/implication type (see `solve::QUANTIFIED_CLASS`).
+        if let Type::Forall(..) | Type::Qual(..) = t {
+            let ty = match self.convert_type(t, tvs)? {
+                f @ Ty::Forall(..) => f,
+                Ty::Qual(preds, body) => Ty::Forall(Vec::new(), preds, body),
+                other => Ty::Forall(Vec::new(), Vec::new(), std::rc::Rc::new(other)),
+            };
             return Ok(vec![Pred { class: super::solve::QUANTIFIED_CLASS.to_string(), args: vec![ty] }]);
         }
         let mut head = t;
@@ -199,15 +211,9 @@ impl Checker {
                     cur = body;
                 }
                 Type::Qual(ctx, body) => {
-                    let outer = std::mem::replace(&mut self.allow_quantified, true);
-                    let r: TR<()> = (|| {
-                        for c in ctx {
-                            preds.extend(self.convert_context_item(c, tvs)?);
-                        }
-                        Ok(())
-                    })();
-                    self.allow_quantified = outer;
-                    r?;
+                    for c in ctx {
+                        preds.extend(self.convert_context_item(c, tvs)?);
+                    }
                     cur = body;
                 }
                 other => {
@@ -250,7 +256,18 @@ pub fn ty_to_preds(t: &Ty) -> Vec<Pred> {
             args.iter().flat_map(|a| ty_to_preds(a)).collect()
         }
         Ty::Con(c) => vec![Pred { class: c.clone(), args: args.into_iter().cloned().collect() }],
-        _ => Vec::new(),
+        Ty::Forall(..) => vec![Pred {
+            class: super::solve::QUANTIFIED_CLASS.into(),
+            args: vec![t.clone()],
+        }],
+        Ty::Qual(ps, b) => vec![Pred {
+            class: super::solve::QUANTIFIED_CLASS.into(),
+            args: vec![Ty::Forall(Vec::new(), ps.clone(), b.clone())],
+        }],
+        _ => vec![Pred {
+            class: CONSTRAINT_VAR.into(),
+            args: vec![t.clone()],
+        }],
     }
 }
 

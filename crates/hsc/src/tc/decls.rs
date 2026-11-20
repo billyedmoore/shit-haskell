@@ -580,17 +580,9 @@ impl Checker {
         let mut tvs = class_vars.clone();
         let mut supers = Vec::new();
         // A superclass may be a quantified constraint (`class (forall a. Eq a => Eq (f a)) => Eq1 f`).
-        let outer = std::mem::replace(&mut self.allow_quantified, true);
         for c in &cd.context {
-            match self.convert_context_item(c, &mut tvs) {
-                Ok(ps) => supers.extend(ps),
-                Err(e) => {
-                    self.allow_quantified = outer;
-                    return Err(e);
-                }
-            }
+            supers.extend(self.convert_context_item(c, &mut tvs)?);
         }
-        self.allow_quantified = outer;
         let class_pred = Pred {
             class: class_key.clone(),
             args: (0..nparams).map(Ty::Gen).collect(),
@@ -978,15 +970,9 @@ impl Checker {
         let mut ctx = Vec::new();
         // An instance's context may hold quantified constraints (`(forall a. Show a => Show (m a))
         // => Show (T m)`): they are wanted where the instance is used and given in its methods.
-        let outer = std::mem::replace(&mut self.allow_quantified, true);
-        let converted: TR<()> = (|| {
-            for c in &id.context {
-                ctx.extend(self.convert_context_item(c, &mut tvs)?);
-            }
-            Ok(())
-        })();
-        self.allow_quantified = outer;
-        converted?;
+        for c in &id.context {
+            ctx.extend(self.convert_context_item(c, &mut tvs)?);
+        }
         // A module can be registered twice (first as a boot file, then for real): the same instance
         // keeps its dictionary name, so that what was compiled against the first still refers to it.
         let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
@@ -1119,8 +1105,10 @@ impl Checker {
     fn instance_body(&mut self, id: &InstDecl) -> TR<()> {
         // GADT refinements made inside the declaration end with it.
         let refinements = self.metas.skol_binds.clone();
+        let saved_skol_kinds = self.skol_kinds.clone();
         let r = self.with_application_scope(|tc| tc.instance_body_body(id));
         self.metas.skol_binds = refinements;
+        self.skol_kinds = saved_skol_kinds;
         r
     }
 
@@ -1140,38 +1128,50 @@ impl Checker {
             Type::Con(q, _) => global_tycon_name(q),
             _ => unreachable!("validated by header"),
         };
-        // Find this instance's registered info by its head.
+        // Find this instance's registered info by its head (and context, when kind-dispatched
+        // instances share an erased head).
         let mut tvs = Vec::new();
         let mut head_check = Vec::new();
         let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
-        for a in args {
+        for a in &args {
             let converted = self.convert_type(a, &mut tvs)?;
             head_check.push(self.normalize(&converted));
+        }
+        // The variables only the context mentions (`gs` of `(gs ~ F opts) => C opts`) come after
+        // the head's, as the header numbered them: they scope over the methods too.
+        let mut ctx_check = Vec::new();
+        for c in &id.context {
+            if let Ok(ps) = self.convert_context_item(c, &mut tvs) {
+                ctx_check.extend(ps);
+            }
         }
         let inst = self
             .env
             .instances
             .for_class(&class)
             .rev()
-            .find(|i| i.head == head_check && (i.kinds.is_empty() || i.kinds == kinds))
+            .find(|i| i.head == head_check && (i.kinds.is_empty() || i.kinds == kinds) && i.ctx == ctx_check)
+            .or_else(|| {
+                self.env
+                    .instances
+                    .for_class(&class)
+                    .rev()
+                    .find(|i| i.head == head_check && (i.kinds.is_empty() || i.kinds == kinds))
+            })
             .cloned()
             .expect("instance registered");
         let info = self.class(&class).cloned().expect("class registered");
-        // The variables only the context mentions (`gs` of `(gs ~ F opts) => C opts`) come after
-        // the head's, as the header numbered them: they scope over the methods too.
-        {
-            let outer = std::mem::replace(&mut self.allow_quantified, true);
-            for c in &id.context {
-                let _ = self.convert_context_item(c, &mut tvs);
-            }
-            self.allow_quantified = outer;
-        }
 
         // Skolemise the instance variables (named as in the source); the context is given.
         let names: Vec<String> =
             (0..inst.nvars as usize).map(|i| tvs.get(i).cloned().unwrap_or_else(|| format!("i{i}"))).collect();
         let skolems: Vec<Ty> = names.iter().map(|n| self.metas.fresh_skolem(n)).collect();
         let head: Vec<Ty> = inst.head.iter().map(|t| subst_gen(t, &skolems)).collect();
+        for (a, h) in args.iter().zip(&head) {
+            if let (Some(kname), Ty::Skol(id, _)) = (super::families::annotated_kind_name(a), h) {
+                self.skol_kinds.insert(*id, kname);
+            }
+        }
         let ctx: Vec<Pred> = inst
             .ctx
             .iter()
@@ -1232,10 +1232,35 @@ impl Checker {
                 Decl::Fun { name, clauses, loc } if *name == occ => Some((clauses, *loc)),
                 _ => None,
             });
+            let inst_sig = id.decls.iter().find_map(|d| match d {
+                Decl::Sig { names, ty, .. } if names.iter().any(|n| n == &occ) => Some(ty),
+                _ => None,
+            });
             let field = match impl_decl {
                 Some((clauses, loc)) => {
-                    let sch = instantiate_method(mscheme, info.nparams, &head);
-                    let core = self.check_method(clauses, &sch, &format!("{}.{occ}@inst", self.module), loc)?;
+                    let mut sch = instantiate_method(mscheme, info.nparams, &head);
+                    let method_key = format!("{}.{occ}@inst", self.module);
+                    let mut scoped_sig = false;
+                    if let Some(sig_ty) = inst_sig {
+                        let has_forall = matches!(sig_ty, Type::Forall(..));
+                        if let Ok(inst_sch) = self.sig_scheme(sig_ty, &[]) {
+                            if inst_sch.preds.len() == sch.preds.len() {
+                                sch = inst_sch;
+                                scoped_sig = has_forall;
+                            } else if has_forall && inst_sch.nvars == sch.nvars {
+                                sch.names = inst_sch.names;
+                                scoped_sig = true;
+                            }
+                        }
+                    }
+                    if scoped_sig {
+                        self.explicit_sigs.insert(method_key.clone());
+                    }
+                    let core = self.check_method(clauses, &sch, &method_key, loc);
+                    if scoped_sig {
+                        self.explicit_sigs.remove(&method_key);
+                    }
+                    let core = core?;
                     let name = self.fresh_name("mi");
                     method_binds.push((name.clone(), core));
                     Core::Var(name)
@@ -1776,14 +1801,14 @@ enum FfiResult {
     Box(String),
 }
 
-/// The runtime representation a kind annotation names (`(a :: TYPE 'IntRep)`, `(a :: Type)`), as
-/// `rep_of_type` names a type's.
+/// The runtime representation or structural kind a kind annotation names (`(a :: TYPE 'IntRep)`,
+/// `(a :: Type)`, `(p :: Constraint)`, `(p :: k -> Constraint)`).
 fn annotated_rep(t: &Type) -> Option<String> {
     let Type::Sig(_, k) = t else { return None };
     fn last(q: &QName) -> String {
         q.name.trim_start_matches('\'').to_string()
     }
-    match k.as_ref() {
+    let rep = match k.as_ref() {
         Type::Con(q, _) if last(q) == "Type" || q.name == "*" => Some("BoxedRep Lifted".into()),
         Type::Con(q, _) if last(q) == "UnliftedType" => Some("BoxedRep Unlifted".into()),
         Type::App(f, r) if matches!(f.as_ref(), Type::Con(q, _) if last(q) == "TYPE") => match r.as_ref() {
@@ -1799,7 +1824,8 @@ fn annotated_rep(t: &Type) -> Option<String> {
             _ => None,
         },
         _ => None,
-    }
+    };
+    rep.or_else(|| super::families::annotated_kind_name(t).map(|kn| format!("kind:{kn}")))
 }
 
 #[cfg(test)]

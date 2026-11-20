@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Bumped when the translation changes, so that cached translations are made again.
-const TRANSLATOR_VERSION: &str = "hsc2hs-5";
+const TRANSLATOR_VERSION: &str = "hsc2hs-6";
 
 const KEYWORDS: &[&str] = &[
     "const", "const_str", "type", "peek", "poke", "ptr", "offset", "size", "alignment", "enum", "let", "def", "comment",
@@ -231,9 +231,11 @@ fn enum_name(c: &str) -> String {
 
 /// The C program that prints the Haskell source.
 fn program(parts: &[Part]) -> Result<String, String> {
-    // The file's own includes come first (a package header may set _GNU_SOURCE for the system
-    // headers); the program's are added after them.
+    // `<stddef.h>` (wchar_t, size_t, offsetof) comes first, as in GHC's `template-hsc.h`; it does
+    // not depend on feature-test macros such as `_GNU_SOURCE`, which a package header may define
+    // before the other system headers below.
     let mut head = crate::syntax::cpp::c_macro_definitions();
+    head.push_str("#include <stddef.h>\n");
     let mut body = String::new();
     let mut lets: Vec<String> = Vec::new();
     for p in parts {
@@ -401,5 +403,13 @@ mod tests {
         assert_eq!(text_of("(## s', 1## ##) -> I## (addr2Int## a)\n"), "(# s', 1# #) -> I# (addr2Int# a)\n");
         assert_eq!(text_of("##if defined(PROFILING)\n"), "#if defined(PROFILING)\n");
         assert_eq!(text_of("f :: Int# -> Int#\n"), "f :: Int# -> Int#\n");
+    }
+
+    #[test]
+    fn stddef_before_user_includes() {
+        let c = program(&split("#include \"pkg.h\"\n")).unwrap();
+        let stddef = c.find("#include <stddef.h>").expect("stddef.h");
+        let user = c.find("#include \"pkg.h\"").expect("user include");
+        assert!(stddef < user);
     }
 }

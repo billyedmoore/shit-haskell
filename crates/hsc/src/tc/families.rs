@@ -137,11 +137,26 @@ impl Checker {
         if args.len() >= info.arity {
             return None;
         }
+        if args.is_empty() && info.equations.len() > 1 {
+            return None;
+        }
         let args: Vec<Ty> = args.into_iter().cloned().collect();
         let extra = info.arity - args.len();
         // (A class's default for an associated type is for its full applications.)
         for eqn in info.equations.iter().filter(|e| !e.default) {
             if eqn.args.len() != info.arity {
+                continue;
+            }
+            // Do not eta-reduce across a kind-annotated trailing argument (its kind is not known
+            // until the argument is supplied), and verify any leading argument kind annotations.
+            if eqn.kinds.iter().skip(args.len()).any(|k| k.is_some()) {
+                continue;
+            }
+            let leading_kinds_ok = eqn.kinds.iter().take(args.len()).zip(&args).all(|(k, a)| match k {
+                Some(want) => self.kind_name_of(a).is_some_and(|have| same_kind(&have, want)),
+                None => true,
+            });
+            if !leading_kinds_ok {
                 continue;
             }
             let mut sub: Vec<Option<Ty>> = vec![None; eqn.nvars as usize];
@@ -251,12 +266,19 @@ impl Checker {
         })
     }
 
-    /// The kind of a type, as the name of a type, when it is plain from the type: a promoted
-    /// constructor's is its data type, a literal's Natural or Symbol, and a saturated type
-    /// constructor's Type ("->" when it is not saturated).
-    fn kind_name_of(&self, t: &Ty) -> Option<String> {
+    /// The kind of a type, as a structural kind tag, when it is plain from the type: a skolem's
+    /// recorded annotation, a promoted constructor's data type, a literal's Natural/Symbol/Char,
+    /// a class's Constraint/arrow kind, or a type constructor's Type/arrow kind.
+    pub(super) fn kind_name_of(&self, t: &Ty) -> Option<String> {
         let t = self.metas.zonk(t);
         let (head, args) = t.split_apps();
+        if let Ty::Skol(id, _) = head {
+            let mut k = self.skol_kinds.get(id)?.as_str();
+            for _ in 0..args.len() {
+                k = k.strip_prefix("->:")?;
+            }
+            return Some(k.to_string());
+        }
         let Ty::Con(c) = head else { return None };
         if let Some(lit) = c.strip_prefix('#') {
             return Some(if lit.starts_with('"') { "Symbol" } else if lit.starts_with('\'') { "Char" } else { "Natural" }.into());
@@ -268,6 +290,16 @@ impl Checker {
         }
         if self.env.families.contains_key(c) {
             return None;
+        }
+        if let Some(info) = self.env.classes.get(c) {
+            let n = info.nparams as usize;
+            if args.len() <= n {
+                let mut k = "GHC.Types.Constraint".to_string();
+                for _ in 0..(n - args.len()) {
+                    k = format!("->:{k}");
+                }
+                return Some(k);
+            }
         }
         let arity = if c == super::types::LIST {
             Some(1)
@@ -429,6 +461,36 @@ impl Checker {
                     n
                 }
             }
+            Ty::Forall(ids, ps, b) => {
+                let ps2: Vec<super::types::Pred> = ps
+                    .iter()
+                    .map(|p| super::types::Pred {
+                        class: p.class.clone(),
+                        args: p.args.iter().map(|a| self.normalize_zonked(a, depth + 1)).collect(),
+                    })
+                    .collect();
+                let b2 = self.normalize_rc(b, depth + 1);
+                if ps2 == *ps && Rc::ptr_eq(&b2, b) {
+                    t.clone()
+                } else {
+                    Rc::new(Ty::Forall(ids.clone(), ps2, b2))
+                }
+            }
+            Ty::Qual(ps, b) => {
+                let ps2: Vec<super::types::Pred> = ps
+                    .iter()
+                    .map(|p| super::types::Pred {
+                        class: p.class.clone(),
+                        args: p.args.iter().map(|a| self.normalize_zonked(a, depth + 1)).collect(),
+                    })
+                    .collect();
+                let b2 = self.normalize_rc(b, depth + 1);
+                if ps2 == *ps && Rc::ptr_eq(&b2, b) {
+                    t.clone()
+                } else {
+                    Rc::new(Ty::Qual(ps2, b2))
+                }
+            }
             _ => t.clone(),
         };
         // A stuck family application that a given equality names (`Weights_ (Rep a) ~ L c` in a
@@ -474,6 +536,9 @@ impl Checker {
         }
         match t {
             Ty::App(f, a) => self.has_family(f) || self.has_family(a),
+            Ty::Forall(_, ps, b) | Ty::Qual(ps, b) => {
+                self.has_family(b) || ps.iter().any(|p| p.args.iter().any(|a| self.has_family(a)))
+            }
             _ => false,
         }
     }
@@ -546,13 +611,7 @@ impl Checker {
         let args: Vec<Type> = args.iter().map(|a| name_wildcards(a, &mut wild)).collect();
         for a in &args {
             pats.push(self.convert_type(a, &mut tvs)?);
-            kinds.push(match a {
-                Type::Sig(_, k) => match k.as_ref() {
-                    Type::Con(q, _) => Some(super::convert::global_tycon_name(q)),
-                    _ => None,
-                },
-                _ => None,
-            });
+            kinds.push(annotated_kind_name(a));
         }
         let mut rhs_ty = self.convert_type(rhs, &mut tvs)?;
         // An instance with more arguments than the family's parameters (`data family F a :: Type
@@ -584,6 +643,24 @@ impl Checker {
     }
 }
 
+/// A structural kind tag from an explicit kind annotation `(p :: k)`: concrete constructors keep
+/// their global name (`GHC.Types.Constraint`), and arrow kinds encode their spine
+/// (`k -> Constraint` is `"->:GHC.Types.Constraint"`, `k1 -> k2 -> k3` is `"->:->:_"`).
+pub(super) fn annotated_kind_name(t: &Type) -> Option<String> {
+    let Type::Sig(_, k) = t else { return None };
+    fn go(k: &Type) -> Option<String> {
+        match k {
+            Type::Con(q, _) => Some(super::convert::global_tycon_name(q)),
+            Type::Fun(_, res) => {
+                let tail = go(res).unwrap_or_else(|| "_".into());
+                Some(format!("->:{tail}"))
+            }
+            _ => None,
+        }
+    }
+    go(k)
+}
+
 /// Whether a type mentions the quantified variable `Gen(i)`.
 fn mentions_gen(t: &Ty, i: u32) -> bool {
     match t {
@@ -602,11 +679,31 @@ fn zonk_with(m: &Metas, t: &Ty) -> Ty {
     m.zonk(t)
 }
 
-/// Whether two kind names are the same kind (Type is named in several modules).
-fn same_kind(a: &str, b: &str) -> bool {
+/// Whether two kind tags are compatible (Type is named in several modules, and arrow spines
+/// `"->:..."` match componentwise with `"_"` standing for a polymorphic kind variable).
+pub(super) fn same_kind(a: &str, b: &str) -> bool {
+    if b == "_" || a == "_" {
+        return true;
+    }
+    if let (Some(ta), Some(tb)) = (a.strip_prefix("->:"), b.strip_prefix("->:")) {
+        return same_kind(ta, tb);
+    }
+    if a == "->" && b.starts_with("->:") {
+        return true;
+    }
+    if b == "->" && a.starts_with("->:") {
+        return true;
+    }
+    if a.starts_with("->:") || b.starts_with("->:") {
+        return false;
+    }
     let is_type = |k: &str| k == "Type" || k.ends_with(".Type") || k.ends_with(".*") || k == "*";
     if is_type(a) || is_type(b) {
         return is_type(a) && is_type(b);
+    }
+    let is_constraint = |k: &str| k == "Constraint" || k.ends_with(".Constraint");
+    if is_constraint(a) || is_constraint(b) {
+        return is_constraint(a) && is_constraint(b);
     }
     let base = |k: &str| k.rsplit('.').next().unwrap_or(k).to_string();
     // Natural is also written Nat; literals answer the short names.

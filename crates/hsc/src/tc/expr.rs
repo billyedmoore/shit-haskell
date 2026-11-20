@@ -90,11 +90,21 @@ impl Checker {
                 self.unify_at(ty, &t)?;
                 Ok(core)
             }
-            // A comprehension is checked at its expected type, so that the refinement of a generator's
-            // pattern (a GADT match) reaches the element expression.
+            // A comprehension or do-block is checked at its expected type, so that the refinement
+            // of a generator's/bind's GADT pattern reaches the rest of the block.
             Expr::ListComp(body, branches, loc) if branches.len() == 1 => {
                 self.loc = *loc;
                 let desugared = self.desugar_comp(body, &branches[0], *loc);
+                self.check(&desugared, ty)
+            }
+            Expr::Do(stmts, loc) => {
+                self.loc = *loc;
+                if self.applicative_do {
+                    if let Some(e) = applicative_do(stmts, *loc) {
+                        return self.check(&e, ty);
+                    }
+                }
+                let desugared = self.desugar_do(stmts, *loc)?;
                 self.check(&desugared, ty)
             }
             Expr::Lam(pats, body, loc) => Ok(self.lambda(pats, body, *loc, Some(ty))?.0),
@@ -399,12 +409,31 @@ impl Checker {
         // An argument checked under dictionaries (`(Throws e => IO a) -> (e -> IO a) -> ..`) comes
         // last: its dictionaries' types are often fixed by the other arguments, and its wanted
         // constraints are solved by them when it is checked.
-        let constrained = |tc: &Self, p: &Ty| match tc.metas.prune(p) {
-            Ty::Qual(ps, _) | Ty::Forall(_, ps, _) => !ps.is_empty(),
-            _ => false,
+        let constrained = |tc: &Self, p: &Ty| {
+            let mut cur = tc.metas.prune(p);
+            loop {
+                match cur {
+                    Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => {
+                        if !ps.is_empty() {
+                            return true;
+                        }
+                        cur = tc.metas.prune(&b);
+                    }
+                    _ => return false,
+                }
+            }
         };
         let mut checked: Vec<Option<Core>> = (0..spine.len()).map(|_| None).collect();
         for pass in 0..3 {
+            if pass == 2 {
+                // Functional dependencies from earlier arguments (`Dict \\ f \\ g` where
+                // `HasDict c e | e -> c`) may determine a constraint variable before a constrained
+                // argument (`c => r`) is checked under it.
+                let pending: Vec<Pred> = self.wanted.iter().map(|w| w.pred.clone()).collect();
+                for p in &pending {
+                    self.improve(p)?;
+                }
+            }
             for (i, (a, p)) in spine.iter().zip(&params).enumerate() {
                 let rank = if constrained(self, p) { 2 } else if matches!(a, Expr::Lam(..)) { 1 } else { 0 };
                 if rank == pass && checked[i].is_none() {
@@ -447,16 +476,30 @@ impl Checker {
     /// Checks an argument against its parameter type. A polymorphic or constrained parameter
     /// is checked under its rigid variables and dictionaries.
     fn check_arg(&mut self, a: &Expr, arg: &Ty) -> TR<Core> {
-        if let Ty::Forall(ids, preds, body) = self.metas.prune(arg) {
-            // A polymorphic argument: its variables are rigid while it is checked.
-            let sk: Vec<Ty> = ids.iter().map(|_| self.metas.fresh_skolem("r")).collect();
-            let preds: Vec<Pred> = preds.iter().map(|p| super::types::subst_bound_pred(p, &ids, &sk)).collect();
-            let body = super::types::subst_bound(&body, &ids, &sk);
-            return self.check_qual_arg(a, &preds, &body);
+        let mut cur = self.metas.prune(arg);
+        let mut all_preds = Vec::new();
+        let mut peeled = false;
+        loop {
+            match cur {
+                Ty::Forall(ids, preds, body) => {
+                    peeled = true;
+                    let sk: Vec<Ty> = ids.iter().map(|_| self.metas.fresh_skolem("r")).collect();
+                    all_preds.extend(preds.iter().map(|p| super::types::subst_bound_pred(p, &ids, &sk)));
+                    cur = self.metas.prune(&super::types::subst_bound(&body, &ids, &sk));
+                }
+                Ty::Qual(preds, body) => {
+                    peeled = true;
+                    all_preds.extend(preds);
+                    cur = self.metas.prune(&body);
+                }
+                other => {
+                    cur = other;
+                    break;
+                }
+            }
         }
-        if let Ty::Qual(preds, body) = self.metas.prune(arg) {
-            // A rank-N argument: checked under the dictionaries it takes.
-            return self.check_qual_arg(a, &preds, &body);
+        if peeled {
+            return self.check_qual_arg(a, &all_preds, &cur);
         }
         self.check(a, arg)
     }
@@ -1112,16 +1155,44 @@ impl Checker {
         Ok(out)
     }
 
+    /// Builds the view function `\qp -> qp d1 .. dn` that instantiates a constrained value before
+    /// an inner pattern matches on it, solving its dictionaries immediately so they are bound in
+    /// the view rather than after the pattern's existential givens.
+    fn constrained_pat_view(&mut self, preds: Vec<Pred>) -> TR<Core> {
+        let v = self.fresh_name("qp");
+        let loc = self.loc;
+        let saved = std::mem::take(&mut self.wanted);
+        let body = self.apply_dicts(Core::Var(v.clone()), preds, loc);
+        let pat_wanted = std::mem::replace(&mut self.wanted, saved);
+        let (binds, residual) = self.solve(pat_wanted)?;
+        self.wanted.extend(residual);
+        let lam = Core::Lam(v, Box::new(body));
+        Ok(if binds.is_empty() { lam } else { Core::Let(binds, Box::new(lam)) })
+    }
+
     /// Checks a pattern against a type, binding its variables with monomorphic types.
     pub fn check_pat(&mut self, p: &Pat, ty: &Ty) -> TR<CPat> {
-        // A structured pattern against a polymorphic type instantiates it (`runST (ST s) = ..`).
+        // A structured pattern against a polymorphic or constrained type instantiates it
+        // (`runST (ST s) = ..`, `rnf (Sub Dict) = ()`).
         if !matches!(p, Pat::Var(..) | Pat::Wild(_)) {
-            if let Ty::Forall(ids, preds, body) = self.metas.prune(ty) {
-                if preds.is_empty() {
+            match self.metas.prune(ty) {
+                Ty::Forall(ids, preds, body) => {
                     let args: Vec<Ty> = ids.iter().map(|_| self.meta()).collect();
                     let inst = super::types::subst_bound(&body, &ids, &args);
-                    return self.check_pat(p, &inst);
+                    if preds.is_empty() {
+                        return self.check_pat(p, &inst);
+                    }
+                    let ps: Vec<Pred> = preds.iter().map(|q| super::types::subst_bound_pred(q, &ids, &args)).collect();
+                    let view = self.constrained_pat_view(ps)?;
+                    let inner = self.check_pat(p, &inst)?;
+                    return Ok(CPat::View(view, Box::new(inner)));
                 }
+                Ty::Qual(preds, body) => {
+                    let view = self.constrained_pat_view(preds)?;
+                    let inner = self.check_pat(p, &body)?;
+                    return Ok(CPat::View(view, Box::new(inner)));
+                }
+                _ => {}
             }
         }
         match p {
@@ -1422,6 +1493,13 @@ impl Checker {
 
     /// Checks the alternatives of a `case`, returning one row per alternative.
     fn alt_rows(&mut self, alts: &[AstAlt], scrut_ty: &Ty, res: &Ty) -> TR<Vec<Row>> {
+        // Functional dependencies from the scrutinee (`case evidence d of Dict -> r` where
+        // `HasDict c e | e -> c`) may determine the scrutinee's type before matching opens a
+        // local solver scope for an existential/GADT pattern.
+        let pending: Vec<Pred> = self.wanted.iter().map(|w| w.pred.clone()).collect();
+        for p in &pending {
+            self.improve(p)?;
+        }
         let mut rows = Vec::with_capacity(alts.len());
         for a in alts {
             self.loc = a.loc;

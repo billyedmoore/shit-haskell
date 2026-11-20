@@ -612,6 +612,13 @@ impl Parser {
             self.bump();
             return Ok(Expr::Con(QName::unqual("()"), loc));
         }
+        // `(#)` is the operator `#` in parens, not an unboxed tuple opener.
+        if self.at_varsym("#") && *self.peek_raw(1) == Tok::Special(')') {
+            let oloc = self.loc();
+            self.bump();
+            self.bump();
+            return Ok(Expr::Var(QName::unqual("#"), oloc));
+        }
         // UnboxedTuples: `(# a, b #)` is an ordinary tuple here. With the extension on, `(#`
         // opens one even with no space after it (`(#q, r#)`).
         if self.at_varsym("#") && (self.raw().space_after || self.exts.is_on("UnboxedTuples") || self.exts.is_on("UnboxedSums")) {
