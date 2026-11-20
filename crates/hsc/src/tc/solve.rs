@@ -1214,10 +1214,11 @@ impl Checker {
         const CHAR: u8 = 3;
         const OTHER: u8 = 4;
         let t = self.metas.zonk(t);
-        match t.split_apps().0 {
+        let (head, args) = t.split_apps();
+        match head {
             Ty::Con(c) => {
                 if let Some(text) = c.strip_prefix('#') {
-                    if text.chars().all(|ch| ch.is_ascii_digit()) {
+                    if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_digit()) {
                         return Some(NAT);
                     }
                     if text.starts_with('"') {
@@ -1230,6 +1231,9 @@ impl Checker {
                 if self.env.families.contains_key(c) {
                     return None;
                 }
+                if c.rsplit_once('.').is_some_and(|(_, occ)| occ.starts_with('\'')) {
+                    return Some(OTHER);
+                }
                 if self.env.tycons.contains_key(c)
                     || c == super::types::LIST
                     || c == super::types::ARROW
@@ -1240,7 +1244,7 @@ impl Checker {
                 }
                 None
             }
-            Ty::Skol(..) => {
+            Ty::Skol(..) if args.is_empty() => {
                 // Check if givens pin this skolem to Nat, Symbol, or Char.
                 let mut avail = Vec::new();
                 for g in self.givens.iter().rev() {
