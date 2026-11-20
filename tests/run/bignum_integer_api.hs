@@ -33,6 +33,9 @@ main = do
   case integerRecipMod# 2 4 of
     (# r | #) -> print r
     (# | () #) -> putStrLn "none"
+  mapM_ (\(b, e, m) -> case integerPowMod# b e m of { (# r | #) -> print r; (# | () #) -> putStrLn "none" })
+    [(5, -1, 1), (0, -3, 7), (0, 0, 7), (1, -5, 9), (2, -1, 4)]
+  print (W# (integerSizeInBase# 10## 0), W# (integerSizeInBase# 10## 999))
   case integerPowMod# 3 (-1) 7 of
     (# r | #) -> print r
     (# | () #) -> putStrLn "none"

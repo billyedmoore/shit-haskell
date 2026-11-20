@@ -62,7 +62,8 @@ one-fix iterations.
 - Sweep of the top 300 Stackage packages: hsc builds 245 of the 300 GHC builds (was 218). This
   PR adds ghc-bignum's API, integer-gmp, RebindableSyntax and CallStack implicit parameters
   (basement, memory, crypton, cborg build). Next, by packages blocked: reflection (lens),
-  optics-core, constraints, monad-control, some, sop-core.
+  optics-core, constraints, monad-control, some, sop-core. RebindableSyntax still to rebind:
+  do-notation, arithmetic sequences, string and list literals.
 - Known gaps it will rank: PolyKinds and kind inference (binary), Template Haskell `[d| |]`,
   type and pattern splices, `foreign import "dynamic"`, collector-run
   finalizers, Arrows, text's plugin.
