@@ -178,6 +178,16 @@ pub fn quoted_types(splices: &[&Expr]) -> Vec<QName> {
 fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice], name: &str, result: Type, table: Expr, setup: Expr, at: (&str, &str)) -> Module {
     let module_loc = splices.first().map_or(Loc::default(), |s| s.loc);
     let mut decls = before;
+    // The reify table and the setup are bound once and shared by the splices (a table can be large).
+    let shared = |name: &str, body: Expr| Decl::Fun {
+        name: name.into(),
+        clauses: vec![Clause { pats: Vec::new(), rhs: Rhs { body: Body::Plain(body), wheres: Vec::new() }, loc: module_loc, end: module_loc }],
+        loc: module_loc,
+    };
+    decls.push(shared("hsc'reifyTable", table));
+    decls.push(shared("hsc'setup", setup));
+    let table = Expr::Var(QName::unqual("hsc'reifyTable"), module_loc);
+    let setup = Expr::Var(QName::unqual("hsc'setup"), module_loc);
     for (i, s) in splices.iter().enumerate() {
         let loc = s.loc;
         // The reify table is set before the splice runs.
@@ -1411,11 +1421,38 @@ pub fn class_entries(classes: &[(String, &crate::tc::env::ClassInfo, Vec<&crate:
     classes.iter().map(|(module, info, insts)| Reify { loc, global: Some(module.clone()) }.class_entry(module, info, insts)).collect()
 }
 
+/// The most arguments `Gen(i)` is applied to in a type (0 when it is not applied): the arity of
+/// its kind, `* -> .. -> *` (kinds are not inferred otherwise).
+fn gen_arity(t: &crate::tc::types::Ty, i: u32) -> usize {
+    use crate::tc::types::Ty;
+    let (head, args) = t.split_apps();
+    let here = if matches!(head, Ty::Gen(j) if *j == i) { args.len() } else { 0 };
+    let inner = match t {
+        Ty::App(f, a) => gen_arity(f, i).max(gen_arity(a, i)),
+        Ty::Forall(_, ps, b) | Ty::Qual(ps, b) => {
+            ps.iter().flat_map(|p| p.args.iter()).map(|a| gen_arity(a, i)).max().unwrap_or(0).max(gen_arity(b, i))
+        }
+        _ => 0,
+    };
+    here.max(inner)
+}
+
+impl Reify {
+    /// The kind `* -> .. -> *` of `n` arguments.
+    fn arity_kind(&self, n: usize) -> Expr {
+        (0..n).fold(self.syn("StarT"), |acc, _| app(app(self.syn("AppT"), app(app(self.syn("AppT"), self.syn("ArrowT")), self.syn("StarT"))), acc))
+    }
+}
+
 /// The `reify` entry of a type synonym: `TyConI (TySynD name params rhs)`.
 pub fn synonym_entry(module: &str, occ: &str, syn: &crate::tc::env::Synonym, loc: Loc) -> Expr {
     let r = Reify { loc, global: Some(module.to_string()) };
     let params: Vec<String> = (0..syn.nparams).map(|i| format!("a{i}")).collect();
-    let tvs = params.iter().map(|n| app(app(app(r.syn("KindedTV"), r.mk_name(n)), r.syn("BndrReq")), r.syn("StarT"))).collect();
+    let tvs = params
+        .iter()
+        .enumerate()
+        .map(|(i, n)| app(app(app(r.syn("KindedTV"), r.mk_name(n)), r.syn("BndrReq")), r.arity_kind(gen_arity(&syn.rhs, i as u32))))
+        .collect();
     let dec = app(app(app(r.syn("TySynD"), r.own(true, occ)), Expr::List(tvs, loc)), r.tc_ty(&syn.rhs, &params));
     Expr::Tuple(vec![Some(r.str(module)), Some(r.str(occ)), Some(app(r.syn("TyConI"), dec))], loc)
 }
@@ -1424,7 +1461,13 @@ pub fn synonym_entry(module: &str, occ: &str, syn: &crate::tc::env::Synonym, loc
 pub fn prim_entry(occ: &str, loc: Loc) -> Expr {
     let r = Reify { loc, global: Some("GHC.Prim".to_string()) };
     let unlifted = Expr::Con(QName { qual: Some("%G:GHC.Types".into()), name: "True".into() }, loc);
-    let info = app(app(app(r.syn("PrimTyConI"), r.mk_name(occ)), lit_int("0", loc)), unlifted);
+    // The primitive types' parameters (GHC.Prim's declarations).
+    let arity = match occ {
+        "Array#" | "SmallArray#" | "State#" | "MutableByteArray#" | "Weak#" | "StablePtr#" | "StableName#" | "Proxy#" => 1,
+        "MutableArray#" | "SmallMutableArray#" | "MutVar#" | "MVar#" | "TVar#" | "IOPort#" => 2,
+        _ => 0,
+    };
+    let info = app(app(app(r.syn("PrimTyConI"), r.mk_name(occ)), lit_int(&arity.to_string(), loc)), unlifted);
     Expr::Tuple(vec![Some(r.str("GHC.Prim")), Some(r.str(occ)), Some(info)], loc)
 }
 
@@ -1434,9 +1477,18 @@ impl Reify {
         let occ = crate::tc::types::unqualify(&info.name).to_string();
         let params: Vec<String> = (0..info.nparams).map(|i| format!("a{i}")).collect();
         let list = |xs: Vec<Expr>| Expr::List(xs, loc);
+        // A parameter's kind from its uses in the methods and superclasses.
+        let used = |i: u32| {
+            let in_methods = info.methods.iter().map(|(_, sch)| {
+                gen_arity(&sch.ty, i).max(sch.preds.iter().flat_map(|p| p.args.iter()).map(|a| gen_arity(a, i)).max().unwrap_or(0))
+            });
+            let in_supers = info.supers.iter().flat_map(|p| p.args.iter()).map(|a| gen_arity(a, i));
+            in_methods.chain(in_supers).max().unwrap_or(0)
+        };
         let tvs = params
             .iter()
-            .map(|n| app(app(app(self.syn("KindedTV"), self.mk_name(n)), self.syn("BndrReq")), self.syn("StarT")))
+            .enumerate()
+            .map(|(i, n)| app(app(app(self.syn("KindedTV"), self.mk_name(n)), self.syn("BndrReq")), self.arity_kind(used(i as u32))))
             .collect();
         let supers = info.supers.iter().map(|p| self.tc_pred(p, &params)).collect();
         let fundeps = info
@@ -1464,7 +1516,12 @@ impl Reify {
                 } else {
                     let binders = own
                         .iter()
-                        .map(|n| app(app(app(self.syn("KindedTV"), self.mk_name(n)), self.syn("SpecifiedSpec")), self.syn("StarT")))
+                        .enumerate()
+                        .map(|(k, n)| {
+                            let i = info.nparams + k as u32;
+                            let arity = gen_arity(&sch.ty, i).max(sch.preds.iter().flat_map(|p| p.args.iter()).map(|a| gen_arity(a, i)).max().unwrap_or(0));
+                            app(app(app(self.syn("KindedTV"), self.mk_name(n)), self.syn("SpecifiedSpec")), self.arity_kind(arity))
+                        })
                         .collect();
                     app(app(app(self.syn("ForallT"), list(binders)), list(ctx)), body)
                 };
