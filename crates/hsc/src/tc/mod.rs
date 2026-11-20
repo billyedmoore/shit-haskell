@@ -107,8 +107,6 @@ pub struct Checker {
     pub overloaded_lists: bool,
     /// GeneralizedNewtypeDeriving: a newtype derives most classes through its representation.
     pub newtype_deriving: bool,
-    /// Quantified constraints are kept while a signature's context is converted.
-    pub allow_quantified: bool,
     /// MonomorphismRestriction (on unless the module turns it off).
     pub monomorphism_restriction: bool,
     /// The monads of the typed quotations being checked, innermost last (their splices share them).
@@ -120,6 +118,8 @@ pub struct Checker {
     pub explicit_sigs: std::collections::HashSet<String>,
     /// Equalities involving type families that cannot be decided yet.
     pub deferred_eqs: Vec<(Ty, Ty, Loc)>,
+    /// Annotated kinds of skolem variables in scope (e.g. from kind-annotated instance heads).
+    pub skol_kinds: HashMap<u32, String>,
 }
 
 /// The module name of built-in syntax.
@@ -183,12 +183,12 @@ impl Checker {
             overloaded_strings: false,
             overloaded_lists: false,
             newtype_deriving: false,
-            allow_quantified: false,
             monomorphism_restriction: true,
             quote_monads: Vec::new(),
             flex_kinds: Vec::new(),
             explicit_sigs: std::collections::HashSet::new(),
             deferred_eqs: Vec::new(),
+            skol_kinds: HashMap::new(),
         };
         c.install_builtins();
         c
@@ -419,6 +419,32 @@ impl Checker {
             (Ty::App(f1, x1), Ty::App(f2, x2)) => {
                 self.unify_fam(&f1, &f2)?;
                 self.unify_fam(&x1, &x2)
+            }
+            (Ty::Forall(i1, p1, b1), Ty::Forall(i2, p2, b2)) if i1.len() == i2.len() && p1.len() == p2.len() => {
+                let sk: Vec<Ty> = (0..i1.len()).map(|k| self.metas.fresh_skolem(&format!("r{k}"))).collect();
+                for (q1, q2) in p1.iter().zip(&p2) {
+                    if q1.class == q2.class && q1.args.len() == q2.args.len() {
+                        for (u, v) in q1.args.iter().zip(&q2.args) {
+                            let su = types::subst_bound(u, &i1, &sk);
+                            let sv = types::subst_bound(v, &i2, &sk);
+                            self.unify_fam(&su, &sv)?;
+                        }
+                    }
+                }
+                let x = types::subst_bound(&b1, &i1, &sk);
+                let y = types::subst_bound(&b2, &i2, &sk);
+                self.unify_fam(&x, &y)
+            }
+            (Ty::Qual(p1, b1), Ty::Qual(p2, b2)) if p1.len() == p2.len() => {
+                for (q1, q2) in p1.iter().zip(&p2) {
+                    if q1.class != q2.class || q1.args.len() != q2.args.len() {
+                        return self.unify_at_raw(&a, &e);
+                    }
+                    for (u, v) in q1.args.iter().zip(&q2.args) {
+                        self.unify_fam(u, v)?;
+                    }
+                }
+                self.unify_fam(&b1, &b2)
             }
             _ => {
                 self.deferred_eqs.push((a, e, self.loc));

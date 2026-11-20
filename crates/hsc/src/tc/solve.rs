@@ -306,28 +306,33 @@ impl Checker {
         }
         if is_eq_class(&g.pred.class) && g.pred.args.len() == 2 {
             let (a, b) = (g.pred.args[0].clone(), g.pred.args[1].clone());
-            let _ = self.metas.unify_refine(&a, &b);
+            self.refine_given_eq(&a, &b);
         }
-        // The superclass equalities of a class given: one equating a rigid variable to an
-        // application that mentions it (`b ~ (Body b) GhcPs`) is kept as that variable's form.
-        if let Some(info) = self.class(&g.pred.class).cloned() {
-            for sp in &info.supers {
-                if !is_eq_class(&sp.class) || sp.args.len() != 2 {
-                    continue;
-                }
-                let args: Vec<Ty> = sp.args.iter().map(|t| self.metas.zonk(&subst_gen(t, &g.pred.args))).collect();
-                let mut skol_form = false;
-                for (v, other) in [(&args[0], &args[1]), (&args[1], &args[0])] {
-                    if let Ty::Skol(id, name) = v {
-                        if matches!(other, Ty::App(..)) && skol_occurs(*id, other) {
-                            self.skol_apps.insert(*id, (name.clone(), other.clone()));
-                            skol_form = true;
-                        }
+        // The superclass equalities of a class given (transitively): one equating a rigid variable
+        // to an application that mentions it (`b ~ (Body b) GhcPs`) is kept as that variable's
+        // form; any other superclass equality (`is ~ '[i]` of `HasSingleIndex is i`) refines rigid
+        // variables just like a direct equality given.
+        let mut supers: Vec<Pred> = Vec::new();
+        self.superclass_closure(&g.pred, &mut supers, 0);
+        for sp in supers.into_iter().skip(1) {
+            if !is_eq_class(&sp.class) || sp.args.len() != 2 {
+                continue;
+            }
+            let args: Vec<Ty> = sp.args.iter().map(|t| self.metas.zonk(t)).collect();
+            let mut skol_form = false;
+            for (v, other) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+                if let Ty::Skol(id, name) = v {
+                    if matches!(other, Ty::App(..)) && skol_occurs(*id, other) {
+                        self.skol_apps.insert(*id, (name.clone(), other.clone()));
+                        skol_form = true;
                     }
                 }
+            }
+            if !skol_form {
+                self.refine_given_eq(&args[0], &args[1]);
                 // One equating a family application (`Anno (GRHS GhcPs (LocatedA (Body b
                 // GhcPs))) ~ EpAnnCO` of `AnnoBody b`) is given, for that application to reduce.
-                if !skol_form && (self.family_app(&args[0]).is_some() || self.family_app(&args[1]).is_some()) {
+                if self.family_app(&args[0]).is_some() || self.family_app(&args[1]).is_some() {
                     let ev = Core::Con("Builtin.()".into(), vec![]);
                     self.givens.push(Given { pred: Pred { class: sp.class.clone(), args }, ev });
                 }
@@ -350,25 +355,131 @@ impl Checker {
         }
     }
 
-    /// Constraint-family givens that now reduce (`If (s == System) (a ~ B, ..) ()` once a GADT
-    /// match has refined `s`): the equalities they reduce to refine the types in scope.
-    pub fn refine_family_givens(&mut self) {
-        let fam_givens: Vec<Pred> = self
-            .givens
-            .iter()
-            .filter(|g| self.env.families.contains_key(&g.pred.class))
-            .map(|g| g.pred.clone())
-            .collect();
-        for p in fam_givens {
-            let applied = Ty::apps(Ty::con(&p.class), p.args.iter().map(|t| self.metas.zonk(t)).collect());
-            let reduced = self.normalize(&applied);
-            if reduced == applied {
+    /// Refines rigid variables from a given equality `a ~ b`, flattening self-mentioning family
+    /// applications under a constructor head (`ys ~ (Head ys ': Tail ys)` becomes `ys ~ (s0 ': s1)`,
+    /// after which `Head ys` reduces to `s0` and `Tail ys` to `s1`).
+    fn refine_given_eq(&mut self, a: &Ty, b: &Ty) {
+        let za0 = self.metas.zonk(a);
+        let zb0 = self.metas.zonk(b);
+        for (lhs, rhs) in [(&za0, &zb0), (&zb0, &za0)] {
+            if let Ty::Skol(id, _) = lhs {
+                if !self.skol_kinds.contains_key(id) {
+                    if let Some(k) = self.kind_name_of(rhs) {
+                        self.skol_kinds.insert(*id, k);
+                    }
+                }
+            }
+        }
+        let before = self.metas.skol_binds.len();
+        if self.metas.unify_refine(a, b).is_ok() && self.metas.skol_binds.len() != before {
+            return;
+        }
+        let za = self.normalize(&self.metas.zonk(a));
+        let zb = self.normalize(&self.metas.zonk(b));
+        for (v, rhs) in [(&za, &zb), (&zb, &za)] {
+            let Ty::Skol(id, _) = v else { continue };
+            let (Ty::Con(head), args) = rhs.split_apps() else { continue };
+            if args.is_empty() || self.env.families.contains_key(head) || !skol_occurs(*id, rhs) {
                 continue;
             }
-            for part in super::convert::ty_to_preds(&reduced) {
-                if is_eq_class(&part.class) && part.args.len() == 2 {
-                    let _ = self.metas.unify_refine(&part.args[0], &part.args[1]);
+            let mut fsks: Vec<(Ty, Ty)> = Vec::new();
+            let flat = self.flatten_skol_fams(rhs, *id, &mut fsks);
+            if !fsks.is_empty() && !skol_occurs(*id, &flat) && self.metas.unify_refine(v, &flat).is_ok() {
+                for (orig, fsk) in fsks {
+                    let reduced = self.normalize(&self.metas.zonk(&orig));
+                    if reduced != fsk {
+                        self.givens.push(Given {
+                            pred: Pred { class: EQ_CLASS.into(), args: vec![orig, fsk] },
+                            ev: Core::Con("Builtin.()".into(), vec![]),
+                        });
+                    }
                 }
+                return;
+            }
+        }
+    }
+
+    /// Replaces maximal type-family applications inside `t` that mention skolem `id` with fresh
+    /// skolems, recording each `(original, fresh)` pair.
+    fn flatten_skol_fams(&mut self, t: &Ty, id: u32, out: &mut Vec<(Ty, Ty)>) -> Ty {
+        if self.family_app(t).is_some() && skol_occurs(id, t) {
+            if let Some((_, existing)) = out.iter().find(|(orig, _)| orig == t) {
+                return existing.clone();
+            }
+            let fsk = self.metas.fresh_skolem("fsk");
+            out.push((t.clone(), fsk.clone()));
+            return fsk;
+        }
+        match t {
+            Ty::App(f, a) => {
+                let f2 = self.flatten_skol_fams(f, id, out);
+                let a2 = self.flatten_skol_fams(a, id, out);
+                Ty::app(f2, a2)
+            }
+            _ => t.clone(),
+        }
+    }
+
+    /// Whether the current givens are contradictory (`TypeError ...` or an equality between two
+    /// demonstrably distinct constructors such as `'[] ~ (x ': xs)`), making wanted equalities
+    /// in this scope vacuously satisfied.
+    fn has_insoluble_given(&self) -> bool {
+        self.givens.iter().any(|g| {
+            if g.pred.class == "TypeError" || g.pred.class.ends_with(".TypeError") {
+                return true;
+            }
+            if is_eq_class(&g.pred.class) && g.pred.args.len() == 2 {
+                let a = self.normalize(&self.metas.zonk(&g.pred.args[0]));
+                let b = self.normalize(&self.metas.zonk(&g.pred.args[1]));
+                return self.types_apart(&a, &b);
+            }
+            false
+        })
+    }
+
+    /// Whether two normalized types have incompatible rigid structure.
+    fn types_apart(&self, a: &Ty, b: &Ty) -> bool {
+        let (ha, aargs) = a.split_apps();
+        let (hb, bargs) = b.split_apps();
+        match (ha, hb) {
+            (Ty::Con(ca), Ty::Con(cb))
+                if !self.env.families.contains_key(ca) && !self.env.families.contains_key(cb) =>
+            {
+                ca != cb
+                    || aargs.len() != bargs.len()
+                    || aargs.iter().zip(bargs).any(|(x, y)| self.types_apart(x, y))
+            }
+            _ => false,
+        }
+    }
+
+    /// Constraint-family givens (including those reached as superclasses of a given, such as
+    /// `SameShapeAs xs ys` of `AllZip c xs ys`) that now reduce (`If (s == System) (a ~ B, ..) ()`
+    /// once a GADT match has refined `s`): the equalities they reduce to refine the types in scope.
+    pub fn refine_family_givens(&mut self) {
+        for _ in 0..8 {
+            let before = self.metas.skol_binds.len();
+            let mut avail: Vec<Pred> = Vec::new();
+            for g in self.givens.iter().rev() {
+                self.superclass_closure(&g.pred, &mut avail, 0);
+            }
+            for p in avail {
+                if !self.env.families.contains_key(&p.class) {
+                    continue;
+                }
+                let applied = Ty::apps(Ty::con(&p.class), p.args.iter().map(|t| self.metas.zonk(t)).collect());
+                let reduced = self.normalize(&applied);
+                if reduced == applied {
+                    continue;
+                }
+                for part in super::convert::ty_to_preds(&reduced) {
+                    if is_eq_class(&part.class) && part.args.len() == 2 {
+                        self.refine_given_eq(&part.args[0], &part.args[1]);
+                    }
+                }
+            }
+            if self.metas.skol_binds.len() == before {
+                break;
             }
         }
     }
@@ -428,7 +539,11 @@ impl Checker {
                 continue;
             }
             if is_eq_class(&pred.class) && pred.args.len() == 2 {
-                self.unify_at(&pred.args[0], &pred.args[1])?;
+                if let Err(e) = self.unify_at(&pred.args[0], &pred.args[1]) {
+                    if !self.has_insoluble_given() {
+                        return Err(e);
+                    }
+                }
                 binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
                 continue;
             }
@@ -450,6 +565,12 @@ impl Checker {
                         1 => evs.pop().unwrap_or(Core::Con("Builtin.()".into(), vec![])),
                         _ => Core::Con(Ty::tuple_con(n), evs),
                     };
+                    binds.push((w.ev.clone(), ev));
+                    continue;
+                }
+                // A stuck constraint family may still be provided directly by a given (`Extra k p`),
+                // whose dictionary must be forwarded rather than replaced by unit.
+                if let Some(ev) = self.find_given(&pred) {
                     binds.push((w.ev.clone(), ev));
                     continue;
                 }
@@ -554,6 +675,28 @@ impl Checker {
                 binds.push((w.ev.clone(), ev));
                 continue;
             }
+            // `withTypeable (typeRepKind tr) ...` introduces `Typeable ?m` for an unconstrained
+            // kind variable because `TypeRep (a :: k)` erases `k`. When a rigid kind variable
+            // `Typeable k` is wanted in that scope, unify `?m` with `k` and forward its dictionary.
+            if pred.class == TYPEABLE_CLASS
+                && pred.args.len() == 1
+                && matches!(self.metas.prune(&pred.args[0]), Ty::Skol(..))
+            {
+                let open_given = self.givens.iter().rev().find_map(|g| {
+                    if g.pred.class == TYPEABLE_CLASS && g.pred.args.len() == 1 {
+                        if let Ty::Meta(m) = self.metas.prune(&g.pred.args[0]) {
+                            return Some((m, g.ev.clone()));
+                        }
+                    }
+                    None
+                });
+                if let Some((m, ev)) = open_given {
+                    if self.unify_at(&Ty::Meta(m), &pred.args[0]).is_ok() {
+                        binds.push((w.ev.clone(), ev));
+                        continue;
+                    }
+                }
+            }
             // KnownNat, KnownSymbol and KnownChar at a literal type: the compiler builds the dictionary.
             if let Some(ev) = self.known_literal_evidence(&pred) {
                 binds.push((w.ev.clone(), ev));
@@ -619,7 +762,13 @@ impl Checker {
         let mut supers = Vec::new();
         self.superclass_closure(p, &mut supers, 0);
         for q in supers.into_iter().skip(1) {
-            if self.class(&q.class).is_some_and(|i| !i.fundeps.is_empty()) {
+            if is_eq_class(&q.class) && q.args.len() == 2 {
+                let a = self.normalize(&self.metas.zonk(&q.args[0]));
+                let b = self.normalize(&self.metas.zonk(&q.args[1]));
+                if (self.has_metas(&a) || self.has_metas(&b)) && !self.has_family(&a) && !self.has_family(&b) {
+                    let _ = self.metas.unify(&a, &b);
+                }
+            } else if self.class(&q.class).is_some_and(|i| !i.fundeps.is_empty()) {
                 self.improve_own(&q)?;
             }
         }
@@ -655,22 +804,47 @@ impl Checker {
                 continue;
             }
             let insts: Vec<InstInfo> = self.env.instances.for_class(&p.class).cloned().collect();
+            let zonked: Vec<Ty> = p.args.iter().map(|t| self.metas.zonk(t)).collect();
+            let mut matches: Vec<(InstInfo, Vec<Option<Ty>>)> = Vec::new();
             for inst in insts {
                 if inst.head.len() != p.args.len() {
                     continue;
                 }
-                let mut sub: Vec<Option<Ty>> = vec![None; inst.nvars as usize];
-                let zonked: Vec<Ty> = p.args.iter().map(|t| self.metas.zonk(t)).collect();
-                let ok = from.iter().all(|&i| self.match_ty(&inst.head[i], &zonked[i], &mut sub));
-                if !ok {
+                let kind_ok = inst.kinds.iter().zip(&zonked).all(|(k, t)| match k {
+                    Some(want_k) => self.inst_kind_ok(want_k, t),
+                    None => true,
+                });
+                if !kind_ok {
                     continue;
                 }
+                let mut sub: Vec<Option<Ty>> = vec![None; inst.nvars as usize];
+                let ok = from.iter().all(|&i| self.match_ty(&inst.head[i], &zonked[i], &mut sub));
+                if ok && self.inst_ctx_kind_ok(&inst, &sub) {
+                    matches.push((inst, sub));
+                }
+            }
+            let rigid = |t: &Ty| super::types::subst_gen(t, &(0..64).map(|i| Ty::Con(format!("%rigid{i}"))).collect::<Vec<_>>());
+            let more_general_from = |a: &InstInfo, b: &InstInfo| -> bool {
+                let mut sub: Vec<Option<Ty>> = vec![None; a.nvars as usize];
+                from.iter().all(|&i| self.match_ty(&a.head[i], &rigid(&b.head[i]), &mut sub))
+            };
+            // Only improve when there is a single most-specific matching instance: if two
+            // incomparable instances match (e.g. `KnownNat n => Reifies n Integer` and
+            // `KnownSymbol n => Reifies n String` on an unconstrained variable), do not guess.
+            let best: Vec<usize> = (0..matches.len())
+                .filter(|&i| {
+                    (0..matches.len()).all(|j| {
+                        j == i || !more_general_from(&matches[i].0, &matches[j].0) || more_general_from(&matches[j].0, &matches[i].0)
+                    })
+                })
+                .collect();
+            if best.len() == 1 {
+                let (inst, sub) = matches.swap_remove(best[0]);
                 let args: Vec<Ty> = sub.into_iter().map(|x| x.unwrap_or_else(|| self.meta())).collect();
                 for &j in &to {
                     let target = subst_gen(&inst.head[j], &args);
                     self.unify_at(&p.args[j], &target)?;
                 }
-                break;
             }
         }
         Ok(())
@@ -697,13 +871,26 @@ impl Checker {
         } else {
             Pred { class: p.class.clone(), args: p.args.iter().map(|t| self.normalize(t)).collect() }
         };
-        // A constraint variable solved to a class (`c a` with `c := Pretty`) is that class's
-        // predicate.
+        // A constraint variable solved to a concrete constraint (`c a` with `c := Pretty`,
+        // `b ~ b`, a constraint family, or a quantified constraint) becomes that predicate.
         if out.class == super::convert::CONSTRAINT_VAR && out.args.len() == 1 {
-            let (head, cargs) = out.args[0].split_apps();
-            if let Ty::Con(c) = head {
-                if self.env.classes.contains_key(c) {
-                    return Pred { class: c.clone(), args: cargs.into_iter().cloned().collect() };
+            match &out.args[0] {
+                Ty::Forall(..) => {
+                    return Pred { class: QUANTIFIED_CLASS.into(), args: vec![out.args[0].clone()] };
+                }
+                Ty::Qual(ps, b) => {
+                    return Pred {
+                        class: QUANTIFIED_CLASS.into(),
+                        args: vec![Ty::Forall(Vec::new(), ps.clone(), b.clone())],
+                    };
+                }
+                _ => {
+                    let (head, cargs) = out.args[0].split_apps();
+                    if let Ty::Con(c) = head {
+                        if self.env.classes.contains_key(c) || is_eq_class(c) || self.env.families.contains_key(c) {
+                            return Pred { class: c.clone(), args: cargs.into_iter().cloned().collect() };
+                        }
+                    }
                 }
             }
         }
@@ -962,10 +1149,49 @@ impl Checker {
         if depth > 16 {
             return None;
         }
-        let info = self.class(&have.class)?;
+        // A constraint tuple (`(c a, d a)`) gives each of its elements.
+        if let Some(parts) = constraint_tuple_parts(&have_z) {
+            let n = parts.len();
+            for (i, part) in parts.into_iter().enumerate() {
+                let mut counter = 0usize;
+                let mut fresh = || {
+                    counter += 1;
+                    format!("st%{depth}_{i}_{counter}")
+                };
+                let sel = select_field(ev.clone(), &Ty::tuple_con(n), n, i, &mut fresh);
+                if let Some(core) = self.search_closure(&part, &sel, want, depth + 1) {
+                    return Some(core);
+                }
+            }
+            return None;
+        }
+        // A constraint type family (`AllF c (x ': xs)` -> `(c x, All c xs)`) reduces after GADT
+        // refinement even when it arrived as a superclass of a given class (`All c xs`).
+        if self.env.families.contains_key(&have_z.class) {
+            if let Some(parts) = self.constraint_family_parts(&have_z.class, &have_z.args) {
+                let n = parts.len();
+                for (i, part) in parts.into_iter().enumerate() {
+                    let sel = if n == 1 {
+                        ev.clone()
+                    } else {
+                        let mut counter = 0usize;
+                        let mut fresh = || {
+                            counter += 1;
+                            format!("sf%{depth}_{i}_{counter}")
+                        };
+                        select_field(ev.clone(), &Ty::tuple_con(n), n, i, &mut fresh)
+                    };
+                    if let Some(core) = self.search_closure(&part, &sel, want, depth + 1) {
+                        return Some(core);
+                    }
+                }
+            }
+            return None;
+        }
+        let info = self.class(&have_z.class)?;
         let nsupers = info.nsupers();
         for (i, sup) in info.supers.iter().enumerate() {
-            let sup_pred = super::types::subst_gen_pred(sup, &have.args);
+            let sup_pred = super::types::subst_gen_pred(sup, &have_z.args);
             let dict_con = info.dict_con.clone();
             let mut counter = 0usize;
             let mut fresh = || {
@@ -978,6 +1204,100 @@ impl Checker {
             }
         }
         None
+    }
+
+    /// Coarse kind of a zonked type for telling apart `Nat`, `Symbol`, `Char` and ordinary types
+    /// when matching instances constrained by `KnownNat`, `KnownSymbol` or `KnownChar`.
+    fn known_kind(&self, t: &Ty) -> Option<u8> {
+        const NAT: u8 = 1;
+        const SYMBOL: u8 = 2;
+        const CHAR: u8 = 3;
+        const OTHER: u8 = 4;
+        let t = self.metas.zonk(t);
+        match t.split_apps().0 {
+            Ty::Con(c) => {
+                if let Some(text) = c.strip_prefix('#') {
+                    if text.chars().all(|ch| ch.is_ascii_digit()) {
+                        return Some(NAT);
+                    }
+                    if text.starts_with('"') {
+                        return Some(SYMBOL);
+                    }
+                    if text.starts_with('\'') {
+                        return Some(CHAR);
+                    }
+                }
+                if self.env.families.contains_key(c) {
+                    return None;
+                }
+                if self.env.tycons.contains_key(c)
+                    || c == super::types::LIST
+                    || c == super::types::ARROW
+                    || c.starts_with("Builtin.(")
+                    || c.starts_with("GHC.Prim.")
+                {
+                    return Some(OTHER);
+                }
+                None
+            }
+            Ty::Skol(..) => {
+                // Check if givens pin this skolem to Nat, Symbol, or Char.
+                let mut avail = Vec::new();
+                for g in self.givens.iter().rev() {
+                    self.superclass_closure(&g.pred, &mut avail, 0);
+                }
+                for p in &avail {
+                    if p.args.len() == 1 && self.metas.zonk(&p.args[0]) == t {
+                        match p.class.as_str() {
+                            "GHC.Internal.TypeNats.KnownNat" => return Some(NAT),
+                            "GHC.Internal.TypeLits.KnownSymbol" => return Some(SYMBOL),
+                            "GHC.Internal.TypeLits.KnownChar" => return Some(CHAR),
+                            _ => {}
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a type matches an instance head's annotated representation or structural kind.
+    fn inst_kind_ok(&self, want: &str, t: &Ty) -> bool {
+        if let Some(k) = want.strip_prefix("kind:") {
+            self.kind_name_of(t).is_none_or(|have| super::families::same_kind(&have, k))
+        } else {
+            self.rep_of_type(t).is_none_or(|have| want == have)
+        }
+    }
+
+    /// Whether an instance's `KnownNat`/`KnownSymbol`/`KnownChar` context constraints are kind-
+    /// compatible with the types matched to its head variables.
+    fn inst_ctx_kind_ok(&self, inst: &InstInfo, sub: &[Option<Ty>]) -> bool {
+        const NAT: u8 = 1;
+        const SYMBOL: u8 = 2;
+        const CHAR: u8 = 3;
+        for p in &inst.ctx {
+            if p.args.len() != 1 {
+                continue;
+            }
+            let req = match p.class.as_str() {
+                "GHC.Internal.TypeNats.KnownNat" => NAT,
+                "GHC.Internal.TypeLits.KnownSymbol" => SYMBOL,
+                "GHC.Internal.TypeLits.KnownChar" => CHAR,
+                _ => continue,
+            };
+            if let Ty::Gen(v) = p.args[0] {
+                if let Some(Some(bound)) = sub.get(v as usize) {
+                    if let Some(actual) = self.known_kind(bound) {
+                        if actual != req {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// The placeholders `find_instance` leaves for an instance's context-only variables, replaced by
@@ -1058,9 +1378,10 @@ impl Checker {
             if inst.head.len() != want.args.len() {
                 continue;
             }
-            // An instance for a kind (`(a :: TYPE 'IntRep)`) is for types of that representation.
+            // An instance for a kind (`(a :: TYPE 'IntRep)`, `(p :: Constraint)`) is for types of
+            // that representation or kind.
             let kind_ok = inst.kinds.iter().zip(&zonked).all(|(k, t)| match k {
-                Some(want_rep) => self.rep_of_type(t).is_none_or(|have| *want_rep == have),
+                Some(want_k) => self.inst_kind_ok(want_k, t),
                 None => true,
             });
             if !kind_ok {
@@ -1072,7 +1393,7 @@ impl Checker {
                 .iter()
                 .zip(&zonked)
                 .all(|(pat, t)| self.match_ty(pat, t, &mut sub));
-            if ok {
+            if ok && self.inst_ctx_kind_ok(inst, &sub) {
                 matches.push((inst, sub));
             }
         }
@@ -1360,14 +1681,16 @@ fn core_apply_base(core: Core, ctx_evs: &[String]) -> Core {
     }
 }
 
-/// The parts of a constraint that is a tuple of constraints (`%constraint ((Show a, Eq a))`, or
-/// `()`), each as a predicate.
+/// The parts of a constraint that is a tuple of constraints (`%constraint ((Show a, Eq a))`,
+/// direct `(Show a, Eq a)`, or `()`), each as a predicate.
 fn constraint_tuple_parts(p: &Pred) -> Option<Vec<Pred>> {
-    if p.class != super::convert::CONSTRAINT_VAR || p.args.len() != 1 {
-        return None;
-    }
-    let (head, args) = p.args[0].split_apps();
-    let Ty::Con(c) = head else { return None };
+    let (c, args): (&str, Vec<&Ty>) = if p.class == super::convert::CONSTRAINT_VAR && p.args.len() == 1 {
+        let (head, args) = p.args[0].split_apps();
+        let Ty::Con(c) = head else { return None };
+        (c.as_str(), args)
+    } else {
+        (p.class.as_str(), p.args.iter().collect())
+    };
     let n = if c == "Builtin.()" { 0 } else { super::types::tuple_arity(c)? };
     if n != args.len() {
         return None;

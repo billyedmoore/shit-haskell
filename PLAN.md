@@ -11,7 +11,7 @@ This file says where things stand and what comes next. History lives in git and
   type and data families, rank-N types. An interpreter (Template Haskell, `runghc`) and a
   native x86-64 back end with a Rust runtime (copying GC, threads, STM, FFI).
 - **Driver:** GHC's command line and package databases; `hsc-pkg`; `cabal build/test -w` works.
-- **Corpus:** 299 differential tests, both back ends, all passing.
+- **Corpus:** 308 differential tests, both back ends, all passing.
 - **Boot libraries:** deepseq, directory, filepath, bytestring, exceptions, file-io pass their
   suites; unix 15/16 and os-string 14/16 (same failures as GHC); parsec 3/4 (a timing test);
   binary 141/142 (needs PolyKinds); time times out; text needs a GHC plugin.
@@ -59,11 +59,13 @@ one-fix iterations.
   hsc next to their GHC builds, unattended, and rank the failures by how many packages each
   blocks; fix from the top. Results recorded in `bench/sweep/`.
 - GHC's own testsuite through difftest, for a conformance score.
-- Sweep of the top 300 Stackage packages: hsc builds 245 of the 300 GHC builds (was 218). This
-  PR adds ghc-bignum's API, integer-gmp, RebindableSyntax and CallStack implicit parameters
-  (basement, memory, crypton, cborg build). Next, by packages blocked: reflection (lens),
-  optics-core, constraints, monad-control, some, sop-core. RebindableSyntax still to rebind:
-  do-notation, arithmetic sequences, string and list literals.
+- Sweep of the top 300 Stackage packages: hsc builds 266 of the 300 GHC builds (was 245). This
+  PR fixes hsc2hs `<stddef.h>` ordering, kind-dispatched instances and associated type families,
+  constraint-family superclasses and self-mentioning family flattening, quantified and nested
+  constraints, constrained patterns, insoluble given equalities and `(#)` parsing (reflection,
+  optics-core, constraints, monad-control, network-info, some and sop-core build). Next, by
+  packages blocked: lens (6), haskell-gi-base (4), tls (4), generics-sop (3), monad-logger (2).
+  RebindableSyntax still to rebind: do-notation, arithmetic sequences, string and list literals.
 - Known gaps it will rank: PolyKinds and kind inference (binary), Template Haskell `[d| |]`,
   type and pattern splices, `foreign import "dynamic"`, collector-run
   finalizers, Arrows, text's plugin.
