@@ -162,6 +162,8 @@ pub struct Gen {
     static_cells: HashMap<(u64, u64), String>,
     /// Shared static cells for constructors without fields, indexed by constructor ID.
     nullary_cons: HashMap<u32, String>,
+    /// Global indices whose body is a nullary constructor (loaded directly via `leaq`).
+    nullary_globals: HashMap<u32, String>,
     /// Byte strings (label, bytes).
     strings: Vec<(String, Vec<u8>)>,
     /// Deduplicated byte strings.
@@ -384,6 +386,7 @@ impl Gen {
             statics: Vec::new(),
             static_cells: HashMap::new(),
             nullary_cons: HashMap::new(),
+            nullary_globals: HashMap::new(),
             strings: Vec::new(),
             string_pool: HashMap::new(),
             joins: HashMap::new(),
@@ -458,6 +461,21 @@ impl Gen {
             // Register every entry before emitting bodies, including forward/mutual calls.
             let arity = if gl.closure.captures.is_empty() { gl.closure.arity } else { 0 };
             g.known_globals.push((arity, l.clone(), gl.closure.uses_closure));
+            if gl.closure.arity == 0 && gl.closure.captures.is_empty() {
+                match &gl.closure.body {
+                    SExpr::Con(name, args) if args.is_empty() => {
+                        let id = g.con_id(name);
+                        let lbl = g.nullary_con(id);
+                        g.nullary_globals.insert(gi as u32, lbl);
+                    }
+                    SExpr::Atom(Atom::Lit(l)) => {
+                        if let Some(lbl) = g.static_literal_label(l) {
+                            g.nullary_globals.insert(gi as u32, lbl);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             g.pending.push((l, gl.closure.clone(), gl.name.clone()));
             let worker = if used_workers.contains(&(gi as u32)) {
                 gl.worker.as_ref().map(|(c, raw)| {
@@ -469,6 +487,27 @@ impl Gen {
                 None
             };
             g.workers.push(worker);
+        }
+        // Propagate static WHNF cells through zero-arity global aliases (e.g. `$fMonoidAll = True`).
+        loop {
+            let mut changed = false;
+            for (gi, gl) in prog.globals.iter().enumerate() {
+                let key = gi as u32;
+                if gl.closure.arity == 0
+                    && gl.closure.captures.is_empty()
+                    && !g.nullary_globals.contains_key(&key)
+                {
+                    if let SExpr::Atom(Atom::Global(target)) = &gl.closure.body {
+                        if let Some(lbl) = g.nullary_globals.get(target).cloned() {
+                            g.nullary_globals.insert(key, lbl);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
         }
         g.out.push_str("    .text\n");
         if std::env::var_os("HSC_DEBUG").is_some() {
@@ -1117,6 +1156,120 @@ impl Gen {
         true
     }
 
+    /// A comparison with at least one boxed operand whose raw result is immediately branched on
+    /// (`case a <# b as r of _ -> case r of 0# -> f; _ -> t`): checks the boxed operand tags
+    /// inline, compares payloads and branches directly without materializing 0/1 or spilling to
+    /// the frame, with an out-of-line slow path for thunks/indirections.
+    fn boxed_compare_and_branch(
+        &mut self,
+        name: &str,
+        args: &[Atom],
+        bslot: u32,
+        alts: &[SAlt],
+        p: Pos,
+    ) -> bool {
+        let Some(k @ (K::Cmp(set) | K::CharCmp(set))) = int_op(name) else { return false };
+        let in_kind = if matches!(k, K::CharCmp(_)) { CHAR } else { INT };
+        let lit_ok = |l: &SLit| matches!((l, in_kind), (SLit::Int(_), INT) | (SLit::Char(_), CHAR));
+        if args.len() != 2 || args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
+            return false;
+        }
+        let [SAlt::Default(SExpr::Case(inner_scrut, _, inner_alts))] = alts else { return false };
+        if !matches!(inner_scrut.as_ref(), SExpr::Atom(Atom::Slot(s)) if *s == bslot) {
+            return false;
+        }
+        let end = inner_alts.iter().position(|a| matches!(a, SAlt::Default(_))).map_or(inner_alts.len(), |i| i + 1);
+        let inner_alts = &inner_alts[..end];
+        let body_of = |a: &SAlt| match a {
+            SAlt::Lit(_, e) | SAlt::Default(e) | SAlt::Con(_, _, e) => e as *const SExpr,
+        };
+        let uses_b = inner_alts.iter().any(|a| {
+            self.raw_uses
+                .get(&body_of(a))
+                .is_none_or(|u| u.binary_search(&bslot).is_ok() || u.binary_search(&ALL_LIVE).is_ok())
+        });
+        if uses_b || (p.mode == Mode::Scrut && self.live.last().is_none_or(|l| l.contains(&bslot) || l.contains(&ALL_LIVE))) {
+            return false;
+        }
+        if inner_alts.iter().any(|a| match a {
+            SAlt::Lit(Lit::Int(0 | 1), _) | SAlt::Default(_) => false,
+            _ => true,
+        }) {
+            return false;
+        }
+        let slow = self.label("slow");
+        for a in args {
+            if is_raw(a) || matches!(a, Atom::Lit(_)) {
+                continue;
+            }
+            self.load(a, p, "%rax");
+            let _ = writeln!(self.out, "    cmpb ${in_kind}, (%rax)");
+            let _ = writeln!(self.out, "    jne {slow}");
+        }
+        self.operand(&args[0], p, "%rcx");
+        self.operand(&args[1], p, "%rdx");
+        match k {
+            K::Cmp(_) => self.emit("cmpq %rdx, %rcx"),
+            K::CharCmp(_) => self.emit("cmpl %edx, %ecx"),
+            _ => unreachable!(),
+        }
+        let cc = &set[3..];
+        let negated = match cc {
+            "e" => "ne", "ne" => "e", "l" => "ge", "le" => "g", "g" => "le", "ge" => "l",
+            "b" => "ae", "be" => "a", "a" => "be", "ae" => "b",
+            other => panic!("internal: condition {other}"),
+        };
+        let labels: Vec<String> = inner_alts.iter().map(|_| self.label("alt")).collect();
+        for (a, l) in inner_alts.iter().zip(&labels) {
+            match a {
+                SAlt::Lit(Lit::Int(1), _) => {
+                    let _ = writeln!(self.out, "    j{cc} {l}");
+                }
+                SAlt::Lit(Lit::Int(0), _) => {
+                    let _ = writeln!(self.out, "    j{negated} {l}");
+                }
+                _ => {}
+            }
+        }
+        let def_lbl = self.label("def");
+        self.put_label(&def_lbl);
+        match inner_alts.last() {
+            Some(SAlt::Default(body)) => self.expr(body, p),
+            _ => self.fail("Non-exhaustive patterns in case", p),
+        }
+        for (a, l) in inner_alts.iter().zip(&labels) {
+            if let SAlt::Lit(Lit::Int(0 | 1), body) = a {
+                self.put_label(l);
+                self.expr(body, p);
+            }
+        }
+        // Cold slow path: evaluate via runtime primitive, then branch on its 0/1 result.
+        let cont = self.label("k");
+        self.put_label(&slow);
+        self.emit("subq $8, %rbp");
+        let _ = writeln!(self.out, "    leaq {cont}(%rip), %rax");
+        self.emit("movq %rax, (%rbp)");
+        let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
+        let live = self.case_live(inner_alts, p);
+        self.live.push(live);
+        self.slow_only = true;
+        self.prim(name, args, sp);
+        self.live.pop();
+        let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
+        let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
+        self.put_label(&cont);
+        self.emit("addq $8, %rbp");
+        self.emit("movq 8(%r14), %rcx");
+        for (a, l) in inner_alts.iter().zip(&labels) {
+            if let SAlt::Lit(Lit::Int(v @ (0 | 1)), _) = a {
+                let _ = writeln!(self.out, "    cmpq ${v}, %rcx");
+                let _ = writeln!(self.out, "    je {l}");
+            }
+        }
+        let _ = writeln!(self.out, "    jmp {def_lbl}");
+        true
+    }
+
     fn expr_node(&mut self, e: &SExpr, p: Pos) {
         match e {
             // A worker returning raw: its result's number goes back in R1.
@@ -1151,6 +1304,18 @@ impl Gen {
                 self.emit("movq %rax, %r14");
                 self.ret(p);
             }
+            SExpr::Atom(Atom::Global(g)) if self.nullary_globals.contains_key(g) => {
+                let lbl = self.nullary_globals[g].clone();
+                let _ = writeln!(self.out, "    leaq {lbl}(%rip), %r14");
+                self.ret(p);
+            }
+            SExpr::Atom(Atom::Lit(l))
+                if matches!(l, SLit::Int(_) | SLit::Char(_) | SLit::Double(_))
+                    || matches!(l, SLit::Integer(s) if s.parse::<i64>().is_ok()) =>
+            {
+                self.literal(l, p, "%r14");
+                self.ret(p);
+            }
             SExpr::Atom(a) => {
                 self.load(a, p, "%r14");
                 self.clear_dead(std::slice::from_ref(a), p);
@@ -1182,9 +1347,25 @@ impl Gen {
             }
             SExpr::Prim(name, args) => self.prim(name, args, p),
             SExpr::Let(binds, body) => {
+                let non_alloc = |a: &Atom| match a {
+                    Atom::Lit(SLit::Str(_) | SLit::Frac(_) | SLit::Addr(_)) => false,
+                    Atom::Lit(SLit::Integer(s)) => s.parse::<i64>().is_ok(),
+                    _ => true,
+                };
+                let fuse_con = match body.as_ref() {
+                    SExpr::Con(name, args)
+                        if !args.is_empty()
+                            && binds.iter().all(|(_, b)| b.atoms().iter().all(non_alloc))
+                            && args.iter().all(non_alloc) =>
+                    {
+                        Some((name, args))
+                    }
+                    _ => None,
+                };
                 let total: usize = binds.iter().map(|(_, b)| bind_words(b)).sum();
-                if total > 0 {
-                    self.alloc(total, p);
+                let con_words = fuse_con.map_or(0, |(_, args)| (1 + args.len()).max(2));
+                if total + con_words > 0 {
+                    self.alloc(total + con_words, p);
                 }
                 // Every binding's address is in its slot before any object is filled (letrec).
                 let mut off = 0usize;
@@ -1222,7 +1403,24 @@ impl Gen {
                         }
                     }
                 }
-                self.expr(body, p);
+                if let Some((name, args)) = fuse_con {
+                    let id = self.con_id(name);
+                    let hdr = header(CON, args.len() as u64, id as u64);
+                    let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
+                    let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * off);
+                    for (i, a) in args.iter().enumerate() {
+                        self.load(a, p, "%rdx");
+                        let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (off + 1 + i));
+                    }
+                    if off == 0 {
+                        self.emit("movq %rax, %r14");
+                    } else {
+                        let _ = writeln!(self.out, "    leaq {}(%rax), %r14", 8 * off);
+                    }
+                    self.ret(p);
+                } else {
+                    self.expr(body, p);
+                }
             }
             // An operation on raw numbers that cannot fail, for a raw binder: computed into a
             // register, with no return address or slow path.
@@ -1304,8 +1502,15 @@ impl Gen {
                 }
             }
             SExpr::Case(scrut, bslot, alts) => {
-                let cont = self.label("k");
                 let raw_binder = *bslot & RAW != 0;
+                if raw_binder {
+                    if let SExpr::Prim(name, args) = scrut.as_ref() {
+                        if self.boxed_compare_and_branch(name, args, *bslot, alts, p) {
+                            return;
+                        }
+                    }
+                }
+                let cont = self.label("k");
                 let mut fast_body: Option<String> = None;
                 // A variable that is already a value (not a thunk or an indirection) goes straight
                 // to the alternatives, without the return address and `hsc_eval`.
@@ -1364,8 +1569,6 @@ impl Gen {
                                             self.load(&args[0], p, "%rax");
                                             let _ = writeln!(self.out, "    cmpb ${REF}, (%rax)");
                                             let _ = writeln!(self.out, "    jne {slow}");
-                                            self.emit("cmpb $0, hsc_preempt(%rip)");
-                                            let _ = writeln!(self.out, "    jne {slow}");
                                             let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
                                             self.emit("movq 8(%rax), %rcx");
                                             let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(slots[1]));
@@ -1386,8 +1589,6 @@ impl Gen {
                                         let slow = self.label("slow");
                                         self.load(&args[0], p, "%rax");
                                         let _ = writeln!(self.out, "    cmpb ${REF}, (%rax)");
-                                        let _ = writeln!(self.out, "    jne {slow}");
-                                        self.emit("cmpb $0, hsc_preempt(%rip)");
                                         let _ = writeln!(self.out, "    jne {slow}");
                                         self.load(&args[1], p, "%rcx");
                                         self.emit("movq %rcx, 8(%rax)");
@@ -1697,8 +1898,12 @@ impl Gen {
                 let _ = writeln!(self.out, "    movq {}({reg}), {reg}", 8 * (2 + *i as i64));
             }
             Atom::Global(g) => {
-                let _ = writeln!(self.out, "    movq {}(%rbx), {reg}", mach::GLOBALS);
-                let _ = writeln!(self.out, "    movq {}({reg}), {reg}", 8 * *g as i64);
+                if let Some(lbl) = self.nullary_globals.get(g) {
+                    let _ = writeln!(self.out, "    leaq {lbl}(%rip), {reg}");
+                } else {
+                    let _ = writeln!(self.out, "    movq {}(%rbx), {reg}", mach::GLOBALS);
+                    let _ = writeln!(self.out, "    movq {}({reg}), {reg}", 8 * *g as i64);
+                }
             }
             Atom::Lit(l) => self.literal(l, p, reg),
         }
@@ -1715,14 +1920,14 @@ impl Gen {
         lbl
     }
 
-    fn literal(&mut self, l: &SLit, p: Pos, reg: &str) {
-        let lbl = match l {
+    fn static_literal_label(&mut self, l: &SLit) -> Option<String> {
+        Some(match l {
             SLit::Int(i) => self.static_cell(INT, *i as u64),
             SLit::Char(c) => self.static_cell(CHAR, crate::syntax::lexer::char_code(*c) as u64),
             SLit::Double(d) => self.static_cell(DOUBLE, d.to_bits()),
             // An `Integer` that fits in an `Int` is `IS` of it: a static cell for both.
-            SLit::Integer(s) if s.parse::<i64>().is_ok() => {
-                let val = s.parse::<i64>().unwrap_or(0) as u64;
+            SLit::Integer(s) => {
+                let val = s.parse::<i64>().ok()? as u64;
                 let id = self.con_id("GHC.Num.Integer.IS");
                 let hdr = header(CON, 1, id as u64);
                 if let Some(lbl) = self.static_cells.get(&(hdr, val)) {
@@ -1735,32 +1940,35 @@ impl Gen {
                     lbl
                 }
             }
-            other => {
-                // Strings, big integers, fractions and addresses: the runtime builds the object (the
-                // call allocates, so the atom is loaded last).
-                let (kind, text) = match other {
-                    SLit::Str(s) => (0u64, s.clone()),
-                    SLit::Integer(s) => (1, s.clone()),
-                    SLit::Frac(s) => (2, s.clone()),
-                    SLit::Addr(s) => (3, s.clone()),
-                    _ => unreachable!("numbers and characters are static"),
-                };
-                // An `Addr#` literal's characters are its bytes (as the interpreter takes them).
-                let latin1 = kind == 3 && text.chars().all(|c| (c as u32) < 256);
-                let bytes: Vec<u8> = if latin1 { text.chars().map(|c| c as u32 as u8).collect() } else { text.into_bytes() };
-                let t = self.string_label(&bytes);
-                let _ = writeln!(self.out, "    leaq {t}(%rip), %rsi");
-                let _ = writeln!(self.out, "    movl ${}, %edx", bytes.len());
-                let _ = writeln!(self.out, "    movl ${kind}, %ecx");
-                self.rt_call("hsc_mk_literal", p, 3);
-                if reg != "%rax" {
-                    let _ = writeln!(self.out, "    movq %rax, {reg}");
-                }
-                return;
-            }
+            _ => return None,
+        })
+    }
+
+    fn literal(&mut self, l: &SLit, p: Pos, reg: &str) {
+        if let Some(lbl) = self.static_literal_label(l) {
+            let _ = writeln!(self.out, "    leaq {lbl}(%rip), {reg}");
+            return;
+        }
+        // Strings, big integers, fractions and addresses: the runtime builds the object (the
+        // call allocates, so the atom is loaded last).
+        let (kind, text) = match l {
+            SLit::Str(s) => (0u64, s.clone()),
+            SLit::Integer(s) => (1, s.clone()),
+            SLit::Frac(s) => (2, s.clone()),
+            SLit::Addr(s) => (3, s.clone()),
+            _ => unreachable!("numbers and characters are static"),
         };
-        let _ = writeln!(self.out, "    leaq {lbl}(%rip), {reg}");
-        let _ = p;
+        // An `Addr#` literal's characters are its bytes (as the interpreter takes them).
+        let latin1 = kind == 3 && text.chars().all(|c| (c as u32) < 256);
+        let bytes: Vec<u8> = if latin1 { text.chars().map(|c| c as u32 as u8).collect() } else { text.into_bytes() };
+        let t = self.string_label(&bytes);
+        let _ = writeln!(self.out, "    leaq {t}(%rip), %rsi");
+        let _ = writeln!(self.out, "    movl ${}, %edx", bytes.len());
+        let _ = writeln!(self.out, "    movl ${kind}, %ecx");
+        self.rt_call("hsc_mk_literal", p, 3);
+        if reg != "%rax" {
+            let _ = writeln!(self.out, "    movq %rax, {reg}");
+        }
     }
 
     fn nullary_con(&mut self, id: u32) -> String {
@@ -1880,6 +2088,9 @@ impl Gen {
     /// was emitted.
     fn int_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
         if self.raw_dest.is_none() && self.mutvar_fast_path(name, args, p, slow) {
+            return true;
+        }
+        if self.integer_fast_path(name, args, p, slow) {
             return true;
         }
         let Some(k) = int_op(name) else { return false };
@@ -2260,7 +2471,7 @@ impl Gen {
 
     /// `readMutVar#` and `writeMutVar#` on an evaluated `MutVar#` (a REF cell), inline: the read
     /// answers the state pair `(,) [state, contents]`, the write stores the contents and answers
-    /// `()`. Otherwise (or when a thread switch is due) control goes to `slow`.
+    /// `()`. Otherwise control goes to `slow`.
     fn mutvar_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
         let read = match (name, args.len()) {
             ("readMutVar#", 2) => true,
@@ -2272,8 +2483,6 @@ impl Gen {
         }
         self.load(&args[0], p, "%rax");
         self.emit(&format!("cmpb ${REF}, (%rax)"));
-        self.emit(&format!("jne {slow}"));
-        self.emit("cmpb $0, hsc_preempt(%rip)");
         self.emit(&format!("jne {slow}"));
         if read {
             let pair = self.con_id("Builtin.(,)");
@@ -2293,6 +2502,207 @@ impl Gen {
             let cell = self.nullary_con(unit);
             self.emit(&format!("leaq {cell}(%rip), %r14"));
         }
+        self.fast_ret(p);
+        true
+    }
+
+    /// Inline small-`Integer` (`IS`) fast path for hot `Integer` arithmetic, comparisons, and
+    /// `Int#` conversions: validates `IS` + `INT` tags inline and falls back to `slow` on big
+    /// integers, unforced thunks, or signed 64-bit overflow.
+    fn integer_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
+        let dest = self.raw_dest;
+        if name == "intToInteger" {
+            if args.len() != 1 || dest.is_some() {
+                return false;
+            }
+            match &args[0] {
+                Atom::Lit(SLit::Int(v)) => {
+                    self.literal(&SLit::Integer(v.to_string()), p, "%r14");
+                    self.fast_ret(p);
+                    return true;
+                }
+                Atom::Lit(_) => return false,
+                Atom::Slot(k) if *k & RAW != 0 => {
+                    let is_id = self.con_id("GHC.Num.Integer.IS");
+                    let hdr_is = header(CON, 1, is_id as u64);
+                    self.alloc(4, p);
+                    let _ = writeln!(self.out, "    movq ${}, (%rax)", header(INT, 1, 0));
+                    let _ = writeln!(self.out, "    movq {}, %rcx", p.slot(*k));
+                    self.emit("movq %rcx, 8(%rax)");
+                    let _ = writeln!(self.out, "    movabsq ${hdr_is}, %rcx");
+                    self.emit("movq %rcx, 16(%rax)");
+                    self.emit("movq %rax, 24(%rax)");
+                    self.emit("leaq 16(%rax), %r14");
+                    self.fast_ret(p);
+                    return true;
+                }
+                _ => {
+                    let is_id = self.con_id("GHC.Num.Integer.IS");
+                    let hdr_is = header(CON, 1, is_id as u64);
+                    self.load(&args[0], p, "%rax");
+                    let _ = writeln!(self.out, "    cmpb ${INT}, (%rax)");
+                    let _ = writeln!(self.out, "    jne {slow}");
+                    self.alloc(2, p);
+                    let _ = writeln!(self.out, "    movabsq ${hdr_is}, %rcx");
+                    self.emit("movq %rcx, (%rax)");
+                    self.load(&args[0], p, "%rdx");
+                    self.emit("movq %rdx, 8(%rax)");
+                    self.emit("movq %rax, %r14");
+                    self.fast_ret(p);
+                    return true;
+                }
+            }
+        }
+
+        enum IOp {
+            Bin(&'static str),
+            Neg,
+            Cmp(&'static str),
+            ToInt,
+        }
+        let op = match name {
+            "integerAdd" => IOp::Bin("addq"),
+            "integerSub" => IOp::Bin("subq"),
+            "integerMul" => IOp::Bin("imulq"),
+            "integerNegate" => IOp::Neg,
+            "integerEq" => IOp::Cmp("cmoveq"),
+            "integerLt" => IOp::Cmp("cmovlq"),
+            "integerLe" => IOp::Cmp("cmovleq"),
+            "integerToInt" => IOp::ToInt,
+            _ => return false,
+        };
+        let arity = match op {
+            IOp::Neg | IOp::ToInt => 1,
+            IOp::Bin(_) | IOp::Cmp(_) => 2,
+        };
+        if args.len() != arity || (dest.is_some() && !matches!(op, IOp::ToInt)) {
+            return false;
+        }
+        let small_lit = |a: &Atom| match a {
+            Atom::Lit(SLit::Integer(s)) => s.parse::<i64>().ok(),
+            _ => None,
+        };
+        if args.iter().any(|a| is_raw(a) || (matches!(a, Atom::Lit(_)) && small_lit(a).is_none())) {
+            return false;
+        }
+        let is_id = self.con_id("GHC.Num.Integer.IS");
+        let hdr_is = header(CON, 1, is_id as u64);
+
+        // Validate every non-literal operand is an `IS` cell holding an evaluated `INT` cell.
+        let mut need_hdr = true;
+        for a in args {
+            if small_lit(a).is_some() {
+                continue;
+            }
+            if need_hdr {
+                let _ = writeln!(self.out, "    movabsq ${hdr_is}, %rcx");
+                need_hdr = false;
+            }
+            self.load(a, p, "%rax");
+            self.emit("cmpq %rcx, (%rax)");
+            let _ = writeln!(self.out, "    jne {slow}");
+            self.emit("movq 8(%rax), %rax");
+            let _ = writeln!(self.out, "    cmpb ${INT}, (%rax)");
+            let _ = writeln!(self.out, "    jne {slow}");
+        }
+
+        if matches!(op, IOp::ToInt) {
+            match small_lit(&args[0]) {
+                Some(v) => match dest {
+                    Some(d) => {
+                        if i32::try_from(v).is_ok() {
+                            let _ = writeln!(self.out, "    movq ${v}, {}", p.slot(d));
+                        } else {
+                            let _ = writeln!(self.out, "    movabsq ${}, %rcx", v as u64);
+                            let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(d));
+                        }
+                    }
+                    None => {
+                        let lbl = self.static_cell(INT, v as u64);
+                        let _ = writeln!(self.out, "    leaq {lbl}(%rip), %r14");
+                    }
+                },
+                None => match dest {
+                    // `%rax` already holds the validated `INT` cell pointer from the check above.
+                    Some(d) => {
+                        self.emit("movq 8(%rax), %rcx");
+                        let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(d));
+                    }
+                    None => self.emit("movq %rax, %r14"),
+                },
+            }
+            self.fast_ret(p);
+            return true;
+        }
+
+        let load_val = |g: &mut Gen, a: &Atom, reg: &str| match small_lit(a) {
+            Some(v) if i32::try_from(v).is_ok() => {
+                let _ = writeln!(g.out, "    movq ${v}, {reg}");
+            }
+            Some(v) => {
+                let _ = writeln!(g.out, "    movabsq ${}, {reg}", v as u64);
+            }
+            None => {
+                g.load(a, p, reg);
+                let _ = writeln!(g.out, "    movq 8({reg}), {reg}");
+                let _ = writeln!(g.out, "    movq 8({reg}), {reg}");
+            }
+        };
+
+        if let IOp::Cmp(cmov) = op {
+            load_val(self, &args[0], "%rcx");
+            match small_lit(&args[1]) {
+                Some(v) if i32::try_from(v).is_ok() => {
+                    let _ = writeln!(self.out, "    cmpq ${v}, %rcx");
+                }
+                _ => {
+                    load_val(self, &args[1], "%rdx");
+                    self.emit("cmpq %rdx, %rcx");
+                }
+            }
+            let t = self.con_id("GHC.Types.True");
+            let f = self.con_id("GHC.Types.False");
+            let (t, f) = (self.nullary_con(t), self.nullary_con(f));
+            let _ = writeln!(self.out, "    leaq {f}(%rip), %r14");
+            let _ = writeln!(self.out, "    leaq {t}(%rip), %rax");
+            let _ = writeln!(self.out, "    {cmov} %rax, %r14");
+            self.fast_ret(p);
+            return true;
+        }
+
+        // Arithmetic (`Add`, `Sub`, `Mul`, `Neg`): allocate 4 words (INT + IS) before reloading
+        // operands so any GC moves them safely; on signed overflow roll back `%r12` and fall back.
+        self.alloc(4, p);
+        self.emit("movq %rax, %r8");
+        load_val(self, &args[0], "%rcx");
+        match op {
+            IOp::Bin(ins @ ("addq" | "subq")) => match small_lit(&args[1]) {
+                Some(v) if i32::try_from(v).is_ok() => {
+                    let _ = writeln!(self.out, "    {ins} ${v}, %rcx");
+                }
+                _ => {
+                    load_val(self, &args[1], "%rdx");
+                    let _ = writeln!(self.out, "    {ins} %rdx, %rcx");
+                }
+            },
+            IOp::Bin(ins) => {
+                load_val(self, &args[1], "%rdx");
+                let _ = writeln!(self.out, "    {ins} %rdx, %rcx");
+            }
+            IOp::Neg => self.emit("negq %rcx"),
+            IOp::Cmp(_) | IOp::ToInt => unreachable!(),
+        }
+        let ok = self.label("iok");
+        let _ = writeln!(self.out, "    jno {ok}");
+        self.emit("subq $32, %r12");
+        let _ = writeln!(self.out, "    jmp {slow}");
+        self.put_label(&ok);
+        let _ = writeln!(self.out, "    movq ${}, (%r8)", header(INT, 1, 0));
+        self.emit("movq %rcx, 8(%r8)");
+        let _ = writeln!(self.out, "    movabsq ${hdr_is}, %rcx");
+        self.emit("movq %rcx, 16(%r8)");
+        self.emit("movq %r8, 24(%r8)");
+        self.emit("leaq 16(%r8), %r14");
         self.fast_ret(p);
         true
     }
@@ -3189,3 +3599,157 @@ mod magic_division {
         }
     }
 }
+
+#[cfg(test)]
+mod sprint6_codegen_tests {
+    use super::*;
+    use crate::core::Lit;
+    use crate::native::stg::{Atom, SAlt, SBind, SClosure, SExpr, SGlobal, SLit, SProgram, RAW};
+    use std::collections::HashMap;
+
+    fn simple_closure(arity: u32, nslots: u32, nraw: u32, body: SExpr) -> SClosure {
+        SClosure {
+            arity,
+            captures: Vec::new(),
+            nslots,
+            nraw,
+            raw_args: Vec::new(),
+            body,
+            ret_raw: false,
+            uses_closure: false,
+        }
+    }
+
+    fn make_prog(globals: Vec<SGlobal>) -> SProgram {
+        let index: HashMap<String, u32> = globals
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (g.name.clone(), i as u32))
+            .collect();
+        SProgram { globals, index }
+    }
+
+    #[test]
+    fn integer_fast_paths_emit_inline_is_ops_and_overflow_rollback() {
+        let prog = make_prog(vec![
+            SGlobal {
+                name: "Test.add".into(),
+                closure: simple_closure(
+                    2,
+                    3,
+                    0,
+                    SExpr::Prim("integerAdd".into(), vec![Atom::Slot(1), Atom::Slot(2)]),
+                ),
+                worker: None,
+            },
+            SGlobal {
+                name: "Test.eq".into(),
+                closure: simple_closure(
+                    2,
+                    3,
+                    0,
+                    SExpr::Prim("integerEq".into(), vec![Atom::Slot(1), Atom::Slot(2)]),
+                ),
+                worker: None,
+            },
+            SGlobal {
+                name: "Test.toInt".into(),
+                closure: simple_closure(
+                    1,
+                    2,
+                    0,
+                    SExpr::Prim("integerToInt".into(), vec![Atom::Slot(1)]),
+                ),
+                worker: None,
+            },
+        ]);
+        let asm = Gen::program(&prog);
+        assert!(asm.contains("addq %rdx, %rcx"), "expected inline addq for integerAdd:\n{asm}");
+        assert!(asm.contains("jno "), "expected overflow branch for integerAdd:\n{asm}");
+        assert!(asm.contains("subq $32, %r12"), "expected bump-pointer rollback on overflow:\n{asm}");
+        assert!(asm.contains("cmoveq "), "expected inline comparison for integerEq:\n{asm}");
+    }
+
+    #[test]
+    fn nullary_globals_propagate_through_aliases_and_static_literals() {
+        // g0 = True; g1 = g0 (alias); g2 = 42# (static literal); g3 = g2 (alias); g4 = return g1; g5 = return g3
+        let prog = make_prog(vec![
+            SGlobal { name: "GHC.Types.True".into(), closure: simple_closure(0, 1, 0, SExpr::Con("GHC.Types.True".into(), vec![])), worker: None },
+            SGlobal { name: "Test.aliasTrue".into(), closure: simple_closure(0, 1, 0, SExpr::Atom(Atom::Global(0))), worker: None },
+            SGlobal { name: "Test.lit42".into(), closure: simple_closure(0, 1, 0, SExpr::Atom(Atom::Lit(SLit::Int(42)))), worker: None },
+            SGlobal { name: "Test.aliasLit".into(), closure: simple_closure(0, 1, 0, SExpr::Atom(Atom::Global(2))), worker: None },
+            SGlobal { name: "Test.useTrue".into(), closure: simple_closure(1, 2, 0, SExpr::Atom(Atom::Global(1))), worker: None },
+            SGlobal { name: "Test.useLit".into(), closure: simple_closure(1, 2, 0, SExpr::Atom(Atom::Global(3))), worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let labels: Vec<&str> = table
+            .lines()
+            .take(6)
+            .map(|r| r.rsplit_once(',').unwrap().1.split_whitespace().next().unwrap())
+            .collect();
+        let g4_start = asm.find(&format!("{}:\n", labels[4])).expect("g4 label");
+        let g4_end = asm[g4_start..].find("jmp *(%rbp)").expect("g4 ret");
+        let g4 = &asm[g4_start..g4_start + g4_end];
+        assert!(g4.contains("leaq .Lcon"), "expected direct static leaq for aliased True:\n{g4}");
+        assert!(!g4.contains("hsc_eval"), "aliased True should not call hsc_eval:\n{g4}");
+        let g5_start = asm.find(&format!("{}:\n", labels[5])).expect("g5 label");
+        let g5_end = asm[g5_start..].find("jmp *(%rbp)").expect("g5 ret");
+        let g5 = &asm[g5_start..g5_start + g5_end];
+        assert!(g5.contains("leaq .Llit"), "expected direct static leaq for aliased literal:\n{g5}");
+        assert!(!g5.contains("hsc_eval"), "aliased literal should not call hsc_eval:\n{g5}");
+    }
+
+    #[test]
+    fn let_plus_con_fuses_into_single_heap_check() {
+        // let a = Con2(x, y) in Con2(a, x) -> 3 + 3 = 6 words (48 bytes) in ONE hsc_gc_rt check.
+        let body = SExpr::Let(
+            vec![(3, SBind::Con("Builtin.:".into(), vec![Atom::Slot(1), Atom::Slot(2)]))],
+            Box::new(SExpr::Con("Builtin.:".into(), vec![Atom::Slot(3), Atom::Slot(1)])),
+        );
+        let prog = make_prog(vec![SGlobal {
+            name: "Test.pair".into(),
+            closure: simple_closure(2, 4, 0, body),
+            worker: None,
+        }]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbl = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let g0_start = asm.find(&format!("{lbl}:\n")).expect("g0 label");
+        let g0_end = asm[g0_start..].find("jmp *(%rbp)").expect("g0 ret");
+        let g0 = &asm[g0_start..g0_start + g0_end];
+        assert_eq!(g0.matches("call hsc_gc_rt").count(), 1, "expected single fused GC check:\n{g0}");
+        assert!(g0.contains("leaq 48(%r12), %rax"), "expected 6-word (48-byte) combined bump:\n{g0}");
+    }
+
+    #[test]
+    fn boxed_compare_and_branch_avoids_materializing_bool_int() {
+        // case (x <# y) as raw0 of _ -> case raw0 of 0# -> 10#; _ -> 20#
+        let body = SExpr::Case(
+            Box::new(SExpr::Prim("<#".into(), vec![Atom::Slot(1), Atom::Slot(2)])),
+            RAW | 0,
+            vec![SAlt::Default(SExpr::Case(
+                Box::new(SExpr::Atom(Atom::Slot(RAW | 0))),
+                RAW | 1,
+                vec![
+                    SAlt::Lit(Lit::Int(0), SExpr::Atom(Atom::Lit(SLit::Int(10)))),
+                    SAlt::Default(SExpr::Atom(Atom::Lit(SLit::Int(20)))),
+                ],
+            ))],
+        );
+        let prog = make_prog(vec![SGlobal {
+            name: "Test.cmp".into(),
+            closure: simple_closure(2, 3, 2, body),
+            worker: None,
+        }]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbl = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let g0_start = asm.find(&format!("{lbl}:\n")).expect("g0 label");
+        let g0 = &asm[g0_start..asm[g0_start..].find("\n    .data").unwrap_or(asm.len() - g0_start) + g0_start];
+        assert!(g0.contains("cmpq %rdx, %rcx"), "expected inline boxed cmpq:\n{g0}");
+        assert!(g0.contains("jge "), "expected direct conditional jump without setl:\n{g0}");
+        assert!(!g0.contains("setl "), "should not materialize 0/1 with setl:\n{g0}");
+    }
+}
+

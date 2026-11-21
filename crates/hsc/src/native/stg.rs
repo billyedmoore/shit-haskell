@@ -283,16 +283,39 @@ fn raw_uses_in(
             for (n, _) in binds {
                 next.remove(n);
             }
-            binds.iter().all(|(_, r)| !mentions(r, x)) && raw_uses_in(body, x, w, strict_map, &next, result)
+            let body_shadowed = binds.iter().any(|(n, _)| n == x);
+            if result && is_join(binds, body) {
+                let mut code_whnf = whnf.clone();
+                let mut cur = &binds[0].1;
+                let mut shadowed = false;
+                while let Core::Lam(p, inner) = cur {
+                    if p == x {
+                        shadowed = true;
+                    }
+                    code_whnf.remove(p);
+                    cur = inner;
+                }
+                (shadowed || raw_uses_in(cur, x, w, strict_map, &code_whnf, result))
+                    && (body_shadowed || raw_uses_in(body, x, w, strict_map, &next, result))
+            } else {
+                binds.iter().all(|(_, r)| !mentions(r, x))
+                    && (body_shadowed || raw_uses_in(body, x, w, strict_map, &next, result))
+            }
         }
         Core::Case(s, b, alts) => {
             if !raw_uses_in(s, x, w, strict_map, whnf, false) {
                 return false;
             }
+            if b == x {
+                return true;
+            }
             let mut base_whnf = whnf.clone();
             add_case_whnf(s, b, &mut base_whnf);
             alts.iter().all(|a| match a {
                 Alt::Con(_, vars, body) => {
+                    if vars.iter().any(|v| v == x) {
+                        return true;
+                    }
                     let mut alt_whnf = base_whnf.clone();
                     for v in vars {
                         alt_whnf.remove(v);
@@ -991,6 +1014,40 @@ impl Lowering {
             Core::Prim(name, args) if IDENTITY_PRIMS.contains(&name.as_str()) && args.len() == 1 => {
                 self.strict(&args[0])
             }
+            Core::Prim(name, args)
+                if strict_integer_arity(name).is_some_and(|n| n == args.len()) =>
+            {
+                let mut new_args = args.to_vec();
+                let mut evals: Vec<(String, Core)> = Vec::new();
+                for a in &mut new_args {
+                    let ready = match a {
+                        Core::Lit(Lit::Integer(s)) => s.parse::<i64>().is_ok(),
+                        Core::Lit(Lit::Int(_)) if name == "intToInteger" => true,
+                        Core::Var(v) => v.starts_with("ip%"),
+                        _ => false,
+                    };
+                    if !ready {
+                        let fresh = format!("ip%{}", self.next_join);
+                        self.next_join += 1;
+                        let orig = std::mem::replace(a, Core::Var(fresh.clone()));
+                        evals.push((fresh, orig));
+                    }
+                }
+                if !evals.is_empty() {
+                    let mut wrapped = Core::Prim(name.clone(), new_args);
+                    for (fresh, orig) in evals.into_iter().rev() {
+                        wrapped = Core::Case(Box::new(orig), fresh, vec![Alt::Default(wrapped)]);
+                    }
+                    return self.strict(&wrapped);
+                }
+                let mark = self.pending.len();
+                let atoms = args.iter().map(|a| self.atom(a)).collect();
+                let prim = self.allocating(mark, SExpr::Prim(name.clone(), atoms));
+                match self.raw_result() {
+                    Some(kind) => self.through_raw(prim, kind),
+                    None => prim,
+                }
+            }
             Core::Prim(name, args) => {
                 let mark = self.pending.len();
                 let atoms = args.iter().map(|a| self.atom(a)).collect();
@@ -1118,8 +1175,9 @@ impl Lowering {
     fn atom(&mut self, e: &Core) -> Atom {
         match e {
             Core::Var(v) => self.resolve(v),
-            // Numbers and characters are static objects; the others are built when they are used.
+            // Numbers, small Integers and characters are static objects; the others are built when they are used.
             Core::Lit(l @ (Lit::Int(_) | Lit::Double(_) | Lit::Char(_))) => Atom::Lit(slit(l)),
+            Core::Lit(Lit::Integer(s)) if s.parse::<i64>().is_ok() => Atom::Lit(SLit::Integer(s.clone())),
             Core::Con(con, args) => {
                 let atoms: Vec<Atom> = args.iter().map(|a| self.atom(a)).collect();
                 let b = self.bodies.last_mut().expect("body");
@@ -1224,6 +1282,16 @@ fn lambdas(e: &Core) -> (usize, &Core) {
 }
 
 const IDENTITY_PRIMS: [&str; 6] = ["unsafeCoerce", "unsafeCoerce#", "lazy", "oneShot", "inline", "noinline"];
+
+/// Expected arity of `Integer` primitives whose arguments are strictly evaluated left-to-right.
+fn strict_integer_arity(name: &str) -> Option<usize> {
+    match name {
+        "integerAdd" | "integerSub" | "integerMul" | "integerQuot" | "integerRem" | "integerDiv"
+        | "integerMod" | "integerEq" | "integerLt" | "integerLe" => Some(2),
+        "integerNegate" | "integerAbs" | "integerSignum" | "integerToInt" | "intToInteger" => Some(1),
+        _ => None,
+    }
+}
 
 /// Whether every use of `j` in `e` is a call `j a1 .. an` in tail position (its arguments not
 /// mentioning `j`). Tail positions are those `strict` lowers in the frame and mode of `e`: case
@@ -1373,6 +1441,418 @@ enum EqLitKey {
     Char(char),
 }
 
+/// Extracts `(false_rhs, true_rhs)` from alternatives covering `GHC.Types.False` and `GHC.Types.True`.
+fn extract_bool_con_alts(alts: &[Alt]) -> Option<(&Core, &Core)> {
+    let mut false_rhs: Option<&Core> = None;
+    let mut true_rhs: Option<&Core> = None;
+    let mut saw_bool_con = false;
+    for a in alts {
+        match a {
+            Alt::Con(c, vars, rhs) if c == "GHC.Types.False" && vars.is_empty() => {
+                saw_bool_con = true;
+                false_rhs.get_or_insert(rhs);
+            }
+            Alt::Con(c, vars, rhs) if c == "GHC.Types.True" && vars.is_empty() => {
+                saw_bool_con = true;
+                true_rhs.get_or_insert(rhs);
+            }
+            Alt::Default(rhs) => {
+                false_rhs.get_or_insert(rhs);
+                true_rhs.get_or_insert(rhs);
+                break;
+            }
+            _ => return None,
+        }
+    }
+    if saw_bool_con {
+        Some((false_rhs?, true_rhs?))
+    } else {
+        None
+    }
+}
+
+/// Builds `case arg of { 0# -> false_rhs; _ -> true_rhs }`, wrapping primitive/call scrutinees
+/// in a raw-eligible `[Default(Case(Var(b_raw), ...))]` shell.
+fn mk_tag_to_enum_case(arg: Core, b_prefix: &str, false_rhs: Core, true_rhs: Core) -> Core {
+    let b_inner = format!("{b_prefix}%ti");
+    let bool_alts = vec![Alt::Lit(Lit::Int(0), false_rhs), Alt::Default(true_rhs)];
+    let needs_raw_wrapper =
+        matches!(&arg, Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str())) || matches!(&arg, Core::App(..));
+    if needs_raw_wrapper {
+        let b_raw = format!("{b_prefix}%te");
+        Core::Case(
+            Box::new(arg),
+            b_raw.clone(),
+            vec![Alt::Default(Core::Case(Box::new(Core::Var(b_raw)), b_inner, bool_alts))],
+        )
+    } else {
+        Core::Case(Box::new(arg), b_inner, bool_alts)
+    }
+}
+
+/// Recognizes `GHC.Types.True` and `GHC.Types.False` represented either as nullary `Core::Con`
+/// or as top-level `Core::Var`.
+fn bool_const(e: &Core) -> Option<bool> {
+    match e {
+        Core::Con(c, args) if args.is_empty() && c == "GHC.Types.True" => Some(true),
+        Core::Con(c, args) if args.is_empty() && c == "GHC.Types.False" => Some(false),
+        Core::Var(v) if v == "GHC.Types.True" => Some(true),
+        Core::Var(v) if v == "GHC.Types.False" => Some(false),
+        _ => None,
+    }
+}
+
+/// Rewrites `case tagToEnum# x of { False -> f; True -> t }` (and the two-step variant through a
+/// case binder, optionally wrapped in a non-capturing join-point `Let`) into an unboxed `Int#`
+/// case on `x` (`0# -> f; _ -> t`), eliminating `Bool` materialization and exposing comparisons
+/// to `match_eq_step` and `compare_and_branch`.
+fn rewrite_tag_to_enum_bool(e: &mut Core) {
+    let Core::Case(scrut, b1, alts) = e else { return };
+    let Core::Prim(p, args) = scrut.as_ref() else { return };
+    if p != "tagToEnum#" || args.len() != 1 {
+        return;
+    }
+    let matched = if let Some((f, t)) = extract_bool_con_alts(alts) {
+        if !mentions(f, b1) && !mentions(t, b1) {
+            Some((Vec::new(), f.clone(), t.clone()))
+        } else {
+            None
+        }
+    } else if let [Alt::Default(def_body)] = &alts[..] {
+        // Peel any leading non-capturing `Let` bindings (e.g. join points created by Bool
+        // Case-of-Case fusion) to reach `case b1 as b2 of { True -> t; False -> f }`.
+        let mut let_layers: Vec<Vec<(String, Core)>> = Vec::new();
+        let mut cur = def_body;
+        let mut ok = true;
+        while let Core::Let(binds, inner) = cur {
+            if binds.iter().any(|(n, rhs)| n == b1 || mentions(rhs, b1)) {
+                ok = false;
+                break;
+            }
+            let_layers.push(binds.clone());
+            cur = inner;
+        }
+        if ok {
+            if let Core::Case(s2, b2, alts2) = cur {
+                if matches!(s2.as_ref(), Core::Var(v) if v == b1) {
+                    if let Some((f, t)) = extract_bool_con_alts(alts2) {
+                        if !mentions(f, b1) && !mentions(t, b1) && !mentions(f, b2) && !mentions(t, b2) {
+                            Some((let_layers, f.clone(), t.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some((let_layers, mut false_rhs, mut true_rhs)) = matched else { return };
+    let arg = args[0].clone();
+    let b_prefix = b1.clone();
+    let mut outer_layers: Vec<Vec<(String, Core)>> = Vec::new();
+    for binds in let_layers.into_iter().rev() {
+        if !outer_layers.is_empty() {
+            outer_layers.push(binds);
+            continue;
+        }
+        let in_f = binds.iter().any(|(n, _)| mentions(&false_rhs, n));
+        let in_t = binds.iter().any(|(n, _)| mentions(&true_rhs, n));
+        match (in_f, in_t) {
+            (false, true) => true_rhs = Core::Let(binds, Box::new(true_rhs)),
+            (true, false) => false_rhs = Core::Let(binds, Box::new(false_rhs)),
+            (false, false) => {}
+            (true, true) => outer_layers.push(binds),
+        }
+    }
+    let mut out = mk_tag_to_enum_case(arg, &b_prefix, false_rhs, true_rhs);
+    for binds in outer_layers {
+        out = Core::Let(binds, Box::new(out));
+    }
+    *e = out;
+}
+
+/// Checks whether `e` is a tree of `Case` expressions whose leaves are all `True`, `False`,
+/// `tagToEnum#`, or `Fail`, with no inner binder capturing variables free in `f` or `t`.
+fn check_bool_case_tree(e: &Core, f: &Core, t: &Core, true_uses: &mut usize, false_uses: &mut usize) -> bool {
+    if let Some(val) = bool_const(e) {
+        if val {
+            *true_uses += 1;
+        } else {
+            *false_uses += 1;
+        }
+        return true;
+    }
+    match e {
+        Core::Prim(p, args) if p == "tagToEnum#" && args.len() == 1 => {
+            *true_uses += 1;
+            *false_uses += 1;
+            true
+        }
+        Core::Fail(_) => true,
+        Core::Case(_, ib, alts) => {
+            if mentions(f, ib) || mentions(t, ib) {
+                return false;
+            }
+            alts.iter().all(|a| match a {
+                Alt::Con(_, vars, body) => {
+                    vars.iter().all(|v| !mentions(f, v) && !mentions(t, v))
+                        && check_bool_case_tree(body, f, t, true_uses, false_uses)
+                }
+                Alt::Lit(_, body) | Alt::Default(body) => check_bool_case_tree(body, f, t, true_uses, false_uses),
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Replaces leaves of a checked Bool case tree with `f_ref` / `t_ref`.
+fn rewrite_bool_case_tree(e: Core, f_ref: &Core, t_ref: &Core, b_prefix: &str, counter: &mut usize) -> Core {
+    if let Some(val) = bool_const(&e) {
+        return if val { t_ref.clone() } else { f_ref.clone() };
+    }
+    match e {
+        Core::Prim(p, mut args) if p == "tagToEnum#" && args.len() == 1 => {
+            let n = *counter;
+            *counter += 1;
+            mk_tag_to_enum_case(args.remove(0), &format!("{b_prefix}%{n}"), f_ref.clone(), t_ref.clone())
+        }
+        Core::Fail(msg) => Core::Fail(msg),
+        Core::Case(s, ib, alts) => Core::Case(
+            s,
+            ib,
+            alts.into_iter()
+                .map(|a| match a {
+                    Alt::Con(c, vs, body) => {
+                        Alt::Con(c, vs, rewrite_bool_case_tree(body, f_ref, t_ref, b_prefix, counter))
+                    }
+                    Alt::Lit(l, body) => Alt::Lit(l, rewrite_bool_case_tree(body, f_ref, t_ref, b_prefix, counter)),
+                    Alt::Default(body) => Alt::Default(rewrite_bool_case_tree(body, f_ref, t_ref, b_prefix, counter)),
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Floats 1-alt `Case`-of-`Case` (`case (case s1 as r of _ -> e1) as b of alts` ->
+/// `case s1 as r of _ -> case e1 as b of alts`) and fuses Bool `Case`-of-`Case` trees (e.g.
+/// `&&` / `||` in guards) directly into branches with zero-allocation join points.
+fn simplify_case_of_case(e: &mut Core) {
+    // 1. Float 1-alt Default Case out of a Case scrutinee.
+    let float_one_alt = match e {
+        Core::Case(scrut, b, alts) => match scrut.as_ref() {
+            Core::Case(s1, r, inner_alts)
+                if matches!(&inner_alts[..], [Alt::Default(_)])
+                    && r != b
+                    && !alts_mention(alts, r)
+                    && !matches!(s1.as_ref(), Core::Prim(p, _) if p == "writeMutVar#") =>
+            {
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if float_one_alt {
+        let Core::Case(scrut, b, alts) = std::mem::replace(e, Core::Fail(String::new())) else { unreachable!() };
+        let Core::Case(s1, r, mut inner_alts) = *scrut else { unreachable!() };
+        let Alt::Default(e1) = inner_alts.remove(0) else { unreachable!() };
+        let mut inner = Core::Case(Box::new(e1), b, alts);
+        if let Core::Case(is, ib, ialts) = &mut inner {
+            if may_flatten_case(is, ialts) {
+                if let Some(flat) = flatten_case_alts(is, ib, ialts) {
+                    *ialts = flat;
+                }
+            }
+        }
+        simplify_case_of_case(&mut inner);
+        rewrite_tag_to_enum_bool(&mut inner);
+        *e = Core::Case(s1, r, vec![Alt::Default(inner)]);
+        return;
+    }
+
+    // 2. Fuse Bool Case-of-Case when the inner Case tree only returns True/False/tagToEnum#.
+    let fuse_bool = match e {
+        Core::Case(scrut, b, alts) if matches!(scrut.as_ref(), Core::Case(..)) => {
+            extract_bool_con_alts(alts).and_then(|(f, t)| {
+                if mentions(f, b)
+                    || mentions(t, b)
+                    || matches!(f, Core::Lam(..))
+                    || matches!(t, Core::Lam(..))
+                {
+                    return None;
+                }
+                let (mut t_uses, mut f_uses) = (0usize, 0usize);
+                check_bool_case_tree(scrut, f, t, &mut t_uses, &mut f_uses)
+                    .then(|| (f.clone(), t.clone(), f_uses, t_uses))
+            })
+        }
+        _ => None,
+    };
+    if let Some((f, t, f_uses, t_uses)) = fuse_bool {
+        let Core::Case(scrut, b, _) = std::mem::replace(e, Core::Fail(String::new())) else { unreachable!() };
+        let is_tiny = |x: &Core| match x {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => true,
+            Core::Con(_, args) => args.is_empty(),
+            _ => false,
+        };
+        let jt_name = format!("{b}%jt");
+        let jf_name = format!("{b}%jf");
+        let bind_t = t_uses >= 2
+            && !is_tiny(&t)
+            && !mentions(&t, &jt_name)
+            && !mentions(&f, &jt_name)
+            && !mentions(&scrut, &jt_name);
+        let bind_f = f_uses >= 2
+            && !is_tiny(&f)
+            && !mentions(&f, &jf_name)
+            && !mentions(&t, &jf_name)
+            && !mentions(&scrut, &jf_name);
+        let t_ref = if bind_t { Core::Var(jt_name.clone()) } else { t.clone() };
+        let f_ref = if bind_f { Core::Var(jf_name.clone()) } else { f.clone() };
+        let mut counter = 0usize;
+        let mut out = rewrite_bool_case_tree(*scrut, &f_ref, &t_ref, &b, &mut counter);
+        if bind_f {
+            out = Core::Let(vec![(jf_name, f)], Box::new(out));
+        }
+        if bind_t {
+            out = Core::Let(vec![(jt_name, t)], Box::new(out));
+        }
+        *e = out;
+    }
+}
+
+/// Whether `e` is a small pure expression safe to float into case alternatives without code bloat.
+fn small_pure_rhs(e: &Core, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    match e {
+        Core::Var(_) | Core::Lit(_) => true,
+        Core::App(f, a) => small_pure_rhs(f, budget) && small_pure_rhs(a, budget),
+        Core::Con(_, args) => args.iter().all(|a| small_pure_rhs(a, budget)),
+        Core::Prim(p, args) if RAW_RESULT_PRIMS.contains(&p.as_str()) => {
+            args.iter().all(|a| small_pure_rhs(a, budget))
+        }
+        Core::Case(s, _, alts) if alts.len() <= 3 => {
+            small_pure_rhs(s, budget)
+                && alts.iter().all(|a| match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => small_pure_rhs(b, budget),
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether floating `r = rhs` into `e` eliminates a thunk allocation on at least one branch
+/// (either `e` does not use `r`, returns `r` directly in tail position, or is a `Case` whose
+/// alternatives do).
+fn alt_benefits_from_float(e: &Core, r: &str, rhs: &Core) -> bool {
+    if !mentions(e, r) || matches!(e, Core::Var(v) if v == r) {
+        return true;
+    }
+    if let Core::Case(s, b, alts) = e {
+        if !mentions(s, r) && b != r && !mentions(rhs, b) {
+            return alts.iter().any(|a| match a {
+                Alt::Con(_, vars, body) => {
+                    let sh = vars.iter().any(|v| v == r);
+                    sh || (!vars.iter().any(|v| mentions(rhs, v)) && alt_benefits_from_float(body, r, rhs))
+                }
+                Alt::Lit(_, body) | Alt::Default(body) => alt_benefits_from_float(body, r, rhs),
+            });
+        }
+    }
+    false
+}
+
+/// Floats a small non-recursive `let r = rhs in case scrut of alts` into `alts` when at least one
+/// alternative returns `r` directly (turning it into a tail call with zero thunk allocation) or
+/// does not use `r`, preserving laziness and sharing in all other alternatives.
+fn float_let_into_case(e: &mut Core) {
+    let Core::Let(binds, body) = e else { return };
+    let [(r, rhs)] = &binds[..] else { return };
+    let Core::Case(scrut, binder, alts) = body.as_ref() else { return };
+    if alts.is_empty()
+        || mentions(rhs, r)
+        || mentions(scrut, r)
+        || binder == r
+        || mentions(rhs, binder)
+        || is_join(binds, body)
+    {
+        return;
+    }
+    let mut budget = 20usize;
+    if !small_pure_rhs(rhs, &mut budget) {
+        return;
+    }
+    let mut used_alts = 0usize;
+    let mut has_benefit = false;
+    for a in alts {
+        let (shadowed, alt_body, capture) = match a {
+            Alt::Con(_, vars, b) => {
+                let sh = vars.iter().any(|v| v == r);
+                let cap = !sh && mentions(b, r) && vars.iter().any(|v| mentions(rhs, v));
+                (sh, b, cap)
+            }
+            Alt::Lit(_, b) | Alt::Default(b) => (false, b, false),
+        };
+        if capture {
+            return;
+        }
+        if shadowed || !mentions(alt_body, r) {
+            has_benefit = true;
+        } else {
+            used_alts += 1;
+            if alt_benefits_from_float(alt_body, r, rhs) {
+                has_benefit = true;
+            }
+        }
+    }
+    if !has_benefit || used_alts > 3 {
+        return;
+    }
+    let r_owned = r.clone();
+    let rhs_owned = rhs.clone();
+    let scrut_owned = scrut.clone();
+    let binder_owned = binder.clone();
+    let new_alts: Vec<Alt> = alts
+        .iter()
+        .map(|a| {
+            let transform = |b: &Core, shadowed: bool| -> Core {
+                if shadowed || !mentions(b, &r_owned) {
+                    b.clone()
+                } else if matches!(b, Core::Var(v) if v == &r_owned) {
+                    rhs_owned.clone()
+                } else {
+                    let mut wrapped = Core::Let(vec![(r_owned.clone(), rhs_owned.clone())], Box::new(b.clone()));
+                    float_let_into_case(&mut wrapped);
+                    wrapped
+                }
+            };
+            match a {
+                Alt::Con(c, vars, b) => {
+                    let sh = vars.iter().any(|v| v == &r_owned);
+                    Alt::Con(c.clone(), vars.clone(), transform(b, sh))
+                }
+                Alt::Lit(l, b) => Alt::Lit(l.clone(), transform(b, false)),
+                Alt::Default(b) => Alt::Default(transform(b, false)),
+            }
+        })
+        .collect();
+    *e = Core::Case(scrut_owned, binder_owned, new_alts);
+}
+
 /// Extracts a single equality-comparison branch `case eqPrim x lit as b of 1# -> hit; _ -> miss`
 /// (or the `0#` swapped polarity, or with an intermediate raw binder `case eqPrim x lit as b of _ -> case b of ...`).
 fn match_eq_step(e: &Core) -> Option<(&str, Lit, bool, &Core, &Core, &str)> {
@@ -1417,11 +1897,73 @@ fn match_eq_step(e: &Core) -> Option<(&str, Lit, bool, &Core, &Core, &str)> {
     None
 }
 
-/// Collapses chained equality-comparison cases (`eqChar#`, `==#`, `eqWord#`) and nested
-/// same-scrutinee `Case` chains into flat multi-way `Case` expressions before worker analysis.
+/// Whether flattening nested cases on `binder` is safe without destroying a 1-alt raw-eligible
+/// case shell (`case rawPrim ... as r of _ -> case r of ...`).
+fn may_flatten_case(scrut: &Core, alts: &[Alt]) -> bool {
+    let raw_shell = matches!(alts, [Alt::Default(_)])
+        && (matches!(scrut, Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str()))
+            || matches!(scrut, Core::App(..)));
+    !raw_shell
+}
+
+/// Simplifies `tagToEnum#` Bool cases, collapses chained equality-comparison cases (`eqChar#`,
+/// `==#`, `eqWord#`) and nested same-scrutinee `Case` chains into flat multi-way `Case`
+/// expressions, and floats single-use tail `Let` bindings into `Case` alternatives before worker
+/// analysis.
 pub fn collapse_case_chains(binds: &mut [TopBind]) {
+    fn rewrite_bools(e: &mut Core) {
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(f, a) => {
+                rewrite_bools(f);
+                rewrite_bools(a);
+            }
+            Core::Lam(_, b) => rewrite_bools(b),
+            Core::Let(binds, body) => {
+                for (_, r) in binds {
+                    rewrite_bools(r);
+                }
+                rewrite_bools(body);
+            }
+            Core::Case(scrut, binder, alts) => {
+                if may_flatten_case(scrut, alts) {
+                    if let Some(flat) = flatten_case_alts(scrut, binder, alts) {
+                        *alts = flat;
+                    }
+                }
+                rewrite_bools(scrut);
+                for a in alts {
+                    match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => rewrite_bools(b),
+                    }
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    rewrite_bools(a);
+                }
+            }
+        }
+        if let Core::Case(scrut, binder, alts) = e {
+            if may_flatten_case(scrut, alts) {
+                if let Some(flat) = flatten_case_alts(scrut, binder, alts) {
+                    *alts = flat;
+                }
+            }
+            let already_whnf = matches!(scrut.as_ref(), Core::Con(..))
+                || matches!(scrut.as_ref(), Core::Prim(p, args) if p == "tagToEnum#" && args.len() == 1);
+            if already_whnf && matches!(&alts[..], [Alt::Default(Core::Var(v))] if v == binder) {
+                let s = std::mem::replace(scrut.as_mut(), Core::Fail(String::new()));
+                *e = s;
+            }
+        }
+        simplify_case_of_case(e);
+        rewrite_tag_to_enum_bool(e);
+    }
+
     fn walk(e: &mut Core) {
-        // Iteratively peel chains of >= 2 equality comparisons on the same variable.
+        // Iteratively peel chains of >= 2 equality comparisons on the same variable (top-down so
+        // earlier branches take precedence over shadowed duplicates).
         if let Some((var, first_lit, is_char, _, _, b1)) = match_eq_step(e) {
             let var_owned = var.to_string();
             let b_fresh = format!("{b1}%eq");
@@ -1483,8 +2025,10 @@ pub fn collapse_case_chains(binds: &mut [TopBind]) {
                 }
             }
         }
+        float_let_into_case(e);
     }
     for b in binds {
+        rewrite_bools(&mut b.body);
         walk(&mut b.body);
     }
 }
@@ -1570,11 +2114,16 @@ mod raw_slot_tests {
         let escapes = vec![
             Core::App(Box::new(var("Test.k")), Box::new(var("y"))),
             Core::Con("Test.K".into(), vec![var("y")]),
-            Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t"))),
+            Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(Core::Con("Test.K".into(), vec![var("t")]))),
             Core::Case(Box::new(var("y")), "z".into(), vec![Alt::Default(var("z"))]),
             Core::App(Box::new(var("Test.k")), Box::new(prim("+#", vec![var("y"), Core::Lit(Lit::Int(1))]))),
             Core::Case(
                 Box::new(Core::Case(Box::new(var("x")), "u".into(), vec![Alt::Default(var("y"))])),
+                "s".into(),
+                vec![Alt::Default(var("s"))],
+            ),
+            Core::Case(
+                Box::new(Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t")))),
                 "s".into(),
                 vec![Alt::Default(var("s"))],
             ),
@@ -1583,6 +2132,10 @@ mod raw_slot_tests {
             let c = lower(case(prim("+#", vec![var("x"), var("x")]), "y", body.clone()));
             assert_eq!(c.nraw, 0, "{body:?}");
         }
+        // A join point runs in the same stack frame and does not capture `y`, so `y` stays raw.
+        let join_body = Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t")));
+        let c = lower(case(prim("+#", vec![var("x"), var("x")]), "y", join_body));
+        assert_eq!(c.nraw, 1);
     }
 
     #[test]
@@ -1865,5 +2418,143 @@ mod raw_slot_tests {
         let SAlt::Default(div_body) = &alts[0] else { panic!("expected Default") };
         assert!(matches!(div_body, SExpr::Let(_, b) if matches!(b.as_ref(), SExpr::App(..))), "{div_body:?}");
     }
+
+    #[test]
+    fn small_integer_literals_are_static_atoms_and_strict_integer_prims_force_args() {
+        // f x = integerAdd (integerAdd x 1) 2
+        // Small i64 Integer literals should stay Atom::Lit(SLit::Integer) without wrapper thunks,
+        // and the nested `integerAdd x 1` should be forced strictly via SExpr::Case (not thunked).
+        let inner = prim("integerAdd", vec![var("x"), Core::Lit(Lit::Integer("1".into()))]);
+        let outer = prim("integerAdd", vec![inner, Core::Lit(Lit::Integer("2".into()))]);
+        let binds = vec![TopBind { name: "Test.f".into(), body: Core::Lam("x".into(), Box::new(outer)) }];
+        let prog = Lowering::program(&binds, &NumericParams::default());
+        let SExpr::Case(scrut, _, alts) = &prog.globals[0].closure.body else {
+            panic!("expected strict Case forcing nested integerAdd, got {:?}", prog.globals[0].closure.body);
+        };
+        let SExpr::Case(_, _, inner_alts) = scrut.as_ref() else {
+            panic!("expected inner strict Case forcing x, got {scrut:?}");
+        };
+        assert!(
+            matches!(&inner_alts[0], SAlt::Default(SExpr::Prim(p, args)) if p == "integerAdd" && matches!(&args[1], Atom::Lit(SLit::Integer(s)) if s == "1")),
+            "expected inner integerAdd with static Integer literal, got {inner_alts:?}"
+        );
+        let SAlt::Default(SExpr::Prim(p, args)) = &alts[0] else {
+            panic!("expected outer integerAdd prim, got {:?}", alts[0]);
+        };
+        assert_eq!(p, "integerAdd");
+        assert!(matches!(&args[1], Atom::Lit(SLit::Integer(s)) if s == "2"), "{args:?}");
+    }
+
+    #[test]
+    fn collapse_case_chains_fuses_bool_trees_and_preserves_raw_comparison_shells() {
+        // 1. Matcher-style nested Bool Case-of-Case (`c /= q && d /= 0`) with Core::Var True/False:
+        //    should fuse into raw comparison shells with zero `tagToEnum#` remaining.
+        let inner_bool = Core::Case(
+            Box::new(prim("/=#", vec![var("c"), var("q")])),
+            "u1".into(),
+            vec![Alt::Default(Core::Case(
+                Box::new(prim("tagToEnum#", vec![var("u1")])),
+                "b1".into(),
+                vec![Alt::Default(Core::Case(
+                    Box::new(Core::Case(
+                        Box::new(var("b1")),
+                        "cb1".into(),
+                        vec![
+                            Alt::Con(
+                                "GHC.Types.True".into(),
+                                vec![],
+                                Core::Case(
+                                    Box::new(prim("/=#", vec![var("d"), Core::Lit(Lit::Int(0))])),
+                                    "u2".into(),
+                                    vec![Alt::Default(prim("tagToEnum#", vec![var("u2")]))],
+                                ),
+                            ),
+                            Alt::Default(Core::Case(
+                                Box::new(var("b1")),
+                                "cb2".into(),
+                                vec![
+                                    Alt::Con("GHC.Types.False".into(), vec![], var("GHC.Types.False")),
+                                    Alt::Default(Core::Fail("&&".into())),
+                                ],
+                            )),
+                        ],
+                    )),
+                    "bout".into(),
+                    vec![
+                        Alt::Con("GHC.Types.True".into(), vec![], Core::Lit(Lit::Int(10))),
+                        Alt::Default(Core::Case(
+                            Box::new(var("bout")),
+                            "cb3".into(),
+                            vec![
+                                Alt::Con("GHC.Types.False".into(), vec![], Core::Lit(Lit::Int(20))),
+                                Alt::Default(Core::Fail("&&".into())),
+                            ],
+                        )),
+                    ],
+                ))],
+            ))],
+        );
+        // 2. Raw comparison shell (`case (n <# 2#) as r of _ -> case r of { 1# -> n; _ -> 0# }`):
+        //    must NOT be flattened into a multi-alt Case on `<#` (which would lose raw binder).
+        let raw_shell = case(
+            prim("<#", vec![var("n"), Core::Lit(Lit::Int(2))]),
+            "r",
+            Core::Case(
+                Box::new(var("r")),
+                "rb".into(),
+                vec![Alt::Lit(Lit::Int(1), var("n")), Alt::Default(Core::Lit(Lit::Int(0)))],
+            ),
+        );
+        // 3. `let r = (case x ==# 0# of 1# -> 1; _ -> 2) in case flag of True -> Con r; _ -> r`:
+        //    should float small Case RHS into alternatives, turning the Default branch into a tail Case.
+        let small_case_rhs = Core::Case(
+            Box::new(prim("==#", vec![var("x"), Core::Lit(Lit::Int(0))])),
+            "eqb".into(),
+            vec![Alt::Lit(Lit::Int(1), Core::Lit(Lit::Int(1))), Alt::Default(Core::Lit(Lit::Int(2)))],
+        );
+        let float_body = Core::Let(
+            vec![("r".into(), small_case_rhs)],
+            Box::new(Core::Case(
+                Box::new(var("flag")),
+                "fb".into(),
+                vec![
+                    Alt::Con("GHC.Types.True".into(), vec![], Core::Con("Test.K".into(), vec![var("r")])),
+                    Alt::Default(var("r")),
+                ],
+            )),
+        );
+        let mut binds = vec![
+            TopBind { name: "Test.f_bool".into(), body: inner_bool },
+            TopBind { name: "Test.f_raw".into(), body: raw_shell },
+            TopBind { name: "Test.f_float".into(), body: float_body },
+        ];
+        collapse_case_chains(&mut binds);
+        fn has_tag_to_enum(e: &Core) -> bool {
+            match e {
+                Core::Prim(p, args) => p == "tagToEnum#" || args.iter().any(has_tag_to_enum),
+                Core::App(f, a) => has_tag_to_enum(f) || has_tag_to_enum(a),
+                Core::Lam(_, b) => has_tag_to_enum(b),
+                Core::Let(bs, b) => bs.iter().any(|(_, r)| has_tag_to_enum(r)) || has_tag_to_enum(b),
+                Core::Case(s, _, alts) => {
+                    has_tag_to_enum(s)
+                        || alts.iter().any(|a| match a {
+                            Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => has_tag_to_enum(b),
+                        })
+                }
+                Core::Con(_, args) => args.iter().any(has_tag_to_enum),
+                Core::Var(_) | Core::Lit(_) | Core::Fail(_) => false,
+            }
+        }
+        assert!(!has_tag_to_enum(&binds[0].body), "tagToEnum# should be eliminated: {:?}", binds[0].body);
+        // Raw shell must remain `[Alt::Default(Case(Var(r), ...))]`.
+        let Core::Case(_, _, ref raw_alts) = binds[1].body else { panic!("{:?}", binds[1].body) };
+        assert!(matches!(&raw_alts[..], [Alt::Default(Core::Case(..))]), "raw shell was flattened: {raw_alts:?}");
+        // Let with small Case RHS should have floated into the Case alternatives.
+        let Core::Case(_, _, ref float_alts) = binds[2].body else {
+            panic!("expected outer Case after float_let_into_case, got {:?}", binds[2].body);
+        };
+        assert!(matches!(&float_alts[1], Alt::Default(Core::Case(..))), "Default branch should inline small Case RHS: {:?}", float_alts[1]);
+    }
 }
+
 
