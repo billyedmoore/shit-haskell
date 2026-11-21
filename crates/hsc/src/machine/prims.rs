@@ -401,10 +401,32 @@ static STATIC_RTS_NULLARY: [[Word; 2]; crate::native::RTS_CONS.len()] = {
     cells
 };
 
+/// Indices of runtime constructors in `native::RTS_CONS`.
+pub const CON_IN: u32 = 9;
+pub const CON_IP: u32 = 10;
+pub const CON_IS: u32 = 11;
+pub const CON_FALSE: u32 = 12;
+pub const CON_TRUE: u32 = 13;
+
 /// Returns the static cell for a nullary constructor in `RTS_CONS` by index.
 #[inline(always)]
 pub fn static_rts_nullary(id: usize) -> Word {
     STATIC_RTS_NULLARY[id].as_ptr() as Word
+}
+
+/// Returns the static `Bool` constructor cell (`GHC.Types.True` / `GHC.Types.False`).
+#[inline(always)]
+pub fn bool_value(v: bool) -> Word {
+    static_rts_nullary(if v { CON_TRUE as usize } else { CON_FALSE as usize })
+}
+
+/// Allocates a 1-field constructor with a known constructor id.
+#[inline(always)]
+pub fn con1_id(m: &mut Machine, id: u32, field: Word) -> Word {
+    let p = m.alloc(2);
+    m.heap_set(p, heap::header(kind::CON, 1, id));
+    m.heap_set(p + 8, field);
+    p
 }
 
 /// A constructor object of the named constructor with the fields given (pointers).
@@ -434,22 +456,19 @@ pub fn integer_value(m: &mut Machine, b: BigInt) -> Word {
         Some(i) => {
             m.reserve(4);
             let iv = int_value(m, i);
-            con_value(m, "GHC.Num.Integer.IS", 1, &[iv])
+            con1_id(m, CON_IS, iv)
         }
         None => {
             let neg = b.is_neg();
-            let mag = if neg { b.abs() } else { b.clone() };
-            let limbs: Vec<u64> = (0..limb64_count(&mag)).map(|i| limb64(&mag, i)).collect();
-            let words = limbs.len();
+            let words = limb64_count(&b);
             m.reserve(words + 4);
             let bp = m.alloc(1 + words);
             // The byte length makes it a ByteArray#, as GHC's BigNat# is.
             m.heap_set(bp, heap::header(kind::BYTES, words as u32, 8 * words as u32));
-            for (i, l) in limbs.iter().enumerate() {
-                m.heap_set(bp + 8 + 8 * i as Word, *l);
+            for i in 0..words {
+                m.heap_set(bp + 8 + 8 * i as Word, limb64(&b, i));
             }
-            let name = if neg { "GHC.Num.Integer.IN" } else { "GHC.Num.Integer.IP" };
-            con_value(m, name, 1, &[bp])
+            con1_id(m, if neg { CON_IN } else { CON_IP }, bp)
         }
     }
 }
@@ -457,18 +476,18 @@ pub fn integer_value(m: &mut Machine, b: BigInt) -> Word {
 /// The value of an `Integer` object (IS, IP or IN), forced: the machine word of an `IS` box may be
 /// a thunk. None when forcing raised.
 pub fn integer_of(m: &mut Machine, p: Word) -> Option<BigInt> {
-    let name = m.con_name(p).to_string();
-    if name == "GHC.Num.Integer.IS" {
-        let field = m.heap_get(p, 1);
+    let id = heap::aux_of(m.heap_get(p, 0));
+    let field = m.heap_get(p, 1);
+    if id == CON_IS {
         let iv = m.force(field)?;
         return Some(BigInt::from_i64(int_of(m, iv)));
     }
     // The limbs object is a field, which may be a thunk: it is forced before its words are read.
-    let field = m.heap_get(p, 1);
     let bp = m.force(field)?;
     let words = heap::size_of(m.heap_get(bp, 0)) as usize;
-    let limbs: Vec<u64> = (0..words).map(|i| m.heap_get(bp, 1 + i)).collect();
-    Some(BigInt::from_u64_limbs(name == "GHC.Num.Integer.IN", &limbs))
+    // SAFETY: `bp` is a forced `BYTES` object with `words` 64-bit payload words.
+    let limbs = unsafe { std::slice::from_raw_parts((bp as *const u64).add(1), words) };
+    Some(BigInt::from_u64_limbs(id == CON_IN, limbs))
 }
 
 #[cfg(test)]

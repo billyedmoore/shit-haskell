@@ -40,6 +40,9 @@ pub struct NativeTable {
     /// The bindings the runtime uses (`native::RTS_GLOBALS`): `[name_off: u32, name_len: u32, global_idx: u32]` relative to `rts`.
     pub rts: *const [u32; 3],
     pub nrts: u64,
+    /// Selector thunk table: `[code_off: i32, con_id: u32, field_word: u32]` relative to `selectors`.
+    pub selectors: *const [u32; 3],
+    pub nselectors: u64,
 }
 
 /// The static name written at a relative byte offset and length in the program's read-only data.
@@ -69,6 +72,17 @@ pub unsafe fn run(table: *const NativeTable) -> i32 {
         .collect();
     let mut m = Machine::new(Program { globals, con_names: cons, prim_names: prims });
     m.bodies = DiagnosticBodies::from_raw_parts(t.bodies, t.nbodies as usize);
+    if !t.selectors.is_null() && t.nselectors > 0 {
+        let sel_base = t.selectors as usize;
+        let entries: Vec<(Word, u32, u32)> = (0..t.nselectors as usize)
+            .map(|i| {
+                let [code_off, con_id, field_word] = *t.selectors.add(i);
+                let code = sel_base.wrapping_add_signed(code_off as i32 as isize) as Word;
+                (code, con_id, field_word)
+            })
+            .collect();
+        m.selectors = super::gc::SelectorTable::new(&entries);
+    }
     // The global closures: functions of their arity, or thunks, allocated on the heap.
     let mut gvec: Vec<Word> = Vec::with_capacity(nglobals);
     for i in 0..nglobals {
@@ -224,10 +238,14 @@ pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
     m.reserve(PRIM_SLACK);
     let r = if let Some(op) = m.int_prims[id as usize] {
         op.run(m)
-    } else { match ordinary {
-        Some(name) => super::prims::run_ordinary(m, id as usize, name, nargs),
-        None => super::prims::run_ccall(m, id as usize, nargs),
-    }};
+    } else if let Some(op) = m.integer_prims[id as usize] {
+        op.run(m)
+    } else {
+        match ordinary {
+            Some(name) => super::prims::run_ordinary(m, id as usize, name, nargs),
+            None => super::prims::run_ccall(m, id as usize, nargs),
+        }
+    };
     // SAFETY: re-derive in case the primitive switched coroutines.
     let m = unsafe { &mut *mp };
     m.prim_nargs = prev_nargs;

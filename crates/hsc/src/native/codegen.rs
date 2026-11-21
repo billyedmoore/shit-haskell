@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use super::stg::{Atom, SAlt, SClosure, SExpr, SLit, SProgram, MAX_REG_RAW_ARGS, RAW, RAW_CHAR};
+use super::stg::{Atom, SAlt, SBind, SClosure, SExpr, SLit, SProgram, MAX_REG_RAW_ARGS, RAW, RAW_CHAR};
 use crate::core::Lit;
 
 /// Header kinds (mirrors `machine::heap::kind`).
@@ -188,6 +188,8 @@ pub struct Gen {
     cache: Vec<Cached>,
     /// The raw slots each expression of the body being generated uses (sorted; by address).
     raw_uses: HashMap<*const SExpr, Vec<u32>>,
+    /// Single-capture selector thunks `(label, con_id, field_word)` for GC short-circuiting.
+    selectors: Vec<(String, u32, u32)>,
 }
 
 /// A raw slot's number held in a register; `dirty` when the slot itself may not have it yet.
@@ -339,6 +341,15 @@ fn closure_words(c: &SClosure) -> usize {
     (c.captures.len() + 2).max(2)
 }
 
+/// The heap words an `SBind` allocates (0 for static nullary constructors).
+fn bind_words(b: &SBind) -> usize {
+    match b {
+        SBind::Closure(c) => closure_words(c),
+        SBind::Con(_, args) if args.is_empty() => 0,
+        SBind::Con(_, args) => (args.len() + 1).max(2),
+    }
+}
+
 /// Whether an atom is a raw slot (an unboxed number).
 fn is_raw(a: &Atom) -> bool {
     matches!(a, Atom::Slot(k) if k & RAW != 0)
@@ -386,6 +397,7 @@ impl Gen {
             join_uses: HashMap::new(),
             cache: Vec::new(),
             raw_uses: HashMap::new(),
+            selectors: Vec::new(),
         }
     }
 
@@ -573,6 +585,12 @@ impl Gen {
                 let _ = writeln!(g.out, "    .ascii \"{}\"", escape(n));
             }
         }
+        // Selector thunks: [code_off: i32, con_id: u32, field_word: u32] relative to `hsc_selectors`.
+        let selectors = std::mem::take(&mut g.selectors);
+        g.out.push_str("    .p2align 2\nhsc_selectors:\n");
+        for (l, con_id, field_word) in &selectors {
+            let _ = writeln!(g.out, "    .long {l} - hsc_selectors, {con_id}, {field_word}");
+        }
         g.out.push_str("    .section .data.rel.ro,\"aw\",@progbits\n    .p2align 3\n");
         for (l, h, w) in rel_statics {
             let _ = writeln!(g.out, "{l}:\n    .quad {h}, {w}");
@@ -581,21 +599,57 @@ impl Gen {
         // The table the runtime reads (`machine::entry::NativeTable`).
         let _ = writeln!(
             g.out,
-            "    .globl hsc_table\nhsc_table:\n    .quad hsc_globals, {}, hsc_con_names, {}, hsc_prim_names, {}, {}, hsc_body_table, {}, hsc_rts_globals, {}",
+            "    .globl hsc_table\nhsc_table:\n    .quad hsc_globals, {}, hsc_con_names, {}, hsc_prim_names, {}, {}, hsc_body_table, {}, hsc_rts_globals, {}, hsc_selectors, {}",
             prog.globals.len(),
             cons.len(),
             prims.len(),
             main_index,
             bodies_count,
-            rts.len()
+            rts.len(),
+            selectors.len()
         );
         g.out.push_str("    .section .note.GNU-stack,\"\",@progbits\n");
         g.out
     }
 
+    /// Recognises a single-capture selector thunk (`case Free(0) of Con [.., f_i, ..] -> f_i`)
+    /// so the garbage collector can short-circuit it when `Free(0)` is already evaluated.
+    fn selector_info(&mut self, c: &SClosure) -> Option<(u32, u32)> {
+        if c.arity != 0 || c.captures.len() != 1 {
+            return None;
+        }
+        let SExpr::Case(scrut, bslot, alts) = &c.body else {
+            return None;
+        };
+        if *bslot & RAW != 0 || !matches!(scrut.as_ref(), SExpr::Atom(Atom::Free(0))) {
+            return None;
+        }
+        let mut found: Option<(&str, u32)> = None;
+        for alt in alts {
+            match alt {
+                SAlt::Con(con, fields, SExpr::Atom(Atom::Slot(s))) if *s & RAW == 0 => {
+                    if let Some(pos) = fields.iter().position(|f| *f == *s) {
+                        if found.is_some() {
+                            return None;
+                        }
+                        found = Some((con.as_str(), (pos + 1) as u32));
+                    }
+                }
+                SAlt::Default(_) => break,
+                _ => {}
+            }
+        }
+        let (con, field_word) = found?;
+        let con_id = self.con_id(con);
+        Some((con_id, field_word))
+    }
+
     /// A closure's code: the prologue, then its expression in tail position.
     fn closure_code(&mut self, label: &str, c: &SClosure, name: &str) {
         self.current_name = name.to_string();
+        if let Some((con_id, field_word)) = self.selector_info(c) {
+            self.selectors.push((label.to_string(), con_id, field_word));
+        }
         let has_closure = c.uses_closure;
         let ptr_slots = if has_closure { c.nslots } else { c.nslots - 1 };
         let f = Frame { s: ptr_slots + c.nraw, a: c.arity, r: c.nraw, has_closure };
@@ -731,8 +785,8 @@ impl Gen {
             }
             SExpr::CallWorker(_, args) | SExpr::Con(_, args) | SExpr::Prim(_, args) => args.iter().for_each(|a| atom(a, &mut out)),
             SExpr::Let(binds, body) => {
-                for (_, c) in binds {
-                    c.captures.iter().for_each(|a| atom(a, &mut out));
+                for (_, b) in binds {
+                    b.atoms().iter().for_each(|a| atom(a, &mut out));
                 }
                 out.extend(self.find_raw_uses(body, joins));
             }
@@ -1123,19 +1177,45 @@ impl Gen {
             }
             SExpr::Prim(name, args) => self.prim(name, args, p),
             SExpr::Let(binds, body) => {
-                let total: usize = binds.iter().map(|(_, c)| closure_words(c)).sum();
-                self.alloc(total, p);
-                // Every closure's address is in its slot before any closure is filled (letrec).
-                let mut off = 0usize;
-                let mut offs = Vec::new();
-                for (slot, c) in binds {
-                    self.emit(&format!("leaq {}(%rax), %rcx", 8 * off));
-                    self.emit(&format!("movq %rcx, {}", p.slot(*slot)));
-                    offs.push(off);
-                    off += closure_words(c);
+                let total: usize = binds.iter().map(|(_, b)| bind_words(b)).sum();
+                if total > 0 {
+                    self.alloc(total, p);
                 }
-                for ((_, c), base) in binds.iter().zip(offs) {
-                    self.fill_closure(c, base, p);
+                // Every binding's address is in its slot before any object is filled (letrec).
+                let mut off = 0usize;
+                let mut offs = Vec::with_capacity(binds.len());
+                for (slot, b) in binds {
+                    match b {
+                        SBind::Con(name, args) if args.is_empty() => {
+                            let id = self.con_id(name);
+                            let lbl = self.nullary_con(id);
+                            let _ = writeln!(self.out, "    leaq {lbl}(%rip), %rcx");
+                            let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(*slot));
+                            offs.push(0);
+                        }
+                        _ => {
+                            self.emit(&format!("leaq {}(%rax), %rcx", 8 * off));
+                            self.emit(&format!("movq %rcx, {}", p.slot(*slot)));
+                            offs.push(off);
+                            off += bind_words(b);
+                        }
+                    }
+                }
+                for ((_, b), base) in binds.iter().zip(offs) {
+                    match b {
+                        SBind::Closure(c) => self.fill_closure(c, base, p),
+                        SBind::Con(_, args) if args.is_empty() => {}
+                        SBind::Con(name, args) => {
+                            let id = self.con_id(name);
+                            let hdr = header(CON, args.len() as u64, id as u64);
+                            let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
+                            let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * base);
+                            for (i, a) in args.iter().enumerate() {
+                                self.load(a, p, "%rdx");
+                                let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (base + 1 + i));
+                            }
+                        }
+                    }
                 }
                 self.expr(body, p);
             }
@@ -2223,8 +2303,8 @@ impl Gen {
             SExpr::CallWorker(_, args) => args.iter().for_each(|a| atom(a, out)),
             SExpr::Con(_, args) | SExpr::Prim(_, args) => args.iter().for_each(|a| atom(a, out)),
             SExpr::Let(binds, body) => {
-                for (_, c) in binds {
-                    c.captures.iter().for_each(|a| atom(a, out));
+                for (_, b) in binds {
+                    b.atoms().iter().for_each(|a| atom(a, out));
                 }
                 self.slot_uses_in(body, out, local);
             }

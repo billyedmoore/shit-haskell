@@ -95,8 +95,11 @@ pub struct Machine {
     pub ordinary_module: Vec<u8>,
     pub(super) int_prims: Vec<Option<prims_num::IntOp>>,
     pub(super) conc_prims: Vec<Option<conc::ConcOp>>,
+    pub(super) integer_prims: Vec<Option<prims_integer::IntegerOp>>,
     /// How each C call primitive ran the first time (see `prims::run_ccall`).
     pub(super) ccall_plans: Vec<prims::CPlan>,
+    /// Selector thunks (`code_addr -> (con_id, field_word)`) short-circuited during GC.
+    pub selectors: gc::SelectorTable,
 }
 
 /// The tables the generated program provides (see `native::codegen`).
@@ -125,10 +128,12 @@ impl Machine {
         let nprims = prog.prim_names.len();
         let mut int_prims = Vec::with_capacity(nprims);
         let mut conc_prims = Vec::with_capacity(nprims);
+        let mut integer_prims = Vec::with_capacity(nprims);
         let mut ordinary_prims = Vec::with_capacity(nprims);
         for &name in &prog.prim_names {
             int_prims.push(prims_num::IntOp::classify(name));
             conc_prims.push(conc::ConcOp::classify(name));
+            integer_prims.push(prims_integer::IntegerOp::classify(name));
             ordinary_prims.push(
                 prims::ordinary_name(name).or_else(|| crate::ccall::parse(name).is_none().then_some(name)),
             );
@@ -172,7 +177,9 @@ impl Machine {
             ordinary_prims,
             int_prims,
             conc_prims,
+            integer_prims,
             ccall_plans,
+            selectors: gc::SelectorTable::default(),
             bodies: entry::DiagnosticBodies::default(),
         });
         m.stack = stack;
@@ -341,7 +348,7 @@ impl Machine {
         // Copy the heap pointers into the collector's root vector and back.
         let mut roots: Vec<Word> = locs.iter().map(|&p| unsafe { *p }).collect();
         self.heap.hp = ((self.hp - self.heap.addr(0)) / 8) as usize;
-        gc::collect(&mut self.heap, &mut roots, need);
+        gc::collect_with_selectors(&mut self.heap, &mut roots, need, &self.selectors);
         for (p, v) in locs.iter().zip(roots) {
             // SAFETY: each location is a live slot the collector was given.
             unsafe { **p = v };

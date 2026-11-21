@@ -31,6 +31,23 @@ pub enum SLit {
     Frac(String),
 }
 
+/// A heap object bound in `SExpr::Let`: either a closure (function/thunk) or a constructor
+/// allocated directly in weak head normal form.
+#[derive(Clone, Debug)]
+pub enum SBind {
+    Closure(SClosure),
+    Con(String, Vec<Atom>),
+}
+
+impl SBind {
+    pub fn atoms(&self) -> &[Atom] {
+        match self {
+            SBind::Closure(c) => &c.captures,
+            SBind::Con(_, args) => args,
+        }
+    }
+}
+
 /// An expression of the body of a closure.
 #[derive(Clone, Debug)]
 pub enum SExpr {
@@ -45,8 +62,8 @@ pub enum SExpr {
     Con(String, Vec<Atom>),
     /// A primitive operation on (lazy) atoms.
     Prim(String, Vec<Atom>),
-    /// Allocate closures into slots, then continue.
-    Let(Vec<(u32, SClosure)>, Box<SExpr>),
+    /// Allocate closures and constructors into slots, then continue.
+    Let(Vec<(u32, SBind)>, Box<SExpr>),
     /// Evaluate the scrutinee, bind it to a slot, select an alternative.
     Case(Box<SExpr>, u32, Vec<SAlt>),
     /// Allocate a closure and return it (a lambda in a strict position).
@@ -370,8 +387,8 @@ pub struct Lowering {
     index: HashMap<String, u32>,
     /// The stack of bodies being lowered: the innermost is last.
     bodies: Vec<Body>,
-    /// Thunks for the non-atomic arguments of the operation being lowered, to be allocated before it.
-    pending: Vec<(u32, SClosure)>,
+    /// Objects for the non-atomic arguments of the operation being lowered, to be allocated before it.
+    pending: Vec<(u32, SBind)>,
     /// The next join point id (unique in the program).
     next_join: u32,
     /// The functions with workers (see `workers`).
@@ -630,9 +647,9 @@ impl Lowering {
                 SExpr::Join(id, params, Box::new(code), Box::new(body))
             }
             Core::Let(binds, body) => {
-                let (slots, rhs) = self.let_binds(binds);
+                let bound = self.let_binds(binds);
                 let body = self.strict(body);
-                SExpr::Let(rhs.into_iter().zip(slots).map(|(c, s)| (s, c)).collect(), Box::new(body))
+                SExpr::Let(bound, Box::new(body))
             }
             Core::Case(scrut, binder, alts) => {
                 // A nested case in a scrutinee becomes a join point, and a let is floated out of
@@ -657,6 +674,8 @@ impl Lowering {
                 let raw = (matches!(scrut.as_ref(), Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str())) || raw_call.is_some())
                     && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder, &self.workers));
                 let char = matches!(scrut.as_ref(), Core::Prim(p, _) if p == "chr#") || raw_call == Some(NUM_CHAR);
+                let flat_alts = if !raw { flatten_case_alts(scrut, binder, alts) } else { None };
+                let alts: &[Alt] = flat_alts.as_deref().unwrap_or(alts);
                 let scrut = self.strict_in(scrut, if raw { Ctx::RawScrut } else { Ctx::Scrut });
                 let bslot = if raw { self.bind_raw(binder, char) } else { self.bind_local(binder) };
                 // Only one alternative runs, so their locals share the slots after the binder: the
@@ -755,12 +774,12 @@ impl Lowering {
         Some(e)
     }
 
-    /// Wraps an operation with the allocations of the thunks its arguments needed.
+    /// Wraps an operation with the allocations of the objects its arguments needed.
     fn allocating(&mut self, mark: usize, op: SExpr) -> SExpr {
         if self.pending.len() == mark {
             return op;
         }
-        let bindings: Vec<(u32, SClosure)> = self.pending.drain(mark..).collect();
+        let bindings: Vec<(u32, SBind)> = self.pending.drain(mark..).collect();
         SExpr::Let(bindings, Box::new(op))
     }
 
@@ -789,11 +808,22 @@ impl Lowering {
     }
 
     /// Letrec bindings: slots are bound first (so the right-hand sides can refer to each other),
-    /// then the closures are lowered.
-    fn let_binds(&mut self, binds: &[(String, Core)]) -> (Vec<u32>, Vec<SClosure>) {
+    /// then closures and direct constructors are lowered into one batched `SExpr::Let`.
+    fn let_binds(&mut self, binds: &[(String, Core)]) -> Vec<(u32, SBind)> {
         let slots: Vec<u32> = binds.iter().map(|(n, _)| self.bind_local(n)).collect();
-        let closures = binds.iter().map(|(_, rhs)| self.closure_of(rhs)).collect();
-        (slots, closures)
+        let mark = self.pending.len();
+        let mut out = Vec::with_capacity(binds.len());
+        for (slot, (_, rhs)) in slots.into_iter().zip(binds) {
+            if let Core::Con(con, args) = rhs {
+                let atoms: Vec<Atom> = args.iter().map(|a| self.atom(a)).collect();
+                out.push((slot, SBind::Con(con.clone(), atoms)));
+            } else {
+                out.push((slot, SBind::Closure(self.closure_of(rhs))));
+            }
+        }
+        let mut all: Vec<(u32, SBind)> = self.pending.drain(mark..).collect();
+        all.extend(out);
+        all
     }
 
     fn alt(&mut self, a: &Alt) -> SAlt {
@@ -807,18 +837,27 @@ impl Lowering {
         }
     }
 
-    /// An argument: a variable or literal is passed as it is; anything else becomes a thunk.
+    /// An argument: a variable or literal is passed as it is; a constructor is allocated directly
+    /// in WHNF (zero heap allocation for nullary constructors, exposing nested selector thunks);
+    /// anything else becomes a closure.
     fn atom(&mut self, e: &Core) -> Atom {
         match e {
             Core::Var(v) => self.resolve(v),
             // Numbers and characters are static objects; the others are built when they are used.
             Core::Lit(l @ (Lit::Int(_) | Lit::Double(_) | Lit::Char(_))) => Atom::Lit(slit(l)),
+            Core::Con(con, args) => {
+                let atoms: Vec<Atom> = args.iter().map(|a| self.atom(a)).collect();
+                let b = self.bodies.last_mut().expect("body");
+                let s = b.fresh_slot();
+                self.pending.push((s, SBind::Con(con.clone(), atoms)));
+                Atom::Slot(s)
+            }
             other => {
                 // A delayed expression (or a lambda): a closure, allocated before the operation.
                 let c = self.closure_of(other);
                 let b = self.bodies.last_mut().expect("body");
                 let s = b.fresh_slot();
-                self.pending.push((s, c));
+                self.pending.push((s, SBind::Closure(c)));
                 Atom::Slot(s)
             }
         }
@@ -835,7 +874,7 @@ fn expr_uses_closure(e: &SExpr) -> bool {
             args.iter().any(atom)
         }
         SExpr::Let(binds, body) => {
-            binds.iter().any(|(_, c)| c.captures.iter().any(atom)) || expr_uses_closure(body)
+            binds.iter().any(|(_, b)| b.atoms().iter().any(atom)) || expr_uses_closure(body)
         }
         SExpr::Case(scrut, _, alts) => {
             expr_uses_closure(scrut)
@@ -976,6 +1015,81 @@ fn mentions(e: &Core, j: &str) -> bool {
         }
         Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| mentions(a, j)),
     }
+}
+
+fn alts_mention(alts: &[Alt], v: &str) -> bool {
+    alts.iter().any(|a| match a {
+        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => mentions(b, v),
+    })
+}
+
+/// Flattens nested `Case` expressions on the same scrutinee inside a trailing `Alt::Default`,
+/// e.g. `case x as cb1 of C1 -> e1; _ -> case x as cb2 of C2 -> e2; _ -> e3` becomes
+/// `case x as cb1 of C1 -> e1; C2 -> e2; _ -> e3`.
+fn flatten_case_alts(scrut: &Core, binder: &str, alts: &[Alt]) -> Option<Vec<Alt>> {
+    let same_scrut = |inner: &Core| match inner {
+        Core::Var(y) => y == binder || matches!(scrut, Core::Var(x) if y == x),
+        _ => false,
+    };
+    let Some(Alt::Default(Core::Case(inner_scrut, b2, inner_alts))) = alts.last() else {
+        return None;
+    };
+    if !same_scrut(inner_scrut)
+        || (b2 != binder && alts_mention(inner_alts, b2))
+        || inner_alts.is_empty()
+    {
+        return None;
+    }
+    // Preserve `[Default]` on `writeMutVar#` so codegen's inline MutVar fast path still matches.
+    if alts.len() == 1 && matches!(scrut, Core::Prim(p, _) if p == "writeMutVar#") {
+        return None;
+    }
+    if alts[..alts.len() - 1].iter().any(|a| matches!(a, Alt::Default(_))) {
+        return None;
+    }
+
+    let mut out: Vec<Alt> = alts[..alts.len() - 1].to_vec();
+    let mut cur_case: (&Core, &str, &[Alt]) = (inner_scrut, b2, inner_alts);
+    let mut flattened = false;
+
+    loop {
+        let (is, ib, ialts) = cur_case;
+        if !same_scrut(is) || (ib != binder && alts_mention(ialts, ib)) || ialts.is_empty() {
+            out.push(Alt::Default(Core::Case(
+                Box::new(is.clone()),
+                ib.to_string(),
+                ialts.to_vec(),
+            )));
+            break;
+        }
+        let has_early_default = ialts[..ialts.len() - 1].iter().any(|a| matches!(a, Alt::Default(_)));
+        let overlaps = ialts.iter().any(|ia| match ia {
+            Alt::Con(c, _, _) => out.iter().any(|oa| matches!(oa, Alt::Con(oc, _, _) if oc == c)),
+            Alt::Lit(l, _) => out.iter().any(|oa| matches!(oa, Alt::Lit(ol, _) if ol == l)),
+            Alt::Default(_) => false,
+        });
+        if has_early_default || overlaps {
+            out.push(Alt::Default(Core::Case(
+                Box::new(is.clone()),
+                ib.to_string(),
+                ialts.to_vec(),
+            )));
+            break;
+        }
+        flattened = true;
+        match ialts.last() {
+            Some(Alt::Default(Core::Case(ns, nb, nalts))) => {
+                out.extend_from_slice(&ialts[..ialts.len() - 1]);
+                cur_case = (ns, nb, nalts);
+            }
+            _ => {
+                out.extend_from_slice(ialts);
+                break;
+            }
+        }
+    }
+
+    flattened.then_some(out)
 }
 
 /// The head and arguments of an application spine.
@@ -1121,5 +1235,67 @@ mod raw_slot_tests {
         // A newtype's constructor (\x -> x) returns its evaluated parameter, of any type.
         let binds = vec![TopBind { name: "Test.K1".into(), body: Core::Lam("x".into(), Box::new(var("x"))) }];
         assert!(workers(&binds, &numeric_all(&binds)).is_empty());
+    }
+
+    #[test]
+    fn nested_same_scrutinee_cases_flatten() {
+        // case x as cb1 of A -> 1#; _ -> case x as cb2 of B -> 2#; _ -> case x as cb3 of C -> 3#; _ -> fail
+        let inner3 = Core::Case(
+            Box::new(var("x")),
+            "cb3".into(),
+            vec![Alt::Con("Test.C".into(), vec![], Core::Lit(Lit::Int(3))), Alt::Default(Core::Fail("no".into()))],
+        );
+        let inner2 = Core::Case(
+            Box::new(var("x")),
+            "cb2".into(),
+            vec![Alt::Con("Test.B".into(), vec![], Core::Lit(Lit::Int(2))), Alt::Default(inner3)],
+        );
+        let outer = Core::Case(
+            Box::new(var("x")),
+            "cb1".into(),
+            vec![Alt::Con("Test.A".into(), vec![], Core::Lit(Lit::Int(1))), Alt::Default(inner2)],
+        );
+        let c = lower(outer);
+        let SExpr::Case(_, _, alts) = &c.body else { panic!("{:?}", c.body) };
+        assert_eq!(alts.len(), 4);
+        assert!(matches!(&alts[0], SAlt::Con(n, _, _) if n == "Test.A"));
+        assert!(matches!(&alts[1], SAlt::Con(n, _, _) if n == "Test.B"));
+        assert!(matches!(&alts[2], SAlt::Con(n, _, _) if n == "Test.C"));
+        assert!(matches!(&alts[3], SAlt::Default(SExpr::Fail(_))));
+    }
+
+    #[test]
+    fn nested_case_with_used_inner_binder_or_overlap_does_not_flatten() {
+        // Inner binder `cb2` is referenced in inner alt body -> must not flatten.
+        let inner_used = Core::Case(
+            Box::new(var("x")),
+            "cb2".into(),
+            vec![Alt::Con("Test.B".into(), vec![], var("cb2")), Alt::Default(Core::Lit(Lit::Int(0)))],
+        );
+        let outer_used = Core::Case(
+            Box::new(var("x")),
+            "cb1".into(),
+            vec![Alt::Con("Test.A".into(), vec![], Core::Lit(Lit::Int(1))), Alt::Default(inner_used)],
+        );
+        let c = lower(outer_used);
+        let SExpr::Case(_, _, alts) = &c.body else { panic!("{:?}", c.body) };
+        assert_eq!(alts.len(), 2);
+        assert!(matches!(&alts[1], SAlt::Default(SExpr::Case(..))));
+
+        // Overlapping constructor `Test.A` -> must not flatten.
+        let inner_dup = Core::Case(
+            Box::new(var("x")),
+            "cb2".into(),
+            vec![Alt::Con("Test.A".into(), vec![], Core::Lit(Lit::Int(2))), Alt::Default(Core::Lit(Lit::Int(0)))],
+        );
+        let outer_dup = Core::Case(
+            Box::new(var("x")),
+            "cb1".into(),
+            vec![Alt::Con("Test.A".into(), vec![], Core::Lit(Lit::Int(1))), Alt::Default(inner_dup)],
+        );
+        let c2 = lower(outer_dup);
+        let SExpr::Case(_, _, alts2) = &c2.body else { panic!("{:?}", c2.body) };
+        assert_eq!(alts2.len(), 2);
+        assert!(matches!(&alts2[1], SAlt::Default(SExpr::Case(..))));
     }
 }
