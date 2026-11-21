@@ -318,7 +318,12 @@ fn check(opts: &Opts, t: &Test, version: &str) -> Verdict {
         Ok(o) => o,
         Err(e) => return Verdict::Fail(format!("compiler could not be run: {e}")),
     };
-    judge(t, &oracle, &hsc, opts.diag)
+    let verdict = judge(t, &oracle, &hsc, opts.diag);
+    if matches!(verdict, Verdict::Pass) {
+        let _ = fs::remove_dir_all(opts.work.join("hsc").join(&t.category).join(&t.stem));
+        let _ = fs::remove_dir_all(opts.work.join("oracle").join(&t.category).join(&t.stem));
+    }
+    verdict
 }
 
 fn judge(t: &Test, o: &Outcome, h: &Outcome, diag: bool) -> Verdict {
