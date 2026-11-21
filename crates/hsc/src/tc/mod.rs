@@ -503,16 +503,25 @@ impl Checker {
             return Ok(true);
         }
         if let (Ty::App(f1, x1), Ty::App(f2, x2)) = (&a, &b) {
-            // Where the heads are the same constructor (`ST s _` against `ST s _`), not a family,
-            // the arguments are aligned (or unified) pairwise.
+            // Where the heads are compatible non-family heads (`ST s _` against `ST s _`, or
+            // `m R:Vector` against `?m (?v ?a)`), align the arguments pairwise.
             let (h1, n1) = (a.split_apps().0.clone(), a.split_apps().1.len());
             let (h2, n2) = (b.split_apps().0.clone(), b.split_apps().1.len());
-            let plain = matches!(&h1, Ty::Con(c) if !self.env.families.contains_key(c));
-            if h1 == h2 && n1 == n2 && plain {
+            let non_fam = |h: &Ty| match self.metas.prune(h) {
+                Ty::Con(c) => !self.env.families.contains_key(&c),
+                Ty::Skol(..) => true,
+                _ => false,
+            };
+            let compatible = n1 == n2
+                && ((h1 == h2 && non_fam(&h1))
+                    || (full
+                        && ((matches!(self.metas.prune(&h1), Ty::Meta(_)) && non_fam(&h2))
+                            || (matches!(self.metas.prune(&h2), Ty::Meta(_)) && non_fam(&h1)))));
+            if compatible {
                 let (f1, x1, f2, x2) = (f1.clone(), x1.clone(), f2.clone(), x2.clone());
                 let done_f = self.align_data_families(&f1, &f2, depth + 1, full)?;
                 let done_x = self.align_data_families(&x1, &x2, depth + 1, full)?;
-                if !full {
+                if !full || (!done_f && !done_x) {
                     return Ok(false);
                 }
                 if !done_f {

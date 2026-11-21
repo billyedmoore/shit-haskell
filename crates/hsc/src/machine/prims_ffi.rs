@@ -128,9 +128,33 @@ pub fn generic(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char, 
     generic_call(m, f, sig, ret, safe, false)
 }
 
+/// A `foreign import ccall "dynamic"` call: argument 0 is the `FunPtr`, and the rest are C args.
+pub fn generic_dynamic(m: &mut Machine, sig: &str, ret: char, safe: bool, interruptible: bool) -> Option<Word> {
+    let v = force_arg(m, 0)?;
+    let v = unbox(m, v)?;
+    let f = match heap::kind_of(m.heap_get(v, 0)) {
+        kind::ADDR => raw(m.heap_get(v, 1), m.heap_get(v, 2) as i64) as *mut std::ffi::c_void,
+        _ => m.heap_get(v, 1) as *mut std::ffi::c_void,
+    };
+    let rest_sig = sig.get(1..).unwrap_or("");
+    generic_call_at(m, f, rest_sig, 1, ret, safe, interruptible)
+}
+
 /// A C call by its signature; a safe call lets the other threads run, and an interruptible one
 /// can be woken by an exception thrown to the thread.
 pub fn generic_call(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: char, safe: bool, interruptible: bool) -> Option<Word> {
+    generic_call_at(m, f, sig, 0, ret, safe, interruptible)
+}
+
+fn generic_call_at(
+    m: &mut Machine,
+    f: *mut std::ffi::c_void,
+    sig: &str,
+    arg_offset: usize,
+    ret: char,
+    safe: bool,
+    interruptible: bool,
+) -> Option<Word> {
     // Fixed arrays, not vectors: a call allocates nothing on the Rust heap (`ccall::call` takes 20
     // integer and 8 floating arguments at most).
     let (mut ints, mut ni) = ([0u64; 20], 0usize);
@@ -138,7 +162,7 @@ pub fn generic_call(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: c
     let mut nargs = 0;
     for (k, class) in sig.chars().enumerate() {
         nargs = k + 1;
-        let v = force_arg(m, k)?;
+        let v = force_arg(m, arg_offset + k)?;
         let v = unbox(m, v)?;
         let h = m.heap_get(v, 0);
         match class {
@@ -187,7 +211,7 @@ pub fn generic_call(m: &mut Machine, f: *mut std::ffi::c_void, sig: &str, ret: c
         // A pointer answered into one of the arrays passed keeps that array (it moves with the
         // collector).
         (crate::ccall::Answer::Int(p), 'p') => {
-            let pointer_args: Vec<usize> = (0..nargs).collect();
+            let pointer_args: Vec<usize> = (arg_offset..arg_offset + nargs).collect();
             addr_result(m, p as *mut u8, &pointer_args)
         }
         (crate::ccall::Answer::Int(i), _) => int_value(m, i),

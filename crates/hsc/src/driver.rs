@@ -502,8 +502,19 @@ impl Driver {
             if self.find_module(&imp.module).is_some() {
                 continue;
             }
-            let key = format!("{}_reexport_{}", real, md5_hex(dir.to_string_lossy().as_bytes()).get(..8).unwrap_or("x"));
-            self.renamed.insert(key.clone(), (real.clone(), dir.clone()));
+            let stem = real.replace('.', "/");
+            let target = Self::find_in_package_dir(dir, &stem);
+            let plain = self.find_module(real);
+            let key = if real != &m.name
+                && target.as_ref().zip(plain.as_ref()).is_some_and(|(t, p)| t.path == p.path)
+            {
+                real.clone()
+            } else {
+                let dtag: String = dir.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                let key = format!("{}_pkg_{}", real, md5_hex(dtag.as_bytes()).get(..8).unwrap_or("x"));
+                self.renamed.insert(key.clone(), (real.clone(), dir.clone()));
+                key
+            };
             if imp.alias.is_none() {
                 imp.alias = Some(imp.module.clone());
             }
@@ -515,20 +526,41 @@ impl Driver {
                 continue;
             }
             let stem = imp.module.replace('.', "/");
-            let Some((dir, found)) = self
+            if let Some((dir, found)) = self
                 .pkg_dirs
                 .iter()
                 .filter(|d| Self::dir_of_package(d, &pkg))
                 .find_map(|d| Self::find_in_package_dir(d, &stem).map(|f| (d.clone(), f)))
-            else {
-                continue;
-            };
-            let plain = self.find_module(&imp.module).map(|f| f.path);
-            if plain.as_ref() == Some(&found.path) && imp.module != m.name {
+            {
+                let plain = self.find_module(&imp.module).map(|f| f.path);
+                if plain.as_ref() == Some(&found.path) && imp.module != m.name {
+                    continue;
+                }
+                let key = format!("{}_pkg_{}", imp.module, pkg.replace('-', "_"));
+                self.renamed.insert(key.clone(), (imp.module.clone(), dir));
+                if imp.alias.is_none() {
+                    imp.alias = Some(imp.module.clone());
+                }
+                imp.module = key;
                 continue;
             }
-            let key = format!("{}_pkg_{}", imp.module, pkg.replace('-', "_"));
-            self.renamed.insert(key.clone(), (imp.module.clone(), dir));
+            // A package-qualified import of a module that `pkg` re-exports from a dependency
+            // (ghcjs-dom's `import "ghcjs-dom-jsaddle" GHCJS.DOM.Document`): route through the
+            // reexport entry's canonical module.
+            let Some((_, real, dir)) = reexports.iter().find(|(n, _, _)| *n == imp.module) else { continue };
+            let rstem = real.replace('.', "/");
+            let target = Self::find_in_package_dir(dir, &rstem);
+            let plain = self.find_module(real);
+            let key = if real != &m.name
+                && target.as_ref().zip(plain.as_ref()).is_some_and(|(t, p)| t.path == p.path)
+            {
+                real.clone()
+            } else {
+                let dtag: String = dir.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                let key = format!("{}_pkg_{}", real, md5_hex(dtag.as_bytes()).get(..8).unwrap_or("x"));
+                self.renamed.insert(key.clone(), (real.clone(), dir.clone()));
+                key
+            };
             if imp.alias.is_none() {
                 imp.alias = Some(imp.module.clone());
             }
@@ -705,7 +737,10 @@ impl Driver {
     fn source_imports(src: &str) -> HashSet<String> {
         let mut out = HashSet::new();
         for line in src.lines() {
-            let Some(rest) = line.strip_prefix("import") else { continue };
+            let Some(rest) = line.trim_start().strip_prefix("import") else { continue };
+            if !rest.starts_with(char::is_whitespace) {
+                continue;
+            }
             let rest = rest.trim_start();
             let Some(rest) = rest.strip_prefix("{-#") else { continue };
             let Some(rest) = rest.trim_start().strip_prefix("SOURCE") else { continue };
@@ -1016,7 +1051,7 @@ impl Driver {
             }
             if batch.len() > 1 {
                 let bodies: Vec<&crate::syntax::ast::Expr> = batch.iter().map(|s| &s.body).collect();
-                if self.quoted_classes(&bodies).is_empty() {
+                if self.quoted_classes(&bodies, &[], "", &[]).is_empty() {
                     if let Ok(generated) = self.run_decl_splice_batch(m, &before.decls, &batch, exts, path) {
                         groups_end = i + generated.len();
                         m.decls.splice(i..j, generated);
@@ -1045,7 +1080,7 @@ impl Driver {
         let first = locs[0];
         let bodies: Vec<&crate::syntax::ast::Expr> = splices.iter().map(|s| &s.body).collect();
         let (imported, reached) = self.quoted_types_closure(&bodies, &m.name);
-        let mut classes = self.quoted_classes(&bodies);
+        let mut classes = self.quoted_classes(&bodies, &m.imports, &m.name, before);
         classes.extend(reached);
         let table = crate::th::reify_table(before, &m.name, &imported, classes, first);
         let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(before, &m.name, &imported), first);
@@ -1286,9 +1321,16 @@ impl Driver {
         (out, extra)
     }
 
-    /// The `reify` entries of the classes the splices quote (`''Lift`): `ClassI` with their
-    /// instances so far.
-    fn quoted_classes(&self, bodies: &[&crate::syntax::ast::Expr]) -> Vec<crate::syntax::ast::Expr> {
+    /// The `reify` entries of classes visible to splices: quoted classes (`''Lift`), classes
+    /// exported by imported modules (for imported TH macros calling `reifyInstances`), and the
+    /// module's own classes, each as `ClassI` with their instances so far.
+    fn quoted_classes(
+        &self,
+        bodies: &[&crate::syntax::ast::Expr],
+        imports: &[crate::syntax::ast::Import],
+        current: &str,
+        before: &[Decl],
+    ) -> Vec<crate::syntax::ast::Expr> {
         let loc = bodies.first().map(|b| b.loc()).unwrap_or_default();
         let mut found: Vec<(String, &crate::tc::env::ClassInfo, Vec<&crate::tc::env::InstInfo>)> = Vec::new();
         for q in crate::th::quoted_types(bodies) {
@@ -1301,7 +1343,46 @@ impl Driver {
                 found.push((module, info, insts));
             }
         }
-        crate::th::class_entries(&found, loc)
+        let mut wanted_keys: Vec<String> = Vec::new();
+        for imp in imports {
+            if let Some(iface) = self.ifaces.get(&imp.module) {
+                for e in &iface.exports {
+                    let key = format!("{}.{}", e.global.module, e.global.name);
+                    if self.checker.env.classes.contains_key(&key) {
+                        wanted_keys.push(key);
+                    }
+                }
+            }
+        }
+        let prefix = format!("{current}.");
+        for key in self.checker.env.classes.keys() {
+            if key.starts_with(&prefix) {
+                wanted_keys.push(key.clone());
+            }
+        }
+        for key in wanted_keys {
+            if let Some(info) = self.checker.env.classes.get(&key) {
+                if found.iter().any(|(_, i, _)| i.name == info.name) {
+                    continue;
+                }
+                let occ = crate::tc::types::unqualify(&key);
+                let module = key[..key.len() - occ.len()].trim_end_matches('.').to_string();
+                let insts: Vec<&crate::tc::env::InstInfo> = self.checker.env.instances.for_class(&key).collect();
+                found.push((module, info, insts));
+            }
+        }
+        let mut local_insts = Vec::new();
+        fn collect_insts<'a>(ds: &'a [Decl], out: &mut Vec<&'a crate::syntax::ast::InstDecl>) {
+            for d in ds {
+                match d {
+                    Decl::Instance(id) => out.push(id),
+                    Decl::Many(inner) => collect_insts(inner, out),
+                    _ => {}
+                }
+            }
+        }
+        collect_insts(before, &mut local_insts);
+        crate::th::class_entries(&found, &local_insts, loc)
     }
 
     /// The fixities a splice's `reifyFixity` answers from: the module's own (its declarations so
@@ -1373,7 +1454,7 @@ impl Driver {
         let first = locs.first().copied().unwrap_or(m.loc);
         let bodies: Vec<&crate::syntax::ast::Expr> = splices.iter().map(|s| &s.body).collect();
         let (imported, reached) = self.quoted_types_closure(&bodies, &m.name);
-        let mut classes = self.quoted_classes(&bodies);
+        let mut classes = self.quoted_classes(&bodies, &m.imports, &m.name, &earlier);
         classes.extend(reached);
         let table = crate::th::reify_table(&earlier, &m.name, &imported, classes, first);
         let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(&earlier, &m.name, &imported), first);
@@ -2129,8 +2210,10 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let mut roots: Vec<&str> = vec![entry];
     roots.extend_from_slice(crate::native::RTS_GLOBALS);
     let t = std::time::Instant::now();
-    let binds = crate::native::reachable(binds, &roots);
-    let prog = crate::native::stg::Lowering::program(&binds, numeric);
+    let mut binds = crate::native::reachable(binds, &roots);
+    let mut numeric = numeric.clone();
+    crate::native::lift::lambda_lift(&mut binds, &mut numeric);
+    let prog = crate::native::stg::Lowering::program(&binds, &numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
     std::fs::write(&asm, &text).map_err(|e| e.to_string())?;
@@ -2160,7 +2243,14 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let debug = std::env::var_os("HSC_DEBUG").is_some();
     let c_objs = compile_c_sources(c_sources, &dir)?;
     let c_objs: Vec<String> = c_objs.iter().map(|p| p.display().to_string()).collect();
-    let result = run(&["-c", &asm.display().to_string(), "-o", &obj.display().to_string()]).and_then(|()| {
+    let asm_str = asm.display().to_string();
+    let obj_str = obj.display().to_string();
+    let assemble = match std::process::Command::new("as").args(["-o", &obj_str, &asm_str]).status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(_) => Err(format!("as -o {obj_str} {asm_str} failed")),
+        Err(_) => run(&["-c", &asm_str, "-o", &obj_str]),
+    };
+    let result = assemble.and_then(|()| {
         timing::add("assemble", t_link);
         let t_link = std::time::Instant::now();
         let r = (|| {
@@ -2168,7 +2258,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
         let mut args = vec![o.as_str()];
         args.extend(c_objs.iter().map(String::as_str));
         // The program's C symbols are found by name at run time (`crate::ccall`).
-        args.extend_from_slice(&[r.as_str(), "-rdynamic", "-o", out]);
+        args.extend_from_slice(&[r.as_str(), "-rdynamic", "-Wl,--gc-sections", "-o", out]);
         if !debug {
             args.push("-s");
         }

@@ -23,29 +23,33 @@ extern "C" {
 /// The tables the code generator emits (`native::codegen::Gen::program`), as the runtime reads them.
 #[repr(C)]
 pub struct NativeTable {
-    /// One pair per global: its kind (the arity, or -1 for a thunk) and its code address.
-    pub globals: *const [i64; 2],
+    /// One pair per global: `[kind_arity: i32, code_off: i32]` relative to `globals`.
+    pub globals: *const [i32; 2],
     pub nglobals: u64,
-    /// Constructor names: pointer and length pairs.
-    pub con_names: *const [u64; 2],
+    /// Constructor names: `[byte_off: u32, len: u32]` relative to `con_names`.
+    pub con_names: *const [u32; 2],
     pub ncons: u64,
-    /// Primitive names: pointer and length pairs.
-    pub prim_names: *const [u64; 2],
+    /// Primitive names: `[byte_off: u32, len: u32]` relative to `prim_names`.
+    pub prim_names: *const [u32; 2],
     pub nprims: u64,
     /// The index of `Main.main` among the globals.
     pub main_index: u64,
-    /// The bodies in address order: entry address, name pointer and length.
-    pub bodies: *const [u64; 3],
+    /// The bodies in address order: `[code_off: i32, name_off: u32, name_len: u32]` relative to `bodies`.
+    pub bodies: *const [u32; 3],
     pub nbodies: u64,
-    /// The bindings the runtime uses (`native::RTS_GLOBALS`): name pointer, length, global index.
-    pub rts: *const [u64; 3],
+    /// The bindings the runtime uses (`native::RTS_GLOBALS`): `[name_off: u32, name_len: u32, global_idx: u32]` relative to `rts`.
+    pub rts: *const [u32; 3],
     pub nrts: u64,
+    /// Selector thunk table: `[code_off: i32, con_id: u32, field_word: u32]` relative to `selectors`.
+    pub selectors: *const [u32; 3],
+    pub nselectors: u64,
 }
 
-/// The name written at a pointer and length.
-unsafe fn name_at(p: *const [u64; 2], i: usize) -> String {
-    let [ptr, len] = *p.add(i);
-    String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, len as usize)).into_owned()
+/// The static name written at a relative byte offset and length in the program's read-only data.
+unsafe fn name_at(p: *const [u32; 2], i: usize) -> &'static str {
+    let [off, len] = *p.add(i);
+    let ptr = (p as *const u8).add(off as usize);
+    std::str::from_utf8(std::slice::from_raw_parts(ptr, len as usize)).unwrap_or("")
 }
 
 /// Runs a compiled program: its global closures are allocated, then `Main.main` is applied to the
@@ -56,19 +60,34 @@ unsafe fn name_at(p: *const [u64; 2], i: usize) -> String {
 /// The body table and its name bytes must remain immutable for the lifetime of the process.
 pub unsafe fn run(table: *const NativeTable) -> i32 {
     let t = &*table;
-    let cons: Vec<String> = (0..t.ncons as usize).map(|i| name_at(t.con_names, i)).collect();
-    let prims: Vec<String> = (0..t.nprims as usize).map(|i| name_at(t.prim_names, i)).collect();
-    let globals: Vec<(i64, usize)> = (0..t.nglobals as usize)
+    let cons: Vec<&'static str> = (0..t.ncons as usize).map(|i| name_at(t.con_names, i)).collect();
+    let prims: Vec<&'static str> = (0..t.nprims as usize).map(|i| name_at(t.prim_names, i)).collect();
+    let globals_base = t.globals as usize;
+    let nglobals = t.nglobals as usize;
+    let globals: Vec<(i64, usize)> = (0..nglobals)
         .map(|i| {
-            let [kind, code] = *t.globals.add(i);
-            (kind, code as usize)
+            let [kind, off] = *t.globals.add(i);
+            (kind as i64, globals_base.wrapping_add_signed(off as isize))
         })
         .collect();
     let mut m = Machine::new(Program { globals, con_names: cons, prim_names: prims });
     m.bodies = DiagnosticBodies::from_raw_parts(t.bodies, t.nbodies as usize);
+    if !t.selectors.is_null() && t.nselectors > 0 {
+        let sel_base = t.selectors as usize;
+        let entries: Vec<(Word, u32, u32)> = (0..t.nselectors as usize)
+            .map(|i| {
+                let [code_off, con_id, field_word] = *t.selectors.add(i);
+                let code = sel_base.wrapping_add_signed(code_off as i32 as isize) as Word;
+                (code, con_id, field_word)
+            })
+            .collect();
+        m.selectors = super::gc::SelectorTable::new(&entries);
+    }
     // The global closures: functions of their arity, or thunks, allocated on the heap.
-    let mut gvec: Vec<Word> = Vec::with_capacity(t.nglobals as usize);
-    for (kind_arity, code) in m.prog.globals.clone() {
+    let mut gvec: Vec<Word> = Vec::with_capacity(nglobals);
+    for i in 0..nglobals {
+        let [kind_arity, off] = *t.globals.add(i);
+        let code = globals_base.wrapping_add_signed(off as isize);
         let p = m.alloc_no_gc(2);
         if kind_arity > 0 {
             m.heap_set(p, heap::header(kind::FUN, 1, kind_arity as u32));
@@ -78,9 +97,11 @@ pub unsafe fn run(table: *const NativeTable) -> i32 {
         m.heap_set(p + 8, code as Word);
         gvec.push(p);
     }
+    m.rts_globals.reserve(t.nrts as usize);
+    let rts_base = t.rts as *const u8;
     for i in 0..t.nrts as usize {
-        let [ptr, len, idx] = *t.rts.add(i);
-        let name = String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, len as usize)).into_owned();
+        let [off, len, idx] = *t.rts.add(i);
+        let name = std::str::from_utf8(std::slice::from_raw_parts(rts_base.add(off as usize), len as usize)).unwrap_or("");
         m.rts_globals.insert(name, idx as usize);
     }
     m.globals = gvec.as_mut_ptr();
@@ -98,6 +119,8 @@ pub unsafe fn run(table: *const NativeTable) -> i32 {
     let status = hsc_enter(&mut *m as *mut Machine, main);
     // The runtime's apply-frame address is referenced for the over-application path.
     let _ = hsc_apply_ret as usize;
+    // The process exits immediately after `hsc_native_main`; skip unmapping the stack/heap.
+    std::mem::forget(m);
     status
 }
 
@@ -185,25 +208,47 @@ pub extern "C" fn hsc_yield(mp: *mut Machine) -> u64 {
 /// Returns the result, or 0 with the exception raised in `exc`.
 #[no_mangle]
 pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
+    // SAFETY: generated code passes the machine record.
+    let nargs = (nargs as usize).min(ARG_SLOTS);
+    let prev_nargs = unsafe {
+        let m = &mut *mp;
+        let prev = m.prim_nargs;
+        m.prim_nargs = nargs;
+        prev
+    };
     // At the end of a time slice another thread runs first; an exception thrown to this one
     // meanwhile is raised in place of the primitive.
     if super::conc::safe_point(mp) {
+        // SAFETY: machine is valid for the running thread.
+        unsafe { (*mp).prim_nargs = prev_nargs };
         return 0;
     }
-    // SAFETY: generated code passes the machine record.
+    // SAFETY: re-derive after safe_point (which may have switched coroutines and back).
     let m = unsafe { &mut *mp };
+    if let Some(op) = m.conc_prims[id as usize] {
+        let r = op.run_fast(mp);
+        // SAFETY: re-derive after possible coroutine switch.
+        unsafe { (*mp).prim_nargs = prev_nargs };
+        return r;
+    }
     let ordinary = m.ordinary_prims[id as usize];
     // A primitive builds its result from several allocations, holding the earlier objects in Rust
     // locals; a collection between them would move those objects. So the collection happens before
     // it runs, and the room it needs is reserved then.
     m.reserve(PRIM_SLACK);
-    let nargs = (nargs as usize).min(ARG_SLOTS);
     let r = if let Some(op) = m.int_prims[id as usize] {
         op.run(m)
-    } else { match ordinary {
-        Some(name) => super::prims::run_ordinary(m, id as usize, name, nargs),
-        None => super::prims::run_ccall(m, id as usize, nargs),
-    }};
+    } else if let Some(op) = m.integer_prims[id as usize] {
+        op.run(m)
+    } else {
+        match ordinary {
+            Some(name) => super::prims::run_ordinary(m, id as usize, name, nargs),
+            None => super::prims::run_ccall(m, id as usize, nargs),
+        }
+    };
+    // SAFETY: re-derive in case the primitive switched coroutines.
+    let m = unsafe { &mut *mp };
+    m.prim_nargs = prev_nargs;
     // Generated code takes a primitive's result as a value: a thunk (a result that is a variable of
     // the program, not yet evaluated) is evaluated here first.
     if r != 0 && matches!(heap::kind_of(m.heap_get(r, 0)), kind::THUNK | kind::IND) {
@@ -419,33 +464,35 @@ impl Machine {
 /// rather than allocating a String for every body during ordinary startup.
 #[derive(Default)]
 pub struct DiagnosticBodies {
-    rows: &'static [[u64; 3]],
+    base: usize,
+    rows: &'static [[u32; 3]],
 }
 
 impl DiagnosticBodies {
-    /// Borrows the executable's body table without copying its names.
+    /// Borrows the executable's relative body table without copying its names.
     ///
     /// # Safety
-    /// For nonzero `len`, `rows` must be aligned and readable for `len` triples, sorted by
-    /// code address. The triples and every nonempty referenced byte range must be immutable
-    /// and valid for the process lifetime. Zero-length tables and names may have null pointers.
-    unsafe fn from_raw_parts(rows: *const [u64; 3], len: usize) -> Self {
+    /// For nonzero `len`, `rows` must be aligned and readable for `len` triples `[code_off,
+    /// name_off, name_len]` relative to `rows`, sorted by resolved code address. The triples and
+    /// every nonempty referenced byte range must be immutable and valid for the process lifetime.
+    unsafe fn from_raw_parts(rows: *const [u32; 3], len: usize) -> Self {
         if len == 0 {
             return Self::default();
         }
-        Self { rows: std::slice::from_raw_parts(rows, len) }
+        Self { base: rows as usize, rows: std::slice::from_raw_parts(rows, len) }
     }
 
     fn name(&self, addr: Word) -> String {
-        match self.rows.partition_point(|row| row[0] <= addr) {
+        let base = self.base;
+        match self.rows.partition_point(|row| (base.wrapping_add_signed((row[0] as i32) as isize) as Word) <= addr) {
             0 => String::from("?"),
             i => {
-                let [_, ptr, len] = self.rows[i - 1];
+                let [_, off, len] = self.rows[i - 1];
                 if len == 0 {
                     return String::new();
                 }
                 // SAFETY: the constructor requires these bytes to remain valid and immutable.
-                let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+                let bytes = unsafe { std::slice::from_raw_parts((base as *const u8).add(off as usize), len as usize) };
                 String::from_utf8_lossy(bytes).into_owned()
             }
         }
@@ -473,21 +520,34 @@ mod diagnostic_body_tests {
 
     #[test]
     fn names_follow_address_boundaries_and_decode_only_selected_bytes() {
-        let first = "main λ".as_bytes();
+        #[repr(C, align(4))]
+        struct Table {
+            rows: [[u32; 3]; 3],
+            bytes: [u8; 16],
+        }
+        let first = "main \u{03bb}".as_bytes();
         let invalid = b"bad\xffname";
-        // Leak the tiny table to satisfy the same process-lifetime contract as generated tables.
-        let rows = Box::leak(Box::new([
-            [10, first.as_ptr() as u64, first.len() as u64],
-            [20, invalid.as_ptr() as u64, invalid.len() as u64],
-            [30, 0, 0],
-        ]));
-        let bodies = unsafe { DiagnosticBodies::from_raw_parts(rows.as_ptr(), rows.len()) };
-        assert_eq!(bodies.name(9), "?");
-        assert_eq!(bodies.name(10), "main λ");
-        assert_eq!(bodies.name(19), "main λ");
-        assert_eq!(bodies.name(20), "bad�name");
-        assert_eq!(bodies.name(29), "bad�name");
-        assert_eq!(bodies.name(30), "");
+        let mut buf = [0u8; 16];
+        buf[..first.len()].copy_from_slice(first);
+        buf[first.len()..first.len() + invalid.len()].copy_from_slice(invalid);
+        let header_bytes = 3 * 12;
+        let tbl = Box::leak(Box::new(Table {
+            rows: [
+                [(-100i32) as u32, header_bytes as u32, first.len() as u32],
+                [(-90i32) as u32, (header_bytes + first.len()) as u32, invalid.len() as u32],
+                [(-80i32) as u32, 0, 0],
+            ],
+            bytes: buf,
+        }));
+        let base = tbl.rows.as_ptr() as usize;
+        let addr = |off: isize| base.wrapping_add_signed(off) as u64;
+        let bodies = unsafe { DiagnosticBodies::from_raw_parts(tbl.rows.as_ptr(), tbl.rows.len()) };
+        assert_eq!(bodies.name(addr(-101)), "?");
+        assert_eq!(bodies.name(addr(-100)), "main \u{03bb}");
+        assert_eq!(bodies.name(addr(-91)), "main \u{03bb}");
+        assert_eq!(bodies.name(addr(-90)), "bad\u{FFFD}name");
+        assert_eq!(bodies.name(addr(-81)), "bad\u{FFFD}name");
+        assert_eq!(bodies.name(addr(-80)), "");
         assert_eq!(bodies.name(u64::MAX), "");
     }
 }

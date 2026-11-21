@@ -140,6 +140,8 @@ pub enum CPlan {
     Addr(u64),
     /// An unsafe call of this C function.
     Generic(std::rc::Rc<CCall>, usize),
+    /// A `foreign import ccall "dynamic"` call through a `FunPtr` in argument 0.
+    Dynamic(std::rc::Rc<CCall>),
 }
 
 pub struct CCall {
@@ -154,6 +156,9 @@ pub struct CCall {
 pub fn run_ccall(m: &mut Machine, id: usize, nargs: usize) -> Word {
     m.prim_failed = false;
     match m.ccall_plans[id].clone() {
+        CPlan::Dynamic(c) => {
+            return super::prims_ffi::generic_dynamic(m, &c.sig, c.ret, c.safe, c.interruptible).unwrap_or(0);
+        }
         CPlan::Safe(c, f) => {
             return super::prims_ffi::generic_call(m, f as *mut std::ffi::c_void, &c.sig, c.ret, true, c.interruptible).unwrap_or(0);
         }
@@ -170,8 +175,8 @@ pub fn run_ccall(m: &mut Machine, id: usize, nargs: usize) -> Word {
         CPlan::Unknown => {}
     }
     // The first call (or an own version that declined): as `run`, recording what ran.
-    let name = m.prog.prim_names[id].clone();
-    let Some((sig, ret, sym)) = crate::ccall::parse(&name) else { return run(m, &name, nargs) };
+    let name = m.prog.prim_names[id];
+    let Some((sig, ret, sym)) = crate::ccall::parse(name) else { return run(m, name, nargs) };
     let c = std::rc::Rc::new(CCall {
         sig: sig.to_string(),
         ret,
@@ -179,6 +184,10 @@ pub fn run_ccall(m: &mut Machine, id: usize, nargs: usize) -> Word {
         safe: crate::ccall::is_safe(&name),
         interruptible: crate::ccall::is_interruptible(&name),
     });
+    if c.sym == "dynamic" {
+        m.ccall_plans[id] = CPlan::Dynamic(c.clone());
+        return super::prims_ffi::generic_dynamic(m, &c.sig, c.ret, c.safe, c.interruptible).unwrap_or(0);
+    }
     if c.safe {
         if let Some(f) = crate::ccall::resolve(&name) {
             m.ccall_plans[id] = CPlan::Safe(c.clone(), f as usize);
@@ -217,6 +226,16 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
     // A foreign C call: the runtime's own version of the function, else the C function itself.
     if let Some((sig, ret, sym)) = crate::ccall::parse(name) {
         let (sig, sym) = (sig.to_string(), sym.to_string());
+        if sym == "dynamic" {
+            return super::prims_ffi::generic_dynamic(
+                m,
+                &sig,
+                ret,
+                crate::ccall::is_safe(name),
+                crate::ccall::is_interruptible(name),
+            )
+            .unwrap_or(0);
+        }
         // A safe call of a C function goes to C (so that other threads run meanwhile), not to the
         // runtime's own version of it.
         if crate::ccall::is_safe(name) {
@@ -371,17 +390,57 @@ pub fn char_code_value(m: &mut Machine, c: u32) -> Word {
     p
 }
 
+/// Static nullary constructor cells for every constructor in `RTS_CONS` (same order as `RTS_CONS`).
+static STATIC_RTS_NULLARY: [[Word; 2]; crate::native::RTS_CONS.len()] = {
+    let mut cells = [[0; 2]; crate::native::RTS_CONS.len()];
+    let mut i = 0;
+    while i < crate::native::RTS_CONS.len() {
+        cells[i] = [heap::header(kind::CON, 0, i as u32), 0];
+        i += 1;
+    }
+    cells
+};
+
+/// Indices of runtime constructors in `native::RTS_CONS`.
+pub const CON_IN: u32 = 9;
+pub const CON_IP: u32 = 10;
+pub const CON_IS: u32 = 11;
+pub const CON_FALSE: u32 = 12;
+pub const CON_TRUE: u32 = 13;
+
+/// Returns the static cell for a nullary constructor in `RTS_CONS` by index.
+#[inline(always)]
+pub fn static_rts_nullary(id: usize) -> Word {
+    STATIC_RTS_NULLARY[id].as_ptr() as Word
+}
+
+/// Returns the static `Bool` constructor cell (`GHC.Types.True` / `GHC.Types.False`).
+#[inline(always)]
+pub fn bool_value(v: bool) -> Word {
+    static_rts_nullary(if v { CON_TRUE as usize } else { CON_FALSE as usize })
+}
+
+/// Allocates a 1-field constructor with a known constructor id.
+#[inline(always)]
+pub fn con1_id(m: &mut Machine, id: u32, field: Word) -> Word {
+    let p = m.alloc(2);
+    m.heap_set(p, heap::header(kind::CON, 1, id));
+    m.heap_set(p + 8, field);
+    p
+}
+
 /// A constructor object of the named constructor with the fields given (pointers).
 pub fn con_value(m: &mut Machine, name: &str, arity: usize, fields: &[Word]) -> Word {
     // The runtime's own constructors (tuples of IO results, lists, Bool) have the first ids, in
     // `RTS_CONS` order (codegen registers them first): found without hashing the name.
     let id = match crate::native::RTS_CONS.iter().position(|c| *c == name) {
-        Some(i) => i as u32,
-        None => match m.con_ids.get(name) {
-            Some(&i) => i,
-            // A constructor the program does not mention: it matches no alternative.
-            None => u32::MAX,
-        },
+        Some(i) => {
+            if arity == 0 {
+                return static_rts_nullary(i);
+            }
+            i as u32
+        }
+        None => m.lookup_con_id(name).unwrap_or(u32::MAX),
     };
     let p = m.alloc(1 + arity);
     m.heap_set(p, heap::header(kind::CON, arity as u32, id));
@@ -397,22 +456,19 @@ pub fn integer_value(m: &mut Machine, b: BigInt) -> Word {
         Some(i) => {
             m.reserve(4);
             let iv = int_value(m, i);
-            con_value(m, "GHC.Num.Integer.IS", 1, &[iv])
+            con1_id(m, CON_IS, iv)
         }
         None => {
             let neg = b.is_neg();
-            let mag = if neg { b.abs() } else { b.clone() };
-            let limbs: Vec<u64> = (0..limb64_count(&mag)).map(|i| limb64(&mag, i)).collect();
-            let words = limbs.len();
+            let words = limb64_count(&b);
             m.reserve(words + 4);
             let bp = m.alloc(1 + words);
             // The byte length makes it a ByteArray#, as GHC's BigNat# is.
             m.heap_set(bp, heap::header(kind::BYTES, words as u32, 8 * words as u32));
-            for (i, l) in limbs.iter().enumerate() {
-                m.heap_set(bp + 8 + 8 * i as Word, *l);
+            for i in 0..words {
+                m.heap_set(bp + 8 + 8 * i as Word, limb64(&b, i));
             }
-            let name = if neg { "GHC.Num.Integer.IN" } else { "GHC.Num.Integer.IP" };
-            con_value(m, name, 1, &[bp])
+            con1_id(m, if neg { CON_IN } else { CON_IP }, bp)
         }
     }
 }
@@ -420,18 +476,18 @@ pub fn integer_value(m: &mut Machine, b: BigInt) -> Word {
 /// The value of an `Integer` object (IS, IP or IN), forced: the machine word of an `IS` box may be
 /// a thunk. None when forcing raised.
 pub fn integer_of(m: &mut Machine, p: Word) -> Option<BigInt> {
-    let name = m.con_name(p).to_string();
-    if name == "GHC.Num.Integer.IS" {
-        let field = m.heap_get(p, 1);
+    let id = heap::aux_of(m.heap_get(p, 0));
+    let field = m.heap_get(p, 1);
+    if id == CON_IS {
         let iv = m.force(field)?;
         return Some(BigInt::from_i64(int_of(m, iv)));
     }
     // The limbs object is a field, which may be a thunk: it is forced before its words are read.
-    let field = m.heap_get(p, 1);
     let bp = m.force(field)?;
     let words = heap::size_of(m.heap_get(bp, 0)) as usize;
-    let limbs: Vec<u64> = (0..words).map(|i| m.heap_get(bp, 1 + i)).collect();
-    Some(BigInt::from_u64_limbs(name == "GHC.Num.Integer.IN", &limbs))
+    // SAFETY: `bp` is a forced `BYTES` object with `words` 64-bit payload words.
+    let limbs = unsafe { std::slice::from_raw_parts((bp as *const u64).add(1), words) };
+    Some(BigInt::from_u64_limbs(id == CON_IN, limbs))
 }
 
 #[cfg(test)]

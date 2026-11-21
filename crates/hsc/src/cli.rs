@@ -52,8 +52,9 @@ pub struct Opts {
     pub abi_hash: bool,
     /// An information mode (`--info` and the like) answers by itself.
     pub info: Option<String>,
-    /// Options for C compilations and links (`-optc`, `-optl`, `-l`, `-L`).
+    /// Options for C/C++ compilations and links (`-optc`, `-optcxx`, `-optl`, `-l`, `-L`).
     pub c_opts: Vec<String>,
+    pub cxx_opts: Vec<String>,
     pub link_opts: Vec<String>,
     /// `-package-env`: a file, or `-` for none (None: look for one, as GHC does).
     pub package_env: Option<String>,
@@ -229,6 +230,7 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
                     o.flags.push(format!("-I{}", absolute(d).display()));
                 }
             }
+            _ if a.starts_with("-optcxx") => o.cxx_opts.push(a[7..].to_string()),
             _ if a.starts_with("-optc") => o.c_opts.push(a[5..].to_string()),
             _ if a.starts_with("-optl") => o.link_opts.push(a[5..].to_string()),
             _ if a.starts_with("-l") || a.starts_with("-L") => o.link_opts.push(a.to_string()),
@@ -618,6 +620,7 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
             empty_object(&out)?;
             continue;
         }
+        let is_cxx = [".cc", ".cpp", ".cxx"].iter().any(|e| c.ends_with(e));
         let st = std::process::Command::new("gcc")
             .arg("-c")
             .arg(c.as_str())
@@ -625,7 +628,7 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
             .arg(&out)
             // Position independent: the interpreter loads C objects as a shared library.
             .arg("-fPIC")
-            .args(&o.c_opts)
+            .args(if is_cxx { &o.cxx_opts } else { &o.c_opts })
             .args(o.flags.iter().filter(|f| f.starts_with("-I") || f.starts_with("-D")))
             .args(pkg_includes.iter().map(|d| format!("-I{}", d.display())))
             // The RTS headers (HsFFI.h), as GHC passes its own include directory.

@@ -8,14 +8,29 @@ use super::Machine;
 use crate::native::codegen::CHAR;
 
 /// The state-passing answer `(# s, v #)`.
+#[inline]
 pub fn state_pair(m: &mut Machine, v: Word) -> Word {
-    con_value(m, "Builtin.(,)", 2, &[0, v])
+    // `Builtin.(,)` is index 1 in `RTS_CONS`.
+    let p = m.alloc(3);
+    m.heap_set(p, heap::header(kind::CON, 2, 1));
+    m.heap_set(p + 8, 0);
+    m.heap_set(p + 16, v);
+    p
 }
 
 /// `state_pair` for a value that was got by running Haskell code (or by another thread running),
 /// which may have used up the room `hsc_prim` reserved: the pair's allocation may collect, so the
 /// value is held in a spare argument slot (a root) meanwhile.
+#[inline]
 pub fn state_pair_rooted(m: &mut Machine, v: Word) -> Word {
+    if m.hp + 24 <= m.hplim {
+        let p = m.hp;
+        m.hp += 24;
+        m.heap_set(p, heap::header(kind::CON, 2, 1));
+        m.heap_set(p + 8, 0);
+        m.heap_set(p + 16, v);
+        return p;
+    }
     let slot = super::ARG_SLOTS - 1;
     m.args[slot] = v;
     m.reserve(4);
@@ -25,8 +40,10 @@ pub fn state_pair_rooted(m: &mut Machine, v: Word) -> Word {
 }
 
 /// The unit object (the answer of a state-only primitive).
-pub fn unit(m: &mut Machine) -> Word {
-    con_value(m, "Builtin.()", 0, &[])
+#[inline(always)]
+pub fn unit(_m: &mut Machine) -> Word {
+    // `Builtin.()` is index 0 in `RTS_CONS`.
+    super::prims::static_rts_nullary(0)
 }
 
 fn int_arg(m: &mut Machine, k: usize) -> Option<i64> {

@@ -6,6 +6,7 @@
 //! Core) to `hsc_native_main`.
 
 pub mod codegen;
+pub mod lift;
 pub mod stg;
 
 use std::collections::{HashMap, HashSet};

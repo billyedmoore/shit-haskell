@@ -530,6 +530,10 @@ impl Checker {
         }
         for w in residual {
             let p = self.metas_zonk_pred(&w.pred);
+            if p.class == "GHC.Types.Coercible" {
+                ev_binds.push((w.ev, Core::Con("Builtin.()".into(), vec![])));
+                continue;
+            }
             let mentions_skolem = p.args.iter().any(|a| mentions(a, &skolems));
             if mentions_skolem {
                 self.givens.truncate(givens_len);

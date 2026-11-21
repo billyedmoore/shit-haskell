@@ -1381,7 +1381,8 @@ impl Checker {
         }
         let (cur_n, ty_n) = if families { (self.normalize(&cur), self.normalize(ty)) } else { (cur.clone(), ty.clone()) };
         let refinements = self.metas.skol_binds.len();
-        let refined = self.metas.unify_refine(&cur_n, &ty_n);
+        let mut fam_eqs = Vec::new();
+        let refined = self.metas.unify_refine_collecting(&cur_n, &ty_n, &mut fam_eqs);
         // A refinement can make a family given reduce to more equalities.
         if self.metas.skol_binds.len() != refinements {
             self.refine_family_givens();
@@ -1415,6 +1416,27 @@ impl Checker {
                     self.metas.subst[m as usize] = Some(sk);
                 }
             }
+        }
+        // GADT matches against a rigid type-family scrutinee (`SFalse :: SBool 'False` matched
+        // against `SBool (FoldRequired mods)`) produce local given equalities so `If (FoldRequired
+        // mods) ...` reduces inside the branch.
+        let mut added_fam_given = false;
+        for (a, b) in fam_eqs {
+            let za = self.metas.zonk(&a);
+            let zb = self.metas.zonk(&b);
+            if za != zb && !self.has_metas(&za) && !self.has_metas(&zb) {
+                self.add_given(super::Given {
+                    pred: Pred {
+                        class: super::solve::EQ_CLASS.into(),
+                        args: vec![za, zb],
+                    },
+                    ev: Core::Con("Builtin.()".into(), vec![]),
+                });
+                added_fam_given = true;
+            }
+        }
+        if added_fam_given {
+            self.refine_family_givens();
         }
         let mut dict_pats = Vec::with_capacity(preds.len());
         for p in preds {

@@ -4,26 +4,111 @@
 
 use super::heap::{self, kind, Heap, Word};
 
+/// Header of an unevaluated single-capture thunk (the only thunks that can be selectors).
+const THUNK1_HDR: Word = heap::header(kind::THUNK, 2, 0);
+
+/// Open-addressed hash table mapping selector thunk code addresses to `(con_id, field_word)`,
+/// where `field_word` is the 1-based word offset of the selected field in the constructor.
+#[derive(Default)]
+pub struct SelectorTable {
+    /// `(code_addr, (con_id << 32) | field_word)`; `code_addr == 0` is an empty slot.
+    slots: Vec<(Word, u64)>,
+    mask: usize,
+}
+
+impl SelectorTable {
+    pub fn new(entries: &[(Word, u32, u32)]) -> Self {
+        if entries.is_empty() {
+            return Self::default();
+        }
+        let cap = (entries.len() * 2).next_power_of_two().max(8);
+        let mask = cap - 1;
+        let mut slots = vec![(0 as Word, 0u64); cap];
+        for &(code, con_id, field_word) in entries {
+            if code == 0 {
+                continue;
+            }
+            let packed = ((con_id as u64) << 32) | (field_word as u64);
+            let mut idx = Self::hash(code) & mask;
+            while slots[idx].0 != 0 && slots[idx].0 != code {
+                idx = (idx + 1) & mask;
+            }
+            slots[idx] = (code, packed);
+        }
+        Self { slots, mask }
+    }
+
+    #[inline(always)]
+    fn hash(code: Word) -> usize {
+        (code.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn get(&self, code: Word) -> Option<(u32, u32)> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut idx = Self::hash(code) & self.mask;
+        loop {
+            // SAFETY: `idx <= self.mask < self.slots.len()` and the table is at most half full.
+            let (k, v) = unsafe { *self.slots.get_unchecked(idx) };
+            if k == code {
+                return Some(((v >> 32) as u32, v as u32));
+            }
+            if k == 0 {
+                return None;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+}
+
 /// Collects `heap`, updating `roots` (the pointer words the caller holds). `need` is the number of
 /// words the allocation that triggered the collection requires: the new space keeps that much room
 /// (and a quarter of its size more), growing if the live data leaves too little.
 pub fn collect(heap: &mut Heap, roots: &mut [Word], need: usize) {
+    let empty = SelectorTable::default();
+    collect_with_selectors(heap, roots, need, &empty);
+}
+
+/// Like `collect`, additionally short-circuiting selector thunks listed in `selectors` when their
+/// captured scrutinee is already evaluated to the matching constructor (avoiding Wadler space leaks).
+pub fn collect_with_selectors(
+    heap: &mut Heap,
+    roots: &mut [Word],
+    need: usize,
+    selectors: &SelectorTable,
+) {
     let mut space = std::mem::take(&mut heap.from);
     // The new space holds three times the data live at the last collection (as GHC sizes its old
-    // generation at twice the live data), so that a large live set is not copied over and over.
-    let mut capacity = space.len().max(heap.last_live * 3 + need);
+    // generation at twice the live data), growing geometrically so a growing heap does not
+    // discard `spare` and page-fault a fresh semispace on every collection.
+    let target = heap.last_live.saturating_mul(3).saturating_add(need);
+    let mut capacity = if target > space.len() {
+        space.len().saturating_mul(2).max(target.checked_next_power_of_two().unwrap_or(target))
+    } else {
+        space.len()
+    };
     let pinned = std::mem::take(&mut heap.pinned);
     let bounds = (pinned.keys().min().copied().unwrap_or(1), pinned.keys().max().copied().unwrap_or(0));
     let mut reached: std::collections::HashSet<Word> = std::collections::HashSet::new();
     // The space left by the previous collection is reused when it is large enough: a fresh one
     // would be zeroed page by page.
     let spare = std::mem::take(&mut heap.to);
-    let (mut to, mut live) = copy(&mut space, roots, capacity, &pinned, bounds, &mut reached, spare);
+    let (mut to, mut live) =
+        copy(&mut space, roots, capacity, &pinned, bounds, &mut reached, spare, selectors);
     capacity = to.len();
     while capacity - live < need + capacity / 4 {
         // Too little room: copy again into a larger space (the live data is all in `to`).
-        capacity = (capacity * 2).max(live + need + capacity / 4);
-        let (bigger, l) = copy(&mut to, roots, capacity, &pinned, bounds, &mut reached, Vec::new());
+        let min_cap = (live + need).saturating_mul(4) / 3 + 1;
+        capacity = capacity.saturating_mul(2).max(min_cap.checked_next_power_of_two().unwrap_or(min_cap));
+        let (bigger, l) =
+            copy(&mut to, roots, capacity, &pinned, bounds, &mut reached, Vec::new(), selectors);
         to = bigger;
         live = l;
     }
@@ -54,6 +139,7 @@ pub fn collect(heap: &mut Heap, roots: &mut [Word], need: usize) {
 /// Copies everything reachable from `roots` out of `src` into a new space of `capacity` words
 /// (`spare` when it is at least that large). Returns the new space and the number of live words.
 /// The roots are updated in place; `src` is left with forwarding pointers.
+#[allow(clippy::too_many_arguments)]
 fn copy(
     src: &mut [Word],
     roots: &mut [Word],
@@ -62,6 +148,7 @@ fn copy(
     bounds: (Word, Word),
     reached: &mut std::collections::HashSet<Word>,
     spare: Vec<Word>,
+    selectors: &SelectorTable,
 ) -> (Vec<Word>, usize) {
     let mut dst: Vec<Word> = if spare.len() >= capacity { spare } else { heap::space(capacity) };
     let mut c = Copier {
@@ -74,6 +161,7 @@ fn copy(
         free: 0,
         pinned: Pinned { map: pinned, bounds },
         reached,
+        selectors,
     };
     // SAFETY: `src` and `dst` are distinct live buffers, and `dst` is not resized while copying.
     // Every object reached lies wholly in `src`, as its header says (the heap's invariant: a
@@ -120,6 +208,7 @@ struct Copier<'a> {
     free: usize,
     pinned: Pinned<'a>,
     reached: &'a mut std::collections::HashSet<Word>,
+    selectors: &'a SelectorTable,
 }
 
 impl Copier<'_> {
@@ -146,6 +235,16 @@ impl Copier<'_> {
         if k == kind::IND && *from.add(1) != v {
             return self.indirection(from);
         }
+        if h == THUNK1_HDR && !self.selectors.is_empty() {
+            if let Some(new_addr) = self.evacuate_selector(from) {
+                return new_addr;
+            }
+        }
+        self.copy_object(from, h)
+    }
+
+    #[inline(always)]
+    unsafe fn copy_object(&mut self, from: *mut Word, h: Word) -> Word {
         let total = heap::total_words(h);
         let at = self.free;
         assert!(at + total <= self.cap, "internal: collector out of room");
@@ -167,6 +266,100 @@ impl Copier<'_> {
         *from = kind::FORWARD as Word;
         *from.add(1) = new_addr;
         new_addr
+    }
+
+    /// Short-circuits a chain of selector thunks (bounded depth, cycle-safe) when each thunk's
+    /// captured scrutinee is already a matching `CON`. Returns `Some(new_addr)` if `from` was
+    /// resolved and forwarded, or `None` to fall back to copying `from` normally.
+    ///
+    /// # Safety
+    /// As for `copy`.
+    #[inline(never)]
+    unsafe fn evacuate_selector(&mut self, from: *mut Word) -> Option<Word> {
+        let mut cur_ptr = from;
+        let mut steps = 0u32;
+        for _ in 0..16 {
+            let code = *cur_ptr.add(1);
+            let Some((con_id, field_word)) = self.selectors.get(code) else {
+                break;
+            };
+            // Follow IND / FORWARD chains on the captured scrutinee pointer.
+            let mut scrut = *cur_ptr.add(2);
+            let mut matched: Option<Word> = None;
+            for _ in 0..8 {
+                if scrut == 0 {
+                    break;
+                }
+                let sp = scrut as *const Word;
+                let sh = *sp;
+                let sk = heap::kind_of(sh);
+                if sk == kind::FORWARD || (sk == kind::IND && *sp.add(1) != scrut) {
+                    scrut = *sp.add(1);
+                    continue;
+                }
+                if sk == kind::CON
+                    && heap::aux_of(sh) == con_id
+                    && field_word >= 1
+                    && field_word <= heap::size_of(sh)
+                {
+                    matched = Some(*sp.add(field_word as usize));
+                }
+                break;
+            }
+            let Some(mut target) = matched else {
+                break;
+            };
+            steps += 1;
+            // Follow IND / FORWARD on the selected field (bounded to prevent IND cycles).
+            let mut ind_ok = false;
+            for _ in 0..8 {
+                if target.wrapping_sub(self.base) >= self.span {
+                    if target >= self.pinned.bounds.0 && target <= self.pinned.bounds.1 {
+                        self.pin(target);
+                    }
+                    *from = kind::FORWARD as Word;
+                    *from.add(1) = target;
+                    return Some(target);
+                }
+                let next_ptr = self.src.add(((target - self.base) / 8) as usize);
+                if next_ptr == from {
+                    // Direct or indirect cycle back to `from`: preserve the thunk for blackholing.
+                    return None;
+                }
+                let nh = *next_ptr;
+                let nk = heap::kind_of(nh);
+                if nk == kind::FORWARD {
+                    let new_addr = *next_ptr.add(1);
+                    *from = kind::FORWARD as Word;
+                    *from.add(1) = new_addr;
+                    return Some(new_addr);
+                }
+                if nk == kind::IND && *next_ptr.add(1) != target {
+                    target = *next_ptr.add(1);
+                    continue;
+                }
+                if nh == THUNK1_HDR {
+                    cur_ptr = next_ptr;
+                    ind_ok = true;
+                    break;
+                }
+                let new_addr = self.copy_object(next_ptr, nh);
+                *from = kind::FORWARD as Word;
+                *from.add(1) = new_addr;
+                return Some(new_addr);
+            }
+            if !ind_ok {
+                return None;
+            }
+        }
+        // Only forward if we resolved at least one selector and stopped cleanly (not at depth 16).
+        if steps > 0 && steps < 16 && cur_ptr != from {
+            let new_addr = self.copy_object(cur_ptr, *cur_ptr);
+            *from = kind::FORWARD as Word;
+            *from.add(1) = new_addr;
+            return Some(new_addr);
+        }
+        None
     }
 
     /// A pinned object stays where it is (it holds no pointers); it is only marked as reached.
@@ -283,5 +476,78 @@ mod tests {
         assert_eq!(heap.word(selfish, 1), selfish);
         // The pair, the INT and the self-indirection: 7 words, nothing copied twice.
         assert_eq!(heap.hp, 7);
+    }
+
+    #[test]
+    fn selector_thunk_short_circuits_and_drops_dead_pair_half() {
+        let mut heap = Heap::new(4096);
+        let kept = heap.try_alloc(2, heap::header(kind::INT, 1, 0)).unwrap();
+        heap.set_word(kept, 1, 99);
+        let dead_list = build_list(&mut heap, 200);
+        // Pair (kept, dead_list) with con_id = 1.
+        let pair = heap.try_alloc(3, heap::header(kind::CON, 2, 1)).unwrap();
+        heap.set_word(pair, 1, kept);
+        heap.set_word(pair, 2, dead_list);
+        // Two chained selector thunks: outer selects field 1 of inner_pair, inner_pair selects field 1 of outer_pair.
+        let outer_pair = heap.try_alloc(3, heap::header(kind::CON, 2, 1)).unwrap();
+        heap.set_word(outer_pair, 1, pair);
+        heap.set_word(outer_pair, 2, dead_list);
+        let sel_code: Word = 0x1000_0000;
+        let inner_sel = heap.try_alloc(3, THUNK1_HDR).unwrap();
+        heap.set_word(inner_sel, 1, sel_code);
+        heap.set_word(inner_sel, 2, outer_pair);
+        let outer_sel = heap.try_alloc(3, THUNK1_HDR).unwrap();
+        heap.set_word(outer_sel, 1, sel_code);
+        heap.set_word(outer_sel, 2, inner_sel);
+
+        let table = SelectorTable::new(&[(sel_code, 1, 1)]);
+        // Wait: outer_sel captures inner_sel (a THUNK, not a CON yet), so let's test direct selector
+        // on `pair` (resolved in 1 step) and chained `sel2 -> sel1 -> kept` where `pair` holds `sel1`.
+        let sel1 = heap.try_alloc(3, THUNK1_HDR).unwrap();
+        heap.set_word(sel1, 1, sel_code);
+        heap.set_word(sel1, 2, pair);
+        let pair2 = heap.try_alloc(3, heap::header(kind::CON, 2, 1)).unwrap();
+        heap.set_word(pair2, 1, sel1);
+        heap.set_word(pair2, 2, dead_list);
+        let sel2 = heap.try_alloc(3, THUNK1_HDR).unwrap();
+        heap.set_word(sel2, 1, sel_code);
+        heap.set_word(sel2, 2, pair2);
+
+        let _ = outer_sel;
+        let mut roots = [sel2];
+        collect_with_selectors(&mut heap, &mut roots, 0, &table);
+        let r = roots[0];
+        assert_eq!(heap::kind_of(heap.word(r, 0)), kind::INT);
+        assert_eq!(heap.word(r, 1), 99);
+        // Only the 2-word INT remains live: both pairs, both selector thunks, and the 200-element list were reclaimed!
+        assert_eq!(heap.hp, 2);
+    }
+
+    #[test]
+    fn selector_thunk_cycles_and_mismatched_cons_are_preserved() {
+        let mut heap = Heap::new(4096);
+        let sel_code: Word = 0x2000_0000;
+        // Self-cycle: `a = fst (a, 1)`.
+        let one = heap.try_alloc(2, heap::header(kind::INT, 1, 0)).unwrap();
+        heap.set_word(one, 1, 1);
+        let cyc_pair = heap.try_alloc(3, heap::header(kind::CON, 2, 1)).unwrap();
+        let cyc_sel = heap.try_alloc(3, THUNK1_HDR).unwrap();
+        heap.set_word(cyc_sel, 1, sel_code);
+        heap.set_word(cyc_sel, 2, cyc_pair);
+        heap.set_word(cyc_pair, 1, cyc_sel);
+        heap.set_word(cyc_pair, 2, one);
+        // Constructor mismatch: selector expects con_id = 1, scrutinee has con_id = 7.
+        let wrong_con = heap.try_alloc(3, heap::header(kind::CON, 2, 7)).unwrap();
+        heap.set_word(wrong_con, 1, one);
+        heap.set_word(wrong_con, 2, one);
+        let wrong_sel = heap.try_alloc(3, THUNK1_HDR).unwrap();
+        heap.set_word(wrong_sel, 1, sel_code);
+        heap.set_word(wrong_sel, 2, wrong_con);
+
+        let table = SelectorTable::new(&[(sel_code, 1, 1)]);
+        let mut roots = [cyc_sel, wrong_sel];
+        collect_with_selectors(&mut heap, &mut roots, 0, &table);
+        assert_eq!(heap::kind_of(heap.word(roots[0], 0)), kind::THUNK);
+        assert_eq!(heap::kind_of(heap.word(roots[1], 0)), kind::THUNK);
     }
 }

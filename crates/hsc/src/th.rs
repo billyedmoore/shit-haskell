@@ -1292,9 +1292,23 @@ fn rt_error_text(e: &crate::interp::RtError) -> String {
 pub fn reify_table(local: &[Decl], module: &str, imported: &[(String, DataDecl)], classes: Vec<Expr>, loc: Loc) -> Expr {
     let mut entries = classes;
     let mut locals = Vec::new();
-    collect_data(local, &mut locals);
+    let mut data_fams: Vec<(String, Vec<TyVarBind>)> = Vec::new();
+    let mut rep_datas: Vec<DataDecl> = Vec::new();
+    let mut type_insts: Vec<(String, Vec<Type>, String)> = Vec::new();
+    collect_data(local, &mut locals, &mut data_fams, &mut rep_datas, &mut type_insts);
+    let mut data_insts: Vec<(String, Vec<Type>, DataDecl)> = Vec::new();
+    for (fam, args, rep) in type_insts {
+        if let Some(dd) = rep_datas.iter().find(|d| d.name == rep) {
+            data_insts.push((fam, args, dd.clone()));
+        }
+    }
+    let r_local = Reify { loc, global: None };
     for dd in locals {
-        Reify { loc, global: None }.entries(&dd, module, &mut entries);
+        r_local.entries(&dd, module, &mut entries);
+    }
+    for (fam_name, fam_params) in &data_fams {
+        let insts: Vec<&(String, Vec<Type>, DataDecl)> = data_insts.iter().filter(|(n, _, _)| n == fam_name).collect();
+        r_local.data_family_entries(fam_name, fam_params, &insts, module, &mut entries);
     }
     for (m, dd) in imported {
         Reify { loc, global: Some(m.clone()) }.entries(dd, m, &mut entries);
@@ -1302,11 +1316,40 @@ pub fn reify_table(local: &[Decl], module: &str, imported: &[(String, DataDecl)]
     Expr::List(entries, loc)
 }
 
-fn collect_data(ds: &[Decl], out: &mut Vec<DataDecl>) {
+fn type_head_name(mut t: &Type) -> Option<&str> {
+    while let Type::App(f, _) = t {
+        t = f;
+    }
+    match t {
+        Type::Con(q, _) => Some(&q.name),
+        _ => None,
+    }
+}
+
+fn collect_data(
+    ds: &[Decl],
+    out: &mut Vec<DataDecl>,
+    data_fams: &mut Vec<(String, Vec<TyVarBind>)>,
+    rep_datas: &mut Vec<DataDecl>,
+    type_insts: &mut Vec<(String, Vec<Type>, String)>,
+) {
     for d in ds {
         match d {
-            Decl::Data(dd) if !dd.name.starts_with("R:") => out.push(dd.clone()),
-            Decl::Many(inner) => collect_data(inner, out),
+            Decl::Data(dd) if dd.name.starts_with("R:") => rep_datas.push(dd.clone()),
+            Decl::Data(dd) => out.push(dd.clone()),
+            Decl::TypeFamily { name, params, equations: None, .. } => {
+                if !data_fams.iter().any(|(n, _)| n == name) {
+                    data_fams.push((name.clone(), params.clone()));
+                }
+            }
+            Decl::TypeInstance { name, equation, .. } => {
+                if let Some(rep) = type_head_name(&equation.rhs) {
+                    if rep.starts_with("R:") {
+                        type_insts.push((name.name.clone(), equation.args.clone(), rep.to_string()));
+                    }
+                }
+            }
+            Decl::Many(inner) => collect_data(inner, out, data_fams, rep_datas, type_insts),
             _ => {}
         }
     }
@@ -1340,18 +1383,97 @@ impl Reify {
     /// The quoted name of a type a field mentions.
     fn tycon(&self, q: &QName) -> Expr {
         let qual = match (&self.global, &q.qual) {
-            (Some(_), Some(m)) => Some(format!("%G:{m}")),
+            (Some(_), Some(m)) if !m.starts_with("%G:") => Some(format!("%G:{m}")),
             _ => q.qual.clone(),
         };
         Expr::NameQuote(true, QName { qual, name: q.name.clone() }, self.loc)
     }
 
+    /// A kind as a TH `Kind` value (`Type` and `*` both normalize to `StarT`, as in GHC).
+    fn kind_ty(&self, t: &Type) -> Expr {
+        let appt = |f: Expr, a: Expr| app(app(self.syn("AppT"), f), a);
+        match t {
+            Type::Con(q, _) if q.name == "*" || q.name == "Type" => self.syn("StarT"),
+            Type::Fun(a, b) => appt(appt(self.syn("ArrowT"), self.kind_ty(a)), self.kind_ty(b)),
+            Type::App(f, a) => appt(self.kind_ty(f), self.kind_ty(a)),
+            Type::Sig(x, _) | Type::Forall(_, x) | Type::Qual(_, x) => self.kind_ty(x),
+            _ => self.ty(t),
+        }
+    }
+
+    fn tv_kind(&self, name: &str, tyvars: &[TyVarBind], arity: usize) -> Expr {
+        match tyvars.iter().find(|tv| tv.name == name).and_then(|tv| tv.kind.as_ref()) {
+            Some(k) => self.kind_ty(k),
+            None => self.arity_kind(arity),
+        }
+    }
+
+    fn con_data_con_info(&self, c: &ConDecl, parent: &str, default_result: &Expr, default_tyvars: &[TyVarBind]) -> Expr {
+        let loc = self.loc;
+        let kinded = |name: &str, flag: &str| {
+            let arity = Self::con_var_arity(c, name);
+            let k = self.tv_kind(name, &c.exist, arity);
+            let k = if c.exist.iter().any(|tv| tv.name == name && tv.kind.is_some()) {
+                k
+            } else {
+                self.tv_kind(name, default_tyvars, arity)
+            };
+            app(app(app(self.syn("KindedTV"), self.mk_name(name)), self.syn(flag)), k)
+        };
+        let fields: Vec<Type> = match &c.fields {
+            ConFields::Positional(fs) => fs.iter().map(|f| f.ty.clone()).collect(),
+            ConFields::Record(groups) => groups.iter().flat_map(|(ns, f)| ns.iter().map(move |_| f.ty.clone())).collect(),
+        };
+        // `a %1 -> r`, as GHC reifies a constructor's fields (`MulArrowT` at `One`).
+        let one = app(self.syn("PromotedT"), Expr::NameQuote(false, QName { qual: Some("%G:GHC.Types".into()), name: "One".into() }, loc));
+        let arrow = app(app(self.syn("AppT"), self.syn("MulArrowT")), one);
+        let mut ty = match &c.gadt_result {
+            Some(res) => self.ty(res),
+            None => default_result.clone(),
+        };
+        for f in fields.iter().rev() {
+            ty = app(app(self.syn("AppT"), app(app(self.syn("AppT"), arrow.clone()), self.ty(f))), ty);
+        }
+        let qvars: Vec<String> = if c.gadt_result.is_some() {
+            Self::con_free_vars(c)
+        } else {
+            let mut vs: Vec<String> = default_tyvars.iter().map(|tv| tv.name.clone()).collect();
+            for tv in &c.exist {
+                if !vs.contains(&tv.name) {
+                    vs.push(tv.name.clone());
+                }
+            }
+            vs
+        };
+        if !qvars.is_empty() || !c.context.is_empty() {
+            let binders: Vec<Expr> = qvars.iter().map(|v| kinded(v, "SpecifiedSpec")).collect();
+            let cxt: Vec<Expr> = c.context.iter().map(|p| self.ty(p)).collect();
+            ty = app(app(app(self.syn("ForallT"), Expr::List(binders, loc)), Expr::List(cxt, loc)), ty);
+        }
+        app(app(app(self.syn("DataConI"), self.own(false, &c.name)), ty), self.own(true, parent))
+    }
+
     fn entries(&self, dd: &DataDecl, module: &str, out: &mut Vec<Expr>) {
         let loc = self.loc;
         let entry = |occ: &str, info: Expr| Expr::Tuple(vec![Some(self.str(module)), Some(self.str(occ)), Some(info)], loc);
-        // Binders as GHC reifies them: kinded, at `Type` (the kinds are not inferred here).
-        let kinded = |name: &str, flag: &str| app(app(app(self.syn("KindedTV"), self.mk_name(name)), self.syn(flag)), self.syn("StarT"));
-        let tvs: Vec<Expr> = dd.tyvars.iter().map(|tv| kinded(&tv.name, "BndrReq")).collect();
+        let tvs: Vec<Expr> = dd
+            .tyvars
+            .iter()
+            .map(|tv| {
+                let k = match &tv.kind {
+                    Some(k) => self.kind_ty(k),
+                    None => {
+                        let arity = Self::dd_var_arity(dd, &tv.name);
+                        if arity == 0 && !Self::dd_var_in_fields(dd, &tv.name) {
+                            app(self.syn("VarT"), self.mk_name(&format!("k_{}", tv.name)))
+                        } else {
+                            self.arity_kind(arity)
+                        }
+                    }
+                };
+                app(app(app(self.syn("KindedTV"), self.mk_name(&tv.name)), self.syn("BndrReq")), k)
+            })
+            .collect();
         let cons: Vec<Expr> = dd.cons.iter().map(|c| self.con(c)).collect();
         let nothing = Expr::Con(QName { qual: Some("%G:GHC.Internal.Maybe".into()), name: "Nothing".into() }, loc);
         let empty = Expr::List(Vec::new(), loc);
@@ -1369,24 +1491,156 @@ impl Reify {
             app(app(self.syn("AppT"), acc), app(self.syn("VarT"), self.mk_name(&tv.name)))
         });
         for c in &dd.cons {
-            let fields: Vec<Type> = match &c.fields {
-                ConFields::Positional(fs) => fs.iter().map(|f| f.ty.clone()).collect(),
-                ConFields::Record(groups) => groups.iter().flat_map(|(ns, f)| ns.iter().map(move |_| f.ty.clone())).collect(),
-            };
-            // `a %1 -> r`, as GHC reifies a constructor's fields (`MulArrowT` at `One`).
-            let one = app(self.syn("PromotedT"), Expr::NameQuote(false, QName { qual: Some("%G:GHC.Types".into()), name: "One".into() }, loc));
-            let arrow = app(app(self.syn("AppT"), self.syn("MulArrowT")), one);
-            let mut ty = result.clone();
-            for f in fields.iter().rev() {
-                ty = app(app(self.syn("AppT"), app(app(self.syn("AppT"), arrow.clone()), self.ty(f))), ty);
-            }
-            if !dd.tyvars.is_empty() {
-                let binders = dd.tyvars.iter().map(|tv| kinded(&tv.name, "SpecifiedSpec")).collect();
-                ty = app(app(app(self.syn("ForallT"), Expr::List(binders, loc)), empty.clone()), ty);
-            }
-            let info = app(app(app(self.syn("DataConI"), self.own(false, &c.name)), ty), self.own(true, &dd.name));
+            let info = self.con_data_con_info(c, &dd.name, &result, &dd.tyvars);
             out.push(entry(&c.name, info));
         }
+    }
+
+    fn data_family_entries(&self, fam_name: &str, fam_params: &[TyVarBind], insts: &[&(String, Vec<Type>, DataDecl)], module: &str, out: &mut Vec<Expr>) {
+        let loc = self.loc;
+        let entry = |occ: &str, info: Expr| Expr::Tuple(vec![Some(self.str(module)), Some(self.str(occ)), Some(info)], loc);
+        let nothing = Expr::Con(QName { qual: Some("%G:GHC.Internal.Maybe".into()), name: "Nothing".into() }, loc);
+        let empty = Expr::List(Vec::new(), loc);
+        let tvs: Vec<Expr> = fam_params
+            .iter()
+            .map(|tv| {
+                let k = match &tv.kind {
+                    Some(k) => self.kind_ty(k),
+                    None => self.syn("StarT"),
+                };
+                app(app(app(self.syn("KindedTV"), self.mk_name(&tv.name)), self.syn("BndrReq")), k)
+            })
+            .collect();
+        let fam_dec = app(app(app(self.syn("DataFamilyD"), self.own(true, fam_name)), Expr::List(tvs, loc)), nothing.clone());
+        let mut inst_decs = Vec::new();
+        for (_, args, dd) in insts {
+            let inst_ty = args.iter().fold(app(self.syn("ConT"), self.own(true, fam_name)), |acc, a| {
+                app(app(self.syn("AppT"), acc), self.ty(a))
+            });
+            let cons: Vec<Expr> = dd.cons.iter().map(|c| self.con(c)).collect();
+            let idec = if dd.newtype && cons.len() == 1 {
+                app(
+                    app(
+                        app(app(app(app(self.syn("NewtypeInstD"), empty.clone()), nothing.clone()), inst_ty.clone()), nothing.clone()),
+                        cons[0].clone(),
+                    ),
+                    empty.clone(),
+                )
+            } else {
+                app(
+                    app(
+                        app(app(app(app(self.syn("DataInstD"), empty.clone()), nothing.clone()), inst_ty.clone()), nothing.clone()),
+                        Expr::List(cons, loc),
+                    ),
+                    empty.clone(),
+                )
+            };
+            inst_decs.push(idec);
+            for c in &dd.cons {
+                let info = self.con_data_con_info(c, fam_name, &inst_ty, &dd.tyvars);
+                out.push(entry(&c.name, info));
+            }
+        }
+        let info = app(app(self.syn("FamilyI"), fam_dec), Expr::List(inst_decs, loc));
+        out.push(entry(fam_name, info));
+    }
+
+    fn ast_var_arity(t: &Type, v: &str) -> usize {
+        let mut head = t;
+        let mut n = 0usize;
+        while let Type::App(f, _) = head {
+            n += 1;
+            head = f;
+        }
+        let here = if matches!(head, Type::Var(name, _) if name == v) { n } else { 0 };
+        let inner = match t {
+            Type::App(f, a) | Type::Fun(f, a) => Self::ast_var_arity(f, v).max(Self::ast_var_arity(a, v)),
+            Type::List(e, _) | Type::Sig(e, _) => Self::ast_var_arity(e, v),
+            Type::Tuple(ts, _) => ts.iter().map(|x| Self::ast_var_arity(x, v)).max().unwrap_or(0),
+            Type::Forall(bs, b) => {
+                if bs.iter().any(|tv| tv.name == v) {
+                    0
+                } else {
+                    Self::ast_var_arity(b, v)
+                }
+            }
+            Type::Qual(ps, b) => {
+                ps.iter().map(|p| Self::ast_var_arity(p, v)).max().unwrap_or(0).max(Self::ast_var_arity(b, v))
+            }
+            _ => 0,
+        };
+        here.max(inner)
+    }
+
+    fn con_var_arity(c: &ConDecl, v: &str) -> usize {
+        let mut a = c.context.iter().map(|p| Self::ast_var_arity(p, v)).max().unwrap_or(0);
+        match &c.fields {
+            ConFields::Positional(fs) => {
+                for f in fs {
+                    a = a.max(Self::ast_var_arity(&f.ty, v));
+                }
+            }
+            ConFields::Record(groups) => {
+                for (_, f) in groups {
+                    a = a.max(Self::ast_var_arity(&f.ty, v));
+                }
+            }
+        }
+        if let Some(res) = &c.gadt_result {
+            a = a.max(Self::ast_var_arity(res, v));
+        }
+        a
+    }
+
+    fn dd_var_arity(dd: &DataDecl, v: &str) -> usize {
+        dd.cons.iter().map(|c| Self::con_var_arity(c, v)).max().unwrap_or(0)
+    }
+
+    fn dd_var_in_fields(dd: &DataDecl, v: &str) -> bool {
+        let mut vs = Vec::new();
+        for c in &dd.cons {
+            match &c.fields {
+                ConFields::Positional(fs) => {
+                    for f in fs {
+                        crate::tc::derive::type_vars(&f.ty, &mut vs);
+                    }
+                }
+                ConFields::Record(groups) => {
+                    for (_, f) in groups {
+                        crate::tc::derive::type_vars(&f.ty, &mut vs);
+                    }
+                }
+            }
+        }
+        vs.iter().any(|x| x == v)
+    }
+
+    fn con_free_vars(c: &ConDecl) -> Vec<String> {
+        let mut vs = Vec::new();
+        for tv in &c.exist {
+            if !vs.contains(&tv.name) {
+                vs.push(tv.name.clone());
+            }
+        }
+        for p in &c.context {
+            crate::tc::derive::type_vars(p, &mut vs);
+        }
+        match &c.fields {
+            ConFields::Positional(fs) => {
+                for f in fs {
+                    crate::tc::derive::type_vars(&f.ty, &mut vs);
+                }
+            }
+            ConFields::Record(groups) => {
+                for (_, f) in groups {
+                    crate::tc::derive::type_vars(&f.ty, &mut vs);
+                }
+            }
+        }
+        if let Some(res) = &c.gadt_result {
+            crate::tc::derive::type_vars(res, &mut vs);
+        }
+        vs
     }
 
     fn bang_type(&self, f: &Field) -> Expr {
@@ -1397,26 +1651,56 @@ impl Reify {
 
     fn con(&self, c: &ConDecl) -> Expr {
         let loc = self.loc;
-        match &c.fields {
-            ConFields::Positional(fs) if c.infix && fs.len() == 2 => {
-                app(app(app(self.syn("InfixC"), self.bang_type(&fs[0])), self.own(false, &c.name)), self.bang_type(&fs[1]))
-            }
-            ConFields::Positional(fs) => {
-                app(app(self.syn("NormalC"), self.own(false, &c.name)), Expr::List(fs.iter().map(|f| self.bang_type(f)).collect(), loc))
-            }
-            ConFields::Record(groups) => {
-                let mut fields = Vec::new();
-                for (names, f) in groups {
-                    for n in names {
-                        let Expr::Tuple(mut bt, _) = self.bang_type(f) else { unreachable!() };
-                        let ty = bt.pop().flatten().expect("type");
-                        let bang = bt.pop().flatten().expect("bang");
-                        let label = crate::rename::iface::field_label(n);
-                        fields.push(Expr::Tuple(vec![Some(self.own(false, label)), Some(bang), Some(ty)], loc));
-                    }
+        let kinded = |name: &str| {
+            let k = self.tv_kind(name, &c.exist, Self::con_var_arity(c, name));
+            app(app(app(self.syn("KindedTV"), self.mk_name(name)), self.syn("SpecifiedSpec")), k)
+        };
+        let record_fields = |groups: &[(Vec<String>, Field)]| -> Expr {
+            let mut fields = Vec::new();
+            for (names, f) in groups {
+                for n in names {
+                    let Expr::Tuple(mut bt, _) = self.bang_type(f) else { unreachable!() };
+                    let ty = bt.pop().flatten().expect("type");
+                    let bang = bt.pop().flatten().expect("bang");
+                    let label = crate::rename::iface::field_label(n);
+                    fields.push(Expr::Tuple(vec![Some(self.own(false, label)), Some(bang), Some(ty)], loc));
                 }
-                app(app(self.syn("RecC"), self.own(false, &c.name)), Expr::List(fields, loc))
             }
+            Expr::List(fields, loc)
+        };
+        let (base, qvars) = if let Some(res) = &c.gadt_result {
+            let names = Expr::List(vec![self.own(false, &c.name)], loc);
+            let res_ty = self.ty(res);
+            let gadt = match &c.fields {
+                ConFields::Positional(fs) => {
+                    let bts = Expr::List(fs.iter().map(|f| self.bang_type(f)).collect(), loc);
+                    app(app(app(self.syn("GadtC"), names), bts), res_ty)
+                }
+                ConFields::Record(groups) => {
+                    app(app(app(self.syn("RecGadtC"), names), record_fields(groups)), res_ty)
+                }
+            };
+            (gadt, Self::con_free_vars(c))
+        } else {
+            let vanilla = match &c.fields {
+                ConFields::Positional(fs) if c.infix && fs.len() == 2 => {
+                    app(app(app(self.syn("InfixC"), self.bang_type(&fs[0])), self.own(false, &c.name)), self.bang_type(&fs[1]))
+                }
+                ConFields::Positional(fs) => {
+                    app(app(self.syn("NormalC"), self.own(false, &c.name)), Expr::List(fs.iter().map(|f| self.bang_type(f)).collect(), loc))
+                }
+                ConFields::Record(groups) => {
+                    app(app(self.syn("RecC"), self.own(false, &c.name)), record_fields(groups))
+                }
+            };
+            (vanilla, c.exist.iter().map(|tv| tv.name.clone()).collect())
+        };
+        if !qvars.is_empty() || !c.context.is_empty() {
+            let binders: Vec<Expr> = qvars.iter().map(|v| kinded(v)).collect();
+            let cxt: Vec<Expr> = c.context.iter().map(|p| self.ty(p)).collect();
+            app(app(app(self.syn("ForallC"), Expr::List(binders, loc)), Expr::List(cxt, loc)), base)
+        } else {
+            base
         }
     }
 
@@ -1428,6 +1712,7 @@ impl Reify {
         match t {
             Type::Var(v, _) => app(self.syn("VarT"), self.mk_name(v)),
             Type::Con(q, _) => match q.name.as_str() {
+                "*" => self.syn("StarT"),
                 "[]" => self.syn("ListT"),
                 "->" => self.syn("ArrowT"),
                 "()" => tuple(0),
@@ -1454,8 +1739,15 @@ impl Reify {
 /// as `VarI name type Nothing`. It sets `hscReifyValues` when its one binding is forced.
 /// The `reify` entries of classes (`ClassI`, with the class's instances), for the classes a
 /// splice quotes: each class with its module and instances.
-pub fn class_entries(classes: &[(String, &crate::tc::env::ClassInfo, Vec<&crate::tc::env::InstInfo>)], loc: Loc) -> Vec<Expr> {
-    classes.iter().map(|(module, info, insts)| Reify { loc, global: Some(module.clone()) }.class_entry(module, info, insts)).collect()
+pub fn class_entries(
+    classes: &[(String, &crate::tc::env::ClassInfo, Vec<&crate::tc::env::InstInfo>)],
+    local_insts: &[&crate::syntax::ast::InstDecl],
+    loc: Loc,
+) -> Vec<Expr> {
+    classes
+        .iter()
+        .map(|(module, info, insts)| Reify { loc, global: Some(module.clone()) }.class_entry(module, info, insts, local_insts))
+        .collect()
 }
 
 /// The most arguments `Gen(i)` is applied to in a type (0 when it is not applied): the arity of
@@ -1509,7 +1801,13 @@ pub fn prim_entry(occ: &str, loc: Loc) -> Expr {
 }
 
 impl Reify {
-    fn class_entry(&self, module: &str, info: &crate::tc::env::ClassInfo, insts: &[&crate::tc::env::InstInfo]) -> Expr {
+    fn class_entry(
+        &self,
+        module: &str,
+        info: &crate::tc::env::ClassInfo,
+        insts: &[&crate::tc::env::InstInfo],
+        local_insts: &[&crate::syntax::ast::InstDecl],
+    ) -> Expr {
         let loc = self.loc;
         let occ = crate::tc::types::unqualify(&info.name).to_string();
         let params: Vec<String> = (0..info.nparams).map(|i| format!("a{i}")).collect();
@@ -1568,7 +1866,7 @@ impl Reify {
         let class_name = self.own(true, &occ);
         let dec = app(app(app(app(app(self.syn("ClassD"), list(supers)), class_name), list(tvs)), list(fundeps)), list(sigs));
         let nothing = Expr::Con(QName { qual: Some("%G:GHC.Internal.Maybe".into()), name: "Nothing".into() }, loc);
-        let instances = insts
+        let mut instances: Vec<Expr> = insts
             .iter()
             .map(|inst| {
                 let names: Vec<String> = (0..inst.nvars).map(|i| format!("t{i}")).collect();
@@ -1580,6 +1878,26 @@ impl Reify {
                 app(app(app(app(self.syn("InstanceD"), nothing.clone()), list(ctx)), head), list(Vec::new()))
             })
             .collect();
+        // Instances declared earlier in the same module (including by earlier declaration splices)
+        // are not yet in `checker.env.instances`; include them so `reifyInstances` observes them.
+        let r_local = Reify { loc, global: None };
+        for id in local_insts {
+            let mut h = &id.head;
+            let mut args = Vec::new();
+            while let Type::App(f, a) = h {
+                args.push(a.as_ref());
+                h = f;
+            }
+            if !matches!(h, Type::Con(q, _) if q.name == occ) {
+                continue;
+            }
+            args.reverse();
+            let head = args
+                .into_iter()
+                .fold(app(self.syn("ConT"), self.own(true, &occ)), |acc, a| app(app(self.syn("AppT"), acc), r_local.ty(a)));
+            let ctx: Vec<Expr> = id.context.iter().map(|p| r_local.ty(p)).collect();
+            instances.push(app(app(app(app(self.syn("InstanceD"), nothing.clone()), list(ctx)), head), list(Vec::new())));
+        }
         let info_e = app(app(self.syn("ClassI"), dec), list(instances));
         Expr::Tuple(vec![Some(self.str(module)), Some(self.str(&occ)), Some(info_e)], loc)
     }

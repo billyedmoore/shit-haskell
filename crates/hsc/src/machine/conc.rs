@@ -104,18 +104,61 @@ impl Drop for CStack {
     }
 }
 
-/// A coroutine's saved stack pointer (boxed: `hsc_coro_swap` writes it while the table changes).
+/// A coroutine's saved stack pointer and suspended Haskell context (boxed for stable address).
 pub struct Coro {
     sp: usize,
     stack: Option<CStack>,
+    ctx: Ctx,
+    suspended: bool,
 }
 
-/// The coroutines of the threads that are not running, and the stacks of finished ones (freed
-/// by the next thread to run: a stack cannot be freed while it is in use).
-#[derive(Default)]
+/// The coroutines of the threads, indexed directly by `Tid`, and the stacks of finished ones
+/// (freed by the next thread to run: a stack cannot be freed while it is in use).
 pub struct Coros {
-    map: crate::sched::IntMap<Tid, Box<Coro>>,
+    slots: Vec<Option<Box<Coro>>>,
     dead: Vec<CStack>,
+}
+
+impl Default for Coros {
+    fn default() -> Self {
+        let main_coro = Box::new(Coro { sp: 0, stack: None, ctx: Ctx::empty(), suspended: false });
+        Coros { slots: vec![None, Some(main_coro)], dead: Vec::new() }
+    }
+}
+
+impl Coros {
+    #[inline(always)]
+    fn get_mut(&mut self, id: Tid) -> &mut Coro {
+        let idx = id as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize_with(idx + 1, || None);
+        }
+        self.slots[idx]
+            .get_or_insert_with(|| Box::new(Coro { sp: 0, stack: None, ctx: Ctx::empty(), suspended: false }))
+    }
+
+    fn insert(&mut self, id: Tid, coro: Box<Coro>) {
+        let idx = id as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize_with(idx + 1, || None);
+        }
+        self.slots[idx] = Some(coro);
+    }
+
+    fn remove(&mut self, id: Tid) -> Option<Box<Coro>> {
+        self.slots.get_mut(id as usize).and_then(Option::take)
+    }
+
+    /// Roots of every suspended thread's context, for the collector.
+    pub fn roots(&mut self, out: &mut Vec<*mut Word>) {
+        for slot in self.slots.iter_mut() {
+            if let Some(c) = slot.as_deref_mut() {
+                if c.suspended {
+                    c.ctx.roots(out);
+                }
+            }
+        }
+    }
 }
 
 /// What a new coroutine starts with.
@@ -125,21 +168,6 @@ struct Start {
     slot: usize,
     /// Its Haskell stack.
     stack: CStack,
-}
-
-/// Continues on thread `next`'s coroutine; returns when this one (`me`) runs again.
-///
-/// # Safety
-/// The caller holds no reference into the machine; `next` was suspended by a switch or is new.
-unsafe fn swap_to(mp: *mut Machine, me: Tid, next: Tid) {
-    let coros = &mut (*mp).coros;
-    let to = match coros.map.get(&next) {
-        Some(c) => c.sp,
-        None => panic!("internal: thread {next} has no coroutine"),
-    };
-    let mine: *mut usize = &mut coros.map.entry(me).or_insert_with(|| Box::new(Coro { sp: 0, stack: None })).sp;
-    hsc_coro_swap(mine, to);
-    (*mp).coros.dead.clear();
 }
 
 /// The body of a forked thread's coroutine: it runs the action and ends the thread.
@@ -152,6 +180,7 @@ extern "C" fn coro_main(arg: usize) {
             let m = &mut *mp;
             let action = std::mem::replace(&mut m.stable[slot], 0);
             m.tid = id;
+            m.prim_nargs = 0;
             m.saved_args.clear();
             m.stm_log.clear();
             m.stm_depth = 0;
@@ -178,12 +207,12 @@ extern "C" fn coro_main(arg: usize) {
         let next = (*mp).sched.finish_pick();
         // This coroutine is done: its stack goes once the next one runs.
         let coros = &mut (*mp).coros;
-        if let Some(mut c) = coros.map.remove(&id) {
+        if let Some(mut c) = coros.remove(id) {
             if let Some(st) = c.stack.take() {
                 coros.dead.push(st);
             }
         }
-        let to = match coros.map.get(&next) {
+        let to = match coros.slots.get(next as usize).and_then(|o| o.as_deref()) {
             Some(c) => c.sp,
             None => panic!("internal: thread {next} has no coroutine"),
         };
@@ -253,9 +282,12 @@ fn worker() -> Option<Worker> {
 /// In the child of a `fork`: only the running thread exists, and no worker OS thread.
 pub fn after_fork(m: &mut Machine) {
     m.sched.only_current();
-    m.suspended.clear();
-    let me = m.sched.current();
-    m.coros.map.retain(|t, _| *t == me);
+    let me = m.sched.current() as usize;
+    for (i, slot) in m.coros.slots.iter_mut().enumerate() {
+        if i != me {
+            *slot = None;
+        }
+    }
     WORKERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
@@ -280,6 +312,7 @@ pub struct Ctx {
     nargs: Word,
     code: Word,
     args: [Word; ARG_SLOTS],
+    args_len: usize,
     exc: Word,
     saved_args: Vec<[Word; ARG_SLOTS]>,
     prim_failed: bool,
@@ -289,43 +322,76 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    fn save(m: &mut Machine) -> Ctx {
+    fn empty() -> Ctx {
         Ctx {
-            sp: m.sp,
-            top: m.top,
-            r1: m.r1,
-            nargs: m.nargs,
-            code: m.code,
-            args: m.args,
-            exc: m.exc,
-            saved_args: std::mem::take(&mut m.saved_args),
-            prim_failed: m.prim_failed,
-            stm_log: std::mem::take(&mut m.stm_log),
-            stm_depth: m.stm_depth,
-            stm_retry: m.stm_retry,
+            sp: 0,
+            top: 0,
+            r1: 0,
+            nargs: 0,
+            code: 0,
+            args: [0; ARG_SLOTS],
+            args_len: 0,
+            exc: 0,
+            saved_args: Vec::new(),
+            prim_failed: false,
+            stm_log: Vec::new(),
+            stm_depth: 0,
+            stm_retry: false,
         }
     }
 
-    fn restore(self, m: &mut Machine, tid: Tid) {
+    #[inline]
+    fn save_into(&mut self, m: &mut Machine) {
+        self.sp = m.sp;
+        self.top = m.top;
+        self.r1 = m.r1;
+        self.nargs = m.nargs;
+        self.code = m.code;
+        self.exc = m.exc;
+        self.prim_failed = m.prim_failed;
+        self.stm_depth = m.stm_depth;
+        self.stm_retry = m.stm_retry;
+        if !m.saved_args.is_empty() {
+            std::mem::swap(&mut self.saved_args, &mut m.saved_args);
+            self.args_len = ARG_SLOTS;
+            self.args = m.args;
+        } else {
+            let k = m.prim_nargs;
+            self.args_len = k;
+            self.args[..k].copy_from_slice(&m.args[..k]);
+        }
+        if !m.stm_log.is_empty() {
+            std::mem::swap(&mut self.stm_log, &mut m.stm_log);
+        }
+    }
+
+    #[inline]
+    fn restore_from(&mut self, m: &mut Machine, tid: Tid) {
         m.sp = self.sp;
         m.top = self.top;
         m.r1 = self.r1;
         m.nargs = self.nargs;
         m.code = self.code;
-        m.args = self.args;
         m.exc = self.exc;
-        m.saved_args = self.saved_args;
         m.prim_failed = self.prim_failed;
-        m.stm_log = self.stm_log;
         m.stm_depth = self.stm_depth;
         m.stm_retry = self.stm_retry;
         m.tid = tid;
+        let k = self.args_len;
+        m.prim_nargs = k;
+        m.args[..k].copy_from_slice(&self.args[..k]);
+        if !self.saved_args.is_empty() {
+            std::mem::swap(&mut m.saved_args, &mut self.saved_args);
+        }
+        if !self.stm_log.is_empty() {
+            std::mem::swap(&mut m.stm_log, &mut self.stm_log);
+        }
     }
 
     /// The heap pointers of the context, for the collector.
     pub fn roots(&mut self, out: &mut Vec<*mut Word>) {
         super::stack_roots(self.sp, self.top, out);
-        for a in self.args.iter_mut() {
+        for a in self.args[..self.args_len].iter_mut() {
             out.push(a);
         }
         for saved in self.saved_args.iter_mut() {
@@ -342,11 +408,6 @@ impl Ctx {
     }
 }
 
-/// Gives the turn to the next thread (the running one has been queued or blocked in the
-/// scheduler) and returns when this one has it again, with its registers back.
-///
-/// The machine is only reached through the pointer: other threads change it meanwhile.
-#[inline(never)]
 /// Runs a safe foreign call: when other threads exist, on a worker OS thread while this one is
 /// blocked and the others run (errno comes back with the result).
 pub fn foreign_call<R>(m: &mut Machine, interruptible: bool, call: impl FnOnce() -> R) -> R {
@@ -393,16 +454,31 @@ pub fn switch(mp: *mut Machine) {
     // SAFETY: the caller holds the baton; the machine outlives every thread.
     unsafe {
         loop {
-            start_signal_handlers(&mut *mp);
+            if crate::signals::pending() {
+                start_signal_handlers(&mut *mp);
+            }
             let me = (*mp).sched.current();
-            let ctx = Ctx::save(&mut *mp);
-            (*mp).suspended.insert(me, ctx);
             let next = (*mp).sched.pick_next();
             if next != me {
-                swap_to(mp, me, next);
-            }
-            if let Some(ctx) = (*mp).suspended.remove(&me) {
-                ctx.restore(&mut *mp, me);
+                let (from_sp, to) = {
+                    let m = &mut *mp;
+                    let me_coro: *mut Coro = m.coros.get_mut(me);
+                    (*me_coro).ctx.save_into(m);
+                    (*me_coro).suspended = true;
+                    let to = match m.coros.slots.get(next as usize).and_then(|o| o.as_deref()) {
+                        Some(c) => c.sp,
+                        None => panic!("internal: thread {next} has no coroutine"),
+                    };
+                    (std::ptr::addr_of_mut!((*me_coro).sp), to)
+                };
+                hsc_coro_swap(from_sp, to);
+                let m = &mut *mp;
+                if !m.coros.dead.is_empty() {
+                    m.coros.dead.clear();
+                }
+                let me_coro: *mut Coro = m.coros.get_mut(me);
+                (*me_coro).suspended = false;
+                (*me_coro).ctx.restore_from(m, me);
             }
             if !(*mp).sched.take_signal_wake() {
                 break;
@@ -583,7 +659,7 @@ fn fork(m: &mut Machine, action: Word) -> Word {
         // SAFETY: the top of the new stack, below its end.
         unsafe { *((sp + 8 * i) as *mut usize) = *w };
     }
-    m.coros.map.insert(id, Box::new(Coro { sp, stack: Some(stack) }));
+    m.coros.insert(id, Box::new(Coro { sp, stack: Some(stack), ctx: Ctx::empty(), suspended: false }));
     let t = int_value(m, id as i64);
     state_pair(m, t)
 }
@@ -743,6 +819,115 @@ fn atomically(mp: *mut Machine) -> Option<Word> {
         let m = unsafe { &mut *mp };
         if check(m) {
             return Some(0);
+        }
+    }
+}
+
+/// Pre-classified hot concurrency primitives dispatched directly from `hsc_prim`.
+#[derive(Clone, Copy)]
+pub enum ConcOp {
+    TakeMVar,
+    PutMVar,
+    ReadMVar,
+    TryTakeMVar,
+    TryPutMVar,
+}
+
+#[inline(always)]
+fn force_mvar(m: &mut Machine) -> Option<Word> {
+    let mv = m.args[0];
+    if mv != 0 && heap::kind_of(m.heap_get(mv, 0)) == kind::MVAR {
+        return Some(mv);
+    }
+    force_arg(m, 0)
+}
+
+impl ConcOp {
+    pub fn classify(name: &str) -> Option<Self> {
+        Some(match name {
+            "takeMVar#" => Self::TakeMVar,
+            "putMVar#" => Self::PutMVar,
+            "readMVar#" => Self::ReadMVar,
+            "tryTakeMVar#" => Self::TryTakeMVar,
+            "tryPutMVar#" => Self::TryPutMVar,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    pub fn run_fast(self, mp: *mut Machine) -> Word {
+        // SAFETY: machine is owned by the running thread until `wait` switches.
+        let m = unsafe { &mut *mp };
+        match self {
+            Self::TakeMVar => {
+                let Some(mv) = force_mvar(m) else { return 0 };
+                let v = m.heap_get(mv, 1);
+                let v = if v != 0 {
+                    let key = key_of(m, mv);
+                    m.heap_set(mv + 8, 0);
+                    if m.sched.front_kind(key) == Some(WaitKind::Putter) {
+                        if let Some(w) = m.sched.pop_waiter(key) {
+                            m.heap_set(mv + 8, w.value.unwrap_or(0));
+                            m.sched.wake(w.thread, None);
+                        }
+                    }
+                    v
+                } else {
+                    match wait(mp, WaitKind::Taker, None) {
+                        Some(v) => v,
+                        None => return 0,
+                    }
+                };
+                // SAFETY: this thread has the turn.
+                let m = unsafe { &mut *mp };
+                super::prims_mem::state_pair_rooted(m, v)
+            }
+            Self::PutMVar => {
+                let Some(mv) = force_mvar(m) else { return 0 };
+                let v = m.args[1];
+                if m.heap_get(mv, 1) != 0 {
+                    if wait(mp, WaitKind::Putter, Some(v)).is_none() {
+                        return 0;
+                    }
+                } else {
+                    put_empty(m, v);
+                }
+                // SAFETY: this thread has the turn.
+                let m = unsafe { &mut *mp };
+                unit(m)
+            }
+            Self::ReadMVar => {
+                let Some(mv) = force_mvar(m) else { return 0 };
+                let v = match m.heap_get(mv, 1) {
+                    0 => match wait(mp, WaitKind::Reader, None) {
+                        Some(v) => v,
+                        None => return 0,
+                    },
+                    v => v,
+                };
+                // SAFETY: this thread has the turn.
+                let m = unsafe { &mut *mp };
+                super::prims_mem::state_pair_rooted(m, v)
+            }
+            Self::TryTakeMVar => {
+                m.reserve(16);
+                let Some(_) = force_mvar(m) else { return 0 };
+                match take_full(m) {
+                    Some(v) => triple(m, 1, v),
+                    None => triple(m, 0, 0),
+                }
+            }
+            Self::TryPutMVar => {
+                m.reserve(16);
+                let Some(mv) = force_mvar(m) else { return 0 };
+                let ok = m.heap_get(mv, 1) == 0;
+                if ok {
+                    let v = m.args[1];
+                    put_empty(m, v);
+                }
+                let f = int_value(m, ok as i64);
+                state_pair(m, f)
+            }
         }
     }
 }

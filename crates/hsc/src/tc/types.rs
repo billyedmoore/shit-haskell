@@ -366,6 +366,10 @@ impl Metas {
     /// Unification for matching a constructor's result type against a scrutinee: an
     /// unbound rigid variable is refined to the other side, for the rest of the alternative.
     pub fn unify_refine(&mut self, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
+        self.unify_refine_collecting(a, b, &mut Vec::new())
+    }
+
+    pub fn unify_refine_collecting(&mut self, a: &Ty, b: &Ty, fam_eqs: &mut Vec<(Ty, Ty)>) -> Result<(), UnifyError> {
         let a = self.prune(a);
         let b = self.prune(b);
         // An unknown equal to a family application is that application (a pattern variable's
@@ -374,7 +378,9 @@ impl Metas {
             return self.unify(&a, &b);
         }
         // A rigid variable equal to an irreducible family application stands for it (`g ~ F a`).
-        // Otherwise a family application cannot be refined, and its equality is not used.
+        // Any remaining stuck family equality (`FoldRequired mods ~ 'False` from matching `SFalse`
+        // against `SBool (FoldRequired mods)`) is returned to the caller so GADT pattern matching
+        // can add it as a local given equality.
         if self.is_family_app(&a) || self.is_family_app(&b) {
             match (&a, &b) {
                 (Ty::Skol(x, _), t) | (t, Ty::Skol(x, _)) if !self.is_family_app(&Ty::Skol(*x, String::new())) => {
@@ -385,10 +391,20 @@ impl Metas {
                 }
                 _ => {}
             }
+            fam_eqs.push((a, b));
             return Ok(());
         }
         match (&a, &b) {
             (Ty::Skol(x, _), Ty::Skol(y, _)) if x == y => Ok(()),
+            (Ty::Skol(x, _), Ty::Skol(y, _)) => {
+                // Refine the newer (inner/existential) skolem to the older (outer) one so
+                // an existential skolem from a pattern branch cannot escape to an outer type.
+                let (from, to) = if x > y { (*x, b.clone()) } else { (*y, a.clone()) };
+                if !self.skol_in(from, &to) {
+                    self.skol_binds.insert(from, to);
+                }
+                Ok(())
+            }
             // An unknown type is determined by the other side, not refined around.
             (Ty::Meta(_), _) | (_, Ty::Meta(_)) => self.unify(&a, &b),
             (Ty::Skol(x, _), t) | (t, Ty::Skol(x, _)) => {
@@ -398,8 +414,8 @@ impl Metas {
                 Ok(())
             }
             (Ty::App(f1, a1), Ty::App(f2, a2)) => {
-                self.unify_refine(f1, f2)?;
-                self.unify_refine(a1, a2)
+                self.unify_refine_collecting(f1, f2, fam_eqs)?;
+                self.unify_refine_collecting(a1, a2, fam_eqs)
             }
             _ => self.unify(&a, &b),
         }

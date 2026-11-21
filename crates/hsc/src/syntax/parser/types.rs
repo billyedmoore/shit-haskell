@@ -258,8 +258,9 @@ impl Parser {
             }
             Tok::Special('(') => {
                 self.bump();
-                // UnboxedTuples: `(##)` is the unboxed unit type, lexed as one symbol.
-                if self.at_varsym("##") && *self.peek_raw(1) == Tok::Special(')') {
+                // UnboxedTuples: `(##)` is the unboxed unit type, lexed as one symbol. Without the
+                // extension, `(##)` is the type operator `##` in parentheses.
+                if self.exts.is_on("UnboxedTuples") && self.at_varsym("##") && *self.peek_raw(1) == Tok::Special(')') {
                     self.bump();
                     self.bump();
                     return Ok(Type::Con(QName::unqual("()"), loc));

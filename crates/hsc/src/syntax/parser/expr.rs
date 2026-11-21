@@ -32,7 +32,7 @@ impl Parser {
         let loc = self.loc();
         let mut items = Vec::new();
         loop {
-            if self.at_varsym("-") {
+            if self.at_varsym("-") && !self.at_neg_lit() {
                 // A minus directly before a primitive literal is part of the literal (`-1#`).
                 if !self.raw().space_after {
                     if let Tok::Prim(p) = self.peek_raw(1).clone() {
@@ -78,7 +78,7 @@ impl Parser {
         let loc = self.loc();
         let q = match self.tok().clone() {
             Tok::VarSym(s) => {
-                if (s == "!" && self.is_prefix_occurrence()) || self.at_splice() {
+                if (s == "!" && self.is_prefix_occurrence()) || self.at_splice() || self.at_neg_lit() {
                     return None;
                 }
                 // `#)` closes an unboxed tuple.
@@ -145,6 +145,16 @@ impl Parser {
             && matches!(self.tok(), Tok::VarSym(s) if s == "$" || s == "$$")
             && self.is_prefix_occurrence()
             && matches!(self.peek_raw(1), Tok::Special('(') | Tok::VarId(_) | Tok::QVarId(..))
+    }
+
+    /// NegativeLiterals: a prefix `-` immediately before a numeric literal (`toEnum -1 = ...`)
+    /// is an atomic negative literal expression/pattern, not binary subtraction.
+    fn at_neg_lit(&self) -> bool {
+        self.real()
+            && self.exts.is_on("NegativeLiterals")
+            && self.at_varsym("-")
+            && self.is_prefix_occurrence()
+            && matches!(self.peek_raw(1), Tok::Int(_) | Tok::Float(_) | Tok::Prim(_))
     }
 
     fn is_prefix_occurrence(&self) -> bool {
@@ -332,6 +342,7 @@ impl Parser {
                 (s == "!" && self.is_prefix_occurrence())
                     || (s == "?" && self.at_implicit_param().is_some())
                     || self.at_splice()
+                    || self.at_neg_lit()
             }
             Tok::QuoteOpen(_) => true,
             Tok::Special('\'') => self.th_quotes(),
@@ -430,6 +441,13 @@ impl Parser {
             return Ok(Expr::IPVar(name, loc));
         }
         match self.tok().clone() {
+            Tok::VarSym(_) if self.at_neg_lit() => {
+                self.bump();
+                match self.aexp()? {
+                    Expr::Lit(Lit::Prim(p), _) => Ok(Expr::Lit(Lit::Prim(negate_prim(p)), loc)),
+                    lit => Ok(Expr::OpChain(vec![OpItem::Neg(loc), OpItem::Operand(lit)], loc)),
+                }
+            }
             Tok::VarSym(s) if self.at_splice() => {
                 let typed = s == "$$";
                 self.bump();
@@ -623,8 +641,9 @@ impl Parser {
     /// Parenthesised expressions: unit, operators, sections, tuples, plain parens.
     fn paren_expr(&mut self, loc: Loc) -> PResult<Expr> {
         self.bump();
-        // UnboxedTuples: `(##)` is the unboxed unit, lexed as one symbol.
-        if self.at_varsym("##") && *self.peek_raw(1) == Tok::Special(')') {
+        // UnboxedTuples: `(##)` is the unboxed unit, lexed as one symbol. Without the extension,
+        // `(##)` is the ordinary operator `##` in parentheses.
+        if self.exts.is_on("UnboxedTuples") && self.at_varsym("##") && *self.peek_raw(1) == Tok::Special(')') {
             self.bump();
             self.bump();
             return Ok(Expr::Con(QName::unqual("()"), loc));

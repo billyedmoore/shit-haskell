@@ -125,6 +125,20 @@ pub fn call(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
 fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
     // A foreign C call: the runtime's own version of the function, else the C function itself.
     if let Some((sig, ret, sym)) = crate::ccall::parse(name) {
+        if sym == "dynamic" {
+            let f = super::ffi::raw_word(rt, &args[0])? as *mut std::ffi::c_void;
+            let rest_sig = sig.get(1..).unwrap_or("");
+            let rest_args = args.get(1..).unwrap_or(&[]);
+            return super::ffi::generic_call(
+                rt,
+                f,
+                rest_sig,
+                ret,
+                rest_args,
+                crate::ccall::is_safe(name),
+                crate::ccall::is_interruptible(name),
+            );
+        }
         // A safe call of a C function goes to C (other threads run meanwhile).
         if crate::ccall::is_safe(name) {
             if let Some(f) = crate::ccall::resolve(name) {
