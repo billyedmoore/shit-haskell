@@ -2241,7 +2241,14 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let debug = std::env::var_os("HSC_DEBUG").is_some();
     let c_objs = compile_c_sources(c_sources, &dir)?;
     let c_objs: Vec<String> = c_objs.iter().map(|p| p.display().to_string()).collect();
-    let result = run(&["-c", &asm.display().to_string(), "-o", &obj.display().to_string()]).and_then(|()| {
+    let asm_str = asm.display().to_string();
+    let obj_str = obj.display().to_string();
+    let assemble = match std::process::Command::new("as").args(["-o", &obj_str, &asm_str]).status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(_) => Err(format!("as -o {obj_str} {asm_str} failed")),
+        Err(_) => run(&["-c", &asm_str, "-o", &obj_str]),
+    };
+    let result = assemble.and_then(|()| {
         timing::add("assemble", t_link);
         let t_link = std::time::Instant::now();
         let r = (|| {

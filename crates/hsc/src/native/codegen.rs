@@ -124,9 +124,15 @@ struct Pos {
 }
 
 impl Pos {
+    /// The byte offset from `%rbp` of a slot.
+    #[inline]
+    fn slot_off(&self, k: u32) -> i64 {
+        self.f.off(k) + 8 * self.pushed
+    }
+
     /// The offset from the stack pointer of a slot.
     fn slot(&self, k: u32) -> String {
-        format!("{}(%rbp)", self.f.off(k) + 8 * self.pushed)
+        format!("{}(%rbp)", self.slot_off(k))
     }
 }
 
@@ -147,10 +153,14 @@ pub struct Gen {
     current_name: String,
     /// Static objects (label, header, payload: a number or a label).
     statics: Vec<(String, u64, String)>,
+    /// Deduplicated static numeric/char/IS literal cells, keyed by `(header, payload_bits)`.
+    static_cells: HashMap<(u64, u64), String>,
     /// Shared static cells for constructors without fields, indexed by constructor ID.
     nullary_cons: HashMap<u32, String>,
     /// Byte strings (label, bytes).
     strings: Vec<(String, Vec<u8>)>,
+    /// Deduplicated byte strings.
+    string_pool: HashMap<Vec<u8>, String>,
     /// The frame slots still used after the scrutinee being generated returns (innermost last).
     live: Vec<std::collections::HashSet<u32>>,
     /// The slots each join point's code uses (a jump to it uses them).
@@ -355,8 +365,10 @@ impl Gen {
             body_names: Vec::new(),
             current_name: String::new(),
             statics: Vec::new(),
+            static_cells: HashMap::new(),
             nullary_cons: HashMap::new(),
             strings: Vec::new(),
+            string_pool: HashMap::new(),
             joins: HashMap::new(),
             bool_cells: None,
             fast_done: None,
@@ -371,9 +383,15 @@ impl Gen {
         }
     }
 
-    fn label(&mut self, prefix: &str) -> String {
+    #[inline]
+    fn next_id(&mut self) -> u64 {
         self.labels += 1;
-        format!(".L{prefix}{}", self.labels)
+        self.labels
+    }
+
+    fn label(&mut self, prefix: &str) -> String {
+        let id = self.next_id();
+        format!(".L{prefix}{id}")
     }
 
     fn con_id(&mut self, name: &str) -> u32 {
@@ -410,10 +428,11 @@ impl Gen {
     /// Generates the assembly of a whole program.
     pub fn program(prog: &SProgram) -> String {
         let mut g = Gen::new();
+        g.out.reserve((prog.globals.len() * 1024).max(65536));
         for c in super::RTS_CONS {
             g.con_id(c);
         }
-        let mut global_labels = Vec::new();
+        let mut global_labels = Vec::with_capacity(prog.globals.len());
         for gl in &prog.globals {
             let l = g.label("g");
             global_labels.push(l.clone());
@@ -477,8 +496,12 @@ impl Gen {
             let _ = writeln!(g.out, "{l}:\n    .quad {h}, {w}");
         }
         for (l, bytes) in std::mem::take(&mut g.strings) {
-            let list: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
-            let _ = writeln!(g.out, "{l}:\n    .byte {}", list.join(","));
+            let _ = writeln!(g.out, "{l}:");
+            if !bytes.is_empty() {
+                g.out.push_str("    .ascii \"");
+                escape_bytes(&bytes, &mut g.out);
+                g.out.push_str("\"\n");
+            }
         }
         let cons = std::mem::take(&mut g.con_names);
         g.out.push_str("hsc_con_names:\n");
@@ -541,12 +564,12 @@ impl Gen {
         self.ret_raw = c.ret_raw;
         self.put_label(label);
         // R1 is the closure; the arguments are above the new frame (they were pushed by the caller).
-        self.emit(&format!("subq ${}, %rbp", 8 * (f.s - f.a) as i64));
+        let _ = writeln!(self.out, "    subq ${}, %rbp", 8 * (f.s - f.a) as i64);
         // The pointer locals start empty for the collector; raw slots are not read by it.
         for k in (f.a + 1)..(f.s - f.r) {
-            self.emit(&format!("movq $0, {}(%rbp)", f.off(k)));
+            let _ = writeln!(self.out, "    movq $0, {}(%rbp)", f.off(k));
         }
-        self.emit(&format!("movq %r14, {}(%rbp)", f.off(0)));
+        let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", f.off(0));
         // A worker's raw parameters arrive as numbers in their argument slots: they move to raw
         // slots, and the argument slots are emptied, before anything can collect.
         // Their numbers stay in cache registers (see `expr`), stored only when needed.
@@ -559,35 +582,33 @@ impl Gen {
             let r = if self.cache.len() < CACHE_REGS.len() { Some(self.fresh_reg(p, &[])) } else { None };
             match r {
                 Some(r) => {
-                    self.emit(&format!("movq {}(%rbp), {r}", f.off(*arg)));
+                    let _ = writeln!(self.out, "    movq {}(%rbp), {r}", f.off(*arg));
                     self.cache_put(*raw, r, true);
                 }
                 None => {
-                    self.emit(&format!("movq {}(%rbp), %rcx", f.off(*arg)));
-                    self.emit(&format!("movq %rcx, {}(%rbp)", f.off(*raw)));
+                    let _ = writeln!(self.out, "    movq {}(%rbp), %rcx", f.off(*arg));
+                    let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", f.off(*raw));
                 }
             }
-            self.emit(&format!("movq $0, {}(%rbp)", f.off(*arg)));
+            let _ = writeln!(self.out, "    movq $0, {}(%rbp)", f.off(*arg));
         }
         // A function's entry is a preemption point (inline arithmetic has none, and every loop
         // goes through one): at the end of a time slice another thread runs, and an exception
         // thrown to this one is raised.
         if c.arity > 0 {
-            let go = self.label("go");
+            let go = self.next_id();
             self.emit("cmpb $0, hsc_preempt(%rip)");
-            self.emit(&format!("je {go}"));
+            let _ = writeln!(self.out, "    je .L{go}");
             // The cached numbers are stored around the call (the registers do not survive it).
             let cached = self.cache.clone();
             for c in &cached {
-                self.emit(&format!("movq {}, {}", c.reg, p.slot(c.slot)));
+                let _ = writeln!(self.out, "    movq {}, {}(%rbp)", c.reg, p.slot_off(c.slot));
             }
             self.rt_call("hsc_yield", p, 0);
-            self.emit("testq %rax, %rax");
-            self.emit("jnz hsc_raise_pending");
             for c in &cached {
-                self.emit(&format!("movq {}, {}", p.slot(c.slot), c.reg));
+                let _ = writeln!(self.out, "    movq {}(%rbp), {}", p.slot_off(c.slot), c.reg);
             }
-            self.put_label(&go);
+            let _ = writeln!(self.out, ".L{go}:");
         }
         self.expr(&c.body, p);
     }
@@ -596,7 +617,7 @@ impl Gen {
     fn ret(&mut self, p: Pos) {
         match p.mode {
             Mode::Tail => {
-                self.emit(&format!("addq ${}, %rbp", 8 * p.f.s as i64));
+                let _ = writeln!(self.out, "    addq ${}, %rbp", 8 * p.f.s as i64);
                 self.emit("jmp *(%rbp)");
             }
             Mode::Scrut => self.emit("jmp *(%rbp)"),
@@ -606,7 +627,7 @@ impl Gen {
     /// Evaluates the value in R1 (possibly a thunk) as the result of the expression.
     fn eval_result(&mut self, p: Pos) {
         if p.mode == Mode::Tail {
-            self.emit(&format!("addq ${}, %rbp", 8 * p.f.s as i64));
+            let _ = writeln!(self.out, "    addq ${}, %rbp", 8 * p.f.s as i64);
         }
         self.emit("jmp hsc_eval");
     }
@@ -1106,13 +1127,15 @@ impl Gen {
                         self.load(a, p, "%r14");
                         self.put_label(&check);
                         self.emit("testq %r14, %r14");
-                        self.emit(&format!("je {value}"));
-                        self.emit(&format!("cmpb ${THUNK}, (%r14)"));
-                        self.emit(&format!("je {eval}"));
-                        self.emit(&format!("cmpb ${IND}, (%r14)"));
-                        self.emit(&format!("jne {value}"));
+                        let _ = writeln!(self.out, "    je {value}");
+                        // Kinds 1..7 (CON, INT, DOUBLE, CHAR, INTEGER, FUN, PAP) are all values.
+                        let _ = writeln!(self.out, "    cmpb ${THUNK}, (%r14)");
+                        let _ = writeln!(self.out, "    jb {value}");
+                        let _ = writeln!(self.out, "    je {eval}");
+                        let _ = writeln!(self.out, "    cmpb ${IND}, (%r14)");
+                        let _ = writeln!(self.out, "    jne {value}");
                         self.emit("movq 8(%r14), %r14");
-                        self.emit(&format!("jmp {check}"));
+                        let _ = writeln!(self.out, "    jmp {check}");
                         // A value: as on the slow path, its slot is cleared when nothing uses it
                         // after (only here: the slow path loads the slot again).
                         self.put_label(&value);
@@ -1120,7 +1143,7 @@ impl Gen {
                         self.live.push(live);
                         self.clear_dead(std::slice::from_ref(a), Pos { mode: Mode::Scrut, ..p });
                         self.live.pop();
-                        self.emit(&format!("jmp {ready}"));
+                        let _ = writeln!(self.out, "    jmp {ready}");
                         self.put_label(&eval);
                         Some(ready)
                     }
@@ -1147,7 +1170,7 @@ impl Gen {
                 };
                 // Push the return address (its frame is this body's, above it).
                 self.emit("subq $8, %rbp");
-                self.emit(&format!("leaq {cont}(%rip), %rax"));
+                let _ = writeln!(self.out, "    leaq {cont}(%rip), %rax");
                 self.emit("movq %rax, (%rbp)");
                 let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
                 // What the alternatives (and, for a nested case, what follows it) still use.
@@ -1174,10 +1197,10 @@ impl Gen {
                     }
                     if self.returns_raw(scrut) {
                         // A worker returning raw answered the number itself.
-                        self.emit(&format!("movq %r14, {}", p.slot(*bslot)));
+                        let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
                     } else {
                         self.emit("movq 8(%r14), %rcx");
-                        self.emit(&format!("movq %rcx, {}", p.slot(*bslot)));
+                        let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*bslot));
                     }
                     if stored {
                         if let Some(ready) = ready {
@@ -1191,7 +1214,7 @@ impl Gen {
                 if let Some(ready) = ready {
                     self.put_label(&ready);
                 }
-                self.emit(&format!("movq %r14, {}", p.slot(*bslot)));
+                let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
                 self.alts(alts, *bslot, p);
             }
             SExpr::Closure(c) => {
@@ -1220,9 +1243,9 @@ impl Gen {
                 // The parameters are fresh slots that no argument refers to.
                 for (a, s) in args.iter().zip(&params) {
                     self.load(a, p, "%rcx");
-                    self.emit(&format!("movq %rcx, {}", p.slot(*s)));
+                    let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*s));
                 }
-                self.emit(&format!("jmp {l}"));
+                let _ = writeln!(self.out, "    jmp {l}");
             }
         }
     }
@@ -1231,14 +1254,21 @@ impl Gen {
     fn alts(&mut self, alts: &[SAlt], bslot: u32, p: Pos) {
         let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
         let mut has_default = false;
+        let con_count = alts.iter().filter(|a| matches!(a, SAlt::Con(..))).count();
+        let load_con_tag = con_count >= 2 && alts.iter().all(|a| matches!(a, SAlt::Con(..) | SAlt::Default(_)));
+        if load_con_tag {
+            self.emit("movl 4(%r14), %ecx");
+        }
         for (a, l) in alts.iter().zip(&labels) {
             match a {
                 SAlt::Con(name, _, _) => {
                     let id = self.con_id(name);
-                    self.emit("movq (%r14), %rcx");
-                    self.emit("shrq $32, %rcx");
-                    self.emit(&format!("cmpq ${id}, %rcx"));
-                    self.emit(&format!("je {l}"));
+                    if load_con_tag {
+                        let _ = writeln!(self.out, "    cmpl ${id}, %ecx");
+                    } else {
+                        let _ = writeln!(self.out, "    cmpl ${id}, 4(%r14)");
+                    }
+                    let _ = writeln!(self.out, "    je {l}");
                 }
                 SAlt::Lit(lit @ (Lit::Int(_) | Lit::Char(_) | Lit::Double(_)), _) => {
                     // A number or character: its kind and payload are compared inline.
@@ -1249,27 +1279,27 @@ impl Gen {
                         Lit::Double(d) => (DOUBLE, d.to_bits(), "cmpq %rcx, 8(%r14)"),
                         _ => unreachable!(),
                     };
-                    self.emit(&format!("cmpb ${kind}, (%r14)"));
-                    self.emit(&format!("jne {next}"));
-                    self.emit(&format!("movabsq ${payload}, %rcx"));
+                    let _ = writeln!(self.out, "    cmpb ${kind}, (%r14)");
+                    let _ = writeln!(self.out, "    jne {next}");
+                    let _ = writeln!(self.out, "    movabsq ${payload}, %rcx");
                     self.emit(cmp);
-                    self.emit(&format!("je {l}"));
+                    let _ = writeln!(self.out, "    je {l}");
                     self.put_label(&next);
                 }
                 SAlt::Lit(lit, _) => {
                     // The runtime compares the scrutinee with the literal's text (no allocation).
                     let (kind, text) = lit_text(lit);
                     let t = self.string_label(text.as_bytes());
-                    self.emit(&format!("movq {}, %rsi", p.slot(bslot)));
-                    self.emit(&format!("leaq {t}(%rip), %rdx"));
-                    self.emit(&format!("movq ${}, %rcx", text.len()));
-                    self.emit(&format!("movq ${kind}, %r8"));
+                    let _ = writeln!(self.out, "    movq {}(%rbp), %rsi", p.slot_off(bslot));
+                    let _ = writeln!(self.out, "    leaq {t}(%rip), %rdx");
+                    let _ = writeln!(self.out, "    movl ${}, %ecx", text.len());
+                    let _ = writeln!(self.out, "    movl ${kind}, %r8d");
                     self.rt_call("hsc_lit_matches", p, 4);
                     self.emit("testl %eax, %eax");
-                    self.emit(&format!("jnz {l}"));
+                    let _ = writeln!(self.out, "    jnz {l}");
                 }
                 SAlt::Default(_) => {
-                    self.emit(&format!("jmp {l}"));
+                    let _ = writeln!(self.out, "    jmp {l}");
                     has_default = true;
                     break;
                 }
@@ -1277,8 +1307,8 @@ impl Gen {
         }
         if !has_default {
             // Diagnostic: the scrutinee is left in the record for the failure's message.
-            self.emit(&format!("movq {}, %rax", p.slot(bslot)));
-            self.emit(&format!("movq %rax, {}(%rbx)", mach::R1));
+            let _ = writeln!(self.out, "    movq {}(%rbp), %rax", p.slot_off(bslot));
+            let _ = writeln!(self.out, "    movq %rax, {}(%rbx)", mach::R1);
             let names: Vec<String> = alts
                 .iter()
                 .map(|a| match a {
@@ -1295,15 +1325,15 @@ impl Gen {
             match a {
                 SAlt::Con(_, slots, body) => {
                     for (i, s) in slots.iter().enumerate() {
-                        self.emit(&format!("movq {}(%r14), %rcx", 8 * (i + 1)));
-                        self.emit(&format!("movq %rcx, {}", p.slot(*s)));
+                        let _ = writeln!(self.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
+                        let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*s));
                     }
                     self.expr(body, p);
                 }
                 SAlt::Default(SExpr::Fail(msg)) => {
                     // Diagnostic: a pattern failure leaves the scrutinee in the record.
-                    self.emit(&format!("movq {}, %rax", p.slot(bslot)));
-                    self.emit(&format!("movq %rax, {}(%rbx)", mach::R1));
+                    let _ = writeln!(self.out, "    movq {}(%rbp), %rax", p.slot_off(bslot));
+                    let _ = writeln!(self.out, "    movq %rax, {}(%rbx)", mach::R1);
                     self.fail(msg, p);
                 }
                 SAlt::Lit(_, body) | SAlt::Default(body) => self.expr(body, p),
@@ -1315,46 +1345,61 @@ impl Gen {
     /// this point), and it is raised.
     fn fail(&mut self, msg: &str, p: Pos) {
         let l = self.string_label(msg.as_bytes());
-        self.emit(&format!("leaq {l}(%rip), %rsi"));
-        self.emit(&format!("movq ${}, %rdx", msg.len()));
-        self.rt_call("hsc_fail", p, 2);
-        self.emit("jmp hsc_raise_pending");
+        let _ = writeln!(self.out, "    leaq {l}(%rip), %rsi");
+        let _ = writeln!(self.out, "    movl ${}, %edx", msg.len());
+        self.emit_top(p);
+        self.emit("jmp hsc_fail_rt");
     }
 
     /// Loads an atom into a register.
     fn load(&mut self, a: &Atom, p: Pos, reg: &str) {
         match a {
             Atom::Slot(k) if k & RAW != 0 => panic!("internal: raw slot {k:#x} used as a pointer in {}", self.current_name),
-            Atom::Slot(k) => self.emit(&format!("movq {}, {reg}", p.slot(*k))),
+            Atom::Slot(k) => {
+                let _ = writeln!(self.out, "    movq {}(%rbp), {reg}", p.slot_off(*k));
+            }
             Atom::Free(i) => {
-                self.emit(&format!("movq {}, {reg}", p.slot(0)));
-                self.emit(&format!("movq {}({reg}), {reg}", 8 * (2 + *i as i64)));
+                let _ = writeln!(self.out, "    movq {}(%rbp), {reg}", p.slot_off(0));
+                let _ = writeln!(self.out, "    movq {}({reg}), {reg}", 8 * (2 + *i as i64));
             }
             Atom::Global(g) => {
-                self.emit(&format!("movq {}(%rbx), {reg}", mach::GLOBALS));
-                self.emit(&format!("movq {}({reg}), {reg}", 8 * *g as i64));
+                let _ = writeln!(self.out, "    movq {}(%rbx), {reg}", mach::GLOBALS);
+                let _ = writeln!(self.out, "    movq {}({reg}), {reg}", 8 * *g as i64);
             }
             Atom::Lit(l) => self.literal(l, p, reg),
         }
     }
 
+    fn static_cell(&mut self, kind: u8, payload: u64) -> String {
+        let hdr = header(kind, 1, 0);
+        if let Some(lbl) = self.static_cells.get(&(hdr, payload)) {
+            return lbl.clone();
+        }
+        let lbl = self.label("lit");
+        self.statics.push((lbl.clone(), hdr, payload.to_string()));
+        self.static_cells.insert((hdr, payload), lbl.clone());
+        lbl
+    }
+
     fn literal(&mut self, l: &SLit, p: Pos, reg: &str) {
-        let stat = |g: &mut Gen, kind: u8, payload: u64| {
-            let lbl = g.label("lit");
-            g.statics.push((lbl.clone(), header(kind, 1, 0), payload.to_string()));
-            lbl
-        };
         let lbl = match l {
-            SLit::Int(i) => stat(self, INT, *i as u64),
-            SLit::Char(c) => stat(self, CHAR, crate::syntax::lexer::char_code(*c) as u64),
-            SLit::Double(d) => stat(self, DOUBLE, d.to_bits()),
+            SLit::Int(i) => self.static_cell(INT, *i as u64),
+            SLit::Char(c) => self.static_cell(CHAR, crate::syntax::lexer::char_code(*c) as u64),
+            SLit::Double(d) => self.static_cell(DOUBLE, d.to_bits()),
             // An `Integer` that fits in an `Int` is `IS` of it: a static cell for both.
             SLit::Integer(s) if s.parse::<i64>().is_ok() => {
-                let small = stat(self, INT, s.parse::<i64>().unwrap_or(0) as u64);
+                let val = s.parse::<i64>().unwrap_or(0) as u64;
                 let id = self.con_id("GHC.Num.Integer.IS");
-                let lbl = self.label("lit");
-                self.statics.push((lbl.clone(), header(CON, 1, id as u64), small));
-                lbl
+                let hdr = header(CON, 1, id as u64);
+                if let Some(lbl) = self.static_cells.get(&(hdr, val)) {
+                    lbl.clone()
+                } else {
+                    let small = self.static_cell(INT, val);
+                    let lbl = self.label("lit");
+                    self.statics.push((lbl.clone(), hdr, small));
+                    self.static_cells.insert((hdr, val), lbl.clone());
+                    lbl
+                }
             }
             other => {
                 // Strings, big integers, fractions and addresses: the runtime builds the object (the
@@ -1370,17 +1415,17 @@ impl Gen {
                 let latin1 = kind == 3 && text.chars().all(|c| (c as u32) < 256);
                 let bytes: Vec<u8> = if latin1 { text.chars().map(|c| c as u32 as u8).collect() } else { text.into_bytes() };
                 let t = self.string_label(&bytes);
-                self.emit(&format!("leaq {t}(%rip), %rsi"));
-                self.emit(&format!("movq ${}, %rdx", bytes.len()));
-                self.emit(&format!("movq ${kind}, %rcx"));
+                let _ = writeln!(self.out, "    leaq {t}(%rip), %rsi");
+                let _ = writeln!(self.out, "    movl ${}, %edx", bytes.len());
+                let _ = writeln!(self.out, "    movl ${kind}, %ecx");
                 self.rt_call("hsc_mk_literal", p, 3);
                 if reg != "%rax" {
-                    self.emit(&format!("movq %rax, {reg}"));
+                    let _ = writeln!(self.out, "    movq %rax, {reg}");
                 }
                 return;
             }
         };
-        self.emit(&format!("leaq {lbl}(%rip), {reg}"));
+        let _ = writeln!(self.out, "    leaq {lbl}(%rip), {reg}");
         let _ = p;
     }
 
@@ -1396,8 +1441,12 @@ impl Gen {
     }
 
     fn string_label(&mut self, bytes: &[u8]) -> String {
+        if let Some(l) = self.string_pool.get(bytes) {
+            return l.clone();
+        }
         let l = self.label("str");
         self.strings.push((l.clone(), bytes.to_vec()));
+        self.string_pool.insert(bytes.to_vec(), l.clone());
         l
     }
 
@@ -1405,15 +1454,15 @@ impl Gen {
     fn alloc(&mut self, words: usize, p: Pos) {
         // Every object has at least two words (the collector relies on it).
         let words = words.max(2);
-        let ok = self.label("ok");
-        self.emit(&format!("leaq {}(%r12), %rax", 8 * words));
+        let ok = self.next_id();
+        let _ = writeln!(self.out, "    leaq {}(%r12), %rax", 8 * words);
         self.emit("cmpq %r13, %rax");
-        self.emit(&format!("jbe {ok}"));
-        self.emit(&format!("movq ${words}, %rsi"));
+        let _ = writeln!(self.out, "    jbe .L{ok}");
+        let _ = writeln!(self.out, "    movl ${words}, %esi");
         self.rt_call("hsc_gc", p, 1);
-        self.put_label(&ok);
+        let _ = writeln!(self.out, ".L{ok}:");
         self.emit("movq %r12, %rax");
-        self.emit(&format!("leaq {}(%r12), %r12", 8 * words));
+        let _ = writeln!(self.out, "    leaq {}(%r12), %r12", 8 * words);
     }
 
     /// Fills the closure at word `base` of the block in %rax; its body is generated separately.
@@ -1425,14 +1474,14 @@ impl Gen {
         } else {
             header(THUNK, (c.captures.len() as u64 + 1).max(1), 0)
         };
-        self.emit(&format!("movabsq ${hdr}, %rcx"));
-        self.emit(&format!("movq %rcx, {}(%rax)", 8 * base));
-        self.emit(&format!("leaq {code}(%rip), %rcx"));
-        self.emit(&format!("movq %rcx, {}(%rax)", 8 * (base + 1)));
+        let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
+        let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * base);
+        let _ = writeln!(self.out, "    leaq {code}(%rip), %rcx");
+        let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * (base + 1));
         for (i, cap) in c.captures.iter().enumerate() {
             // The captured atom is loaded through %rdx so that %rax (the block) survives.
             self.load(cap, p, "%rdx");
-            self.emit(&format!("movq %rdx, {}(%rax)", 8 * (base + 2 + i)));
+            let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (base + 2 + i));
         }
     }
 
@@ -1443,7 +1492,7 @@ impl Gen {
         self.load(&args[2], p, "%r8");
         self.load(&args[0], p, "%r14");
         if p.mode == Mode::Tail {
-            self.emit(&format!("addq ${}, %rbp", 8 * p.f.s as i64));
+            let _ = writeln!(self.out, "    addq ${}, %rbp", 8 * p.f.s as i64);
         }
         self.emit("subq $16, %rbp");
         self.emit("leaq hsc_catch_ret(%rip), %rax");
@@ -1475,22 +1524,19 @@ impl Gen {
                     // A raw operand is boxed for the runtime (the arguments in the record are roots,
                     // so a collection here keeps those already stored).
                     self.alloc(2, p);
-                    self.emit(&format!("movq ${}, (%rax)", header(operand_kind(name), 1, 0)));
-                    self.emit(&format!("movq {}, %rcx", p.slot(*k)));
+                    let _ = writeln!(self.out, "    movq ${}, (%rax)", header(operand_kind(name), 1, 0));
+                    let _ = writeln!(self.out, "    movq {}(%rbp), %rcx", p.slot_off(*k));
                     self.emit("movq %rcx, 8(%rax)");
-                    self.emit(&format!("movq %rax, {}(%rbx)", mach::ARGS + 8 * i as i64));
+                    let _ = writeln!(self.out, "    movq %rax, {}(%rbx)", mach::ARGS + 8 * i as i64);
                     continue;
                 }
             }
             self.load(a, p, "%rdx");
-            self.emit(&format!("movq %rdx, {}(%rbx)", mach::ARGS + 8 * i as i64));
+            let _ = writeln!(self.out, "    movq %rdx, {}(%rbx)", mach::ARGS + 8 * i as i64);
         }
-        self.emit(&format!("movq ${id}, %rsi"));
-        self.emit(&format!("movq ${}, %rdx", args.len()));
+        let _ = writeln!(self.out, "    movl ${id}, %esi");
+        let _ = writeln!(self.out, "    movl ${}, %edx", args.len());
         self.rt_call("hsc_prim", p, 2);
-        self.emit("testq %rax, %rax");
-        self.emit("jz hsc_raise_pending");
-        self.emit("movq %rax, %r14");
         self.ret(p);
     }
 
@@ -1939,38 +1985,30 @@ impl Gen {
         if let Some(c) = &self.bool_cells {
             return c.clone();
         }
-        let zero = self.label("int0");
-        let one = self.label("int1");
-        self.statics.push((zero.clone(), header(INT, 1, 0), "0".into()));
-        self.statics.push((one.clone(), header(INT, 1, 0), "1".into()));
+        let zero = self.static_cell(INT, 0);
+        let one = self.static_cell(INT, 1);
         self.bool_cells = Some((zero.clone(), one.clone()));
         (zero, one)
     }
 
-    /// Calls the runtime with the machine record in rdi, after recording the heap and stack state
-    /// it needs: the stack pointer, and the number of pointer words at its top (the frame, or none
-    /// when a return address is on top).
+    /// Loads the frame's GC size word (`mach::TOP`) into `%rax` for an out-of-line runtime stub.
+    fn emit_top(&mut self, p: Pos) {
+        let top = if p.pushed == 0 { p.f.size_word() } else { 0 };
+        if top == 0 {
+            self.emit("xorl %eax, %eax");
+        } else if top <= u32::MAX as u64 {
+            let _ = writeln!(self.out, "    movl ${top}, %eax");
+        } else {
+            let _ = writeln!(self.out, "    movabsq ${top}, %rax");
+        }
+    }
+
+    /// Calls an out-of-line runtime stub (`{name}_rt`) that saves HP/SP/TOP, aligns `%rsp`,
+    /// calls `{name}` with `%rdi = %rbx`, and reloads HP/HPLIM.
     fn rt_call(&mut self, name: &str, p: Pos, nargs: usize) {
         let _ = nargs;
-        let top = if p.pushed == 0 { p.f.size_word() } else { 0 };
-        self.emit(&format!("movq %r12, {}(%rbx)", mach::HP));
-        if top > i32::MAX as u64 {
-            // A size word with raw slots does not fit an immediate store (%rax is no argument).
-            self.emit(&format!("movabsq ${top}, %rax"));
-            self.emit(&format!("movq %rax, {}(%rbx)", mach::TOP));
-        } else {
-            self.emit(&format!("movq ${top}, {}(%rbx)", mach::TOP));
-        }
-        self.emit(&format!("movq %rbp, {}(%rbx)", mach::SP));
-        self.emit("movq %rbx, %rdi");
-        // The C ABI wants a 16-byte aligned stack at each call; r15 keeps the old stack pointer (the
-        // callee preserves it).
-        self.emit("movq %rsp, %r15");
-        self.emit("andq $-16, %rsp");
-        self.emit(&format!("call {name}"));
-        self.emit("movq %r15, %rsp");
-        self.emit(&format!("movq {}(%rbx), %r12", mach::HP));
-        self.emit(&format!("movq {}(%rbx), %r13", mach::HPLIM));
+        self.emit_top(p);
+        let _ = writeln!(self.out, "    call {name}_rt");
     }
 }
 
@@ -1987,21 +2025,22 @@ fn lit_text(l: &Lit) -> (u64, String) {
     }
 }
 
-fn escape(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
-            c => {
-                let mut buf = [0u8; 4];
-                for b in c.encode_utf8(&mut buf).bytes() {
-                    let _ = write!(out, "\\{:03o}", b);
-                }
+fn escape_bytes(bytes: &[u8], out: &mut String) {
+    for &b in bytes {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            _ => {
+                let _ = write!(out, "\\{:03o}", b);
             }
         }
     }
+}
+
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    escape_bytes(s.as_bytes(), &mut out);
     out
 }
 
@@ -2067,11 +2106,11 @@ hsc_eval:
     testq %r14, %r14
     je .Leval_void
     movq (%r14), %rax
-    movzbl %al, %ecx
-    cmpb $9, %cl
-    je .Leval_ind
-    cmpb $8, %cl
+    cmpb $8, %al
+    jb .Leval_void
     je .Leval_thunk
+    cmpb $9, %al
+    je .Leval_ind
 .Leval_void:
     jmp *(%rbp)
 .Leval_ind:
@@ -2276,6 +2315,93 @@ hsc_raise_pending:
 .Lraise_caught:
     movq 48(%rbx), %rcx
     jmp hsc_apply
+
+.Lrt_raise:
+    addq $8, %rsp
+    jmp hsc_raise_pending
+
+hsc_gc_rt:
+    movq %r12, 0(%rbx)
+    movq %rax, 24(%rbx)
+    movq %rbp, 16(%rbx)
+    movq %rbx, %rdi
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call hsc_gc
+    movq %r15, %rsp
+    movq 0(%rbx), %r12
+    movq 8(%rbx), %r13
+    ret
+
+hsc_yield_rt:
+    movq %r12, 0(%rbx)
+    movq %rax, 24(%rbx)
+    movq %rbp, 16(%rbx)
+    movq %rbx, %rdi
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call hsc_yield
+    movq %r15, %rsp
+    movq 0(%rbx), %r12
+    movq 8(%rbx), %r13
+    testq %rax, %rax
+    jnz .Lrt_raise
+    ret
+
+hsc_prim_rt:
+    movq %r12, 0(%rbx)
+    movq %rax, 24(%rbx)
+    movq %rbp, 16(%rbx)
+    movq %rbx, %rdi
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call hsc_prim
+    movq %r15, %rsp
+    movq 0(%rbx), %r12
+    movq 8(%rbx), %r13
+    testq %rax, %rax
+    jz .Lrt_raise
+    movq %rax, %r14
+    ret
+
+hsc_fail_rt:
+    movq %r12, 0(%rbx)
+    movq %rax, 24(%rbx)
+    movq %rbp, 16(%rbx)
+    movq %rbx, %rdi
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call hsc_fail
+    movq %r15, %rsp
+    movq 0(%rbx), %r12
+    movq 8(%rbx), %r13
+    jmp hsc_raise_pending
+
+hsc_lit_matches_rt:
+    movq %r12, 0(%rbx)
+    movq %rax, 24(%rbx)
+    movq %rbp, 16(%rbx)
+    movq %rbx, %rdi
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call hsc_lit_matches
+    movq %r15, %rsp
+    movq 0(%rbx), %r12
+    movq 8(%rbx), %r13
+    ret
+
+hsc_mk_literal_rt:
+    movq %r12, 0(%rbx)
+    movq %rax, 24(%rbx)
+    movq %rbp, 16(%rbx)
+    movq %rbx, %rdi
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call hsc_mk_literal
+    movq %r15, %rsp
+    movq 0(%rbx), %r12
+    movq 8(%rbx), %r13
+    ret
 
 "#;
 
