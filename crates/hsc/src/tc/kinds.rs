@@ -35,7 +35,7 @@ fn show(k: &Kind) -> String {
 }
 
 /// The kinds of type constructors, and the metas of the kind checker.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct KindEnv {
     pub tycons: super::env::EnvMap<Kind>,
     metas: Vec<Option<Kind>>,
@@ -307,7 +307,7 @@ impl Checker {
                 }
                 Ok(kt)
             }
-            Type::Lit(..) | Type::Wild(_) => Ok(self.kinds.fresh()),
+            Type::Lit(..) | Type::Wild(_) | Type::Splice(..) => Ok(self.kinds.fresh()),
             Type::OpChain(..) => Ok(self.kinds.fresh()),
         }
     }

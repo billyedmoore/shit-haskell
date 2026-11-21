@@ -679,7 +679,7 @@ impl Checker {
         self.kinds
             .tycons
             .insert(types::ARROW.into(), arr(star.clone(), arr(star.clone(), star.clone())));
-        for n in (2..=12usize).filter(|n| *n != 1) {
+        for n in 2..=64usize {
             let mut k = star.clone();
             for _ in 0..n {
                 k = arr(star.clone(), k);
@@ -730,7 +730,7 @@ impl Checker {
         );
         // Unit and tuples.
         // Arity 1 has no tuple; `tuple_con(1)` would clash with unit.
-        for n in (0..=15usize).filter(|n| *n != 1) {
+        for n in (0..=64usize).filter(|n| *n != 1) {
             let name = Ty::tuple_con(n);
             let vars: Vec<Ty> = (0..n as u32).map(Ty::Gen).collect();
             let res = Ty::apps(Ty::Con(name.clone()), vars.clone());
@@ -923,9 +923,32 @@ impl Checker {
         let introduced = self.alt_introduced(&mark);
         let inner = std::mem::replace(&mut self.wanted, mark.outer);
         let result = if introduced {
-            self.solve(inner).map(|(binds, residual)| {
+            self.solve(inner).and_then(|(mut binds, mut residual)| {
+                if !residual.is_empty() && !self.coercions.is_empty() {
+                    let mut metas = Vec::new();
+                    for w in &residual {
+                        let p = self.metas_zonk_pred(&w.pred);
+                        for a in &p.args {
+                            self.metas.free_metas(a, &mut metas);
+                        }
+                    }
+                    let mut progress = false;
+                    for m in metas {
+                        if matches!(self.metas.prune(&Ty::Meta(m)), Ty::Meta(x) if x == m) {
+                            if let Some(t) = self.coercible_partner(m) {
+                                self.metas.subst[m as usize] = Some(t);
+                                progress = true;
+                            }
+                        }
+                    }
+                    if progress {
+                        let (more, rest) = self.solve(residual)?;
+                        binds.extend(more);
+                        residual = rest;
+                    }
+                }
                 self.wanted.extend(residual);
-                binds
+                Ok(binds)
             })
         } else {
             self.wanted.extend(inner);

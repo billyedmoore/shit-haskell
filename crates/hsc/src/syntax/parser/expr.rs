@@ -139,7 +139,7 @@ impl Parser {
     }
 
     /// A splice `$(`, `$x`, `$$(`: the operator written as a prefix, with Template Haskell on.
-    fn at_splice(&self) -> bool {
+    pub(super) fn at_splice(&self) -> bool {
         self.real()
             && self.th_quotes()
             && matches!(self.tok(), Tok::VarSym(s) if s == "$" || s == "$$")
@@ -149,9 +149,12 @@ impl Parser {
 
     fn is_prefix_occurrence(&self) -> bool {
         let t = self.raw();
-        // Preceded by white space or an opening token (`($x)`, `[$x]`, `, $x`), as GHC lexes it.
+        // Preceded by white space or an opening token (`($x)`, `[$x]`, `[|$x|]`, `, $x`), as GHC lexes it.
         let opening = self.pos > 0
-            && matches!(self.toks[self.pos - 1].tok, Tok::Special('(' | '[' | ',' | '{' | ';'))
+            && matches!(
+                self.toks[self.pos - 1].tok,
+                Tok::Special('(' | '[' | ',' | '{' | ';') | Tok::QuoteOpen(_)
+            )
             && self.toks[self.pos - 1].end_line == t.line;
         (t.space_before || opening) && !t.space_after
     }
@@ -458,18 +461,32 @@ impl Parser {
                     Tok::QVarId(m, s) | Tok::QConId(m, s) => QName { qual: Some(m), name: s },
                     Tok::Special('(') => {
                         self.bump();
-                        let q = match self.tok().clone() {
-                            Tok::VarSym(s) | Tok::ConSym(s) => QName::unqual(s),
-                            Tok::QVarSym(m, s) | Tok::QConSym(m, s) => QName { qual: Some(m), name: s },
-                            // The reserved operators that name types: `''(~)`, `''(->)`.
-                            Tok::Res(op @ (ROp::Tilde | ROp::RArrow)) => QName::unqual(op.text().to_string()),
-                            _ => return self.unexpected(),
-                        };
-                        self.bump();
-                        if !self.at_special(')') {
-                            return self.unexpected();
+                        if self.at_special(')') {
+                            QName::unqual("()".to_string())
+                        } else if self.at_special(',') {
+                            let mut commas = 0usize;
+                            while self.at_special(',') {
+                                self.bump();
+                                commas += 1;
+                            }
+                            if !self.at_special(')') {
+                                return self.unexpected();
+                            }
+                            QName::unqual(format!("({})", ",".repeat(commas)))
+                        } else {
+                            let q = match self.tok().clone() {
+                                Tok::VarSym(s) | Tok::ConSym(s) => QName::unqual(s),
+                                Tok::QVarSym(m, s) | Tok::QConSym(m, s) => QName { qual: Some(m), name: s },
+                                // The reserved operators that name types: `''(~)`, `''(->)`.
+                                Tok::Res(op @ (ROp::Tilde | ROp::RArrow)) => QName::unqual(op.text().to_string()),
+                                _ => return self.unexpected(),
+                            };
+                            self.bump();
+                            if !self.at_special(')') {
+                                return self.unexpected();
+                            }
+                            q
                         }
-                        q
                     }
                     Tok::Special('[') if self.peek_raw(1) == &Tok::Special(']') => {
                         self.bump();
@@ -620,31 +637,66 @@ impl Parser {
             return Ok(Expr::Var(QName::unqual("#"), oloc));
         }
         // UnboxedTuples: `(# a, b #)` is an ordinary tuple here. With the extension on, `(#`
-        // opens one even with no space after it (`(#q, r#)`).
-        if self.at_varsym("#") && (self.raw().space_after || self.exts.is_on("UnboxedTuples") || self.exts.is_on("UnboxedSums")) {
+        // opens one even with no space after it (`(#q, r#)`). With UnboxedSums, `(#|a #)` lexes
+        // `#|` as one symbol.
+        let unboxed_open = match self.tok() {
+            Tok::VarSym(s) if s == "#" && (self.raw().space_after || self.exts.is_on("UnboxedTuples") || self.exts.is_on("UnboxedSums")) => Some(0usize),
+            Tok::VarSym(s) if self.exts.is_on("UnboxedSums") && s.starts_with('#') && s.len() > 1 && s[1..].bytes().all(|b| b == b'|') => Some(s.len() - 1),
+            _ => None,
+        };
+        if let Some(mut lead) = unboxed_open {
             self.bump();
-            if self.at_varsym("#") {
+            if lead == 0 && self.at_varsym("#") {
                 self.bump();
                 self.expect_special(')')?;
                 return Ok(Expr::Con(QName::unqual("()"), loc));
             }
             // UnboxedSums: `(# | e | #)` is alternative 1 of 3, built as a constructor.
-            let mut lead = 0usize;
-            while self.at_res(ROp::Bar) {
-                self.bump();
-                lead += 1;
+            loop {
+                if self.at_res(ROp::Bar) {
+                    self.bump();
+                    lead += 1;
+                } else if let Tok::VarSym(s) = self.tok().clone() {
+                    if !s.is_empty() && s.bytes().all(|b| b == b'|') {
+                        lead += s.len();
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
             let first = self.expr()?;
             let mut trail = 0usize;
-            while self.at_res(ROp::Bar) {
-                self.bump();
-                trail += 1;
+            let mut closed_hash = false;
+            loop {
+                if self.at_res(ROp::Bar) {
+                    self.bump();
+                    trail += 1;
+                } else if let Tok::VarSym(s) = self.tok().clone() {
+                    if !s.is_empty() && s.bytes().all(|b| b == b'|') {
+                        trail += s.len();
+                        self.bump();
+                    } else if s.len() > 1 && s.ends_with('#') && s[..s.len() - 1].bytes().all(|b| b == b'|') {
+                        trail += s.len() - 1;
+                        self.bump();
+                        closed_hash = true;
+                        break;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
             if lead + trail > 0 {
-                if !self.at_varsym("#") {
-                    return self.unexpected();
+                if !closed_hash {
+                    if !self.at_varsym("#") {
+                        return self.unexpected();
+                    }
+                    self.bump();
                 }
-                self.bump();
                 self.expect_special(')')?;
                 let con = QName::unqual(format!("(#_{lead}|{}#)", lead + trail + 1));
                 return Ok(Expr::App(Box::new(Expr::Con(con, loc)), Box::new(first)));

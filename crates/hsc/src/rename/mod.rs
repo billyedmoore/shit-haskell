@@ -1503,9 +1503,9 @@ impl<'a> Renamer<'a> {
                 } else if is_type && q.qual.is_none() && matches!(q.name.as_str(), "~" | "->" | "[]") {
                     // The built-in type operators and the list type: GHC names them in GHC.Types.
                     ("mkNameG_tc", Some(("GHC.Types".to_string(), q.name.clone())))
-                } else if is_type && q.qual.is_none() && (q.name == "()" || q.name.starts_with("(,")) {
-                    // Unit and the tuple types, in GHC.Tuple.
-                    ("mkNameG_tc", Some(("GHC.Tuple".to_string(), q.name.clone())))
+                } else if q.qual.is_none() && (q.name == "()" || q.name.starts_with("(,")) {
+                    // Unit and the tuple types/constructors, in GHC.Tuple.
+                    (if is_type { "mkNameG_tc" } else { "mkNameG_d" }, Some(("GHC.Tuple".to_string(), q.name.clone())))
                 } else if is_type {
                     let e = self.lookup_global(&q, Ns::Type).map_err(|c| {
                         if c.is_empty() {
@@ -2082,6 +2082,7 @@ impl<'a> Renamer<'a> {
             }
             Type::Lit(l, loc) => Type::Lit(l, loc),
             Type::Wild(loc) => Type::Wild(loc),
+            Type::Splice(e, loc) => Type::Splice(Box::new(self.expr(*e)?), loc),
         })
     }
 

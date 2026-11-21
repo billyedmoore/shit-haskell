@@ -11,7 +11,7 @@ This file says where things stand and what comes next. History lives in git and
   type and data families, rank-N types. An interpreter (Template Haskell, `runghc`) and a
   native x86-64 back end with a Rust runtime (copying GC, threads, STM, FFI).
 - **Driver:** GHC's command line and package databases; `hsc-pkg`; `cabal build/test -w` works.
-- **Corpus:** 308 differential tests, both back ends, all passing.
+- **Corpus:** 314 differential tests, both back ends, all passing.
 - **Boot libraries:** deepseq, directory, filepath, bytestring, exceptions, file-io pass their
   suites; unix 15/16 and os-string 14/16 (same failures as GHC); parsec 3/4 (a timing test);
   binary 141/142 (needs PolyKinds); time times out; text needs a GHC plugin.
@@ -59,13 +59,16 @@ one-fix iterations.
   hsc next to their GHC builds, unattended, and rank the failures by how many packages each
   blocks; fix from the top. Results recorded in `bench/sweep/`.
 - GHC's own testsuite through difftest, for a conformance score.
-- Sweep of the top 300 Stackage packages: hsc builds 266 of the 300 GHC builds (was 245). This
-  PR fixes hsc2hs `<stddef.h>` ordering, kind-dispatched instances and associated type families,
-  constraint-family superclasses and self-mentioning family flattening, quantified and nested
-  constraints, constrained patterns, insoluble given equalities and `(#)` parsing (reflection,
-  optics-core, constraints, monad-control, network-info, some and sop-core build). Next, by
-  packages blocked: lens (6), haskell-gi-base (4), tls (4), generics-sop (3), monad-logger (2).
-  RebindableSyntax still to rebind: do-notation, arithmetic sequences, string and list literals.
+- Sweep of the top 300 Stackage packages: hsc builds 279 of the 300 GHC builds (was 266). This
+  PR fixes stuck given type-family equality orientation, fundep improvement through type families,
+  direct-root package precedence and per-package `-hsc-pkgdep` isolation, TH adjacent quote
+  brackets, unit/tuple/underscore name quotes, type splices, `TySynInstD`, `reifyConStrictness`,
+  built-in `reify`, 64-tuples, TH splice env restoration and batching, compact unboxed sums,
+  GADT `~Type` fields, and `}` closing aligned `do` blocks (lens, tls, crypton-connection,
+  http-client-tls, http-conduit, generics-sop, haskell-gi-base, haskell-gi, monad-logger,
+  wai-extra, haskell-src-meta, primitive-unlifted and shakespeare build). Next, by packages
+  blocked: jsaddle (4), gi-glib (2), servant (2). RebindableSyntax still to rebind: do-notation,
+  arithmetic sequences, string and list literals.
 - Known gaps it will rank: PolyKinds and kind inference (binary), Template Haskell `[d| |]`,
   type and pattern splices, `foreign import "dynamic"`, collector-run
   finalizers, Arrows, text's plugin.

@@ -118,11 +118,12 @@ pub fn splice_module(m: &Module, splices: &[Splice], name: &str, table: Expr, se
     splice_module_at(m.imports.clone(), Vec::new(), splices, name, exp, table, setup, (file, &m.name))
 }
 
-/// The module a declaration splice runs in: the module's name and imports, the declarations
-/// before the splice, and the splice (a `[Dec]`).
-pub fn decl_splice_module(m: &Module, before: Vec<Decl>, body: Expr, loc: Loc, table: Expr, setup: Expr, file: &str) -> Module {
+/// The module a batch of declaration splices runs in: the module's name and imports, the
+/// declarations before the splices, and the splices (each a `[Dec]`).
+pub fn decl_splices_module(m: &Module, before: Vec<Decl>, splices: &[Splice], table: Expr, setup: Expr, file: &str) -> Module {
+    let loc = splices.first().map_or(m.loc, |s| s.loc);
     let decs = Type::List(Box::new(Type::Con(QName { qual: Some("%G:GHC.Internal.TH.Syntax".into()), name: "Dec".into() }, loc)), loc);
-    splice_module_at(m.imports.clone(), before, &[Splice { body, loc }], &m.name, decs, table, setup, (file, &m.name))
+    splice_module_at(m.imports.clone(), before, splices, &m.name, decs, table, setup, (file, &m.name))
 }
 
 /// The IO action that sets, before a splice runs, the extensions on in the module (for
@@ -412,16 +413,20 @@ pub fn run_splices(binds: &[crate::core::TopBind], module: &str, count: usize, l
     })
 }
 
-/// Runs a declaration splice (the first splice binding of `module`, a `[Dec]`) and converts the
-/// declarations it produced.
-pub fn run_decl_splice(binds: &[crate::core::TopBind], module: &str, loc: Loc, pre: Option<String>) -> Result<Vec<Decl>, String> {
-    let name = format!("{module}.{}", placeholder(0));
-    let mut roots = vec![name.clone()];
+/// Runs a batch of declaration splices (the splice bindings of `module`, each a `[Dec]`) and
+/// concatenates the declarations they produced.
+pub fn run_decl_splices(binds: &[crate::core::TopBind], module: &str, locs: Vec<Loc>, pre: Option<String>) -> Result<Vec<Decl>, String> {
+    let names: Vec<String> = (0..locs.len()).map(|i| format!("{module}.{}", placeholder(i))).collect();
+    let mut roots = names.clone();
     roots.extend(pre.clone());
     with_runtime(binds, roots, move |rt| {
-        run_pre(rt, pre.as_deref(), loc)?;
-        let cell = rt.global(&name).ok_or_else(|| format!("internal: splice {name} was not compiled"))?;
-        Conv { rt, loc }.top_decs(&cell)
+        run_pre(rt, pre.as_deref(), locs.first().copied().unwrap_or_default())?;
+        let mut out = Vec::new();
+        for (name, loc) in names.iter().zip(locs) {
+            let cell = rt.global(name).ok_or_else(|| format!("internal: splice {name} was not compiled"))?;
+            out.extend(Conv { rt, loc }.top_decs(&cell)?);
+        }
+        Ok(out)
     })
 }
 
@@ -929,10 +934,42 @@ impl Conv<'_> {
                     }
                 }
                 "SigD" => out.push(Decl::Sig { names: vec![self.binder(&a[0])?], ty: self.ty(&a[1])?, loc }),
+                "TySynInstD" => {
+                    let (name, equation) = self.ty_syn_eqn(&a[0])?;
+                    out.push(Decl::TypeInstance { name, equation, loc });
+                }
+                // Pragmas and kind signatures inside instance/where blocks change nothing here.
+                "PragmaD" | "KiSigD" => {}
                 other => return Err(format!("Template Haskell declaration {other} is not supported here yet")),
             }
         }
         Ok(out)
+    }
+
+    /// Converts a Template Haskell `TySynEqn (Maybe [TyVarBndr ()]) Type Type` to `(family, equation)`.
+    fn ty_syn_eqn(&self, c: &crate::interp::Cell) -> CR<(QName, TypeEquation)> {
+        let loc = self.loc;
+        let (_, ea) = self.con(c)?;
+        let lhs = self.ty(&ea[1])?;
+        let rhs = self.ty(&ea[2])?;
+        let mut args = Vec::new();
+        let mut cur = lhs;
+        loop {
+            match cur {
+                Type::App(f, a) => {
+                    args.push(*a);
+                    cur = *f;
+                }
+                Type::Sig(inner, _) => cur = *inner,
+                _ => break,
+            }
+        }
+        args.reverse();
+        let name = match cur {
+            Type::Con(q, _) => q,
+            _ => return Err("malformed Template Haskell type family instance head".into()),
+        };
+        Ok((name, TypeEquation { args, rhs, loc }))
     }
 
     // ----- top-level declarations -----
@@ -944,7 +981,7 @@ impl Conv<'_> {
         for d in self.list(c)? {
             let (k, a) = self.con(&d)?;
             match k.as_str() {
-                "FunD" | "ValD" | "SigD" => out.extend(self.decs_of(&[d.clone()])?),
+                "FunD" | "ValD" | "SigD" | "TySynInstD" => out.extend(self.decs_of(&[d.clone()])?),
                 "DataD" | "NewtypeD" => {
                     let newtype = k == "NewtypeD";
                     let context = self.cxt(&a[0])?;
@@ -1795,8 +1832,12 @@ pub fn native_exps(out: &str, locs: Vec<Loc>) -> Result<Vec<Expr>, String> {
 }
 
 /// The declarations a native declaration-splice program produced.
-pub fn native_decs(out: &str, loc: Loc) -> Result<Vec<Decl>, String> {
-    let cells = native_lines(out, 1)?;
+pub fn native_decs(out: &str, locs: Vec<Loc>) -> Result<Vec<Decl>, String> {
+    let cells = native_lines(out, locs.len())?;
     let rt = Runtime::new(Vec::new(), "hsc-splice".into());
-    Conv { rt: &rt, loc }.top_decs(&cells[0])
+    let mut decls = Vec::new();
+    for (c, loc) in cells.iter().zip(locs) {
+        decls.extend(Conv { rt: &rt, loc }.top_decs(c)?);
+    }
+    Ok(decls)
 }

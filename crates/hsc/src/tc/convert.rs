@@ -69,7 +69,7 @@ impl Checker {
                 Lit::Frac(s) => format!("#{s}"),
                 Lit::Prim(p) => format!("#{p:?}"),
             }),
-            Type::Wild(_) => self.meta(),
+            Type::Wild(_) | Type::Splice(..) => self.meta(),
             // A nested forall is approximated by quantifying its variables at the
             // enclosing signature. This accepts rank-N programs whose uses are
             // instantiation-compatible, such as `runST`, without checking them rank-N.

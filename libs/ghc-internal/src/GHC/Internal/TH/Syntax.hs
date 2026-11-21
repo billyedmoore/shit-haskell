@@ -191,7 +191,7 @@ instance Quasi IO where
   qReifyRoles           = hscReifyRoles
   qReifyAnnotations _   = badIO "reifyAnnotations"
   qReifyModule _        = badIO "reifyModule"
-  qReifyConStrictness _ = badIO "reifyConStrictness"
+  qReifyConStrictness   = hscReifyConStrictness
   qLocation             = readIORef hscLocation
   -- hsc: splices run in IO, so a failure is an exception the handler replaces.
   qRecover h m          = m `catch` \e -> const h (e :: SomeException)
@@ -272,7 +272,7 @@ hscReifyValues :: IORef [(String, String, Info)]
 hscReifyValues = unsafePerformIO (newIORef [])
 
 hscReify :: Name -> IO Info
-hscReify n@(Name (OccName occ) flavour) = do
+hscReify (Name (OccName occ) flavour) = do
   types <- readIORef hscReifyTable
   values <- readIORef hscReifyValues
   let table = types ++ values
@@ -281,7 +281,52 @@ hscReify n@(Name (OccName occ) flavour) = do
         _ -> True
   case [i | e@(_, _, i) <- table, matches e] of
     (i : _) -> pure i
-    [] -> fail ("\8216" ++ occ ++ "\8217 is not in scope at a reify")
+    [] -> case hscBuiltinReify occ flavour of
+      Just i -> pure i
+      Nothing -> fail ("\8216" ++ occ ++ "\8217 is not in scope at a reify")
+
+-- | hsc: wired-in unit, tuple and list types/constructors for 'reify' (they are syntax, not
+-- declared in a module's data-declaration table).
+hscBuiltinReify :: String -> NameFlavour -> Maybe Info
+hscBuiltinReify occ flavour = case flavour of
+  NameG DataName _ _ -> case occ of
+    "()" -> Just (DataConI unitCon (TupleT 0) unitTy)
+    "[]" -> let v = mkName "a" in Just (DataConI nilCon (ForallT [PlainTV v SpecifiedSpec] [] (AppT ListT (VarT v))) listTy)
+    ":" -> let v = mkName "a"
+           in Just (DataConI consCon (ForallT [PlainTV v SpecifiedSpec] [] (arr (VarT v) (arr (AppT ListT (VarT v)) (AppT ListT (VarT v))))) listTy)
+    _ | isTuple occ ->
+        let n = length occ - 1
+            vs = [mkName ("a" ++ show i) | i <- [0 .. n - 1]]
+            res = foldl AppT (TupleT n) (map VarT vs)
+            ty = ForallT [PlainTV v SpecifiedSpec | v <- vs] [] (arrs vs res)
+        in Just (DataConI (mkNameG_d "ghc-internal" "GHC.Tuple" occ) ty (mkNameG_tc "ghc-internal" "GHC.Tuple" occ))
+    _ -> Nothing
+  _ -> case occ of
+    "()" -> Just (TyConI (DataD [] unitTy [] Nothing [NormalC unitCon []] []))
+    "Unit" -> Just (TyConI (DataD [] unitTy [] Nothing [NormalC unitCon []] []))
+    "[]" -> let v = mkName "a"
+            in Just (TyConI (DataD [] listTy [PlainTV v BndrReq] Nothing [NormalC nilCon [], InfixC (lazy, VarT v) consCon (lazy, AppT ListT (VarT v))] []))
+    "List" -> let v = mkName "a"
+              in Just (TyConI (DataD [] listTy [PlainTV v BndrReq] Nothing [NormalC nilCon [], InfixC (lazy, VarT v) consCon (lazy, AppT ListT (VarT v))] []))
+    _ | isTuple occ ->
+        let n = length occ - 1
+            vs = [mkName ("a" ++ show i) | i <- [0 .. n - 1]]
+            tname = mkNameG_tc "ghc-internal" "GHC.Tuple" occ
+            cname = mkNameG_d "ghc-internal" "GHC.Tuple" occ
+        in Just (TyConI (DataD [] tname [PlainTV v BndrReq | v <- vs] Nothing [NormalC cname [(lazy, VarT v) | v <- vs]] []))
+    _ -> Nothing
+  where
+    lazy = Bang NoSourceUnpackedness NoSourceStrictness
+    arr a b = AppT (AppT ArrowT a) b
+    arrs [] r = r
+    arrs (v : vs) r = arr (VarT v) (arrs vs r)
+    unitTy = mkNameG_tc "ghc-internal" "GHC.Tuple" "()"
+    unitCon = mkNameG_d "ghc-internal" "GHC.Tuple" "()"
+    listTy = mkNameG_tc "ghc-internal" "GHC.Types" "[]"
+    nilCon = mkNameG_d "ghc-internal" "GHC.Types" "[]"
+    consCon = mkNameG_d "ghc-internal" "GHC.Types" ":"
+    isTuple ('(' : ',' : rest) = not (null rest) && all (== ',') (init rest) && last rest == ')'
+    isTuple _ = False
 
 -- | hsc: the extensions on in the module being compiled, by name, set before a splice runs.
 {-# NOINLINE hscExtensions #-}
@@ -391,6 +436,40 @@ hscReifyRoles n = do
     TyConI (NewtypeD _ _ tvs _ _ _) -> pure (map (const RepresentationalR) tvs)
     TyConI (TySynD _ tvs _) -> pure (map (const RepresentationalR) tvs)
     _ -> fail ("reifyRoles: " ++ show n ++ " is not a type constructor")
+
+-- | hsc: a constructor's field strictnesses, from the reified data/newtype declarations
+-- (newtype fields are always 'DecidedLazy', as in GHC; built-in list/unit/tuple constructors
+-- are lazy).
+hscReifyConStrictness :: Name -> IO [DecidedStrictness]
+hscReifyConStrictness (Name (OccName occ) flavour) = do
+  table <- readIORef hscReifyTable
+  let modOk m = case flavour of
+        NameG _ _ (ModName m') -> m == m'
+        _ -> True
+      decided (Bang _ SourceStrict) = DecidedStrict
+      decided _ = DecidedLazy
+      conFields c = case c of
+        NormalC n bts | nameBase n == occ -> Just (map (\(b, _) -> decided b) bts)
+        RecC n vbts | nameBase n == occ -> Just (map (\(_, b, _) -> decided b) vbts)
+        InfixC (b1, _) n (b2, _) | nameBase n == occ -> Just [decided b1, decided b2]
+        ForallC _ _ c' -> conFields c'
+        GadtC ns bts _ | any (\n -> nameBase n == occ) ns -> Just (map (\(b, _) -> decided b) bts)
+        RecGadtC ns vbts _ | any (\n -> nameBase n == occ) ns -> Just (map (\(_, b, _) -> decided b) vbts)
+        _ -> Nothing
+      fromInfo (m, _, TyConI (NewtypeD _ _ _ _ c _)) | modOk m =
+        case conFields c of
+          Just _ -> [[DecidedLazy]]
+          Nothing -> []
+      fromInfo (m, _, TyConI (DataD _ _ _ _ cs _)) | modOk m =
+        [fs | c <- cs, Just fs <- [conFields c]]
+      fromInfo _ = []
+      isTuple ('(' : ',' : rest) = not (null rest) && all (== ',') (init rest) && last rest == ')'
+      isTuple _ = False
+  case [fs | e <- table, fs <- fromInfo e] of
+    (fs : _) -> pure fs
+    [] | occ == ":" -> pure [DecidedLazy, DecidedLazy]
+       | isTuple occ -> pure (map (const DecidedLazy) (init occ))
+       | otherwise -> pure []
 
 -- | hsc: the state 'getQ' and 'putQ' keep, by type: across the splices that run together (a
 -- declaration splice, or a module's expression splices), not yet across separate runs.

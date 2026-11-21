@@ -491,9 +491,36 @@ fn package_dirs(o: &Opts) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<String>), S
             }
         }
     }
+    // Per-package direct dependencies: an installed package's module resolves imports against its
+    // own declared dependencies even when another package in the build exposes the same module
+    // name (e.g. `base16` vs `base16-bytestring`, `base64` vs `base64-bytestring`).
+    for p in &pkgs {
+        for pdir in p.list("import-dirs") {
+            for dep in p.list("depends") {
+                if let Some(dp) = stack.by_id(&dep) {
+                    for ddir in dp.list("import-dirs") {
+                        let flag = format!("{}{pdir}={ddir}", crate::driver::PKGDEP_FLAG);
+                        if !visible.contains(&flag) {
+                            visible.push(flag);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut dirs = Vec::new();
     let mut includes = Vec::new();
-    // The packages named directly come before their dependencies in the search.
+    // The packages named directly come before all transitive dependencies in the search.
+    for r in roots.iter().rev() {
+        if let Some(p) = stack.by_id(r) {
+            for d in p.list("import-dirs") {
+                let d = PathBuf::from(d);
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+        }
+    }
     for p in pkgs.iter().rev() {
         for d in p.list("import-dirs") {
             let d = PathBuf::from(d);

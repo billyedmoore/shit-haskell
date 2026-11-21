@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 /// A global environment only gains keys. Remember their insertion order so a module's
 /// additions can be collected without copying or scanning every earlier module's keys.
+#[derive(Clone)]
 pub struct EnvMap<V> {
     entries: HashMap<String, V>,
     added: Vec<String>,
@@ -145,7 +146,7 @@ pub struct InstInfo {
 
 /// Instances in registration order, indexed by class. Keeping the index here ensures that
 /// cached modules, derived instances and boot-file replacements all update it together.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Instances {
     entries: Vec<InstInfo>,
     by_class: HashMap<String, Vec<usize>>,
@@ -284,7 +285,7 @@ pub struct FamilyInfo {
     pub injective: Vec<usize>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Env {
     /// Data declarations by global type name, with the module that declares them; standalone
     /// deriving needs the constructors of types declared elsewhere.

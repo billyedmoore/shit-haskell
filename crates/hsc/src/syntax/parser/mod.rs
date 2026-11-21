@@ -555,7 +555,8 @@ impl Parser {
         matches!(
             self.tok(),
             Tok::Kw(Kw::Where | Kw::In | Kw::Then | Kw::Else | Kw::Of)
-                | Tok::Special(')' | ']' | ',')
+                | Tok::Special(')' | ']' | '}' | ',')
+                | Tok::QuoteClose(_)
                 | Tok::Res(ROp::RArrow | ROp::DArrow | ROp::Eq | ROp::Bar)
                 | Tok::Eof
         )

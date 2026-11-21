@@ -99,8 +99,8 @@ impl Parser {
             | Tok::Char(_)
             | Tok::Str(_) => true,
             // StarIsType: `*` is `Type`, an argument too (reflection's `Proxy (a * b)` is
-            // `Proxy (a Type b)`, as GHC reads it).
-            Tok::VarSym(s) => s == "*" && self.exts.is_on("StarIsType"),
+            // `Proxy (a Type b)`, as GHC reads it). TemplateHaskell type splices (`$t`, `$(e)`).
+            Tok::VarSym(s) => (s == "*" && self.exts.is_on("StarIsType")) || self.at_splice(),
             // A tick before a constructor operator is an infix promoted operator, not an argument.
             Tok::Special('\'') => !matches!(self.peek_raw(1), Tok::ConSym(_)),
             _ => false,
@@ -118,7 +118,7 @@ impl Parser {
                 name: s,
             },
             Tok::VarSym(s)
-                if s != "!" && s != "." && s != "#" && s != "%" && (s != "*" || !self.exts.is_on("StarIsType")) =>
+                if s != "!" && s != "." && s != "#" && s != "%" && (s != "*" || !self.exts.is_on("StarIsType")) && !self.at_splice() =>
             {
                 QName::unqual(s)
             }
@@ -157,6 +157,25 @@ impl Parser {
             return self.unexpected();
         }
         match self.tok().clone() {
+            Tok::VarSym(_) if self.at_splice() => {
+                self.bump();
+                let inner = if self.at_special('(') {
+                    self.bump();
+                    let e = self.expr()?;
+                    self.expect_special(')')?;
+                    e
+                } else {
+                    let l = self.loc();
+                    let q = match self.tok().clone() {
+                        Tok::VarId(v) => QName::unqual(v),
+                        Tok::QVarId(m, v) => QName { qual: Some(m), name: v },
+                        _ => return self.unexpected(),
+                    };
+                    self.bump();
+                    Expr::Var(q, l)
+                };
+                Ok(Type::Splice(Box::new(inner), loc))
+            }
             Tok::VarId(s) => {
                 self.bump();
                 Ok(Type::Var(s, loc))
@@ -169,8 +188,12 @@ impl Parser {
                 self.bump();
                 Ok(Type::Wild(loc))
             }
-            // A strictness mark on a field type (`!t`); strictness is not recorded for GADT fields.
+            // A strictness or laziness mark on a field type (`!t`, `~t`); strictness is not recorded for GADT fields.
             Tok::VarSym(s) if s == "!" && self.real() => {
+                self.bump();
+                self.atype()
+            }
+            Tok::Res(ROp::Tilde) if self.real() => {
                 self.bump();
                 self.atype()
             }

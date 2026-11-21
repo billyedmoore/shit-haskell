@@ -354,6 +354,7 @@ bin_struct!(TyVarBind { name, kind });
 bin_enum!(Type {
     0 => Var(a, b), 1 => Con(a, b), 2 => App(a, b), 3 => Fun(a, b), 4 => List(a, b), 5 => Tuple(a, b),
     6 => Forall(a, b), 7 => Qual(a, b), 8 => Sig(a, b), 9 => OpChain(a, b), 10 => Lit(a, b), 11 => Wild(a),
+    12 => Splice(a, b),
 });
 bin_enum!(TypeOpItem { 0 => Operand(a), 1 => Op(a, b) });
 bin_enum!(Pat {
