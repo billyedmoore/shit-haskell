@@ -450,19 +450,24 @@ impl Gen {
         for c in super::RTS_CONS {
             g.con_id(c);
         }
+        let used_workers = collect_called_workers(prog);
         let mut global_labels = Vec::with_capacity(prog.globals.len());
-        for gl in &prog.globals {
+        for (gi, gl) in prog.globals.iter().enumerate() {
             let l = g.label("g");
             global_labels.push(l.clone());
             // Register every entry before emitting bodies, including forward/mutual calls.
             let arity = if gl.closure.captures.is_empty() { gl.closure.arity } else { 0 };
             g.known_globals.push((arity, l.clone(), gl.closure.uses_closure));
             g.pending.push((l, gl.closure.clone(), gl.name.clone()));
-            let worker = gl.worker.as_ref().map(|(c, raw)| {
-                let wl = g.label("w");
-                g.pending.push((wl.clone(), c.clone(), format!("{}/worker", gl.name)));
-                (wl, raw.clone(), c.ret_raw, c.uses_closure)
-            });
+            let worker = if used_workers.contains(&(gi as u32)) {
+                gl.worker.as_ref().map(|(c, raw)| {
+                    let wl = g.label("w");
+                    g.pending.push((wl.clone(), c.clone(), format!("{}/worker", gl.name)));
+                    (wl, raw.clone(), c.ret_raw, c.uses_closure)
+                })
+            } else {
+                None
+            };
             g.workers.push(worker);
         }
         g.out.push_str("    .text\n");
@@ -1243,20 +1248,46 @@ impl Gen {
                 let end = alts.iter().position(|a| matches!(a, SAlt::Default(_))).map_or(alts.len(), |i| i + 1);
                 let alts = &alts[..end];
                 let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
-                for (a, l) in alts.iter().zip(&labels) {
-                    match a {
-                        SAlt::Lit(lit, _) => {
-                            let v = match lit {
-                                Lit::Int(i) => *i,
-                                Lit::Char(c) => crate::syntax::lexer::char_code(*c) as i64,
-                                other => panic!("internal: raw case on literal {other:?}"),
-                            };
-                            let t = self.src_text(Src::Imm(v), "%rcx");
-                            self.emit(&format!("cmpq {t}, {r}"));
-                            self.emit(&format!("je {l}"));
+                let lit_count = alts.iter().filter(|a| matches!(a, SAlt::Lit(..))).count();
+                if lit_count >= 8 {
+                    let mut seen = std::collections::HashSet::with_capacity(lit_count);
+                    let mut entries: Vec<(i64, &str)> = Vec::with_capacity(lit_count);
+                    for (a, l) in alts.iter().zip(&labels) {
+                        match a {
+                            SAlt::Lit(lit, _) => {
+                                let v = match lit {
+                                    Lit::Int(i) => *i,
+                                    Lit::Char(c) => crate::syntax::lexer::char_code(*c) as i64,
+                                    other => panic!("internal: raw case on literal {other:?}"),
+                                };
+                                if seen.insert(v) {
+                                    entries.push((v, l.as_str()));
+                                }
+                            }
+                            SAlt::Default(_) => {}
+                            SAlt::Con(..) => panic!("internal: raw case on a constructor"),
                         }
-                        SAlt::Default(_) => {}
-                        SAlt::Con(..) => panic!("internal: raw case on a constructor"),
+                    }
+                    entries.sort_unstable_by_key(|&(v, _)| v);
+                    let def_lbl = self.label("def");
+                    self.emit_lit_bsearch(r, &entries, &def_lbl);
+                    self.put_label(&def_lbl);
+                } else {
+                    for (a, l) in alts.iter().zip(&labels) {
+                        match a {
+                            SAlt::Lit(lit, _) => {
+                                let v = match lit {
+                                    Lit::Int(i) => *i,
+                                    Lit::Char(c) => crate::syntax::lexer::char_code(*c) as i64,
+                                    other => panic!("internal: raw case on literal {other:?}"),
+                                };
+                                let t = self.src_text(Src::Imm(v), "%rcx");
+                                self.emit(&format!("cmpq {t}, {r}"));
+                                self.emit(&format!("je {l}"));
+                            }
+                            SAlt::Default(_) => {}
+                            SAlt::Con(..) => panic!("internal: raw case on a constructor"),
+                        }
                     }
                 }
                 let snapshot = self.cache.clone();
@@ -1482,58 +1513,117 @@ impl Gen {
         }
     }
 
+    /// Emits a binary search over sorted `(val, target_label)` pairs, comparing `reg` (never
+    /// `%rcx`, which is scratch for 64-bit immediates) against each pivot and jumping to
+    /// `default_lbl` on miss.
+    fn emit_lit_bsearch(&mut self, reg: &str, entries: &[(i64, &str)], default_lbl: &str) {
+        if entries.len() <= 4 {
+            for &(v, lbl) in entries {
+                let t = self.src_text(Src::Imm(v), "%rcx");
+                self.emit(&format!("cmpq {t}, {reg}"));
+                self.emit(&format!("je {lbl}"));
+            }
+            let _ = writeln!(self.out, "    jmp {default_lbl}");
+            return;
+        }
+        let mid = entries.len() / 2;
+        let (v, lbl) = entries[mid];
+        let left_lbl = self.label("bs");
+        let t = self.src_text(Src::Imm(v), "%rcx");
+        self.emit(&format!("cmpq {t}, {reg}"));
+        self.emit(&format!("je {lbl}"));
+        let _ = writeln!(self.out, "    jl {left_lbl}");
+        self.emit_lit_bsearch(reg, &entries[mid + 1..], default_lbl);
+        self.put_label(&left_lbl);
+        self.emit_lit_bsearch(reg, &entries[..mid], default_lbl);
+    }
+
     /// The alternatives of a case: the value is in R1 and in the binder slot `bslot`.
     fn alts(&mut self, alts: &[SAlt], bslot: u32, p: Pos, fast_body: Option<&str>) {
         let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
         let mut has_default = false;
-        let con_count = alts.iter().filter(|a| matches!(a, SAlt::Con(..))).count();
-        let load_con_tag = con_count >= 2 && alts.iter().all(|a| matches!(a, SAlt::Con(..) | SAlt::Default(_)));
-        if load_con_tag {
-            self.emit("movl 4(%r14), %ecx");
-        }
-        for (a, l) in alts.iter().zip(&labels) {
-            match a {
-                SAlt::Con(name, _, _) => {
-                    let id = self.con_id(name);
-                    if load_con_tag {
-                        let _ = writeln!(self.out, "    cmpl ${id}, %ecx");
-                    } else {
-                        let _ = writeln!(self.out, "    cmpl ${id}, 4(%r14)");
+        let end = alts.iter().position(|a| matches!(a, SAlt::Default(_))).unwrap_or(alts.len());
+        let all_int = end >= 8 && alts[..end].iter().all(|a| matches!(a, SAlt::Lit(Lit::Int(_), _)));
+        let all_char = !all_int && end >= 8 && alts[..end].iter().all(|a| matches!(a, SAlt::Lit(Lit::Char(_), _)));
+        if all_int || all_char {
+            let has_def = end < alts.len();
+            let def_lbl = if has_def { labels[end].clone() } else { self.label("def") };
+            let kind = if all_char { CHAR } else { INT };
+            let _ = writeln!(self.out, "    cmpb ${kind}, (%r14)");
+            let _ = writeln!(self.out, "    jne {def_lbl}");
+            if all_char {
+                self.emit("movl 8(%r14), %eax");
+            } else {
+                self.emit("movq 8(%r14), %rax");
+            }
+            let mut seen = std::collections::HashSet::with_capacity(end);
+            let mut entries: Vec<(i64, &str)> = Vec::with_capacity(end);
+            for (a, l) in alts[..end].iter().zip(&labels[..end]) {
+                let v = match a {
+                    SAlt::Lit(Lit::Int(i), _) => *i,
+                    SAlt::Lit(Lit::Char(c), _) => crate::syntax::lexer::char_code(*c) as i64,
+                    _ => unreachable!(),
+                };
+                if seen.insert(v) {
+                    entries.push((v, l.as_str()));
+                }
+            }
+            entries.sort_unstable_by_key(|&(v, _)| v);
+            self.emit_lit_bsearch("%rax", &entries, &def_lbl);
+            if !has_def {
+                self.put_label(&def_lbl);
+            }
+            has_default = has_def;
+        } else {
+            let con_count = alts.iter().filter(|a| matches!(a, SAlt::Con(..))).count();
+            let load_con_tag = con_count >= 2 && alts.iter().all(|a| matches!(a, SAlt::Con(..) | SAlt::Default(_)));
+            if load_con_tag {
+                self.emit("movl 4(%r14), %ecx");
+            }
+            for (a, l) in alts.iter().zip(&labels) {
+                match a {
+                    SAlt::Con(name, _, _) => {
+                        let id = self.con_id(name);
+                        if load_con_tag {
+                            let _ = writeln!(self.out, "    cmpl ${id}, %ecx");
+                        } else {
+                            let _ = writeln!(self.out, "    cmpl ${id}, 4(%r14)");
+                        }
+                        let _ = writeln!(self.out, "    je {l}");
                     }
-                    let _ = writeln!(self.out, "    je {l}");
-                }
-                SAlt::Lit(lit @ (Lit::Int(_) | Lit::Char(_) | Lit::Double(_)), _) => {
-                    // A number or character: its kind and payload are compared inline.
-                    let next = self.label("lit");
-                    let (kind, payload, cmp) = match lit {
-                        Lit::Int(i) => (INT, *i as u64, "cmpq %rcx, 8(%r14)"),
-                        Lit::Char(c) => (CHAR, crate::syntax::lexer::char_code(*c) as u64, "cmpl %ecx, 8(%r14)"),
-                        Lit::Double(d) => (DOUBLE, d.to_bits(), "cmpq %rcx, 8(%r14)"),
-                        _ => unreachable!(),
-                    };
-                    let _ = writeln!(self.out, "    cmpb ${kind}, (%r14)");
-                    let _ = writeln!(self.out, "    jne {next}");
-                    let _ = writeln!(self.out, "    movabsq ${payload}, %rcx");
-                    self.emit(cmp);
-                    let _ = writeln!(self.out, "    je {l}");
-                    self.put_label(&next);
-                }
-                SAlt::Lit(lit, _) => {
-                    // The runtime compares the scrutinee with the literal's text (no allocation).
-                    let (kind, text) = lit_text(lit);
-                    let t = self.string_label(text.as_bytes());
-                    let _ = writeln!(self.out, "    movq {}(%rbp), %rsi", p.slot_off(bslot));
-                    let _ = writeln!(self.out, "    leaq {t}(%rip), %rdx");
-                    let _ = writeln!(self.out, "    movl ${}, %ecx", text.len());
-                    let _ = writeln!(self.out, "    movl ${kind}, %r8d");
-                    self.rt_call("hsc_lit_matches", p, 4);
-                    self.emit("testl %eax, %eax");
-                    let _ = writeln!(self.out, "    jnz {l}");
-                }
-                SAlt::Default(_) => {
-                    let _ = writeln!(self.out, "    jmp {l}");
-                    has_default = true;
-                    break;
+                    SAlt::Lit(lit @ (Lit::Int(_) | Lit::Char(_) | Lit::Double(_)), _) => {
+                        // A number or character: its kind and payload are compared inline.
+                        let next = self.label("lit");
+                        let (kind, payload, cmp) = match lit {
+                            Lit::Int(i) => (INT, *i as u64, "cmpq %rcx, 8(%r14)"),
+                            Lit::Char(c) => (CHAR, crate::syntax::lexer::char_code(*c) as u64, "cmpl %ecx, 8(%r14)"),
+                            Lit::Double(d) => (DOUBLE, d.to_bits(), "cmpq %rcx, 8(%r14)"),
+                            _ => unreachable!(),
+                        };
+                        let _ = writeln!(self.out, "    cmpb ${kind}, (%r14)");
+                        let _ = writeln!(self.out, "    jne {next}");
+                        let _ = writeln!(self.out, "    movabsq ${payload}, %rcx");
+                        self.emit(cmp);
+                        let _ = writeln!(self.out, "    je {l}");
+                        self.put_label(&next);
+                    }
+                    SAlt::Lit(lit, _) => {
+                        // The runtime compares the scrutinee with the literal's text (no allocation).
+                        let (kind, text) = lit_text(lit);
+                        let t = self.string_label(text.as_bytes());
+                        let _ = writeln!(self.out, "    movq {}(%rbp), %rsi", p.slot_off(bslot));
+                        let _ = writeln!(self.out, "    leaq {t}(%rip), %rdx");
+                        let _ = writeln!(self.out, "    movl ${}, %ecx", text.len());
+                        let _ = writeln!(self.out, "    movl ${kind}, %r8d");
+                        self.rt_call("hsc_lit_matches", p, 4);
+                        self.emit("testl %eax, %eax");
+                        let _ = writeln!(self.out, "    jnz {l}");
+                    }
+                    SAlt::Default(_) => {
+                        let _ = writeln!(self.out, "    jmp {l}");
+                        has_default = true;
+                        break;
+                    }
                 }
             }
         }
@@ -2382,6 +2472,47 @@ impl Gen {
 }
 
 /// A literal pattern's kind and text, as the runtime reads them.
+/// Global indices whose worker is referenced by at least one `SExpr::CallWorker`.
+fn collect_called_workers(prog: &SProgram) -> std::collections::HashSet<u32> {
+    fn walk(e: &SExpr, out: &mut std::collections::HashSet<u32>) {
+        match e {
+            SExpr::CallWorker(g, _) => {
+                out.insert(*g);
+            }
+            SExpr::Atom(_) | SExpr::App(..) | SExpr::Con(..) | SExpr::Prim(..) | SExpr::Fail(_) | SExpr::Jump(..) => {}
+            SExpr::Let(binds, body) => {
+                for (_, b) in binds {
+                    if let SBind::Closure(c) = b {
+                        walk(&c.body, out);
+                    }
+                }
+                walk(body, out);
+            }
+            SExpr::Case(s, _, alts) => {
+                walk(s, out);
+                for a in alts {
+                    match a {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => walk(b, out),
+                    }
+                }
+            }
+            SExpr::Closure(c) => walk(&c.body, out),
+            SExpr::Join(_, _, code, body) => {
+                walk(code, out);
+                walk(body, out);
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for gl in &prog.globals {
+        walk(&gl.closure.body, &mut out);
+        if let Some((c, _)) = &gl.worker {
+            walk(&c.body, &mut out);
+        }
+    }
+    out
+}
+
 fn lit_text(l: &Lit) -> (u64, String) {
     match l {
         Lit::Int(i) => (0, i.to_string()),
@@ -2894,6 +3025,70 @@ mod known_global_call_tests {
         // Swaps %rsi and %rdi via %rax and jumps directly to .Lloop without stack ops.
         assert!(asm.contains("movq %rdi, %rax\n    movq %rsi, %rdi\n    movq %rax, %rsi\n"), "{asm}");
         assert!(asm.contains("jmp .Lloop"), "{asm}");
+    }
+
+    #[test]
+    fn unreferenced_worker_body_is_not_emitted() {
+        let r0 = RAW | 0;
+        let worker_closure = SClosure {
+            arity: 0,
+            captures: Vec::new(),
+            nslots: 1,
+            nraw: 1,
+            raw_args: vec![(0, r0)],
+            ret_raw: false,
+            uses_closure: false,
+            body: SExpr::Atom(Atom::Lit(SLit::Int(999))),
+        };
+        let globals = vec![SGlobal {
+            name: "Test.unused_worker".into(),
+            closure: SClosure {
+                arity: 1,
+                captures: Vec::new(),
+                nslots: 2,
+                nraw: 0,
+                raw_args: Vec::new(),
+                ret_raw: false,
+                uses_closure: false,
+                body: SExpr::Atom(Atom::Slot(1)),
+            },
+            worker: Some((worker_closure, vec![true])),
+        }];
+        let index = [("Test.unused_worker".to_string(), 0)].into_iter().collect();
+        let asm = Gen::program(&SProgram { globals, index });
+        assert!(!asm.contains("999"), "unreferenced worker body should not be emitted:\n{asm}");
+    }
+
+    #[test]
+    fn multiway_literal_cases_use_binary_search_for_eight_or_more_alts() {
+        let mut raw_alts: Vec<SAlt> = (0..10i64)
+            .map(|i| SAlt::Lit(Lit::Int(i * 10), SExpr::Atom(Atom::Lit(SLit::Int(i + 100)))))
+            .collect();
+        raw_alts.push(SAlt::Default(SExpr::Atom(Atom::Lit(SLit::Int(0)))));
+        let raw_case = SExpr::Case(Box::new(SExpr::Atom(Atom::Slot(RAW | 0))), 1, raw_alts);
+        let mut g = Gen::new();
+        g.expr(&raw_case, Pos { f: Frame { s: 2, a: 0, r: 1, has_closure: true }, mode: Mode::Tail, pushed: 0 });
+        assert!(g.out.contains("jl .Lbs"), "raw literal case >= 8 alts should binary-search:\n{}", g.out);
+
+        let mut boxed_alts: Vec<SAlt> = (0..10i64)
+            .map(|i| SAlt::Lit(Lit::Char(char::from(b'a' + i as u8)), SExpr::Atom(Atom::Lit(SLit::Int(i)))))
+            .collect();
+        boxed_alts.push(SAlt::Default(SExpr::Atom(Atom::Lit(SLit::Int(-1)))));
+        let boxed_case = SExpr::Case(Box::new(SExpr::Atom(Atom::Slot(1))), 2, boxed_alts);
+        let mut g2 = Gen::new();
+        g2.expr(&boxed_case, Pos { f: Frame { s: 3, a: 1, r: 0, has_closure: true }, mode: Mode::Tail, pushed: 0 });
+        assert!(g2.out.contains("jl .Lbs"), "boxed char literal case >= 8 alts should binary-search:\n{}", g2.out);
+
+        // Fewer than 8 alts keeps linear dispatch.
+        let small_alts = vec![
+            SAlt::Lit(Lit::Int(1), SExpr::Atom(Atom::Lit(SLit::Int(10)))),
+            SAlt::Lit(Lit::Int(2), SExpr::Atom(Atom::Lit(SLit::Int(20)))),
+            SAlt::Default(SExpr::Atom(Atom::Lit(SLit::Int(0)))),
+        ];
+        let small_case = SExpr::Case(Box::new(SExpr::Atom(Atom::Slot(RAW | 0))), 1, small_alts);
+        let mut g3 = Gen::new();
+        g3.expr(&small_case, Pos { f: Frame { s: 2, a: 0, r: 1, has_closure: true }, mode: Mode::Tail, pushed: 0 });
+        assert!(!g3.out.contains("jl .Lbs"), "small literal case should stay linear:\n{}", g3.out);
     }
 }
 

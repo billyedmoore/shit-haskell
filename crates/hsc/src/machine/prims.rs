@@ -175,7 +175,7 @@ pub fn run_ccall(m: &mut Machine, id: usize, nargs: usize) -> Word {
         CPlan::Unknown => {}
     }
     // The first call (or an own version that declined): as `run`, recording what ran.
-    let name = m.prog.prim_names[id];
+    let name = m.prog.prim_name(id);
     let Some((sig, ret, sym)) = crate::ccall::parse(name) else { return run(m, name, nargs) };
     let c = std::rc::Rc::new(CCall {
         sig: sig.to_string(),

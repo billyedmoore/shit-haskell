@@ -89,24 +89,57 @@ pub struct Machine {
     pub saved_args: Vec<[Word; ARG_SLOTS]>,
     /// Set when a nested evaluation a primitive made raised: the primitive answers the exception.
     pub prim_failed: bool,
-    /// Ordinary names indexed by the unchanged program-local primitive IDs.
-    pub ordinary_prims: Vec<Option<&'static str>>,
+    /// Lazily classified dispatch entry per program-local primitive ID.
+    pub(super) prim_dispatch: Vec<PrimDispatch>,
     /// The module that ran each ordinary primitive (0 not yet; see `prims::run_ordinary`).
     pub ordinary_module: Vec<u8>,
-    pub(super) int_prims: Vec<Option<prims_num::IntOp>>,
-    pub(super) conc_prims: Vec<Option<conc::ConcOp>>,
-    pub(super) integer_prims: Vec<Option<prims_integer::IntegerOp>>,
     /// How each C call primitive ran the first time (see `prims::run_ccall`).
     pub(super) ccall_plans: Vec<prims::CPlan>,
-    /// Selector thunks (`code_addr -> (con_id, field_word)`) short-circuited during GC.
+    /// Selector thunks (`code_addr -> (con_id, field_word)`) built lazily on first GC.
     pub selectors: gc::SelectorTable,
+    pub(super) selectors_raw: (*const [u32; 3], usize),
+    pub(super) selectors_loaded: bool,
+}
+
+/// Cached dispatch target for one program-local primitive ID (classified on first call).
+#[derive(Clone, Copy)]
+pub(super) enum PrimDispatch {
+    Unclassified,
+    Conc(conc::ConcOp),
+    Int(prims_num::IntOp),
+    Integer(prims_integer::IntegerOp),
+    Ordinary(&'static str),
+    CCall,
 }
 
 /// The tables the generated program provides (see `native::codegen`).
+/// Name tables are read directly from `.rodata` on demand so startup does zero decoding.
 pub struct Program {
-    pub globals: Vec<(i64, usize)>,
-    pub con_names: Vec<&'static str>,
-    pub prim_names: Vec<&'static str>,
+    pub nglobals: usize,
+    pub con_names: *const [u32; 2],
+    pub ncons: usize,
+    pub prim_names: *const [u32; 2],
+    pub nprims: usize,
+}
+
+impl Program {
+    #[inline]
+    pub fn con_name(&self, i: usize) -> &'static str {
+        if i >= self.ncons || self.con_names.is_null() {
+            return "";
+        }
+        // SAFETY: `con_names` points to immutable `.rodata` entries emitted by codegen.
+        unsafe { entry::name_at(self.con_names, i) }
+    }
+
+    #[inline]
+    pub fn prim_name(&self, i: usize) -> &'static str {
+        if i >= self.nprims || self.prim_names.is_null() {
+            return "";
+        }
+        // SAFETY: `prim_names` points to immutable `.rodata` entries emitted by codegen.
+        unsafe { entry::name_at(self.prim_names, i) }
+    }
 }
 
 thread_local! {
@@ -120,28 +153,20 @@ impl Machine {
         // HSC_HEAP_WORDS: the initial heap (a small one makes collections frequent, for testing).
         let words = std::env::var("HSC_HEAP_WORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(HEAP_WORDS);
         // At least room for the program's global closures and some slack, whatever was asked.
-        let words = words.max(4 * prog.globals.len() + (1 << 14));
+        let words = words.max(4 * prog.nglobals + (1 << 14));
         let heap = Heap::new(words);
         let base = heap.addr(0);
         let limit = base + (words as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
-        let nprims = prog.prim_names.len();
-        let mut int_prims = Vec::with_capacity(nprims);
-        let mut conc_prims = Vec::with_capacity(nprims);
-        let mut integer_prims = Vec::with_capacity(nprims);
-        let mut ordinary_prims = Vec::with_capacity(nprims);
-        for &name in &prog.prim_names {
-            int_prims.push(prims_num::IntOp::classify(name));
-            conc_prims.push(conc::ConcOp::classify(name));
-            integer_prims.push(prims_integer::IntegerOp::classify(name));
-            ordinary_prims.push(
-                prims::ordinary_name(name).or_else(|| crate::ccall::parse(name).is_none().then_some(name)),
-            );
-        }
+        let nprims = prog.nprims;
         let ccall_plans = vec![prims::CPlan::Unknown; nprims];
         // `prims::con_value` takes the runtime's constructors' ids from their position.
         for (i, c) in crate::native::RTS_CONS.iter().enumerate() {
-            assert_eq!(prog.con_names.get(i).copied(), Some(*c), "internal: runtime constructor {c} out of place");
+            assert_eq!(
+                (i < prog.ncons).then(|| prog.con_name(i)),
+                Some(*c),
+                "internal: runtime constructor {c} out of place"
+            );
         }
         let mut m = Box::new(Machine {
             hp: base,
@@ -173,13 +198,12 @@ impl Machine {
             prog_name: std::env::args().next().and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "main".into()),
             saved_args: Vec::new(),
             prim_failed: false,
+            prim_dispatch: vec![PrimDispatch::Unclassified; nprims],
             ordinary_module: vec![0; nprims],
-            ordinary_prims,
-            int_prims,
-            conc_prims,
-            integer_prims,
             ccall_plans,
             selectors: gc::SelectorTable::default(),
+            selectors_raw: (std::ptr::null(), 0),
+            selectors_loaded: false,
             bodies: entry::DiagnosticBodies::default(),
         });
         m.stack = stack;
@@ -188,12 +212,33 @@ impl Machine {
         m
     }
 
+    /// Classifies primitive `id` on first use and caches its dispatch target.
+    #[inline]
+    pub(super) fn classify_prim(&mut self, id: usize) -> PrimDispatch {
+        let name = self.prog.prim_name(id);
+        let d = if let Some(op) = conc::ConcOp::classify(name) {
+            PrimDispatch::Conc(op)
+        } else if let Some(op) = prims_num::IntOp::classify(name) {
+            PrimDispatch::Int(op)
+        } else if let Some(op) = prims_integer::IntegerOp::classify(name) {
+            PrimDispatch::Integer(op)
+        } else if let Some(ord) = prims::ordinary_name(name) {
+            PrimDispatch::Ordinary(ord)
+        } else if crate::ccall::parse(name).is_none() {
+            PrimDispatch::Ordinary(name)
+        } else {
+            PrimDispatch::CCall
+        };
+        self.prim_dispatch[id] = d;
+        d
+    }
+
     /// Lazily resolves a non-RTS constructor name to its program ID.
     pub fn lookup_con_id(&mut self, name: &str) -> Option<u32> {
-        if self.con_ids.is_empty() && !self.prog.con_names.is_empty() {
-            self.con_ids.reserve(self.prog.con_names.len());
-            for (i, &n) in self.prog.con_names.iter().enumerate() {
-                self.con_ids.insert(n, i as u32);
+        if self.con_ids.is_empty() && self.prog.ncons > 0 {
+            self.con_ids.reserve(self.prog.ncons);
+            for i in 0..self.prog.ncons {
+                self.con_ids.insert(self.prog.con_name(i), i as u32);
             }
         }
         self.con_ids.get(name).copied()
@@ -267,7 +312,7 @@ impl Machine {
     /// The name of the constructor of an evaluated object.
     pub fn con_name(&self, p: Word) -> &str {
         let id = heap::aux_of(self.heap_get(p, 0)) as usize;
-        self.prog.con_names.get(id).copied().unwrap_or("")
+        self.prog.con_name(id)
     }
 
     /// Whether a scrutinee (evaluated) matches a literal pattern given as text, by kind.
@@ -315,11 +360,27 @@ impl Machine {
 
     /// Collects the heap, with every root the machine holds.
     pub fn collect(&mut self, need: usize) {
+        if !self.selectors_loaded {
+            self.selectors_loaded = true;
+            let (raw, count) = self.selectors_raw;
+            if !raw.is_null() && count > 0 {
+                let sel_base = raw as usize;
+                let entries: Vec<(Word, u32, u32)> = (0..count)
+                    .map(|i| {
+                        // SAFETY: `selectors_raw` points to immutable `.rodata` emitted by codegen.
+                        let [code_off, con_id, field_word] = unsafe { *raw.add(i) };
+                        let code = sel_base.wrapping_add_signed(code_off as i32 as isize) as Word;
+                        (code, con_id, field_word)
+                    })
+                    .collect();
+                self.selectors = gc::SelectorTable::new(&entries);
+            }
+        }
         // Roots: the stack (walked from sp), the globals, the record's arguments and registers,
         // the exception, and the stable pointers.
         let mut locs: Vec<*mut Word> = Vec::new();
         stack_roots(self.sp, self.top, &mut locs);
-        for i in 0..self.prog.globals.len() {
+        for i in 0..self.prog.nglobals {
             // SAFETY: the globals table has one slot per global, allocated with the machine.
             locs.push(unsafe { self.globals.add(i) });
         }
