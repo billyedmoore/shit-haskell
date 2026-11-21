@@ -784,6 +784,11 @@ impl<'a> Renamer<'a> {
             if let Some(e) = found {
                 return Ok(e);
             }
+            if m == self.module {
+                if let Some(e) = self.vals.get(&q.name).and_then(|list| list.iter().find(|e| e.global.module == m).cloned()) {
+                    return Ok(e);
+                }
+            }
         }
         match self.lookup_global(q, Ns::Value) {
             Ok(e) => Ok(e),
@@ -1047,6 +1052,7 @@ impl<'a> Renamer<'a> {
                 }
             }
             Decl::Data(mut dd) => {
+                dd.tyvars = self.tyvar_binds(std::mem::take(&mut dd.tyvars))?;
                 dd.context = self.types(dd.context)?;
                 for c in &mut dd.cons {
                     c.exist = self.tyvar_binds(std::mem::take(&mut c.exist))?;
@@ -2170,6 +2176,20 @@ impl<'a> Renamer<'a> {
             return Ok(self.own.clone());
         };
         let mut out: Vec<Entity> = Vec::new();
+        // A module can export a type or class more than once (`module System.Random, Uniform(..)`
+        // where `System.Random` exported bare `Uniform` without its methods). Merge their
+        // sub-entities into one entry so `select_item` sees all exported children.
+        let push_export = |out: &mut Vec<Entity>, e: Entity| {
+            if let Some(existing) = out.iter_mut().find(|x| x.global == e.global && x.kind.is_value() == e.kind.is_value()) {
+                for s in e.subs {
+                    if !existing.subs.iter().any(|o| o.global == s.global) {
+                        existing.subs.push(s);
+                    }
+                }
+            } else {
+                out.push(e);
+            }
+        };
         // The exported types and classes with all their children, so that a child exported on its
         // own (`StateT(StateT), runStateT`) is still one of its parent's (imported by `StateT(..)`).
         let mut parents: Vec<(GName, Vec<Entity>)> = Vec::new();
@@ -2185,7 +2205,7 @@ impl<'a> Renamer<'a> {
                             format!("Ambiguous occurrence ‘{}’", display_qname(q))
                         },
                     })?;
-                    out.push(e);
+                    push_export(&mut out, e);
                 }
                 IEItem::Thing { name, .. } if name.qual.is_none() && is_builtin_tycon(&name.name) => {
                     // Built-in syntax and operators have no defining entity to export.
@@ -2228,11 +2248,13 @@ impl<'a> Renamer<'a> {
                             some
                         }
                     };
-                    out.push(with_subs);
+                    push_export(&mut out, with_subs);
                 }
                 IEItem::Module(m) => {
                     if *m == self.module {
-                        out.extend(self.own.iter().cloned());
+                        for e in &self.own {
+                            push_export(&mut out, e.clone());
+                        }
                     }
                     {
                         // `module M` exports the entities in scope both unqualified and as `M.x`
@@ -2249,9 +2271,7 @@ impl<'a> Renamer<'a> {
                                         }
                                         // A type and a constructor can share a global name; they
                                         // are different entities.
-                                        if !out.iter().any(|x| x.global == e.global && x.kind.is_value() == e.kind.is_value()) {
-                                            out.push(e.clone());
-                                        }
+                                        push_export(&mut out, e.clone());
                                     }
                                 }
                             }

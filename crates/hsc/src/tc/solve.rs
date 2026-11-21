@@ -102,6 +102,9 @@ impl Checker {
             Some(c) => c.dict_con.clone(),
             None => return Ok(None),
         };
+        if let Some(ev) = self.find_given(pred) {
+            return Ok(Some(ev));
+        }
         let t = self.metas.zonk(&pred.args[0]);
         let (head, args) = t.split_apps();
         let head = head.clone();
@@ -111,6 +114,16 @@ impl Checker {
             work.push(Wanted { pred: Pred { class: TYPEABLE_CLASS.into(), args: vec![ty] }, ev: ev.clone(), loc });
             this.typeable_rep_of(&ev, &class)
         };
+        if let Ty::App(f, x) = &t {
+            let f_pred = Pred { class: TYPEABLE_CLASS.into(), args: vec![(**f).clone()] };
+            if self.find_given(&f_pred).is_some() {
+                let rf = wanted_rep(self, (**f).clone(), work);
+                let rx = wanted_rep(self, (**x).clone(), work);
+                let app = Core::Var("GHC.Internal.Data.Typeable.Internal.mkTrApp".into());
+                let rep = Core::App(Box::new(Core::App(Box::new(app), Box::new(rf))), Box::new(rx));
+                return Ok(Some(Core::Con(class, vec![rep])));
+            }
+        }
         let rep = match &head {
             // A function type: its own representation.
             Ty::Con(c) if c == super::types::ARROW && args.len() == 2 => {
@@ -602,9 +615,17 @@ impl Checker {
                 continue;
             }
             // Representational equality is not checked (coercions are erased), so it always holds.
+            // When a side is still a bare unification variable (`let jsval = coerce obj`), keep the
+            // constraint residual so the monomorphism restriction keeps the binding monomorphic.
             if pred.class == "GHC.Types.Coercible" {
                 if pred.args.len() == 2 {
                     self.coercions.push((pred.args[0].clone(), pred.args[1].clone()));
+                    if matches!(self.metas.prune(&pred.args[0]), Ty::Meta(_))
+                        || matches!(self.metas.prune(&pred.args[1]), Ty::Meta(_))
+                    {
+                        residual.push(Wanted { pred, ev: w.ev, loc: w.loc });
+                        continue;
+                    }
                 }
                 binds.push((w.ev.clone(), Core::Con("Builtin.()".into(), vec![])));
                 continue;
@@ -1556,7 +1577,21 @@ impl Checker {
             self.top_binds_from_evidence(binds);
             residual = rest;
         }
-        Ok(residual)
+        // Any remaining `Coercible` constraint whose variable was kept open for the monomorphism
+        // restriction is discharged here (coercions are erased).
+        let mut kept = Vec::with_capacity(residual.len());
+        let mut coerce_binds = Vec::new();
+        for w in residual {
+            if w.pred.class == "GHC.Types.Coercible" {
+                coerce_binds.push((w.ev, Core::Con("Builtin.()".into(), vec![])));
+            } else {
+                kept.push(w);
+            }
+        }
+        if !coerce_binds.is_empty() {
+            self.top_binds_from_evidence(coerce_binds);
+        }
+        Ok(kept)
     }
 
     /// The type opposite unification variable `m` in a solved coercion with both sides headed
@@ -1566,6 +1601,16 @@ impl Checker {
         // `NonEmpty (Set t) -> Set t` to `NonEmpty (Intersection a) -> Intersection a`: `t` is
         // `a` under `Set`). GHC needs the parameter's role to be nominal there; a program it
         // accepts gets the same answer.
+        fn has_bound(t: &Ty) -> bool {
+            match t {
+                Ty::Bound(_) => true,
+                Ty::App(f, x) => has_bound(f) || has_bound(x),
+                Ty::Forall(_, ps, b) | Ty::Qual(ps, b) => {
+                    has_bound(b) || ps.iter().any(|p| p.args.iter().any(has_bound))
+                }
+                _ => false,
+            }
+        }
         fn walk(c: &Checker, a: &Ty, b: &Ty, m: u32, depth: usize) -> Option<Ty> {
             let (a, b) = (c.metas.prune(a), c.metas.prune(b));
             match (&a, &b) {
@@ -1575,9 +1620,14 @@ impl Checker {
                 (Ty::App(f1, x1), Ty::App(f2, x2)) if c.same_head(&a, &b) => {
                     walk(c, f1, f2, m, depth).or_else(|| walk(c, x1, x2, m, depth))
                 }
+                (Ty::Forall(i1, _, b1), Ty::Forall(i2, _, b2)) if i1.len() == i2.len() => {
+                    walk(c, b1, b2, m, depth).filter(|r| !has_bound(r))
+                }
+                (Ty::Qual(_, b1), Ty::Qual(_, b2)) => walk(c, b1, b2, m, depth),
                 _ if depth < 8 => {
                     match (c.newtype_unwrap(&a), c.newtype_unwrap(&b)) {
-                        (Some(u), _) => return walk(c, &u, &b, m, depth + 1),
+                        (Some(ua), Some(ub)) => return walk(c, &ua, &ub, m, depth + 1),
+                        (Some(u), None) => return walk(c, &u, &b, m, depth + 1),
                         (None, Some(u)) => return walk(c, &a, &u, m, depth + 1),
                         _ => {}
                     }
@@ -1614,17 +1664,22 @@ impl Checker {
             if self.same_head(&pa, &pb) {
                 return walk(self, &pa, &pb, m, 0);
             }
+            if let (Some(ua), Some(ub)) = (self.newtype_unwrap(&pa), self.newtype_unwrap(&pb)) {
+                if let Some(r) = walk(self, &ua, &ub, m, 1) {
+                    return Some(r);
+                }
+            }
             for g in self.givens.iter().rev() {
                 if g.pred.class != "GHC.Types.Coercible" || g.pred.args.len() != 2 {
                     continue;
                 }
                 let (ga, gb) = (self.metas.prune(&g.pred.args[0]), self.metas.prune(&g.pred.args[1]));
                 for (lhs, rhs) in [(&ga, &gb), (&gb, &ga)] {
-                    if *lhs == pb && self.same_head(&pa, rhs) {
+                    if *lhs == pb && (self.same_head(&pa, rhs) || matches!(pa, Ty::Meta(x) if x == m)) {
                         if let Some(r) = walk(self, &pa, rhs, m, 1) {
                             return Some(r);
                         }
-                    } else if *lhs == pa && self.same_head(rhs, &pb) {
+                    } else if *lhs == pa && (self.same_head(rhs, &pb) || matches!(pb, Ty::Meta(x) if x == m)) {
                         if let Some(r) = walk(self, rhs, &pb, m, 1) {
                             return Some(r);
                         }
@@ -1654,19 +1709,20 @@ impl Checker {
 
     /// Whether two types are applications of the same type constructor (after pruning).
     fn same_head(&self, a: &Ty, b: &Ty) -> bool {
-        fn head(c: &Checker, t: &Ty) -> Option<String> {
+        fn head(c: &Checker, t: &Ty) -> Ty {
             match c.metas.prune(t) {
-                Ty::Con(n) => Some(n),
                 Ty::App(f, _) => head(c, &f),
-                _ => None,
+                other => other,
             }
         }
         // A newtype's coercion relates it to its representation, not argument-wise.
         match (head(self, a), head(self, b)) {
-            (Some(x), Some(y)) => {
+            (Ty::Con(x), Ty::Con(y)) => {
                 let newtype = self.env.tycons.get(&x).and_then(|t| t.cons.first()).and_then(|c| self.env.datacons.get(c)).is_some_and(|d| d.newtype);
                 x == y && !newtype && !self.env.families.contains_key(&x)
             }
+            (Ty::Skol(x, _), Ty::Skol(y, _)) => x == y,
+            (Ty::Bound(x), Ty::Bound(y)) => x == y,
             _ => false,
         }
     }

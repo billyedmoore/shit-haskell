@@ -183,7 +183,7 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
             };
             // Constructor classes are derived for the type constructor without its last parameter.
             let drop_last = matches!(name.as_str(), "Functor" | "Foldable" | "Traversable" | "Generic1");
-            let mut inst = instance(&checker.module, dd, &class_qname, derived, drop_last);
+            let mut inst = instance(checker, dd, &class_qname, derived, drop_last);
             if let Decl::Instance(id) = &mut inst {
                 id.overlap = Some(DERIVED_MARK.into());
             }
@@ -239,15 +239,30 @@ pub fn is_stock(name: &str) -> bool {
 /// headed by a type variable (`f p`) needs the class at that type; any other field needs the class
 /// at the variables it mentions (`Tree a` needs `C a`). For constructor classes the variable
 /// applied to the last parameter is the one needed.
-fn field_context(class: &QName, dd: &DataDecl, loc: Loc, last: Option<&str>) -> Vec<Type> {
+fn field_context(checker: &Checker, class: &QName, dd: &DataDecl, loc: Loc, last: Option<&str>) -> Vec<Type> {
     let mut out: Vec<Type> = Vec::new();
+    let kept: Vec<&str> = if last.is_some() {
+        dd.tyvars[..dd.tyvars.len().saturating_sub(1)].iter().map(|tv| tv.name.as_str()).collect()
+    } else {
+        dd.tyvars.iter().map(|tv| tv.name.as_str()).collect()
+    };
+    let self_key = format!("{}.{}", checker.module, dd.name);
     for c in &dd.cons {
         let fields: Vec<&Type> = match &c.fields {
             ConFields::Positional(fs) => fs.iter().map(|f| &f.ty).collect(),
             ConFields::Record(groups) => groups.iter().map(|(_, f)| &f.ty).collect(),
         };
         for t in fields {
-            collect_needs(t, last, &mut |need: &Type| {
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(self_key.clone());
+            collect_needs(checker, t, last, &mut visited, &mut |need: &Type| {
+                // Only add constraints mentioning the derived datatype's own parameters
+                // (never an existential variable from a nested datatype).
+                let mut vs = Vec::new();
+                type_vars(need, &mut vs);
+                if vs.is_empty() || vs.iter().any(|v| !kept.iter().any(|k| k == v)) {
+                    return;
+                }
                 let item = Type::App(Box::new(Type::Con(class.clone(), loc)), Box::new(need.clone()));
                 if !out.contains(&item) {
                     out.push(item);
@@ -256,6 +271,24 @@ fn field_context(class: &QName, dd: &DataDecl, loc: Loc, last: Option<&str>) -> 
         }
     }
     out
+}
+
+/// Substitutes type variables in surface syntax (used when following a nested datatype's fields
+/// during derived context inference).
+fn subst_ast_type(t: &Type, map: &[(&str, &Type)]) -> Type {
+    match t {
+        Type::Var(v, _) => map
+            .iter()
+            .find(|(k, _)| *k == v.as_str())
+            .map(|(_, r)| (*r).clone())
+            .unwrap_or_else(|| t.clone()),
+        Type::App(f, a) => Type::App(Box::new(subst_ast_type(f, map)), Box::new(subst_ast_type(a, map))),
+        Type::Fun(a, b) => Type::Fun(Box::new(subst_ast_type(a, map)), Box::new(subst_ast_type(b, map))),
+        Type::List(e, l) => Type::List(Box::new(subst_ast_type(e, map)), *l),
+        Type::Tuple(ts, l) => Type::Tuple(ts.iter().map(|x| subst_ast_type(x, map)).collect(), *l),
+        Type::Sig(x, k) => Type::Sig(Box::new(subst_ast_type(x, map)), k.clone()),
+        _ => t.clone(),
+    }
 }
 
 /// A derived `Generic1` instance needs `Functor f` for each composition `f :.: ..` whose outer
@@ -283,7 +316,13 @@ fn generic1_context(dd: &DataDecl, loc: Loc, last: Option<&str>) -> Vec<Type> {
 }
 
 /// The types a derived instance needs the class at, for one field type.
-fn collect_needs(t: &Type, last: Option<&str>, add: &mut dyn FnMut(&Type)) {
+fn collect_needs(
+    checker: &Checker,
+    t: &Type,
+    last: Option<&str>,
+    visited: &mut std::collections::HashSet<String>,
+    add: &mut dyn FnMut(&Type),
+) {
     let mut vars = Vec::new();
     type_vars(t, &mut vars);
     if vars.is_empty() {
@@ -292,46 +331,76 @@ fn collect_needs(t: &Type, last: Option<&str>, add: &mut dyn FnMut(&Type)) {
     // Lists and tuples are instances of the class at their elements: a list needs what its
     // element needs (`[a]` needs `Show a`), a tuple what each component needs.
     match t {
-        Type::List(e, _) => return collect_needs(e, last, add),
+        Type::List(e, _) => return collect_needs(checker, e, last, visited, add),
         // A function field (`s -> m (a, s)`): what its argument and result need.
         Type::Fun(a, b) => {
-            collect_needs(a, last, add);
-            return collect_needs(b, last, add);
+            collect_needs(checker, a, last, visited, add);
+            return collect_needs(checker, b, last, visited, add);
         }
         Type::Tuple(ts, _) => {
             for x in ts {
-                collect_needs(x, last, add);
+                collect_needs(checker, x, last, visited, add);
             }
             return;
         }
         _ => {}
     }
-    let (head, args) = spine(t);
+    let expanded = expand_synonyms(checker, t, 0);
+    let (head, args) = spine(&expanded);
     match (last, head) {
         // Constructor classes: the head variable applied to the last parameter.
         (Some(l), Type::Var(..)) => {
             if let Some(last_arg) = args.last().filter(|a| mentions(a, l)) {
-                add(&strip_last(t));
+                add(&strip_last(&expanded));
                 // The argument is itself a field of the class's kind (`f (g p)` needs `g`).
-                collect_needs(last_arg, last, add);
+                collect_needs(checker, last_arg, last, visited, add);
+            }
+        }
+        (Some(l), Type::Con(q, _)) => {
+            // A nested/mutually recursive datatype (`data MLView m a = ConsML a (ML m a)` where
+            // `newtype ML m a = ML (m (MLView m a))`) passes its functor requirements through:
+            // inspect its fields (guarding against cycles) so `MLView` inherits `Functor m`.
+            if args.last().is_some_and(|a| mentions(a, l)) {
+                let key = checker.resolve_type(&super::expr::qkey(q));
+                if let Some((_, inner_dd)) = checker.env.data_decls.get(&key) {
+                    if args.len() == inner_dd.tyvars.len() && visited.insert(key) {
+                        let map: Vec<(&str, &Type)> = inner_dd
+                            .tyvars
+                            .iter()
+                            .zip(args.iter())
+                            .map(|(tv, a)| (tv.name.as_str(), *a))
+                            .collect();
+                        for c in &inner_dd.cons {
+                            for ft in field_types(c) {
+                                let sub = subst_ast_type(&ft, &map);
+                                collect_needs(checker, &sub, last, visited, add);
+                            }
+                        }
+                    }
+                }
+            }
+            for a in args {
+                if mentions(a, l) {
+                    collect_needs(checker, a, last, visited, add);
+                }
             }
         }
         (Some(l), _) => {
             for a in args {
                 if mentions(a, l) {
-                    collect_needs(a, last, add);
+                    collect_needs(checker, a, last, visited, add);
                 }
             }
         }
         // Ordinary classes: a variable-headed field needs the class at the field itself.
         (None, Type::Var(v, _)) if v.is_empty() => {}
-        (None, Type::Var(..)) => add(t),
+        (None, Type::Var(..)) => add(&expanded),
         (None, _) => {
-            if let Type::Var(..) = t {
-                add(t);
+            if let Type::Var(..) = expanded {
+                add(&expanded);
             } else {
                 for a in args {
-                    collect_needs(a, last, add);
+                    collect_needs(checker, a, last, visited, add);
                 }
             }
         }
@@ -382,7 +451,8 @@ pub fn type_vars(t: &Type, out: &mut Vec<String>) {
 }
 
 /// Builds the instance declaration: the context has the class at every type parameter.
-fn instance(module: &str, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_last: bool) -> Decl {
+fn instance(checker: &Checker, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_last: bool) -> Decl {
+    let module = checker.module.as_str();
     let loc = dd.loc;
     let kept: Vec<&crate::syntax::ast::TyVarBind> = if drop_last {
         dd.tyvars[..dd.tyvars.len().saturating_sub(1)].iter().collect()
@@ -405,7 +475,7 @@ fn instance(module: &str, dd: &DataDecl, class: &QName, decls: Vec<Decl>, drop_l
     let mut context = match class.name.as_str() {
         "Generic" => Vec::new(),
         "Generic1" => generic1_context(dd, loc, last.as_deref()),
-        _ => field_context(class, dd, loc, last.as_deref()),
+        _ => field_context(checker, class, dd, loc, last.as_deref()),
     };
     // `Data` has `Typeable` as its superclass: each type parameter must be Typeable, as GHC infers.
     if class.name == "Data" {

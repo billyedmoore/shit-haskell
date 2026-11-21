@@ -1340,7 +1340,41 @@ impl Checker {
             fields.push(field);
         }
         let default_wanted = std::mem::replace(&mut self.wanted, outer_wanted);
-        let (db, residual) = self.solve(default_wanted)?;
+        let (mut db, mut residual) = self.solve(default_wanted)?;
+        // A variable that a coercion relates to an instance skolem is that type, solved while
+        // the instance's context is still given (containers' `sconcat = coerce intersections`).
+        if !residual.is_empty() && !self.coercions.is_empty() {
+            fn mentions_skolem(t: &Ty, skolems: &[Ty]) -> bool {
+                match t {
+                    Ty::Skol(..) => skolems.contains(t),
+                    Ty::App(f, a) => mentions_skolem(f, skolems) || mentions_skolem(a, skolems),
+                    _ => false,
+                }
+            }
+            let mut fixed = false;
+            for w in &residual {
+                let p = self.metas_zonk_pred(&w.pred);
+                let mut ms = Vec::new();
+                for a in &p.args {
+                    self.metas.free_metas(a, &mut ms);
+                }
+                for m in ms {
+                    if matches!(self.metas.prune(&Ty::Meta(m)), Ty::Meta(x) if x == m) {
+                        if let Some(t) = self.coercible_partner(m) {
+                            if mentions_skolem(&t, &skolems) {
+                                self.metas.subst[m as usize] = Some(t);
+                                fixed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if fixed {
+                let (more, rest) = self.solve(residual)?;
+                db.extend(more);
+                residual = rest;
+            }
+        }
         method_binds.extend(db);
         self.wanted.extend(residual);
         self.scoped.truncate(scope_len);

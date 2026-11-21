@@ -140,6 +140,8 @@ pub enum CPlan {
     Addr(u64),
     /// An unsafe call of this C function.
     Generic(std::rc::Rc<CCall>, usize),
+    /// A `foreign import ccall "dynamic"` call through a `FunPtr` in argument 0.
+    Dynamic(std::rc::Rc<CCall>),
 }
 
 pub struct CCall {
@@ -154,6 +156,9 @@ pub struct CCall {
 pub fn run_ccall(m: &mut Machine, id: usize, nargs: usize) -> Word {
     m.prim_failed = false;
     match m.ccall_plans[id].clone() {
+        CPlan::Dynamic(c) => {
+            return super::prims_ffi::generic_dynamic(m, &c.sig, c.ret, c.safe, c.interruptible).unwrap_or(0);
+        }
         CPlan::Safe(c, f) => {
             return super::prims_ffi::generic_call(m, f as *mut std::ffi::c_void, &c.sig, c.ret, true, c.interruptible).unwrap_or(0);
         }
@@ -179,6 +184,10 @@ pub fn run_ccall(m: &mut Machine, id: usize, nargs: usize) -> Word {
         safe: crate::ccall::is_safe(&name),
         interruptible: crate::ccall::is_interruptible(&name),
     });
+    if c.sym == "dynamic" {
+        m.ccall_plans[id] = CPlan::Dynamic(c.clone());
+        return super::prims_ffi::generic_dynamic(m, &c.sig, c.ret, c.safe, c.interruptible).unwrap_or(0);
+    }
     if c.safe {
         if let Some(f) = crate::ccall::resolve(&name) {
             m.ccall_plans[id] = CPlan::Safe(c.clone(), f as usize);
@@ -217,6 +226,16 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Word {
     // A foreign C call: the runtime's own version of the function, else the C function itself.
     if let Some((sig, ret, sym)) = crate::ccall::parse(name) {
         let (sig, sym) = (sig.to_string(), sym.to_string());
+        if sym == "dynamic" {
+            return super::prims_ffi::generic_dynamic(
+                m,
+                &sig,
+                ret,
+                crate::ccall::is_safe(name),
+                crate::ccall::is_interruptible(name),
+            )
+            .unwrap_or(0);
+        }
         // A safe call of a C function goes to C (so that other threads run meanwhile), not to the
         // runtime's own version of it.
         if crate::ccall::is_safe(name) {

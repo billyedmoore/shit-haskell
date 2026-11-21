@@ -101,3 +101,11 @@ __attribute__((weak)) HpcModuleInfo *hs_hpc_rootModule(void) { return 0; }
 __attribute__((weak)) RTS_FLAGS RtsFlags;
 __attribute__((weak)) bool keepCAFs;
 __attribute__((weak)) void setKeepCAFs(void) { keepCAFs = true; }
+
+/* StablePtr / FunPtr RTS internals referenced by library C shims (e.g. haskell-gi-base's
+   hsgclosure.c, which uses deRefStablePtr from rts/StablePtr.h and freeHaskellFunctionPtr from
+   rts/Adjustor.h). */
+__attribute__((weak)) spEntry *stable_ptr_table = 0;
+__attribute__((weak)) StgStablePtr getStablePtr(StgPtr p) { (void)p; return 0; }
+__attribute__((weak)) void freeHaskellFunctionPtr(void *ptr) { (void)ptr; }
+

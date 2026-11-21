@@ -24,5 +24,8 @@ module GHC.Internal.Data.Coerce
           -- @since base-4.7.0.0
           coerce, Coercible
         ) where
-import GHC.Prim (coerce)
+import qualified GHC.Prim
 import GHC.Types (Coercible)
+
+coerce :: Coercible a b => a -> b
+coerce = GHC.Prim.coerce
