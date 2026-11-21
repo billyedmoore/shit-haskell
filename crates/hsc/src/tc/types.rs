@@ -7,7 +7,7 @@ use std::rc::Rc;
 pub const ARROW: &str = "Builtin.->";
 pub const LIST: &str = "Builtin.[]";
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ty {
     /// A type constructor by global name.
     Con(String),
@@ -96,8 +96,7 @@ impl Ty {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[derive(Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pred {
     pub class: String,
     pub args: Vec<Ty>,

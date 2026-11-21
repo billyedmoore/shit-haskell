@@ -40,6 +40,8 @@ pub struct Driver {
     /// module importing its namesake from another package): the internal name each is loaded
     /// under, with its real name and the package directory it is in.
     renamed: BTreeMap<String, (String, PathBuf)>,
+    /// Per-package direct dependency import directories (`pkg_dir -> dep_dirs`).
+    pkg_deps: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 /// Where a module was found: its source, the flags it is compiled with, and whether it is one of
@@ -148,6 +150,9 @@ pub const PREPROCESSED_FLAG: &str = "-hsc-preprocessed";
 
 /// The flag of a reexported module of a package in scope: `-hsc-reexport=NAME=MODULE=DIR`.
 pub const REEXPORT_FLAG: &str = "-hsc-reexport=";
+
+/// The flag recording a package's direct dependency import directory: `-hsc-pkgdep=PKG_DIR=DEP_DIR`.
+pub const PKGDEP_FLAG: &str = "-hsc-pkgdep=";
 
 /// The flag naming an interface module's source as its package's build was given it.
 pub const SOURCE_NAME_FLAG: &str = "-hsc-source-name=";
@@ -285,7 +290,8 @@ pub fn write_interface(path: &Path, module: &str, source: &Path, name: &Path, fl
     for f in flags {
         let cpp = f == "-cpp" || f == "-XCPP" || f.starts_with("-I") || f.starts_with("-D") || f.starts_with("-U")
             || f.starts_with("-include=") || f.starts_with("-optP") || f.starts_with("-hsc-pkgver=")
-            || f.starts_with("-hsc-archive=") || f.starts_with("-hsc-lib=") || f.starts_with(REEXPORT_FLAG);
+            || f.starts_with("-hsc-archive=") || f.starts_with("-hsc-lib=") || f.starts_with(REEXPORT_FLAG)
+            || f.starts_with(PKGDEP_FLAG);
         if !cpp {
             out.push_str(&format!("flag: {f}\n"));
         }
@@ -333,6 +339,14 @@ impl Driver {
         // checked (whose cache entry would carry them).
         let mut checker = Checker::new();
         let builtin_binds = std::mem::take(&mut checker.out);
+        let mut pkg_deps: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        for f in &flags {
+            if let Some(rest) = f.strip_prefix(PKGDEP_FLAG) {
+                if let Some((pdir, ddir)) = rest.split_once('=') {
+                    pkg_deps.entry(PathBuf::from(pdir)).or_default().push(PathBuf::from(ddir));
+                }
+            }
+        }
         Driver {
             search,
             pkg_dirs,
@@ -347,6 +361,7 @@ impl Driver {
             c_sources: Vec::new(),
             c_flags: Vec::new(),
             renamed: BTreeMap::new(),
+            pkg_deps,
             keys: HashMap::new(),
             boot_deps: HashMap::new(),
         }
@@ -538,18 +553,26 @@ impl Driver {
             }
             let stem = imp.module.replace('.', "/");
             let found = self.find_module(&imp.module);
-            // The module of its own package; else, when the plain name finds a home module (one of
-            // the program's, as ghc-lib-parser's GHC.Internal.TH.Syntax), the packages' one: a
-            // package's modules never see the program's.
+            // The module of its own package; else one of its declared direct dependencies (so an
+            // installed package sees the version of e.g. `Data.ByteString.Base16` it depends on,
+            // even when another package in scope exposes the same module name); else, when the
+            // plain name finds a home module (one of the program's, as ghc-lib-parser's
+            // GHC.Internal.TH.Syntax), the packages' one: a package's modules never see the
+            // program's.
             let (from_dir, own) = match Self::find_in_package_dir(&dir, &stem) {
                 Some(own) => (dir.clone(), own),
-                None if found.as_ref().is_some_and(|f| f.home) => {
-                    match self.pkg_dirs.iter().find_map(|d| Self::find_in_package_dir(d, &stem).map(|f| (d.clone(), f))) {
-                        Some(hit) => hit,
-                        None => continue,
+                None => match self.pkg_deps.get(&dir).and_then(|deps| {
+                    deps.iter().find_map(|d| Self::find_in_package_dir(d, &stem).map(|f| (d.clone(), f)))
+                }) {
+                    Some(hit) => hit,
+                    None if found.as_ref().is_some_and(|f| f.home) => {
+                        match self.pkg_dirs.iter().find_map(|d| Self::find_in_package_dir(d, &stem).map(|f| (d.clone(), f))) {
+                            Some(hit) => hit,
+                            None => continue,
+                        }
                     }
-                }
-                None => continue,
+                    None => continue,
+                },
             };
             if found.map(|f| f.path) == Some(own.path) {
                 continue;
@@ -801,6 +824,7 @@ impl Driver {
         for d in &deps {
             let loaded = if source.contains(d) { self.load_boot(d) } else { self.load(d) };
             if let Err(e) = loaded {
+                self.loading.pop();
                 return Err(match self.find_source(d) {
                     Some(_) => e,
                     None => format!("{}:{}:{}: error:\n    {}", path.display(), parsed.loc.line, parsed.loc.col, e),
@@ -970,42 +994,88 @@ impl Driver {
     fn expand_decl_splices(&mut self, m: &mut Module, exts: &Extensions, path: &Path) -> Result<usize, String> {
         let mut groups_end = 0;
         while let Some(i) = m.decls.iter().position(|d| matches!(d, Decl::Splice(..))) {
-            let Decl::Splice(body, loc) = m.decls[i].clone() else { unreachable!() };
             // (The top handler too, for a native run of the splices.)
             for lib in ["GHC.Internal.TH.Syntax", "GHC.Internal.IO.Unsafe", "GHC.Internal.TopHandler"] {
                 self.load(lib)?;
             }
             self.load_booted()?;
-            // The declarations before it may have expression splices of their own.
+            // The declarations before the splice(s) may have expression splices of their own.
             let mut before = Module { decls: m.decls[..i].to_vec(), ..m.clone() };
             self.expand_expr_splices(&mut before, exts, path, groups_end)?;
             m.decls.splice(..i, before.decls.iter().cloned());
-            let (imported, reached) = self.quoted_types_closure(&[&body], &m.name);
-            let mut classes = self.quoted_classes(&[&body]);
-            classes.extend(reached);
-            let table = crate::th::reify_table(&before.decls, &m.name, &imported, classes, loc);
-            let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(&before.decls, &m.name, &imported), loc);
-            let smod = crate::th::decl_splice_module(m, before.decls, body, loc, table, setup, &path.display().to_string());
-            let mark = self.binds.len();
-            let user_module = self.checker.user_module;
-            self.compile_module(smod, exts.clone(), path)?;
-            let pre = self.reify_values(&m.name, exts, path, loc)?;
-            self.checker.user_module = user_module;
-            let pre_io = pre.as_ref().map(|p| format!("{}IO", p));
-            let generated = match crate::th::run_decl_splice(&self.binds, &m.name, loc, pre) {
-                Err(e) if e == crate::th::SPLICE_BUDGET => {
-                    self.native_splices(&m.name, 1, pre_io).and_then(|out| crate::th::native_decs(&out, loc))
-                }
-                r => r,
+            // A contiguous run of declaration splices (like generics-sop's 196 `deriveGeneric`
+            // calls) can run in a single splice module and runtime when none quotes a class
+            // (which could observe instances generated by an earlier splice in the run). If the
+            // batch fails to compile or run (e.g. a later splice refers to a type generated by an
+            // earlier one), fall back to running just the first splice.
+            let mut j = i;
+            let mut batch = Vec::new();
+            while let Some(Decl::Splice(body, loc)) = m.decls.get(j) {
+                batch.push(crate::th::Splice { body: body.clone(), loc: *loc });
+                j += 1;
             }
-                .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), loc.line, loc.col))?;
-            // The module is compiled for real afterwards.
-            self.binds.truncate(mark);
-            self.ifaces.remove(&m.name);
+            if batch.len() > 1 {
+                let bodies: Vec<&crate::syntax::ast::Expr> = batch.iter().map(|s| &s.body).collect();
+                if self.quoted_classes(&bodies).is_empty() {
+                    if let Ok(generated) = self.run_decl_splice_batch(m, &before.decls, &batch, exts, path) {
+                        groups_end = i + generated.len();
+                        m.decls.splice(i..j, generated);
+                        continue;
+                    }
+                }
+            }
+            let generated = self.run_decl_splice_batch(m, &before.decls, &batch[..1], exts, path)?;
             groups_end = i + generated.len();
             m.decls.splice(i..=i, generated);
         }
         Ok(groups_end)
+    }
+
+    /// Compiles and runs one or more declaration splices in a temporary splice module, restoring
+    /// the checker environment and bindings afterwards so the real module starts clean.
+    fn run_decl_splice_batch(
+        &mut self,
+        m: &Module,
+        before: &[Decl],
+        splices: &[crate::th::Splice],
+        exts: &Extensions,
+        path: &Path,
+    ) -> Result<Vec<Decl>, String> {
+        let locs: Vec<crate::syntax::ast::Loc> = splices.iter().map(|s| s.loc).collect();
+        let first = locs[0];
+        let bodies: Vec<&crate::syntax::ast::Expr> = splices.iter().map(|s| &s.body).collect();
+        let (imported, reached) = self.quoted_types_closure(&bodies, &m.name);
+        let mut classes = self.quoted_classes(&bodies);
+        classes.extend(reached);
+        let table = crate::th::reify_table(before, &m.name, &imported, classes, first);
+        let setup = crate::th::splice_setup(&exts.names(), &self.splice_fixities(before, &m.name, &imported), first);
+        let smod = crate::th::decl_splices_module(m, before.to_vec(), splices, table, setup, &path.display().to_string());
+        let mark = self.binds.len();
+        let user_module = self.checker.user_module;
+        let saved_env = self.checker.env.clone();
+        let saved_kinds = self.checker.kinds.clone();
+        let saved_families = self.checker.metas.families.clone();
+        let run = (|| -> Result<Vec<Decl>, String> {
+            self.compile_module(smod, exts.clone(), path)?;
+            let pre = self.reify_values(&m.name, exts, path, first)?;
+            let pre_io = pre.as_ref().map(|p| format!("{p}IO"));
+            match crate::th::run_decl_splices(&self.binds, &m.name, locs.clone(), pre) {
+                Err(e) if e == crate::th::SPLICE_BUDGET => {
+                    self.native_splices(&m.name, splices.len(), pre_io).and_then(|out| crate::th::native_decs(&out, locs))
+                }
+                r => r,
+            }
+            .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))
+        })();
+        // The module is compiled for real afterwards; discard everything the temporary splice
+        // module added so instances, families and bindings do not accumulate across splices.
+        self.checker.user_module = user_module;
+        self.checker.env = saved_env;
+        self.checker.kinds = saved_kinds;
+        self.checker.metas.families = saved_families;
+        self.binds.truncate(mark);
+        self.ifaces.remove(&m.name);
+        run
     }
 
     /// Runs the splices of a compiled splice module as a native program (built beside the current
@@ -1316,29 +1386,37 @@ impl Driver {
         }
         let user_module = self.checker.user_module;
         let mark = self.binds.len();
-        self.compile_module(smod, exts.clone(), path)?;
-        let pre = if own { self.reify_values(&m.name, exts, path, first)? } else { None };
-        self.checker.user_module = user_module;
-        if timing {
-            eprintln!("splices compiled: {:?}", t0.elapsed());
-        }
-        let pre_io = pre.as_ref().map(|p| format!("{}IO", p));
-        let results = match crate::th::run_splices(&self.binds, &name, splices.len(), locs.clone(), pre) {
-            // Too costly for the interpreter: the splices run as a native program.
-            Err(e) if e == crate::th::SPLICE_BUDGET => {
-                self.native_splices(&name, splices.len(), pre_io).and_then(|out| crate::th::native_exps(&out, locs))
+        let saved_env = self.checker.env.clone();
+        let saved_kinds = self.checker.kinds.clone();
+        let saved_families = self.checker.metas.families.clone();
+        let results = (|| -> Result<Vec<crate::syntax::ast::Expr>, String> {
+            self.compile_module(smod, exts.clone(), path)?;
+            let pre = if own { self.reify_values(&m.name, exts, path, first)? } else { None };
+            if timing {
+                eprintln!("splices compiled: {:?}", t0.elapsed());
             }
-            r => r,
-        }
-        .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))?;
-        crate::th::fill_splices(m, &results);
+            let pre_io = pre.as_ref().map(|p| format!("{p}IO"));
+            match crate::th::run_splices(&self.binds, &name, splices.len(), locs.clone(), pre) {
+                // Too costly for the interpreter: the splices run as a native program.
+                Err(e) if e == crate::th::SPLICE_BUDGET => {
+                    self.native_splices(&name, splices.len(), pre_io).and_then(|out| crate::th::native_exps(&out, locs))
+                }
+                r => r,
+            }
+            .map_err(|e| format!("{}:{}:{}: error:\n    {e}", path.display(), first.line, first.col))
+        })();
         // The splice module is not part of the program (the module itself is compiled next).
+        self.checker.user_module = user_module;
+        self.checker.env = saved_env;
+        self.checker.kinds = saved_kinds;
+        self.checker.metas.families = saved_families;
         self.binds.truncate(mark);
         if !own {
             self.ifaces.remove(&name);
         } else {
             self.ifaces.remove(&m.name);
         }
+        crate::th::fill_splices(m, &results?);
         Ok(())
     }
 
@@ -1733,6 +1811,37 @@ mod cache_tests {
             explicit_sigs: Vec::new(),
         };
         assert!(d.use_cached("A", entry, "source", &s.0.join("A.hs"), true));
+    }
+
+    #[test]
+    fn pkgdep_isolates_same_named_dependency_modules() {
+        // Two packages (`dep1`, `dep2`) both expose `Shared`; `consumer` declares `-hsc-pkgdep`
+        // on `dep2`, while `dep1` appears first in `pkg_dirs` (as another direct dependency of the
+        // build might). `consumer` must resolve `Shared` to `dep2`.
+        let src = Sources::new();
+        let (dep1, dep2, consumer) = (Sources::new(), Sources::new(), Sources::new());
+        let iface = |pkg: &Sources, module: &str, text: &str| {
+            let path = src.0.join(format!("{module}.hs"));
+            std::fs::write(&path, text).unwrap();
+            write_interface(&pkg.0.join(format!("{module}.hi")), module, &path, &path, &["-XNoImplicitPrelude".into()]).unwrap();
+            std::fs::remove_file(&path).unwrap();
+        };
+        iface(&dep1, "Shared", "module Shared (fromOne) where\ndata One = One\nfromOne :: One\nfromOne = One\n");
+        iface(&dep2, "Shared", "module Shared (fromTwo) where\ndata Two = Two\nfromTwo :: Two\nfromTwo = Two\n");
+        iface(&consumer, "Consumer", "module Consumer (c) where\nimport Shared (fromTwo)\nc = fromTwo\n");
+        let pkgdep = format!("{PKGDEP_FLAG}{}={}", consumer.0.display(), dep2.0.display());
+        let mut d = Driver::new(Vec::new(), vec![dep1.0.clone(), consumer.0.clone(), dep2.0.clone()], vec![pkgdep]);
+        d.load("Shared").unwrap();
+        d.load("Consumer").unwrap();
+    }
+
+    #[test]
+    fn failed_dependency_clears_loading_stack() {
+        let s = Sources::new();
+        s.write("A.hs", "module A where\nimport Missing");
+        let mut d = s.driver();
+        assert!(d.load("A").is_err());
+        assert!(d.loading.is_empty());
     }
 }
 

@@ -781,11 +781,18 @@ impl Checker {
             Some(info) if !info.fundeps.is_empty() => info.fundeps.clone(),
             _ => return Ok(()),
         };
+        let norm = |tc: &Checker, t: &Ty| {
+            if tc.env.families.is_empty() {
+                tc.metas.zonk(t)
+            } else {
+                tc.normalize(t)
+            }
+        };
         for (from, to) in fundeps {
             // A given whose determining arguments are the wanted's fixes the others (`MonadReader r m`
             // given and `MonadReader ?r m` wanted: `?r := r`).
             // The givens' superclasses count too (`RegexOptions r c e` of a given `RegexMaker r c e s`).
-            let zonked: Vec<Ty> = p.args.iter().map(|t| self.metas.zonk(t)).collect();
+            let zonked: Vec<Ty> = p.args.iter().map(|t| norm(self, t)).collect();
             let mut available: Vec<Pred> = Vec::new();
             for g in self.givens.iter().rev() {
                 self.superclass_closure(&g.pred, &mut available, 0);
@@ -794,7 +801,7 @@ impl Checker {
                 if g.class != p.class || g.args.len() != zonked.len() {
                     return None;
                 }
-                let gz: Vec<Ty> = g.args.iter().map(|t| self.metas.zonk(t)).collect();
+                let gz: Vec<Ty> = g.args.iter().map(|t| norm(self, t)).collect();
                 from.iter().all(|&i| gz[i] == zonked[i]).then_some(gz)
             });
             if let Some(gz) = given_match {
@@ -804,7 +811,7 @@ impl Checker {
                 continue;
             }
             let insts: Vec<InstInfo> = self.env.instances.for_class(&p.class).cloned().collect();
-            let zonked: Vec<Ty> = p.args.iter().map(|t| self.metas.zonk(t)).collect();
+            let zonked: Vec<Ty> = p.args.iter().map(|t| norm(self, t)).collect();
             let mut matches: Vec<(InstInfo, Vec<Option<Ty>>)> = Vec::new();
             for inst in insts {
                 if inst.head.len() != p.args.len() {
@@ -1568,11 +1575,33 @@ impl Checker {
                 (Ty::App(f1, x1), Ty::App(f2, x2)) if c.same_head(&a, &b) => {
                     walk(c, f1, f2, m, depth).or_else(|| walk(c, x1, x2, m, depth))
                 }
-                _ if depth < 8 => match (c.newtype_unwrap(&a), c.newtype_unwrap(&b)) {
-                    (Some(u), _) => walk(c, &u, &b, m, depth + 1),
-                    (None, Some(u)) => walk(c, &a, &u, m, depth + 1),
-                    _ => None,
-                },
+                _ if depth < 8 => {
+                    match (c.newtype_unwrap(&a), c.newtype_unwrap(&b)) {
+                        (Some(u), _) => return walk(c, &u, &b, m, depth + 1),
+                        (None, Some(u)) => return walk(c, &a, &u, m, depth + 1),
+                        _ => {}
+                    }
+                    // Step across a given `Coercible x y` (autodocodec's `HashMapCodec` gives
+                    // `Coercible b (HashMap k v)` beside `coerce :: Parser (HashMap ?k ?v) -> Parser b`).
+                    for g in c.givens.iter().rev() {
+                        if g.pred.class != "GHC.Types.Coercible" || g.pred.args.len() != 2 {
+                            continue;
+                        }
+                        let (ga, gb) = (c.metas.prune(&g.pred.args[0]), c.metas.prune(&g.pred.args[1]));
+                        for (lhs, rhs) in [(&ga, &gb), (&gb, &ga)] {
+                            if *lhs == b && *rhs != b {
+                                if let Some(r) = walk(c, &a, rhs, m, depth + 1) {
+                                    return Some(r);
+                                }
+                            } else if *lhs == a && *rhs != a {
+                                if let Some(r) = walk(c, rhs, &b, m, depth + 1) {
+                                    return Some(r);
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
                 _ => None,
             }
         }
@@ -1580,7 +1609,30 @@ impl Checker {
         let kept: Vec<(Ty, Ty)> = pairs.into_iter().filter(|(a, b)| self.has_metas(a) || self.has_metas(b)).collect();
         // Only pairs of one type constructor's applications (a bare variable against a type is
         // ambiguous in GHC); newtypes are looked through inside them.
-        let found = kept.iter().find_map(|(a, b)| if self.same_head(a, b) { walk(self, a, b, m, 0) } else { None });
+        let found = kept.iter().find_map(|(a, b)| {
+            let (pa, pb) = (self.metas.prune(a), self.metas.prune(b));
+            if self.same_head(&pa, &pb) {
+                return walk(self, &pa, &pb, m, 0);
+            }
+            for g in self.givens.iter().rev() {
+                if g.pred.class != "GHC.Types.Coercible" || g.pred.args.len() != 2 {
+                    continue;
+                }
+                let (ga, gb) = (self.metas.prune(&g.pred.args[0]), self.metas.prune(&g.pred.args[1]));
+                for (lhs, rhs) in [(&ga, &gb), (&gb, &ga)] {
+                    if *lhs == pb && self.same_head(&pa, rhs) {
+                        if let Some(r) = walk(self, &pa, rhs, m, 1) {
+                            return Some(r);
+                        }
+                    } else if *lhs == pa && self.same_head(rhs, &pb) {
+                        if let Some(r) = walk(self, rhs, &pb, m, 1) {
+                            return Some(r);
+                        }
+                    }
+                }
+            }
+            None
+        });
         self.coercions = kept;
         found
     }

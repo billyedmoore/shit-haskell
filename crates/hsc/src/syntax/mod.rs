@@ -122,6 +122,50 @@ fn quote_brackets(toks: Vec<token::Token>) -> Vec<token::Token> {
     let adjacent = |a: &token::Token, b: &token::Token| a.end_line == b.line && b.col == a.end_col + 1;
     let mut out: Vec<token::Token> = Vec::with_capacity(toks.len());
     let mut i = 0;
+    let sym_tok = |s: &str| -> Tok {
+        match s {
+            ".." => Tok::Res(ROp::DotDot),
+            "::" => Tok::Res(ROp::DColon),
+            "=" => Tok::Res(ROp::Eq),
+            "\\" => Tok::Res(ROp::Backslash),
+            "|" => Tok::Res(ROp::Bar),
+            "<-" => Tok::Res(ROp::LArrow),
+            "->" => Tok::Res(ROp::RArrow),
+            "@" => Tok::Res(ROp::At),
+            "~" => Tok::Res(ROp::Tilde),
+            "=>" => Tok::Res(ROp::DArrow),
+            _ if s.starts_with(':') => Tok::ConSym(s.to_string()),
+            _ => Tok::VarSym(s.to_string()),
+        }
+    };
+    let split_bar = |bar: &token::Token, allow_typed: bool| -> Option<(bool, u32, Option<token::Token>)> {
+        match &bar.tok {
+            Tok::Res(ROp::Bar) => Some((false, 1, None)),
+            Tok::VarSym(s) if allow_typed && s.starts_with("||") => {
+                let rest = &s[2..];
+                let tail = (!rest.is_empty()).then(|| {
+                    let mut r = bar.clone();
+                    r.tok = sym_tok(rest);
+                    r.col += 2;
+                    r.space_before = false;
+                    r
+                });
+                Some((true, 2, tail))
+            }
+            Tok::VarSym(s) if s.starts_with('|') => {
+                let rest = &s[1..];
+                let tail = (!rest.is_empty()).then(|| {
+                    let mut r = bar.clone();
+                    r.tok = sym_tok(rest);
+                    r.col += 1;
+                    r.space_before = false;
+                    r
+                });
+                Some((false, 1, tail))
+            }
+            _ => None,
+        }
+    };
     while i < toks.len() {
         let t = &toks[i];
         let next = toks.get(i + 1);
@@ -129,22 +173,28 @@ fn quote_brackets(toks: Vec<token::Token>) -> Vec<token::Token> {
         if t.tok == Tok::Special('[') {
             if let Some(n) = next.filter(|n| adjacent(t, n)) {
                 let open = match &n.tok {
-                    Tok::Res(ROp::Bar) => Some(('e', 2)),
-                    Tok::VarSym(s) if s == "||" => Some(('T', 2)),
-                    Tok::VarId(k) if ["e", "d", "t", "p"].contains(&k.as_str()) => match next2.filter(|m| adjacent(n, m)) {
-                        Some(m) if m.tok == Tok::Res(ROp::Bar) => Some((k.chars().next().unwrap_or('e'), 3)),
-                        Some(m) if k == "e" && matches!(&m.tok, Tok::VarSym(s) if s == "||") => Some(('T', 3)),
-                        _ => None,
-                    },
-                    _ => None,
+                    Tok::VarId(k) if ["e", "d", "t", "p"].contains(&k.as_str()) => {
+                        next2.filter(|m| adjacent(n, m)).and_then(|m| {
+                            let (typed, bar_len, tail) = split_bar(m, k == "e")?;
+                            let kind = if typed { 'T' } else { k.chars().next().unwrap_or('e') };
+                            Some((kind, 3usize, m.end_line, m.col + bar_len - 1, tail))
+                        })
+                    }
+                    _ => split_bar(n, true).map(|(typed, bar_len, tail)| {
+                        let kind = if typed { 'T' } else { 'e' };
+                        (kind, 2usize, n.end_line, n.col + bar_len - 1, tail)
+                    }),
                 };
-                if let Some((kind, len)) = open {
-                    let last = &toks[i + len - 1];
+                if let Some((kind, len, end_line, end_col, tail)) = open {
                     let mut tok = t.clone();
                     tok.tok = Tok::QuoteOpen(kind);
-                    tok.end_line = last.end_line;
-                    tok.end_col = last.end_col;
+                    tok.end_line = end_line;
+                    tok.end_col = end_col;
+                    tok.space_after = if tail.is_some() { false } else { toks[i + len - 1].space_after };
                     out.push(tok);
+                    if let Some(r) = tail {
+                        out.push(r);
+                    }
                     i += len;
                     continue;
                 }

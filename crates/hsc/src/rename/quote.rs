@@ -388,6 +388,7 @@ impl Q<'_, '_> {
             Type::Sig(x, k) => app(app(self.lib("sigT"), self.ty(x)?), self.ty(k)?),
             Type::Lit(Lit::Int(n), _) => app(self.lib("litT"), app(self.lib("numTyLit"), Expr::Lit(Lit::Int(n.clone()), self.loc))),
             Type::Lit(Lit::Str(s), _) => app(self.lib("litT"), app(self.lib("strTyLit"), self.str(s))),
+            Type::Splice(e, _) => (**e).clone(),
             _ => return self.err("this type"),
         })
     }

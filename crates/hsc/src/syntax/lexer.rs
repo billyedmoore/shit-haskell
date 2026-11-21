@@ -349,8 +349,10 @@ impl Lexer {
                     self.bump();
                     return Ok(Tok::Special('\''));
                 }
-                // A quote that cannot open a character literal is a promotion tick (DataKinds).
-                let promoted = self.peek(1).is_some_and(|c| c.is_alphabetic() || c == '[' || c == '(' || c == ':')
+                // A quote that cannot open a character literal is a promotion tick (DataKinds)
+                // or Template Haskell value name quote (including names starting with `_`, such
+                // as `'_Wrapped'`).
+                let promoted = self.peek(1).is_some_and(|c| c.is_alphabetic() || c == '_' || c == '[' || c == '(' || c == ':')
                     && self.peek(2) != Some('\'');
                 if promoted {
                     self.bump();

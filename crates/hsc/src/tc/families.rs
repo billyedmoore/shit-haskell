@@ -524,10 +524,18 @@ impl Checker {
             }
             // Never towards a type containing the one rewritten (`NoGhcTcPass p` is not
             // `NoGhcTcPass (NoGhcTcPass p)`, IsPass's superclass read backwards).
-            if a == *t && b != *t && !contains_ty(&b, t) {
+            // When both sides are stuck family applications (`Prod (Prod h) ~ Prod h`, or
+            // `GT (GSize s) n ~ GT (GSize t) n`), rewrite strictly towards the smaller side
+            // under `(ty_size, Ord)` so shrinking rewrites always fire and equal-size pairs
+            // terminate at one canonical representative instead of oscillating.
+            if a == *t && b != *t && !contains_ty(&b, t)
+                && (self.family_app(&b).is_none() || (ty_size(&b), &b) < (ty_size(&a), &a))
+            {
                 return Some(b);
             }
-            if b == *t && a != *t && !contains_ty(&a, t) {
+            if b == *t && a != *t && !contains_ty(&a, t)
+                && (self.family_app(&a).is_none() || (ty_size(&a), &a) < (ty_size(&b), &b))
+            {
                 return Some(a);
             }
         }
@@ -738,4 +746,14 @@ fn contains_ty(outer: &Ty, t: &Ty) -> bool {
             Ty::App(f, x) => contains_ty(f, t) || contains_ty(x, t),
             _ => false,
         }
+}
+
+fn ty_size(t: &Ty) -> usize {
+    match t {
+        Ty::App(f, x) => 1 + ty_size(f) + ty_size(x),
+        Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => {
+            1 + ty_size(b) + ps.iter().flat_map(|p| &p.args).map(ty_size).sum::<usize>()
+        }
+        _ => 1,
+    }
 }

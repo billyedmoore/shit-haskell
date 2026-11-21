@@ -440,6 +440,8 @@ pub enum Type {
     OpChain(Vec<TypeOpItem>, Loc),
     Lit(Lit, Loc),
     Wild(Loc),
+    /// A Template Haskell type splice (`$t` or `$(expr)`).
+    Splice(Box<Expr>, Loc),
 }
 
 #[derive(Clone, Debug, PartialEq)]
