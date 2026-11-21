@@ -1482,7 +1482,7 @@ impl Checker {
             }
             Lit::Char(c) => {
                 self.unify_at(&Ty::con("GHC.Types.Char"), ty)?;
-                (Core::Lit(CLit::Char(*c)), ty.clone(), false)
+                return Ok(CPat::Lit(CLit::Char(*c)));
             }
             Lit::Str(s) if self.overloaded_strings => {
                 let (fs, fty) = self.lookup_inst("GHC.Internal.Data.String.fromString")?;

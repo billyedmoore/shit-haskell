@@ -46,7 +46,7 @@ pub struct NativeTable {
 }
 
 /// The static name written at a relative byte offset and length in the program's read-only data.
-unsafe fn name_at(p: *const [u32; 2], i: usize) -> &'static str {
+pub(super) unsafe fn name_at(p: *const [u32; 2], i: usize) -> &'static str {
     let [off, len] = *p.add(i);
     let ptr = (p as *const u8).add(off as usize);
     std::str::from_utf8(std::slice::from_raw_parts(ptr, len as usize)).unwrap_or("")
@@ -60,28 +60,18 @@ unsafe fn name_at(p: *const [u32; 2], i: usize) -> &'static str {
 /// The body table and its name bytes must remain immutable for the lifetime of the process.
 pub unsafe fn run(table: *const NativeTable) -> i32 {
     let t = &*table;
-    let cons: Vec<&'static str> = (0..t.ncons as usize).map(|i| name_at(t.con_names, i)).collect();
-    let prims: Vec<&'static str> = (0..t.nprims as usize).map(|i| name_at(t.prim_names, i)).collect();
     let globals_base = t.globals as usize;
     let nglobals = t.nglobals as usize;
-    let globals: Vec<(i64, usize)> = (0..nglobals)
-        .map(|i| {
-            let [kind, off] = *t.globals.add(i);
-            (kind as i64, globals_base.wrapping_add_signed(off as isize))
-        })
-        .collect();
-    let mut m = Machine::new(Program { globals, con_names: cons, prim_names: prims });
+    let mut m = Machine::new(Program {
+        nglobals,
+        con_names: t.con_names,
+        ncons: t.ncons as usize,
+        prim_names: t.prim_names,
+        nprims: t.nprims as usize,
+    });
     m.bodies = DiagnosticBodies::from_raw_parts(t.bodies, t.nbodies as usize);
     if !t.selectors.is_null() && t.nselectors > 0 {
-        let sel_base = t.selectors as usize;
-        let entries: Vec<(Word, u32, u32)> = (0..t.nselectors as usize)
-            .map(|i| {
-                let [code_off, con_id, field_word] = *t.selectors.add(i);
-                let code = sel_base.wrapping_add_signed(code_off as i32 as isize) as Word;
-                (code, con_id, field_word)
-            })
-            .collect();
-        m.selectors = super::gc::SelectorTable::new(&entries);
+        m.selectors_raw = (t.selectors, t.nselectors as usize);
     }
     // The global closures: functions of their arity, or thunks, allocated on the heap.
     let mut gvec: Vec<Word> = Vec::with_capacity(nglobals);
@@ -225,26 +215,27 @@ pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
     }
     // SAFETY: re-derive after safe_point (which may have switched coroutines and back).
     let m = unsafe { &mut *mp };
-    if let Some(op) = m.conc_prims[id as usize] {
+    let idx = id as usize;
+    let dispatch = match m.prim_dispatch[idx] {
+        super::PrimDispatch::Unclassified => m.classify_prim(idx),
+        d => d,
+    };
+    if let super::PrimDispatch::Conc(op) = dispatch {
         let r = op.run_fast(mp);
         // SAFETY: re-derive after possible coroutine switch.
         unsafe { (*mp).prim_nargs = prev_nargs };
         return r;
     }
-    let ordinary = m.ordinary_prims[id as usize];
     // A primitive builds its result from several allocations, holding the earlier objects in Rust
     // locals; a collection between them would move those objects. So the collection happens before
     // it runs, and the room it needs is reserved then.
     m.reserve(PRIM_SLACK);
-    let r = if let Some(op) = m.int_prims[id as usize] {
-        op.run(m)
-    } else if let Some(op) = m.integer_prims[id as usize] {
-        op.run(m)
-    } else {
-        match ordinary {
-            Some(name) => super::prims::run_ordinary(m, id as usize, name, nargs),
-            None => super::prims::run_ccall(m, id as usize, nargs),
-        }
+    let r = match dispatch {
+        super::PrimDispatch::Int(op) => op.run(m),
+        super::PrimDispatch::Integer(op) => op.run(m),
+        super::PrimDispatch::Ordinary(name) => super::prims::run_ordinary(m, idx, name, nargs),
+        super::PrimDispatch::CCall => super::prims::run_ccall(m, idx, nargs),
+        super::PrimDispatch::Conc(_) | super::PrimDispatch::Unclassified => unreachable!(),
     };
     // SAFETY: re-derive in case the primitive switched coroutines.
     let m = unsafe { &mut *mp };

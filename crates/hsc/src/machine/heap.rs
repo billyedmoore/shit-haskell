@@ -89,9 +89,11 @@ pub fn space(words: usize) -> Vec<Word> {
         const MADV_HUGEPAGE: i32 = 14;
         const HUGE: usize = 2 << 20;
         let bytes = words * 8;
-        if bytes >= 2 * HUGE {
+        if bytes >= 3 * HUGE {
             let start = v.as_mut_ptr() as usize;
-            let aligned = (start + HUGE - 1) & !(HUGE - 1);
+            // Leave the first 2 MB on 4 KB pages so small programs touching only a few KB at
+            // startup do not pay a 2 MB huge-page zero-fault.
+            let aligned = (start + 2 * HUGE - 1) & !(HUGE - 1);
             let end = (start + bytes) & !(HUGE - 1);
             if end > aligned {
                 // SAFETY: a range inside the vector's allocation, which stays the allocator's to

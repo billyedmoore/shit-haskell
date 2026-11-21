@@ -54,6 +54,40 @@ pub type Fresh<'a> = &'a mut dyn FnMut(&str) -> String;
 /// Compiles rows matching the scrutinee variables `scruts`. `fail` is the expression
 /// evaluated when no row matches.
 pub fn compile_rows(scruts: &[String], rows: &[Row], fail: Core, fresh: Fresh) -> Core {
+    if let [s] = scruts {
+        let n = rows
+            .iter()
+            .take_while(|r| {
+                matches!(&r.pats[..], [CPat::Lit(Lit::Int(_) | Lit::Char(_))]) && !body_has_guards(&r.body)
+            })
+            .count();
+        if n >= 2 {
+            #[derive(Eq, Hash, PartialEq)]
+            enum LitKey {
+                Int(i64),
+                Char(char),
+            }
+            let rest_code = compile_rows(scruts, &rows[n..], fail, fresh);
+            let mut alts = Vec::with_capacity(n + 1);
+            let mut seen = std::collections::HashSet::with_capacity(n);
+            for r in &rows[..n] {
+                let [CPat::Lit(l)] = &r.pats[..] else { unreachable!() };
+                let key = match l {
+                    Lit::Int(i) => LitKey::Int(*i),
+                    Lit::Char(c) => LitKey::Char(*c),
+                    _ => unreachable!(),
+                };
+                if !seen.insert(key) {
+                    continue;
+                }
+                let body = compile_body(&r.body, Core::Fail(String::new()), fresh);
+                alts.push(Alt::Lit(l.clone(), body));
+            }
+            alts.push(Alt::Default(rest_code));
+            let b = fresh("lb");
+            return Core::Case(Box::new(Core::Var(s.clone())), b, alts);
+        }
+    }
     match rows.split_first() {
         None => fail,
         Some((row, [])) => row_code(scruts, row, fail, fresh),
@@ -70,6 +104,14 @@ pub fn compile_rows(scruts: &[String], rows: &[Row], fail: Core, fresh: Fresh) -
             let code = row_code(scruts, row, fallthrough, fresh);
             Core::Let(vec![(k, Core::Lam(u, Box::new(rest_code)))], Box::new(code))
         }
+    }
+}
+
+fn body_has_guards(body: &CBody) -> bool {
+    match body {
+        CBody::Expr(_) => false,
+        CBody::Where(_, inner) => body_has_guards(inner),
+        CBody::Guards(_) => true,
     }
 }
 
@@ -221,3 +263,32 @@ pub fn cpat_vars(p: &CPat, out: &mut Vec<String>) {
         CPat::Bang(sub) | CPat::Lazy(sub) | CPat::View(_, sub) => cpat_vars(sub, out),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_literal_rows_compile_to_single_multiway_case_deduped() {
+        let mut n = 0usize;
+        let mut fresh = |prefix: &str| {
+            n += 1;
+            format!("{prefix}{n}")
+        };
+        let rows = vec![
+            Row { pats: vec![CPat::Lit(Lit::Char('a'))], body: CBody::Expr(Core::Lit(Lit::Char('A'))) },
+            Row { pats: vec![CPat::Lit(Lit::Char('b'))], body: CBody::Expr(Core::Lit(Lit::Char('B'))) },
+            // Duplicate 'a' must be dropped so the first row wins.
+            Row { pats: vec![CPat::Lit(Lit::Char('a'))], body: CBody::Expr(Core::Lit(Lit::Char('X'))) },
+            Row { pats: vec![CPat::Wild], body: CBody::Expr(Core::Var("c".into())) },
+        ];
+        let core = compile_rows(&["c".into()], &rows, Core::Fail("no".into()), &mut fresh);
+        let Core::Case(scrut, _, alts) = core else { panic!("expected flat Case, got {core:?}") };
+        assert!(matches!(scrut.as_ref(), Core::Var(v) if v == "c"));
+        assert_eq!(alts.len(), 3);
+        assert!(matches!(&alts[0], Alt::Lit(Lit::Char('a'), Core::Lit(Lit::Char('A')))));
+        assert!(matches!(&alts[1], Alt::Lit(Lit::Char('b'), Core::Lit(Lit::Char('B')))));
+        assert!(matches!(&alts[2], Alt::Default(Core::Var(v)) if v == "c"));
+    }
+}
+

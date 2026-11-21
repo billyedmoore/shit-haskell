@@ -2213,6 +2213,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let mut binds = crate::native::reachable(binds, &roots);
     let mut numeric = numeric.clone();
     crate::native::lift::lambda_lift(&mut binds, &mut numeric);
+    crate::native::stg::collapse_case_chains(&mut binds);
     let prog = crate::native::stg::Lowering::program(&binds, &numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
@@ -2258,7 +2259,16 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
         let mut args = vec![o.as_str()];
         args.extend(c_objs.iter().map(String::as_str));
         // The program's C symbols are found by name at run time (`crate::ccall`).
-        args.extend_from_slice(&[r.as_str(), "-rdynamic", "-Wl,--gc-sections", "-o", out]);
+        // Exclude `libhsc.a` from `-rdynamic` so `--gc-sections` strips unused compiler/RTS code.
+        args.extend_from_slice(&[
+            r.as_str(),
+            "-rdynamic",
+            "-Wl,--exclude-libs,libhsc.a",
+            "-Wl,--gc-sections",
+            "-Wl,--as-needed",
+            "-o",
+            out,
+        ]);
         if !debug {
             args.push("-s");
         }

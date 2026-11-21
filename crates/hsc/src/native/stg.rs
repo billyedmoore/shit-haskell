@@ -147,29 +147,113 @@ pub struct NumericParams {
 pub const NUM_INT: u8 = 1;
 pub const NUM_CHAR: u8 = 2;
 
+/// Primitives in `RAW_RESULT_PRIMS` that cannot trap (excludes integer division/remainder by zero).
+fn total_raw_prim(p: &str) -> bool {
+    RAW_RESULT_PRIMS.contains(&p) && !matches!(p, "quotInt#" | "remInt#")
+}
+
+/// Whether `e` is guaranteed to evaluate to WHNF without diverging or throwing an exception,
+/// given that every variable in `whnf` is already in WHNF (or raw).
+fn is_whnf_expr(e: &Core, whnf: &std::collections::HashSet<String>) -> bool {
+    match e {
+        Core::Lit(Lit::Int(_) | Lit::Char(_)) => true,
+        Core::Var(v) => whnf.contains(v.as_str()),
+        Core::Prim(p, args) if total_raw_prim(p) => args.iter().all(|a| is_whnf_expr(a, whnf)),
+        Core::Prim(p, args) if matches!(p.as_str(), "lazy" | "oneShot" | "inline" | "noinline") && args.len() == 1 => {
+            is_whnf_expr(&args[0], whnf)
+        }
+        _ => false,
+    }
+}
+
+/// Records the variables guaranteed to be in WHNF inside the alternatives of `case scrut as binder of ...`.
+fn add_case_whnf(scrut: &Core, binder: &str, whnf: &mut std::collections::HashSet<String>) {
+    whnf.insert(binder.to_string());
+    match scrut {
+        Core::Var(v) => {
+            whnf.insert(v.clone());
+        }
+        Core::Prim(p, args) if RAW_RESULT_PRIMS.contains(&p.as_str()) => {
+            for a in args {
+                if let Core::Var(v) = a {
+                    whnf.insert(v.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether an exact call `g args` may invoke `g`'s worker given `strict_map` and the currently
+/// known-WHNF variables: every non-strict raw parameter must receive a guaranteed-WHNF argument.
+fn can_call_worker(
+    g: &str,
+    args: &[&Core],
+    w: &Workers,
+    strict_map: &Workers,
+    whnf: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(raw) = w.get(g).filter(|r| r.len() == args.len()) else {
+        return false;
+    };
+    let strict = strict_map.get(g);
+    args.iter().enumerate().all(|(i, a)| {
+        !raw[i] || strict.and_then(|s| s.get(i)).copied().unwrap_or(false) || is_whnf_expr(a, whnf)
+    })
+}
+
 /// Whether every use of `x` in `e` can take it raw: as an operand of an inline primitive, as the
 /// scrutinee of a case on literals whose binder is unused, as a raw argument of a worker call,
 /// or as the body's result (boxed once, when returned).
-fn raw_uses(e: &Core, x: &str, w: &Workers) -> bool {
-    raw_uses_in(e, x, w, true)
+fn raw_uses(
+    e: &Core,
+    x: &str,
+    w: &Workers,
+    strict_map: &Workers,
+    whnf: &std::collections::HashSet<String>,
+) -> bool {
+    raw_uses_in(e, x, w, strict_map, whnf, true)
 }
 
 /// `raw_uses`; `result` says whether `e` is in a result position of the body. Elsewhere (inside a
 /// scrutinee, whose own results become a join point's arguments, or an operand) `x` itself must
 /// not be the value.
-fn raw_uses_in(e: &Core, x: &str, w: &Workers, result: bool) -> bool {
+fn raw_uses_in(
+    e: &Core,
+    x: &str,
+    w: &Workers,
+    strict_map: &Workers,
+    whnf: &std::collections::HashSet<String>,
+    result: bool,
+) -> bool {
     match e {
         Core::Var(v) => v != x || result,
         Core::Lit(_) | Core::Fail(_) => true,
         // An operand that is not an atom becomes a thunk: it must not mention the raw value.
-        Core::Prim(p, args) if raw_operand_prim(p) => args.iter().all(|a| matches!(a, Core::Var(v) if v == x) || !mentions(a, x)),
+        Core::Prim(p, args) if raw_operand_prim(p) => {
+            args.iter().all(|a| matches!(a, Core::Var(v) if v == x) || !mentions(a, x))
+        }
+        Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+            if mentions(&args[0], x) {
+                return false;
+            }
+            if let Core::Var(v) = &args[0] {
+                let mut next = whnf.clone();
+                next.insert(v.clone());
+                raw_uses_in(&args[1], x, w, strict_map, &next, result)
+            } else {
+                raw_uses_in(&args[1], x, w, strict_map, whnf, result)
+            }
+        }
         Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
-            raw_uses_in(&args[0], x, w, result)
+            raw_uses_in(&args[0], x, w, strict_map, whnf, result)
         }
         Core::Case(s, b, alts) if matches!(&**s, Core::Var(v) if v == x) => {
+            let mut base_whnf = whnf.clone();
+            add_case_whnf(s, b, &mut base_whnf);
             alts.iter().all(|a| match a {
                 Alt::Lit(Lit::Int(_) | Lit::Char(_), body) | Alt::Default(body) => {
-                    !mentions(body, b) && raw_uses_in(body, x, w, result)
+                    !mentions(body, b) && raw_uses_in(body, x, w, strict_map, &base_whnf, result)
                 }
                 _ => false,
             })
@@ -177,13 +261,14 @@ fn raw_uses_in(e: &Core, x: &str, w: &Workers, result: bool) -> bool {
         Core::App(..) => {
             let (f, args) = spine(e);
             if let Core::Var(g) = f {
-                if let Some(raw) = w.get(g.as_str()).filter(|r| r.len() == args.len()) {
+                if can_call_worker(g.as_str(), &args, w, strict_map, whnf) {
+                    let raw = &w[g.as_str()];
                     // A raw parameter's argument is evaluated in place (see `worker_call`); the others
                     // are passed or captured.
                     return g != x
                         && args.iter().zip(raw).all(|(a, r)| match a {
                             Core::Var(v) if v == x => *r,
-                            a if *r => raw_uses_in(a, x, w, false),
+                            a if *r => raw_uses_in(a, x, w, strict_map, whnf, false),
                             a => !mentions(a, x),
                         });
                 }
@@ -193,12 +278,31 @@ fn raw_uses_in(e: &Core, x: &str, w: &Workers, result: bool) -> bool {
             !mentions(e, x)
         }
         Core::Lam(_, b) => !mentions(b, x),
-        Core::Let(binds, body) => binds.iter().all(|(_, r)| !mentions(r, x)) && raw_uses_in(body, x, w, result),
-        Core::Case(s, _, alts) => {
-            raw_uses_in(s, x, w, false)
-                && alts.iter().all(|a| match a {
-                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => raw_uses_in(b, x, w, result),
-                })
+        Core::Let(binds, body) => {
+            let mut next = whnf.clone();
+            for (n, _) in binds {
+                next.remove(n);
+            }
+            binds.iter().all(|(_, r)| !mentions(r, x)) && raw_uses_in(body, x, w, strict_map, &next, result)
+        }
+        Core::Case(s, b, alts) => {
+            if !raw_uses_in(s, x, w, strict_map, whnf, false) {
+                return false;
+            }
+            let mut base_whnf = whnf.clone();
+            add_case_whnf(s, b, &mut base_whnf);
+            alts.iter().all(|a| match a {
+                Alt::Con(_, vars, body) => {
+                    let mut alt_whnf = base_whnf.clone();
+                    for v in vars {
+                        alt_whnf.remove(v);
+                    }
+                    raw_uses_in(body, x, w, strict_map, &alt_whnf, result)
+                }
+                Alt::Lit(_, body) | Alt::Default(body) => {
+                    raw_uses_in(body, x, w, strict_map, &base_whnf, result)
+                }
+            })
         }
         Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, x)),
     }
@@ -231,64 +335,145 @@ fn numeric_use(e: &Core, x: &str) -> bool {
 
 /// The workers that return their result raw: the type says the result of a full application
 /// is a number, the body has exactly that many parameters, and no result is a constructor or a
-/// function (each result is then a number to pass back as it is).
-fn raw_returns(binds: &[TopBind], w: &Workers, numeric: &NumericParams) -> HashMap<String, u8> {
+/// function (each result is then a number to pass back as it is). Functions with no raw
+/// parameters may also get a raw-returning worker (e.g. `size :: Tree -> Int`).
+fn raw_returns(
+    binds: &[TopBind],
+    w: &Workers,
+    strict_map: &Workers,
+    numeric: &NumericParams,
+) -> HashMap<String, u8> {
     // A result that is a call must be an exact call of another worker returning raw (so that a
     // tail call stays a jump: a call answering a boxed result would have to return here first).
-    fn numeric_results(e: &Core, out: &HashMap<String, u8>, w: &Workers) -> bool {
+    fn numeric_results(
+        e: &Core,
+        out: &HashMap<String, u8>,
+        w_all: &Workers,
+        strict_map: &Workers,
+        whnf: &std::collections::HashSet<String>,
+    ) -> bool {
         match e {
             Core::Con(..) | Core::Lam(..) => false,
             Core::Lit(l) => matches!(l, Lit::Int(_) | Lit::Char(_)),
             Core::Var(_) | Core::Fail(_) => true,
             Core::App(..) => {
                 let (f, args) = spine(e);
-                matches!(f, Core::Var(g) if out.contains_key(g.as_str()) && w.get(g.as_str()).is_some_and(|r| r.len() == args.len()))
+                matches!(
+                    f,
+                    Core::Var(g)
+                        if out.contains_key(g.as_str())
+                            && can_call_worker(g.as_str(), &args, w_all, strict_map, whnf)
+                )
             }
-            Core::Prim(p, args) if p == "seq" && args.len() == 2 => numeric_results(&args[1], out, w),
-            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => numeric_results(&args[0], out, w),
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                if let Core::Var(v) = &args[0] {
+                    let mut next = whnf.clone();
+                    next.insert(v.clone());
+                    numeric_results(&args[1], out, w_all, strict_map, &next)
+                } else {
+                    numeric_results(&args[1], out, w_all, strict_map, whnf)
+                }
+            }
+            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+                numeric_results(&args[0], out, w_all, strict_map, whnf)
+            }
             Core::Prim(..) => true,
             Core::Let(binds, body) => {
-                (!is_join(binds, body) || numeric_results(lambdas(&binds[0].1).1, out, w)) && numeric_results(body, out, w)
+                let mut body_whnf = whnf.clone();
+                for (n, _) in binds {
+                    body_whnf.remove(n);
+                }
+                let join_ok = if is_join(binds, body) {
+                    let mut code_whnf = whnf.clone();
+                    let mut cur = &binds[0].1;
+                    while let Core::Lam(p, inner) = cur {
+                        code_whnf.remove(p);
+                        cur = inner;
+                    }
+                    numeric_results(cur, out, w_all, strict_map, &code_whnf)
+                } else {
+                    true
+                };
+                join_ok && numeric_results(body, out, w_all, strict_map, &body_whnf)
             }
-            Core::Case(_, _, alts) => alts.iter().all(|a| match a {
-                Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => numeric_results(b, out, w),
-            }),
+            Core::Case(s, b, alts) => {
+                let mut base_whnf = whnf.clone();
+                add_case_whnf(s, b, &mut base_whnf);
+                alts.iter().all(|a| match a {
+                    Alt::Con(_, vars, body) => {
+                        let mut alt_whnf = base_whnf.clone();
+                        for v in vars {
+                            alt_whnf.remove(v);
+                        }
+                        numeric_results(body, out, w_all, strict_map, &alt_whnf)
+                    }
+                    Alt::Lit(_, body) | Alt::Default(body) => {
+                        numeric_results(body, out, w_all, strict_map, &base_whnf)
+                    }
+                })
+            }
         }
     }
     let mut out = HashMap::new();
+    let mut w_all = w.clone();
     let mut bodies = Vec::new();
     for b in binds {
-        if !w.contains_key(&b.name) {
+        let Some((n, kind)) = numeric.results.get(&b.name) else { continue };
+        if *n == 0 {
             continue;
         }
-        let Some((n, kind)) = numeric.results.get(&b.name) else { continue };
-        let (arity, inner) = lambdas(&b.body);
-        if arity == *n {
+        let mut params = Vec::new();
+        let mut inner = &b.body;
+        while let Core::Lam(p, next) = inner {
+            params.push(p.as_str());
+            inner = next;
+        }
+        if params.len() == *n {
             out.insert(b.name.clone(), *kind);
-            bodies.push((b.name.as_str(), inner));
+            w_all.entry(b.name.clone()).or_insert_with(|| vec![false; *n]);
+            let mut init_whnf = std::collections::HashSet::new();
+            if let Some(raw) = w.get(&b.name) {
+                for (p, r) in params.iter().zip(raw) {
+                    if *r {
+                        init_whnf.insert((*p).to_string());
+                    }
+                }
+            }
+            bodies.push((b.name.as_str(), inner, init_whnf));
         }
     }
     // From every candidate, weakened until each claim holds.
     loop {
         let failing: Vec<&str> = bodies
             .iter()
-            .filter(|(name, inner)| out.contains_key(*name) && !numeric_results(inner, &out, w))
-            .map(|(name, _)| *name)
+            .filter(|(name, inner, init_whnf)| {
+                out.contains_key(*name) && !numeric_results(inner, &out, &w_all, strict_map, init_whnf)
+            })
+            .map(|(name, _, _)| *name)
             .collect();
         if failing.is_empty() {
             return out;
         }
         for name in failing {
             out.remove(name);
+            if !w.contains_key(name) {
+                w_all.remove(name);
+            }
         }
     }
 }
 
-/// The global functions given workers: a parameter is passed raw when the body certainly
-/// evaluates it and every use takes it raw (with the other workers' raw parameters: a fixpoint
-/// from every candidate, weakened until each claim holds).
+/// The global functions given workers: a parameter is passed raw when its type says it is a number,
+/// the body uses it as a number, every use takes it raw, and either the body certainly evaluates
+/// it (strict worker) or no strict numeric parameter exists (WHNF-guarded worker, invoked only at
+/// call sites passing a guaranteed-WHNF argument).
 pub fn workers(binds: &[TopBind], numeric: &NumericParams) -> Workers {
+    workers_with_strict(binds, numeric).0
+}
+
+fn workers_with_strict(binds: &[TopBind], numeric: &NumericParams) -> (Workers, Workers) {
     let mut w: Workers = HashMap::new();
+    let mut strict_map: Workers = HashMap::new();
     let mut bodies: HashMap<&str, (Vec<&str>, &Core)> = HashMap::new();
     for b in binds {
         let mut params = Vec::new();
@@ -306,16 +491,30 @@ pub fn workers(binds: &[TopBind], numeric: &NumericParams) -> Workers {
         // Both the types (a GADT match can refine a parameter's type in one alternative only) and
         // the body say it is a number.
         let types = numeric.params.get(&b.name);
-        let raw: Vec<bool> = params
+        let strict_raw: Vec<bool> = params
             .iter()
             .enumerate()
             .map(|(i, p)| {
                 types.and_then(|t| t.get(i)).is_some_and(|k| *k != 0) && evaluated.contains(*p) && numeric_use(cur, p)
             })
             .collect();
-        if raw.iter().any(|r| *r) {
-            w.insert(b.name.clone(), raw);
+        if strict_raw.iter().any(|r| *r) {
+            strict_map.insert(b.name.clone(), strict_raw.clone());
+            w.insert(b.name.clone(), strict_raw);
             bodies.insert(b.name.as_str(), (params, cur));
+        } else {
+            // No strict numeric parameter: allow WHNF-guarded raw parameters (e.g. `member`,
+            // `safe`, IO loops), invoked only at call sites passing guaranteed-WHNF values.
+            let whnf_raw: Vec<bool> = params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| types.and_then(|t| t.get(i)).is_some_and(|k| *k != 0) && numeric_use(cur, p))
+                .collect();
+            if whnf_raw.iter().any(|r| *r) {
+                strict_map.insert(b.name.clone(), vec![false; params.len()]);
+                w.insert(b.name.clone(), whnf_raw);
+                bodies.insert(b.name.as_str(), (params, cur));
+            }
         }
     }
     loop {
@@ -324,8 +523,14 @@ pub fn workers(binds: &[TopBind], numeric: &NumericParams) -> Workers {
         for name in names {
             let (params, body) = &bodies[name.as_str()];
             let mut raw = w[&name].clone();
+            let mut init_whnf = std::collections::HashSet::new();
+            for (p, r) in params.iter().zip(&raw) {
+                if *r {
+                    init_whnf.insert((*p).to_string());
+                }
+            }
             for (i, p) in params.iter().enumerate() {
-                if raw[i] && !raw_uses(body, p, &w) {
+                if raw[i] && !raw_uses(body, p, &w, &strict_map, &init_whnf) {
                     raw[i] = false;
                     changed = true;
                 }
@@ -334,10 +539,11 @@ pub fn workers(binds: &[TopBind], numeric: &NumericParams) -> Workers {
                 w.insert(name, raw);
             } else {
                 w.remove(&name);
+                strict_map.remove(&name);
             }
         }
         if !changed {
-            return w;
+            return (w, strict_map);
         }
     }
 }
@@ -368,6 +574,8 @@ struct Body {
     capture_index: HashMap<String, u32>,
     /// The join points in scope, to their id and arity.
     joins: HashMap<String, (u32, usize)>,
+    /// Variables known to be in WHNF (or raw) at the current point in this body.
+    whnf: std::collections::HashSet<String>,
     /// Where the expression being lowered is (see `Ctx`).
     ctx: Ctx,
     /// The kind of the raw result this body returns (a worker returning its number raw).
@@ -393,6 +601,8 @@ pub struct Lowering {
     next_join: u32,
     /// The functions with workers (see `workers`).
     workers: Workers,
+    /// For each worker, which raw parameters are certainly evaluated (vs WHNF-guarded).
+    worker_strict: Workers,
     /// The parameters the types say are numbers (see `NumericParams`).
     numeric: NumericParams,
     /// The workers that return their result raw, with its kind (see `raw_returns`).
@@ -402,7 +612,17 @@ pub struct Lowering {
 impl Body {
     fn new() -> Body {
         // Slot 0 is the closure itself.
-        Body { locals: HashMap::new(), nslots: 1, nraw: 0, captures: Vec::new(), capture_index: HashMap::new(), joins: HashMap::new(), ctx: Ctx::Tail, ret_raw: None }
+        Body {
+            locals: HashMap::new(),
+            nslots: 1,
+            nraw: 0,
+            captures: Vec::new(),
+            capture_index: HashMap::new(),
+            joins: HashMap::new(),
+            whnf: std::collections::HashSet::new(),
+            ctx: Ctx::Tail,
+            ret_raw: None,
+        }
     }
 
     fn fresh_slot(&mut self) -> u32 {
@@ -416,16 +636,32 @@ impl Lowering {
     /// Lowers a whole program. Global names are the top-level bindings.
     pub fn program(binds: &[TopBind], numeric: &NumericParams) -> SProgram {
         let index: HashMap<String, u32> = binds.iter().enumerate().map(|(i, b)| (b.name.clone(), i as u32)).collect();
+        let no_workers = std::env::var_os("HSC_NO_WORKERS").is_some();
+        let (workers, worker_strict) = if no_workers {
+            (HashMap::new(), HashMap::new())
+        } else {
+            workers_with_strict(binds, numeric)
+        };
         let mut lw = Lowering {
             index: index.clone(),
             bodies: Vec::new(),
             pending: Vec::new(),
             next_join: 0,
-            workers: if std::env::var_os("HSC_NO_WORKERS").is_some() { HashMap::new() } else { workers(binds, numeric) },
+            workers,
+            worker_strict,
             numeric: numeric.clone(),
             raw_returns: HashMap::new(),
         };
-        lw.raw_returns = raw_returns(binds, &lw.workers, numeric);
+        if !no_workers {
+            lw.raw_returns = raw_returns(binds, &lw.workers, &lw.worker_strict, numeric);
+            for name in lw.raw_returns.keys() {
+                if !lw.workers.contains_key(name) {
+                    let n = numeric.results[name].0;
+                    lw.workers.insert(name.clone(), vec![false; n]);
+                    lw.worker_strict.insert(name.clone(), vec![false; n]);
+                }
+            }
+        }
         let globals = binds
             .iter()
             .map(|b| {
@@ -471,6 +707,7 @@ impl Lowering {
                         let r = RAW | kind | top.nraw;
                         top.nraw += 1;
                         top.locals.insert(p.clone(), r);
+                        top.whnf.insert(p.clone());
                         if reg_raws < MAX_REG_RAW_ARGS {
                             reg_raws += 1;
                             raw_args.push((0, r));
@@ -554,15 +791,23 @@ impl Lowering {
         if b.ctx == Ctx::Tail { b.ret_raw } else { None }
     }
 
+    /// Whether an exact call `g args` in the current body may invoke `g`'s worker.
+    fn can_invoke_worker(&self, g: &str, args: &[&Core]) -> bool {
+        if self.bodies.iter().any(|b| b.locals.contains_key(g) || b.capture_index.contains_key(g)) {
+            return false;
+        }
+        let Some(body) = self.bodies.last() else { return false };
+        can_call_worker(g, args, &self.workers, &self.worker_strict, &body.whnf)
+    }
+
     /// The raw result kind of an exact call of a worker that returns raw.
     fn raw_call(&self, e: &Core) -> Option<u8> {
         let (f, args) = spine(e);
         let Core::Var(g) = f else { return None };
-        if self.bodies.iter().any(|b| b.locals.contains_key(g) || b.capture_index.contains_key(g)) {
+        if !self.can_invoke_worker(g.as_str(), &args) {
             return None;
         }
-        let kind = *self.raw_returns.get(g.as_str())?;
-        (self.workers.get(g.as_str())?.len() == args.len()).then_some(kind)
+        self.raw_returns.get(g.as_str()).copied()
     }
 
     /// `case e as r of _ -> r` with a raw binder of the given kind: the number of `e` (unboxed,
@@ -628,27 +873,43 @@ impl Lowering {
             Core::Lam(..) => SExpr::Closure(Box::new(self.closure_of(e))),
             Core::Let(binds, body) if is_join(binds, body) => {
                 let (name, rhs) = &binds[0];
+                let saved_whnf = self.bodies.last().expect("body").whnf.clone();
                 let mut params = Vec::new();
                 let mut code = rhs;
                 while let Core::Lam(x, b) = code {
+                    self.bodies.last_mut().expect("body").whnf.remove(x);
                     params.push(self.bind_local(x));
                     code = b;
                 }
                 let code = self.strict(code);
                 let id = self.next_join;
                 self.next_join += 1;
+                {
+                    let top = self.bodies.last_mut().expect("body");
+                    top.whnf = saved_whnf.clone();
+                    top.whnf.remove(name);
+                }
                 let prev = self.bodies.last_mut().expect("body").joins.insert(name.clone(), (id, params.len()));
                 let body = self.strict(body);
-                let joins = &mut self.bodies.last_mut().expect("body").joins;
+                let top = self.bodies.last_mut().expect("body");
+                top.whnf = saved_whnf;
                 match prev {
-                    Some(p) => joins.insert(name.clone(), p),
-                    None => joins.remove(name),
+                    Some(p) => top.joins.insert(name.clone(), p),
+                    None => top.joins.remove(name),
                 };
                 SExpr::Join(id, params, Box::new(code), Box::new(body))
             }
             Core::Let(binds, body) => {
                 let bound = self.let_binds(binds);
+                let saved_whnf = self.bodies.last().expect("body").whnf.clone();
+                {
+                    let top = self.bodies.last_mut().expect("body");
+                    for (n, _) in binds {
+                        top.whnf.remove(n);
+                    }
+                }
                 let body = self.strict(body);
+                self.bodies.last_mut().expect("body").whnf = saved_whnf;
                 SExpr::Let(bound, Box::new(body))
             }
             Core::Case(scrut, binder, alts) => {
@@ -671,8 +932,11 @@ impl Lowering {
                 }
                 // The result of an inline primitive that is only used raw is kept unboxed.
                 let raw_call = self.raw_call(scrut);
+                let saved_whnf = self.bodies.last().expect("body").whnf.clone();
+                let mut alt_base_whnf = saved_whnf.clone();
+                add_case_whnf(scrut, binder, &mut alt_base_whnf);
                 let raw = (matches!(scrut.as_ref(), Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str())) || raw_call.is_some())
-                    && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder, &self.workers));
+                    && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder, &self.workers, &self.worker_strict, &alt_base_whnf));
                 let char = matches!(scrut.as_ref(), Core::Prim(p, _) if p == "chr#") || raw_call == Some(NUM_CHAR);
                 let flat_alts = if !raw { flatten_case_alts(scrut, binder, alts) } else { None };
                 let alts: &[Alt] = flat_alts.as_deref().unwrap_or(alts);
@@ -690,6 +954,12 @@ impl Lowering {
                     let b = self.bodies.last_mut().expect("body");
                     b.nslots = base;
                     b.nraw = raw_base;
+                    b.whnf = alt_base_whnf.clone();
+                    if let Alt::Con(_, vars, _) = a {
+                        for v in vars {
+                            b.whnf.remove(v);
+                        }
+                    }
                     lowered.push(self.alt(a));
                     let b = self.bodies.last().expect("body");
                     top = top.max(b.nslots);
@@ -698,6 +968,7 @@ impl Lowering {
                 let b = self.bodies.last_mut().expect("body");
                 b.nslots = top;
                 b.nraw = raw_top;
+                b.whnf = saved_whnf;
                 SExpr::Case(Box::new(scrut), bslot, lowered)
             }
             Core::Con(name, args) => {
@@ -709,7 +980,12 @@ impl Lowering {
             Core::Prim(name, args) if name == "seq" && args.len() == 2 => {
                 let slot = self.bind_local(&format!("seq%{}", self.bodies.len()));
                 let scrut = self.strict_in(&args[0], Ctx::Scrut);
+                let saved_whnf = self.bodies.last().expect("body").whnf.clone();
+                if let Core::Var(v) = &args[0] {
+                    self.bodies.last_mut().expect("body").whnf.insert(v.clone());
+                }
                 let body = self.strict(&args[1]);
+                self.bodies.last_mut().expect("body").whnf = saved_whnf;
                 SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(body)])
             }
             Core::Prim(name, args) if IDENTITY_PRIMS.contains(&name.as_str()) && args.len() == 1 => {
@@ -730,15 +1006,14 @@ impl Lowering {
     }
 
     /// An exact call of a function with a worker: each raw parameter's argument is a raw slot or a
-    /// number literal, evaluated first (into a fresh raw slot) otherwise; the parameter is strict,
-    /// so evaluating it before the call is what the function would do.
+    /// number literal, evaluated first (into a fresh raw slot) otherwise; every raw parameter is
+    /// either strict or receives a guaranteed-WHNF argument (checked by `can_invoke_worker`).
     fn worker_call(&mut self, f: &Core, args: &[&Core]) -> Option<SExpr> {
         let Core::Var(g) = f else { return None };
-        // A local of that name in any enclosing body shadows the global.
-        if self.bodies.iter().any(|b| b.locals.contains_key(g) || b.capture_index.contains_key(g)) {
+        if !self.can_invoke_worker(g.as_str(), args) {
             return None;
         }
-        let raw = self.workers.get(g.as_str()).filter(|r| r.len() == args.len())?.clone();
+        let raw = self.workers.get(g.as_str())?.clone();
         let mut evals: Vec<(u32, SExpr)> = Vec::new();
         let mut atoms: Vec<Option<Atom>> = vec![None; args.len()];
         for (i, a) in args.iter().enumerate() {
@@ -1092,6 +1367,128 @@ fn flatten_case_alts(scrut: &Core, binder: &str, alts: &[Alt]) -> Option<Vec<Alt
     flattened.then_some(out)
 }
 
+#[derive(Eq, Hash, PartialEq)]
+enum EqLitKey {
+    Int(i64),
+    Char(char),
+}
+
+/// Extracts a single equality-comparison branch `case eqPrim x lit as b of 1# -> hit; _ -> miss`
+/// (or the `0#` swapped polarity, or with an intermediate raw binder `case eqPrim x lit as b of _ -> case b of ...`).
+fn match_eq_step(e: &Core) -> Option<(&str, Lit, bool, &Core, &Core, &str)> {
+    let Core::Case(scrut, b1, alts) = e else { return None };
+    let Core::Prim(p, args) = scrut.as_ref() else { return None };
+    if args.len() != 2 {
+        return None;
+    }
+    let (var, lit, is_char) = match (p.as_str(), &args[0], &args[1]) {
+        ("eqChar#", Core::Var(x), Core::Lit(l @ Lit::Char(_)))
+        | ("eqChar#", Core::Lit(l @ Lit::Char(_)), Core::Var(x)) => (x.as_str(), l.clone(), true),
+        ("==#" | "eqWord#", Core::Var(x), Core::Lit(l @ Lit::Int(_)))
+        | ("==#" | "eqWord#", Core::Lit(l @ Lit::Int(_)), Core::Var(x)) => (x.as_str(), l.clone(), false),
+        _ => return None,
+    };
+    fn extract_bool_alts(alts: &[Alt]) -> Option<(&Core, &Core)> {
+        match alts {
+            [Alt::Lit(Lit::Int(1), hit), Alt::Default(miss)] => Some((hit, miss)),
+            [Alt::Lit(Lit::Int(0), miss), Alt::Default(hit)] => Some((hit, miss)),
+            _ => None,
+        }
+    }
+    if let Some((hit, miss)) = extract_bool_alts(alts) {
+        if !mentions(hit, b1) && !mentions(miss, b1) {
+            return Some((var, lit, is_char, hit, miss, b1.as_str()));
+        }
+        return None;
+    }
+    if let [Alt::Default(Core::Case(s2, b2, alts2))] = &alts[..] {
+        if matches!(s2.as_ref(), Core::Var(v) if v == b1) {
+            if let Some((hit, miss)) = extract_bool_alts(alts2) {
+                if !mentions(hit, b1)
+                    && !mentions(miss, b1)
+                    && !mentions(hit, b2)
+                    && !mentions(miss, b2)
+                {
+                    return Some((var, lit, is_char, hit, miss, b1.as_str()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Collapses chained equality-comparison cases (`eqChar#`, `==#`, `eqWord#`) and nested
+/// same-scrutinee `Case` chains into flat multi-way `Case` expressions before worker analysis.
+pub fn collapse_case_chains(binds: &mut [TopBind]) {
+    fn walk(e: &mut Core) {
+        // Iteratively peel chains of >= 2 equality comparisons on the same variable.
+        if let Some((var, first_lit, is_char, _, _, b1)) = match_eq_step(e) {
+            let var_owned = var.to_string();
+            let b_fresh = format!("{b1}%eq");
+            let mut steps: Vec<(Lit, Core)> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut cur_ref: &Core = e;
+            let mut count = 0usize;
+            while let Some((v, lit, ic, hit, miss, _)) = match_eq_step(cur_ref) {
+                if v != var_owned || ic != is_char {
+                    break;
+                }
+                count += 1;
+                let key = match &lit {
+                    Lit::Int(i) => EqLitKey::Int(*i),
+                    Lit::Char(c) => EqLitKey::Char(*c),
+                    _ => unreachable!(),
+                };
+                if seen.insert(key) {
+                    steps.push((lit, hit.clone()));
+                }
+                cur_ref = miss;
+            }
+            let _ = first_lit;
+            if count >= 2 {
+                let mut alts: Vec<Alt> = steps.into_iter().map(|(l, h)| Alt::Lit(l, h)).collect();
+                alts.push(Alt::Default(cur_ref.clone()));
+                *e = Core::Case(Box::new(Core::Var(var_owned)), b_fresh, alts);
+            }
+        }
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(f, a) => {
+                walk(f);
+                walk(a);
+            }
+            Core::Lam(_, b) => walk(b),
+            Core::Let(binds, body) => {
+                for (_, r) in binds {
+                    walk(r);
+                }
+                walk(body);
+            }
+            Core::Case(scrut, binder, alts) => {
+                if matches!(scrut.as_ref(), Core::Var(_)) {
+                    if let Some(flat) = flatten_case_alts(scrut, binder, alts) {
+                        *alts = flat;
+                    }
+                }
+                walk(scrut);
+                for a in alts {
+                    match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => walk(b),
+                    }
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    walk(a);
+                }
+            }
+        }
+    }
+    for b in binds {
+        walk(&mut b.body);
+    }
+}
+
 /// The head and arguments of an application spine.
 fn spine(e: &Core) -> (&Core, Vec<&Core>) {
     let mut args = Vec::new();
@@ -1298,4 +1695,175 @@ mod raw_slot_tests {
         assert_eq!(alts2.len(), 2);
         assert!(matches!(&alts2[1], SAlt::Default(SExpr::Case(..))));
     }
+
+    #[test]
+    fn collapse_case_chains_folds_eq_chains_and_deduplicates() {
+        // case eqChar# c 'a' of 1# -> 1; _ -> case eqChar# c 'b' of 1# -> 2; _ -> case eqChar# c 'a' of 1# -> 9; _ -> 0
+        let step3 = Core::Case(
+            Box::new(prim("eqChar#", vec![var("c"), Core::Lit(Lit::Char('a'))])),
+            "e3".into(),
+            vec![Alt::Lit(Lit::Int(1), Core::Lit(Lit::Int(9))), Alt::Default(Core::Lit(Lit::Int(0)))],
+        );
+        let step2 = Core::Case(
+            Box::new(prim("eqChar#", vec![var("c"), Core::Lit(Lit::Char('b'))])),
+            "e2".into(),
+            vec![Alt::Lit(Lit::Int(1), Core::Lit(Lit::Int(2))), Alt::Default(step3)],
+        );
+        let step1 = Core::Case(
+            Box::new(prim("eqChar#", vec![var("c"), Core::Lit(Lit::Char('a'))])),
+            "e1".into(),
+            vec![Alt::Lit(Lit::Int(1), Core::Lit(Lit::Int(1))), Alt::Default(step2)],
+        );
+        let mut binds = vec![TopBind { name: "Test.f".into(), body: Core::Lam("c".into(), Box::new(step1)) }];
+        collapse_case_chains(&mut binds);
+        let Core::Lam(_, body) = &binds[0].body else { panic!("expected Lam") };
+        let Core::Case(scrut, _, alts) = body.as_ref() else { panic!("expected flat Case, got {body:?}") };
+        assert!(matches!(scrut.as_ref(), Core::Var(v) if v == "c"));
+        assert_eq!(alts.len(), 3);
+        assert!(matches!(&alts[0], Alt::Lit(Lit::Char('a'), Core::Lit(Lit::Int(1)))));
+        assert!(matches!(&alts[1], Alt::Lit(Lit::Char('b'), Core::Lit(Lit::Int(2)))));
+        assert!(matches!(&alts[2], Alt::Default(Core::Lit(Lit::Int(0)))));
+    }
+
+    #[test]
+    fn zero_raw_param_function_can_get_raw_returning_worker() {
+        // size t = case t of Tip -> 0#; Bin l r -> case size l as a of _ -> case size r as b of _ -> a +# b
+        let body = Core::Case(
+            Box::new(var("t")),
+            "u".into(),
+            vec![
+                Alt::Con("Test.Tip".into(), vec![], Core::Lit(Lit::Int(0))),
+                Alt::Con(
+                    "Test.Bin".into(),
+                    vec!["l".into(), "r".into()],
+                    case(
+                        Core::App(Box::new(var("Test.size")), Box::new(var("l"))),
+                        "a",
+                        case(
+                            Core::App(Box::new(var("Test.size")), Box::new(var("r"))),
+                            "b",
+                            prim("+#", vec![var("a"), var("b")]),
+                        ),
+                    ),
+                ),
+            ],
+        );
+        let binds = vec![TopBind { name: "Test.size".into(), body: Core::Lam("t".into(), Box::new(body)) }];
+        let numeric = NumericParams {
+            params: [("Test.size".to_string(), vec![0])].into_iter().collect(),
+            results: [("Test.size".to_string(), (1, NUM_INT))].into_iter().collect(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, raw) = prog.globals[0].worker.as_ref().expect("0-raw-param raw-returning worker");
+        assert_eq!(raw, &vec![false]);
+        assert!(worker.ret_raw);
+        assert!(worker.raw_args.is_empty());
+        // Recursive call inside worker uses CallWorker into a raw slot.
+        let SExpr::Case(_, _, alts) = &worker.body else { panic!("{:?}", worker.body) };
+        let SAlt::Con(_, _, bin_body) = &alts[1] else { panic!("{:?}", alts[1]) };
+        let SExpr::Case(scrut, b, _) = bin_body else { panic!("{bin_body:?}") };
+        assert!(matches!(scrut.as_ref(), SExpr::CallWorker(0, _)), "{scrut:?}");
+        assert_ne!(b & RAW, 0);
+    }
+
+    #[test]
+    fn whnf_guarded_worker_called_only_on_whnf_arguments() {
+        // member k t = case t of Tip -> 0#; Bin x l r -> case k <# x of 1# -> member k l; _ -> member k r
+        // `k` is NOT certainly evaluated (Tip doesn't touch `k`), so `member` gets a WHNF-guarded worker.
+        let member_body = Core::Case(
+            Box::new(var("t")),
+            "u".into(),
+            vec![
+                Alt::Con("Test.Tip".into(), vec![], Core::Lit(Lit::Int(0))),
+                Alt::Con(
+                    "Test.Bin".into(),
+                    vec!["x".into(), "l".into(), "r".into()],
+                    case(
+                        prim("<#", vec![var("k"), var("x")]),
+                        "c",
+                        Core::Case(
+                            Box::new(var("c")),
+                            "d".into(),
+                            vec![
+                                Alt::Lit(
+                                    Lit::Int(1),
+                                    Core::App(Box::new(Core::App(Box::new(var("Test.member")), Box::new(var("k")))), Box::new(var("l"))),
+                                ),
+                                Alt::Default(Core::App(
+                                    Box::new(Core::App(Box::new(var("Test.member")), Box::new(var("k")))),
+                                    Box::new(var("r")),
+                                )),
+                            ],
+                        ),
+                    ),
+                ),
+            ],
+        );
+        // Caller 1: `caller_lit t = member 7# t` -> literal 7# is WHNF -> CallWorker.
+        let caller_lit = Core::Lam(
+            "t".into(),
+            Box::new(Core::App(
+                Box::new(Core::App(Box::new(var("Test.member")), Box::new(Core::Lit(Lit::Int(7))))),
+                Box::new(var("t")),
+            )),
+        );
+        // Caller 2: `caller_lazy k t = member k t` -> unforced `k` -> must NOT call worker!
+        let caller_lazy = Core::Lam(
+            "k".into(),
+            Box::new(Core::Lam(
+                "t".into(),
+                Box::new(Core::App(
+                    Box::new(Core::App(Box::new(var("Test.member")), Box::new(var("k")))),
+                    Box::new(var("t")),
+                )),
+            )),
+        );
+        // Caller 3: `caller_div k t = case k of _ -> member (k quotInt# 0#) t` -> quotInt# can trap -> boxed App!
+        let caller_div = Core::Lam(
+            "k".into(),
+            Box::new(Core::Lam(
+                "t".into(),
+                Box::new(case(
+                    var("k"),
+                    "kb",
+                    Core::App(
+                        Box::new(Core::App(
+                            Box::new(var("Test.member")),
+                            Box::new(prim("quotInt#", vec![var("k"), Core::Lit(Lit::Int(0))])),
+                        )),
+                        Box::new(var("t")),
+                    ),
+                )),
+            )),
+        );
+        let binds = vec![
+            TopBind {
+                name: "Test.member".into(),
+                body: Core::Lam("k".into(), Box::new(Core::Lam("t".into(), Box::new(member_body)))),
+            },
+            TopBind { name: "Test.caller_lit".into(), body: caller_lit },
+            TopBind { name: "Test.caller_lazy".into(), body: caller_lazy },
+            TopBind { name: "Test.caller_div".into(), body: caller_div },
+        ];
+        let numeric = NumericParams {
+            params: [("Test.member".to_string(), vec![NUM_INT, 0])].into_iter().collect(),
+            results: [("Test.member".to_string(), (2, NUM_INT))].into_iter().collect(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, raw) = prog.globals[0].worker.as_ref().expect("WHNF-guarded worker");
+        assert_eq!(raw, &vec![true, false]);
+        assert!(worker.ret_raw);
+        // caller_lit invokes worker (wrapped in through_raw to box the raw return).
+        let SExpr::Case(scrut, _, _) = &prog.globals[1].closure.body else {
+            panic!("expected through_raw Case, got {:?}", prog.globals[1].closure.body);
+        };
+        assert!(matches!(scrut.as_ref(), SExpr::CallWorker(0, _)), "{scrut:?}");
+        // caller_lazy must stay a boxed App so `member undefined Tip` does not diverge.
+        assert!(matches!(prog.globals[2].closure.body, SExpr::App(..)), "{:?}", prog.globals[2].closure.body);
+        // caller_div must stay a boxed App because `quotInt#` can divide by zero.
+        let SExpr::Case(_, _, alts) = &prog.globals[3].closure.body else { panic!("expected Case") };
+        let SAlt::Default(div_body) = &alts[0] else { panic!("expected Default") };
+        assert!(matches!(div_body, SExpr::Let(_, b) if matches!(b.as_ref(), SExpr::App(..))), "{div_body:?}");
+    }
 }
+
