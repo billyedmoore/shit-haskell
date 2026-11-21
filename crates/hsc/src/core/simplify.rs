@@ -65,10 +65,14 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
     // Fusion in phase 0 makes local loops: their calls by value, and a clean-up of the
     // bindings that changed.
     // Loops made in phase 0 (`eftIntFB` inlined into a fused consumer) take their extra
-    // parameters too (an IO loop its state token), in that clean-up.
-    let mut changed = if std::env::var_os("HSC_NO_ETA").is_none() { eta_expand(binds, None, &rules) } else { HashSet::new() };
-    changed.extend(call_by_value(binds));
-    if !changed.is_empty() {
+    // parameters too (an IO loop its state token), in that clean-up. Up to two rounds handle
+    // accumulator + state-token loops such as `foldM` over `[1..n]`.
+    for _ in 0..2 {
+        let mut changed = if std::env::var_os("HSC_NO_ETA").is_none() { eta_expand(binds, None, &rules) } else { HashSet::new() };
+        changed.extend(call_by_value(binds));
+        if changed.is_empty() {
+            break;
+        }
         pass(binds, 0, &rules, Some(&changed));
     }
     // `oneShot` was kept as a marker (see `into_one_shot`); it is the identity.
@@ -651,6 +655,7 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
                 dead: &dead,
                 pending: HashMap::new(),
                 known: &known,
+                local_known: HashMap::new(),
                 literals: &literals,
                 aliases: &aliases,
                 templates: &templates,
@@ -688,12 +693,13 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
     FRESH.store(fresh, std::sync::atomic::Ordering::Relaxed);
 }
 
-
 struct Simp<'a> {
     once: &'a HashSet<String>,
     dead: &'a HashSet<String>,
     pending: HashMap<String, Core>,
     known: &'a HashMap<String, (String, Vec<Core>)>,
+    /// Local let-bound constructors with atomic fields (`let r = STRef mv`), for known-case elimination.
+    local_known: HashMap<String, (String, Vec<Core>)>,
     /// Globals that are literals.
     literals: &'a HashMap<String, Lit>,
     aliases: &'a HashMap<String, String>,
@@ -791,6 +797,13 @@ impl Simp<'_> {
                 for (_, rhs) in kept.iter_mut() {
                     self.expr(rhs);
                 }
+                for (name, rhs) in &kept {
+                    if let Core::Con(con, args) = rhs {
+                        if args.iter().all(is_atom) {
+                            self.local_known.insert(name.clone(), (con.clone(), args.clone()));
+                        }
+                    }
+                }
                 self.expr(body);
                 if kept.is_empty() {
                     *c = take(body);
@@ -842,11 +855,21 @@ impl Simp<'_> {
                     return;
                 }
                 // Case of a case with one alternative: the outer case moves into it.
+                // Alternatives that fail do not count: the outer case of a failure fails too.
                 if let Core::Case(_, _, inner) = &mut **s {
-                    if inner.len() == 1 {
+                    fn alt_fails(a: &Alt) -> bool {
+                        let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                        let mut e = b;
+                        while let Core::App(f, _) = e {
+                            e = f;
+                        }
+                        matches!(e, Core::Fail(_))
+                    }
+                    let live: Vec<usize> = (0..inner.len()).filter(|&i| !alt_fails(&inner[i])).collect();
+                    if let [one] = live[..] {
                         let Core::Case(s, binder, alts) = take(c) else { unreachable!() };
                         let Core::Case(s2, b2, mut inner) = *s else { unreachable!() };
-                        let body = match &mut inner[0] {
+                        let body = match &mut inner[one] {
                             Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => b,
                         };
                         *body = Core::Case(Box::new(take(body)), binder, alts);
@@ -930,6 +953,16 @@ impl Simp<'_> {
                     e = Core::Case(Box::new(a), v, vec![Alt::Default(e)]);
                 }
                 *c = e;
+            }
+            // `seq a b` is a case of `a` with one default alternative, so that the case
+            // rewrites (case of case, of an evaluated variable) see it.
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                let b = args.pop().expect("two arguments");
+                let a = args.pop().expect("two arguments");
+                *self.fresh += 1;
+                *c = Core::Case(Box::new(a), format!("sq~{}", self.fresh), vec![Alt::Default(b)]);
+                self.changed = true;
+                self.expr(c);
             }
             Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| self.expr(a)),
         }
@@ -1261,18 +1294,18 @@ impl Simp<'_> {
     fn select(&mut self, c: &mut Core) -> Option<Core> {
         let Core::Case(s, binder, alts) = c else { return None };
         match &**s {
-            Core::Var(v) if self.known.contains_key(v.as_str()) => {
-                let (con, fields) = &self.known[v.as_str()];
+            Core::Var(v) if self.local_known.contains_key(v.as_str()) || self.known.contains_key(v.as_str()) => {
+                let (con, fields) = self.local_known.get(v.as_str()).unwrap_or_else(|| &self.known[v.as_str()]).clone();
                 let i = alts
                     .iter()
-                    .position(|a| matches!(a, Alt::Con(k, vars, _) if k == con && vars.len() == fields.len()))
+                    .position(|a| matches!(a, Alt::Con(k, vars, _) if k == &con && vars.len() == fields.len()))
                     .or_else(|| alts.iter().position(|a| matches!(a, Alt::Default(_))))?;
                 let v = Core::Var(v.clone());
                 let (vars, mut body) = match alts.swap_remove(i) {
                     Alt::Con(_, vars, body) => (vars, body),
                     other => (Vec::new(), alt_body(other)),
                 };
-                for (x, f) in vars.iter().zip(fields) {
+                for (x, f) in vars.iter().zip(&fields) {
                     subst(&mut body, x, f);
                 }
                 subst(&mut body, binder, &v);
@@ -2907,7 +2940,7 @@ mod rule_tests {
         let mut fresh = 0;
         let no_arities = HashMap::new();
         let mut s = Simp {
-            once: &once, dead: &dead, pending: HashMap::new(), known: &known, literals: &literals, aliases: &aliases, templates: &templates,
+            once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates,
             this: "Test.x", rules: &rules, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
             fresh: &mut fresh, budget: 0, changed: false,
         };

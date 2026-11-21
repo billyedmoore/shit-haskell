@@ -1114,6 +1114,7 @@ impl Gen {
             SExpr::Case(scrut, bslot, alts) => {
                 let cont = self.label("k");
                 let raw_binder = *bslot & RAW != 0;
+                let mut fast_body: Option<String> = None;
                 // A variable that is already a value (not a thunk or an indirection) goes straight
                 // to the alternatives, without the return address and `hsc_eval`.
                 let ready = match scrut.as_ref() {
@@ -1150,20 +1151,87 @@ impl Gen {
                     // A primitive with an inline fast path is computed in place (before the return
                     // address, which only its slow path needs).
                     SExpr::Prim(name, args) => {
-                        let ready = self.label("ready");
-                        let slow = self.label("slow");
-                        self.fast_done = Some(ready.clone());
-                        // A raw binder takes the number straight from the inline path.
-                        self.raw_dest = raw_binder.then_some(*bslot);
-                        let fast = self.int_fast_path(name, args, p, &slow);
-                        self.raw_dest = None;
-                        self.fast_done = None;
-                        if fast {
-                            self.put_label(&slow);
-                            self.slow_only = true;
-                            Some(ready)
-                        } else {
+                        let mut matched_mv = false;
+                        if !raw_binder && !args.is_empty() && !is_raw(&args[0]) && !matches!(args[0], Atom::Lit(_)) {
+                            let non_alloc = |a: &Atom| {
+                                !is_raw(a)
+                                    && match a {
+                                        Atom::Lit(SLit::Str(_) | SLit::Frac(_) | SLit::Addr(_)) => false,
+                                        Atom::Lit(SLit::Integer(s)) => s.parse::<i64>().is_ok(),
+                                        _ => true,
+                                    }
+                            };
+                            if name == "readMutVar#" && args.len() == 2 {
+                                if let Some(SAlt::Con(c, slots, body)) = alts.first() {
+                                    if c == "Builtin.(,)" && slots.len() == 2 {
+                                        let mut uses = std::collections::HashSet::new();
+                                        self.slot_uses(body, &mut uses);
+                                        if !uses.contains(bslot) {
+                                            let body_lbl = self.label("mv_body");
+                                            let slow = self.label("slow");
+                                            self.load(&args[0], p, "%rax");
+                                            let _ = writeln!(self.out, "    cmpb ${REF}, (%rax)");
+                                            let _ = writeln!(self.out, "    jne {slow}");
+                                            self.emit("cmpb $0, hsc_preempt(%rip)");
+                                            let _ = writeln!(self.out, "    jne {slow}");
+                                            let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
+                                            self.emit("movq 8(%rax), %rcx");
+                                            let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(slots[1]));
+                                            let _ = writeln!(self.out, "    jmp {body_lbl}");
+                                            self.put_label(&slow);
+                                            self.slow_only = true;
+                                            fast_body = Some(body_lbl);
+                                            matched_mv = true;
+                                        }
+                                    }
+                                }
+                            } else if name == "writeMutVar#" && args.len() == 3 && non_alloc(&args[1]) {
+                                if let [SAlt::Default(body)] = &alts[..] {
+                                    if !matches!(body, SExpr::Fail(_)) {
+                                        let mut uses = std::collections::HashSet::new();
+                                        self.slot_uses(body, &mut uses);
+                                        let body_lbl = self.label("mv_body");
+                                        let slow = self.label("slow");
+                                        self.load(&args[0], p, "%rax");
+                                        let _ = writeln!(self.out, "    cmpb ${REF}, (%rax)");
+                                        let _ = writeln!(self.out, "    jne {slow}");
+                                        self.emit("cmpb $0, hsc_preempt(%rip)");
+                                        let _ = writeln!(self.out, "    jne {slow}");
+                                        self.load(&args[1], p, "%rcx");
+                                        self.emit("movq %rcx, 8(%rax)");
+                                        if uses.contains(bslot) {
+                                            let unit_id = self.con_id("Builtin.()");
+                                            let unit_lbl = self.nullary_con(unit_id);
+                                            let _ = writeln!(self.out, "    leaq {unit_lbl}(%rip), %rcx");
+                                            let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*bslot));
+                                        }
+                                        let _ = writeln!(self.out, "    jmp {body_lbl}");
+                                        self.put_label(&slow);
+                                        self.slow_only = true;
+                                        fast_body = Some(body_lbl);
+                                        matched_mv = true;
+                                    }
+                                }
+                            }
+                        }
+                        if matched_mv {
                             None
+                        } else {
+                            let ready = self.label("ready");
+                            let slow = self.label("slow");
+                            self.fast_done = Some(ready.clone());
+                            // A raw binder takes the number straight from the inline path.
+                            self.raw_dest = raw_binder.then_some(*bslot);
+                            let fast = self.int_fast_path(name, args, p, &slow);
+                            self.raw_dest = None;
+                            self.fast_done = None;
+                            if fast {
+                                self.put_label(&slow);
+                                self.slow_only = true;
+                                Some(ready)
+                            } else {
+                                None
+                            }
                         }
                     }
                     _ => None,
@@ -1215,7 +1283,7 @@ impl Gen {
                     self.put_label(&ready);
                 }
                 let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
-                self.alts(alts, *bslot, p);
+                self.alts(alts, *bslot, p, fast_body.as_deref());
             }
             SExpr::Closure(c) => {
                 self.alloc(closure_words(c), p);
@@ -1251,7 +1319,7 @@ impl Gen {
     }
 
     /// The alternatives of a case: the value is in R1 and in the binder slot `bslot`.
-    fn alts(&mut self, alts: &[SAlt], bslot: u32, p: Pos) {
+    fn alts(&mut self, alts: &[SAlt], bslot: u32, p: Pos, fast_body: Option<&str>) {
         let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
         let mut has_default = false;
         let con_count = alts.iter().filter(|a| matches!(a, SAlt::Con(..))).count();
@@ -1320,13 +1388,18 @@ impl Gen {
             let fail_msg = format!("Non-exhaustive patterns in case [{}]", names.join(" | "));
             self.fail(&fail_msg, p);
         }
-        for (a, l) in alts.iter().zip(&labels) {
+        for (idx, (a, l)) in alts.iter().zip(&labels).enumerate() {
             self.put_label(l);
             match a {
                 SAlt::Con(_, slots, body) => {
                     for (i, s) in slots.iter().enumerate() {
                         let _ = writeln!(self.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
                         let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*s));
+                    }
+                    if idx == 0 {
+                        if let Some(fb) = fast_body {
+                            self.put_label(fb);
+                        }
                     }
                     self.expr(body, p);
                 }
@@ -1336,7 +1409,14 @@ impl Gen {
                     let _ = writeln!(self.out, "    movq %rax, {}(%rbx)", mach::R1);
                     self.fail(msg, p);
                 }
-                SAlt::Lit(_, body) | SAlt::Default(body) => self.expr(body, p),
+                SAlt::Lit(_, body) | SAlt::Default(body) => {
+                    if idx == 0 {
+                        if let Some(fb) = fast_body {
+                            self.put_label(fb);
+                        }
+                    }
+                    self.expr(body, p);
+                }
             }
         }
     }

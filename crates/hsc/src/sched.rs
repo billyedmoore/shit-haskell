@@ -143,6 +143,82 @@ pub struct Waiter<V> {
     pub value: Option<V>,
 }
 
+/// An `MVar` waiter queue optimized for the common single-waiter case (zero heap allocation).
+struct WaitQueue<V> {
+    first: Option<Waiter<V>>,
+    rest: VecDeque<Waiter<V>>,
+}
+
+impl<V> Default for WaitQueue<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> WaitQueue<V> {
+    const fn new() -> Self {
+        WaitQueue { first: None, rest: VecDeque::new() }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    #[inline(always)]
+    fn front(&self) -> Option<&Waiter<V>> {
+        self.first.as_ref()
+    }
+
+    #[inline]
+    fn push_back(&mut self, w: Waiter<V>) {
+        if self.first.is_none() {
+            self.first = Some(w);
+        } else {
+            self.rest.push_back(w);
+        }
+    }
+
+    #[inline]
+    fn push_front(&mut self, w: Waiter<V>) {
+        if let Some(old) = self.first.replace(w) {
+            self.rest.push_front(old);
+        }
+    }
+
+    #[inline]
+    fn pop_front(&mut self) -> Option<Waiter<V>> {
+        let w = self.first.take()?;
+        if !self.rest.is_empty() {
+            self.first = self.rest.pop_front();
+        }
+        Some(w)
+    }
+
+    fn retain(&mut self, mut f: impl FnMut(&Waiter<V>) -> bool) {
+        if !self.rest.is_empty() {
+            self.rest.retain(|w| f(w));
+        }
+        if let Some(w) = &self.first {
+            if !f(w) {
+                self.first = self.rest.pop_front();
+            }
+        }
+    }
+
+    fn for_each_mut(&mut self, mut f: impl FnMut(&mut Waiter<V>)) {
+        if let Some(w) = self.first.as_mut() {
+            f(w);
+        }
+        for w in self.rest.iter_mut() {
+            f(w);
+        }
+    }
+}
+
+/// Number of low `MVar` keys kept in a direct-indexed table (zero hashing).
+const INLINE_WAITS: usize = 1024;
+
 /// The answer of `throw_to`.
 #[derive(PartialEq)]
 pub enum Thrown {
@@ -174,12 +250,16 @@ struct Thread<V> {
 pub struct Sched<V> {
     cur: Tid,
     next_id: Tid,
-    threads: IntMap<Tid, Thread<V>>,
+    /// Threads indexed directly by `Tid` (`threads[0]` is always `None`).
+    threads: Vec<Option<Box<Thread<V>>>>,
+    live_threads: usize,
     runq: VecDeque<Tid>,
     /// Sleeping threads with the instants they wake at.
     sleepers: Vec<(Instant, Tid)>,
-    /// The queues of the `MVar`s that have waiters, by key.
-    waits: IntMap<u64, VecDeque<Waiter<V>>>,
+    /// Direct-indexed waiter queues for `MVar` keys `< INLINE_WAITS`.
+    inline_waits: Vec<WaitQueue<V>>,
+    /// Waiter queues for `MVar` keys `>= INLINE_WAITS`.
+    waits: IntMap<u64, WaitQueue<V>>,
     /// The threads whose transactions retried.
     stm_waiters: VecDeque<Tid>,
     next_key: u64,
@@ -229,14 +309,15 @@ impl<V> Sched<V> {
     /// A scheduler with the main thread running; `slice_ms` is the time slice.
     pub fn new(slice_ms: u64) -> Sched<V> {
         crate::signals::init();
-        let mut threads = IntMap::default();
-        threads.insert(1, Self::thread(0));
+        let threads = vec![None, Some(Box::new(Self::thread(0)))];
         Sched {
             cur: 1,
             next_id: 2,
             threads,
+            live_threads: 1,
             runq: VecDeque::new(),
             sleepers: Vec::new(),
+            inline_waits: Vec::new(),
             waits: IntMap::default(),
             stm_waiters: VecDeque::new(),
             next_key: 1,
@@ -262,6 +343,66 @@ impl<V> Sched<V> {
         }
     }
 
+    #[inline(always)]
+    fn thread_ref(&self, id: Tid) -> Option<&Thread<V>> {
+        self.threads.get(id as usize).and_then(|o| o.as_deref())
+    }
+
+    #[inline(always)]
+    fn thread_mut(&mut self, id: Tid) -> Option<&mut Thread<V>> {
+        self.threads.get_mut(id as usize).and_then(|o| o.as_deref_mut())
+    }
+
+    fn insert_thread(&mut self, id: Tid, t: Thread<V>) {
+        let idx = id as usize;
+        if self.threads.len() <= idx {
+            self.threads.resize_with(idx + 1, || None);
+        }
+        self.threads[idx] = Some(Box::new(t));
+        self.live_threads += 1;
+    }
+
+    fn remove_thread(&mut self, id: Tid) -> Option<Box<Thread<V>>> {
+        let r = self.threads.get_mut(id as usize).and_then(Option::take);
+        if r.is_some() {
+            self.live_threads -= 1;
+        }
+        r
+    }
+
+    #[inline(always)]
+    fn wait_get(&self, key: u64) -> Option<&WaitQueue<V>> {
+        let idx = key as usize;
+        if idx < INLINE_WAITS {
+            self.inline_waits.get(idx)
+        } else {
+            self.waits.get(&key)
+        }
+    }
+
+    #[inline(always)]
+    fn wait_get_mut(&mut self, key: u64) -> Option<&mut WaitQueue<V>> {
+        let idx = key as usize;
+        if idx < INLINE_WAITS {
+            self.inline_waits.get_mut(idx)
+        } else {
+            self.waits.get_mut(&key)
+        }
+    }
+
+    #[inline(always)]
+    fn wait_entry(&mut self, key: u64) -> &mut WaitQueue<V> {
+        let idx = key as usize;
+        if idx < INLINE_WAITS {
+            if self.inline_waits.len() <= idx {
+                self.inline_waits.resize_with(idx + 1, WaitQueue::new);
+            }
+            &mut self.inline_waits[idx]
+        } else {
+            self.waits.entry(key).or_default()
+        }
+    }
+
     /// Whether the last switch came back only so that signal handlers are started (the thread is
     /// still blocked: it starts them and switches again).
     pub fn take_signal_wake(&mut self) -> bool {
@@ -270,10 +411,16 @@ impl<V> Sched<V> {
 
     /// In the child of a fork: only the running thread exists (the other OS threads are gone).
     pub fn only_current(&mut self) {
-        let me = self.cur;
-        self.threads.retain(|t, _| *t == me);
+        let me = self.cur as usize;
+        for (i, slot) in self.threads.iter_mut().enumerate() {
+            if i != me {
+                *slot = None;
+            }
+        }
+        self.live_threads = usize::from(self.thread_ref(self.cur).is_some());
         self.runq.clear();
         self.sleepers.clear();
+        self.inline_waits.clear();
         self.waits.clear();
         self.stm_waiters.clear();
         self.in_foreign = 0;
@@ -281,12 +428,14 @@ impl<V> Sched<V> {
     }
 
     /// The running thread.
+    #[inline(always)]
     pub fn current(&self) -> Tid {
         self.cur
     }
 
+    #[inline(always)]
     fn me(&mut self) -> &mut Thread<V> {
-        self.threads.get_mut(&self.cur).expect("the running thread is in the table")
+        self.threads[self.cur as usize].as_deref_mut().expect("the running thread is in the table")
     }
 
     /// A key for a new `MVar`.
@@ -310,23 +459,26 @@ impl<V> Sched<V> {
         self.next_id += 1;
         let t = Self::thread(self.me().mask);
         let cv = t.cv.clone();
-        self.threads.insert(id, t);
+        self.insert_thread(id, t);
         self.runq.push_back(id);
         (id, self.baton.clone(), cv)
     }
 
     /// The masking state of the running thread.
+    #[inline(always)]
     pub fn mask(&self) -> u8 {
-        self.threads.get(&self.cur).map_or(0, |t| t.mask)
+        self.thread_ref(self.cur).map_or(0, |t| t.mask)
     }
 
+    #[inline(always)]
     pub fn set_mask(&mut self, mask: u8) {
         self.me().mask = mask;
     }
 
     /// Whether more than one thread exists.
+    #[inline(always)]
     pub fn multi(&self) -> bool {
-        self.threads.len() > 1
+        self.live_threads > 1
     }
 
     /// Queues the running thread behind the others (the caller then switches).
@@ -349,6 +501,7 @@ impl<V> Sched<V> {
 
     /// Whether the running thread may block now. It may not when an exception waits for it and it is
     /// not masked uninterruptibly: the exception is raised in place of the blocking operation.
+    #[inline(always)]
     fn may_block(&mut self) -> bool {
         let t = self.me();
         if !t.pending.is_empty() && t.mask != 1 {
@@ -360,13 +513,14 @@ impl<V> Sched<V> {
 
     /// Blocks the running thread in the queue of an `MVar` (at the front for a reader). Answers
     /// false when it must raise an exception first (see `interrupt`); else the caller switches.
+    #[inline]
     pub fn enqueue(&mut self, key: u64, kind: WaitKind, value: Option<V>, front: bool) -> bool {
         if !self.may_block() {
             return false;
         }
         let me = self.cur;
         let w = Waiter { thread: me, kind, value };
-        let q = self.waits.entry(key).or_default();
+        let q = self.wait_entry(key);
         if front {
             q.push_front(w);
         } else {
@@ -377,23 +531,31 @@ impl<V> Sched<V> {
     }
 
     /// The kind of the first waiter of an `MVar`.
+    #[inline(always)]
     pub fn front_kind(&self, key: u64) -> Option<WaitKind> {
-        self.waits.get(&key).and_then(|q| q.front()).map(|w| w.kind)
+        self.wait_get(key).and_then(|q| q.front()).map(|w| w.kind)
     }
 
     /// Takes the first waiter of an `MVar` out of its queue; the caller wakes it up.
+    #[inline]
     pub fn pop_waiter(&mut self, key: u64) -> Option<Waiter<V>> {
-        let q = self.waits.get_mut(&key)?;
-        let w = q.pop_front();
-        if q.is_empty() {
-            self.waits.remove(&key);
+        let idx = key as usize;
+        if idx < INLINE_WAITS {
+            self.inline_waits.get_mut(idx)?.pop_front()
+        } else {
+            let q = self.waits.get_mut(&key)?;
+            let w = q.pop_front();
+            if q.is_empty() {
+                self.waits.remove(&key);
+            }
+            w
         }
-        w
     }
 
     /// Makes a blocked thread (already out of its queue) runnable, with a value handed to it.
+    #[inline]
     pub fn wake(&mut self, t: Tid, handoff: Option<V>) {
-        if let Some(th) = self.threads.get_mut(&t) {
+        if let Some(th) = self.thread_mut(t) {
             th.state = State::Ready;
             th.handoff = handoff;
             self.runq.push_back(t);
@@ -401,6 +563,7 @@ impl<V> Sched<V> {
     }
 
     /// The value handed to the running thread by the operation that woke it.
+    #[inline(always)]
     pub fn take_handoff(&mut self) -> Option<V> {
         self.me().handoff.take()
     }
@@ -440,9 +603,9 @@ impl<V> Sched<V> {
             // A thread in C comes back by itself; what was thrown to it waits for it.
             Why::Foreign => return,
             Why::MVar(key) | Why::MVarRead(key) => {
-                if let Some(q) = self.waits.get_mut(&key) {
+                if let Some(q) = self.wait_get_mut(key) {
                     q.retain(|w| w.thread != t);
-                    if q.is_empty() {
+                    if q.is_empty() && (key as usize) >= INLINE_WAITS {
                         self.waits.remove(&key);
                     }
                 }
@@ -451,12 +614,12 @@ impl<V> Sched<V> {
             Why::Delay => self.sleepers.retain(|(_, w)| *w != t),
             Why::Throw(target) => {
                 // The exception it was throwing is withdrawn.
-                if let Some(th) = self.threads.get_mut(&target) {
+                if let Some(th) = self.thread_mut(target) {
                     th.pending.retain(|(_, from)| *from != Some(t));
                 }
             }
         }
-        if let Some(th) = self.threads.get_mut(&t) {
+        if let Some(th) = self.thread_mut(t) {
             th.state = State::Ready;
             self.runq.push_back(t);
         }
@@ -469,7 +632,7 @@ impl<V> Sched<V> {
         // A foreign call that has returned is not interrupted (its worker may be in another one).
         self.take_returned();
         let me = self.cur;
-        let Some(t) = self.threads.get_mut(&target) else { return Thrown::Done };
+        let Some(t) = self.thread_mut(target) else { return Thrown::Done };
         let blocked = match t.state {
             State::Blocked(why) => Some(why),
             State::Ready => None,
@@ -492,7 +655,7 @@ impl<V> Sched<V> {
             // The thrower has an exception of its own to raise first; this one is not thrown.
             return Thrown::Done;
         }
-        if let Some(t) = self.threads.get_mut(&target) {
+        if let Some(t) = self.thread_mut(target) {
             t.pending.push_back((exc, Some(me)));
         }
         self.me().state = State::Blocked(Why::Throw(target));
@@ -502,6 +665,7 @@ impl<V> Sched<V> {
     /// What the running thread must raise now, if anything: the notice that it is blocked for ever,
     /// or an exception thrown to it that its masking state lets in. Called at safe points, after
     /// every switch, and when the thread unmasks.
+    #[inline]
     pub fn interrupt(&mut self) -> Option<Interrupt<V>> {
         let me = self.cur;
         let t = self.me();
@@ -525,18 +689,18 @@ impl<V> Sched<V> {
 
     /// Whether `interrupt` would answer something for the running thread at a safe point.
     pub fn has_interrupt(&self) -> bool {
-        self.threads.get(&self.cur).is_some_and(|t| t.marker.is_some() || (!t.pending.is_empty() && (t.mask == 0 || t.interrupted)))
+        self.thread_ref(self.cur).is_some_and(|t| t.marker.is_some() || (!t.pending.is_empty() && (t.mask == 0 || t.interrupted)))
     }
 
     fn wake_thrower(&mut self, s: Tid, target: Tid) {
-        if self.threads.get(&s).is_some_and(|t| t.state == State::Blocked(Why::Throw(target))) {
+        if self.thread_ref(s).is_some_and(|t| t.state == State::Blocked(Why::Throw(target))) {
             self.wake(s, None);
         }
     }
 
     /// The status of a thread as `threadStatus#` numbers it.
     pub fn status(&self, t: Tid) -> i64 {
-        match self.threads.get(&t).map(|t| t.state) {
+        match self.thread_ref(t).map(|t| t.state) {
             None => 16,
             Some(State::Ready) => 0,
             Some(State::Blocked(Why::MVar(_))) => 1,
@@ -549,6 +713,7 @@ impl<V> Sched<V> {
     }
 
     /// Queues the threads back from safe foreign calls.
+    #[inline(always)]
     fn take_returned(&mut self) {
         if self.in_foreign == 0 {
             return;
@@ -556,7 +721,7 @@ impl<V> Sched<V> {
         let back: Vec<Tid> = std::mem::take(&mut *self.returned.0.lock().unwrap_or_else(|e| e.into_inner()));
         for t in back {
             self.in_foreign = self.in_foreign.saturating_sub(1);
-            if let Some(th) = self.threads.get_mut(&t) {
+            if let Some(th) = self.thread_mut(t) {
                 th.state = State::Ready;
                 self.runq.push_back(t);
             }
@@ -574,12 +739,12 @@ impl<V> Sched<V> {
         let s = &mut *this;
         s.wake_due();
         let me = s.cur;
-        let my_cv = s.threads.get(&me)?.cv.clone();
+        let my_cv = s.thread_ref(me)?.cv.clone();
         // With nothing to run now, the baton is left free: a sleeper whose time comes, or this
         // thread when it is back, claims it.
         let next = s.runq.pop_front().unwrap_or(FREE);
-        let next_cv = if next == FREE { my_cv.clone() } else { s.threads.get(&next)?.cv.clone() };
-        if let Some(t) = s.threads.get_mut(&me) {
+        let next_cv = if next == FREE { my_cv.clone() } else { s.thread_ref(next)?.cv.clone() };
+        if let Some(t) = s.thread_mut(me) {
             t.state = State::Blocked(Why::Foreign);
             t.interruptible = interruptible;
             t.os_thread = pthread_self();
@@ -624,7 +789,7 @@ impl<V> Sched<V> {
                 }
                 Some(next) => {
                     s.cur = next;
-                    if let Some(ncv) = s.threads.get(&next).map(|t| t.cv.clone()) {
+                    if let Some(ncv) = s.thread_ref(next).map(|t| t.cv.clone()) {
                         baton.pass(next, &ncv);
                     }
                 }
@@ -638,6 +803,7 @@ impl<V> Sched<V> {
     }
 
     /// Moves the sleepers whose time has come to the run queue, earliest first.
+    #[inline]
     fn wake_due(&mut self) {
         self.take_returned();
         if self.sleepers.is_empty() {
@@ -666,8 +832,9 @@ impl<V> Sched<V> {
         let mut found: Vec<(Tid, Why)> = self
             .threads
             .iter()
-            .filter_map(|(id, t)| match t.state {
-                State::Blocked(why @ (Why::MVar(_) | Why::MVarRead(_) | Why::Stm)) => Some((*id, why)),
+            .enumerate()
+            .filter_map(|(id, slot)| match slot.as_deref()?.state {
+                State::Blocked(why @ (Why::MVar(_) | Why::MVarRead(_) | Why::Stm)) => Some((id as Tid, why)),
                 _ => None,
             })
             .collect();
@@ -675,9 +842,10 @@ impl<V> Sched<V> {
             found = self
                 .threads
                 .iter()
-                .filter_map(|(id, t)| match t.state {
+                .enumerate()
+                .filter_map(|(id, slot)| match slot.as_deref()?.state {
                     State::Blocked(Why::Foreign) => None,
-                    State::Blocked(why) => Some((*id, why)),
+                    State::Blocked(why) => Some((id as Tid, why)),
                     State::Ready => None,
                 })
                 .collect();
@@ -685,21 +853,32 @@ impl<V> Sched<V> {
         found.sort_by_key(|(id, _)| (*id == 1, *id));
         for (id, why) in found {
             self.unblock(id, why);
-            if let Some(t) = self.threads.get_mut(&id) {
+            if let Some(t) = self.thread_mut(id) {
                 t.marker = Some(why);
             }
         }
     }
 
     /// The thread to run next; the running one has been queued, blocked or removed.
+    #[inline]
     fn next(&mut self) -> Tid {
+        if self.in_foreign == 0 && self.sleepers.is_empty() {
+            if let Some(t) = self.runq.pop_front() {
+                return t;
+            }
+        }
+        self.next_slow()
+    }
+
+    #[cold]
+    fn next_slow(&mut self) -> Tid {
         loop {
             self.wake_due();
             if let Some(t) = self.runq.pop_front() {
                 return t;
             }
             // Signals arrived and nothing can run: the switching thread starts their handlers.
-            if crate::signals::pending() && self.threads.contains_key(&self.cur) {
+            if crate::signals::pending() && self.thread_ref(self.cur).is_some() {
                 self.signal_wake = true;
                 return self.cur;
             }
@@ -752,7 +931,7 @@ impl<V> Sched<V> {
                 return;
             }
             s.cur = next;
-            let cv = |s: &Sched<V>, t: Tid| s.threads.get(&t).map(|t| t.cv.clone());
+            let cv = |s: &Sched<V>, t: Tid| s.thread_ref(t).map(|t| t.cv.clone());
             match (cv(s, me), cv(s, next)) {
                 (Some(a), Some(b)) => (s.baton.clone(), me, a, next, b),
                 _ => return,
@@ -770,7 +949,7 @@ impl<V> Sched<V> {
     pub unsafe fn finish(this: *mut Sched<V>) {
         let s = &mut *this;
         let me = s.cur;
-        if let Some(t) = s.threads.remove(&me) {
+        if let Some(t) = s.remove_thread(me) {
             for (_, from) in t.pending {
                 if let Some(f) = from {
                     s.wake_thrower(f, me);
@@ -779,7 +958,7 @@ impl<V> Sched<V> {
         }
         let next = s.next();
         s.cur = next;
-        if let Some(cv) = s.threads.get(&next).map(|t| t.cv.clone()) {
+        if let Some(cv) = s.thread_ref(next).map(|t| t.cv.clone()) {
             let baton = s.baton.clone();
             baton.pass(next, &cv);
         }
@@ -788,6 +967,7 @@ impl<V> Sched<V> {
     /// Green threads (the native runtime, where every Haskell thread is a coroutine on one OS
     /// thread): the thread to run after the running one has been queued or blocked, made the
     /// running one. It may be the same thread.
+    #[inline]
     pub fn pick_next(&mut self) -> Tid {
         let next = self.next();
         self.cur = next;
@@ -798,7 +978,7 @@ impl<V> Sched<V> {
     /// one.
     pub fn finish_pick(&mut self) -> Tid {
         let me = self.cur;
-        if let Some(t) = self.threads.remove(&me) {
+        if let Some(t) = self.remove_thread(me) {
             for (_, from) in t.pending {
                 if let Some(f) = from {
                     self.wake_thrower(f, me);
@@ -822,20 +1002,29 @@ impl<V> Sched<V> {
 
     /// Every value the scheduler holds (for the collector of the native runtime).
     pub fn roots(&mut self, f: &mut dyn FnMut(&mut V)) {
-        for t in self.threads.values_mut() {
-            for (v, _) in t.pending.iter_mut() {
-                f(v);
-            }
-            if let Some(v) = t.handoff.as_mut() {
-                f(v);
-            }
-        }
-        for q in self.waits.values_mut() {
-            for w in q.iter_mut() {
-                if let Some(v) = w.value.as_mut() {
+        for slot in self.threads.iter_mut() {
+            if let Some(t) = slot.as_deref_mut() {
+                for (v, _) in t.pending.iter_mut() {
+                    f(v);
+                }
+                if let Some(v) = t.handoff.as_mut() {
                     f(v);
                 }
             }
+        }
+        for q in self.inline_waits.iter_mut() {
+            q.for_each_mut(|w| {
+                if let Some(v) = w.value.as_mut() {
+                    f(v);
+                }
+            });
+        }
+        for q in self.waits.values_mut() {
+            q.for_each_mut(|w| {
+                if let Some(v) = w.value.as_mut() {
+                    f(v);
+                }
+            });
         }
     }
 }

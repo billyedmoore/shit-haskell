@@ -65,10 +65,10 @@ pub struct Machine {
     pub weaks: Vec<crate::ccall::WeakState>,
     /// The scheduler of the Haskell threads; the values it holds are roots.
     pub sched: crate::sched::Sched<Word>,
-    /// The registers of the threads waiting for their turn (their roots), by thread.
-    pub suspended: crate::sched::IntMap<crate::sched::Tid, conc::Ctx>,
     /// The coroutines of the threads that are not running.
     pub coros: conc::Coros,
+    /// Number of active primitive arguments in `args` (saved across coroutine switches).
+    pub prim_nargs: usize,
     /// The writes of the running transaction: each variable with its contents before.
     pub stm_log: Vec<(Word, Word)>,
     /// The transactions the running thread is in.
@@ -94,6 +94,7 @@ pub struct Machine {
     /// The module that ran each ordinary primitive (0 not yet; see `prims::run_ordinary`).
     pub ordinary_module: Vec<u8>,
     pub(super) int_prims: Vec<Option<prims_num::IntOp>>,
+    pub(super) conc_prims: Vec<Option<conc::ConcOp>>,
     /// How each C call primitive ran the first time (see `prims::run_ccall`).
     pub(super) ccall_plans: Vec<prims::CPlan>,
 }
@@ -122,6 +123,7 @@ impl Machine {
         let limit = base + (words as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
         let int_prims = prog.prim_names.iter().map(|name| prims_num::IntOp::classify(name)).collect();
+        let conc_prims = prog.prim_names.iter().map(|name| conc::ConcOp::classify(name)).collect();
         // Every primitive but a C call takes the ordinary path, which remembers the module that
         // ran it (the names live as long as the program).
         let ordinary_prims: Vec<Option<&'static str>> = prog
@@ -153,8 +155,8 @@ impl Machine {
             weaks: Vec::new(),
             tid: 1,
             sched: crate::sched::Sched::new(conc::SLICE_MS),
-            suspended: crate::sched::IntMap::default(),
             coros: conc::Coros::default(),
+            prim_nargs: 0,
             stm_log: Vec::new(),
             stm_depth: 0,
             stm_retry: false,
@@ -167,6 +169,7 @@ impl Machine {
             ordinary_module: vec![0; ordinary_count],
             ordinary_prims,
             int_prims,
+            conc_prims,
             ccall_plans,
             bodies: entry::DiagnosticBodies::default(),
         });
@@ -324,9 +327,7 @@ impl Machine {
             locs.push(t as *mut Word);
             locs.push(v as *mut Word);
         }
-        for ctx in self.suspended.values_mut() {
-            ctx.roots(&mut locs);
-        }
+        self.coros.roots(&mut locs);
         self.sched.roots(&mut |v: &mut Word| locs.push(v as *mut Word));
         for v in self.named.values_mut() {
             locs.push(v as *mut Word);

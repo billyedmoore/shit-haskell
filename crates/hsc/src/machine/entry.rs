@@ -185,25 +185,43 @@ pub extern "C" fn hsc_yield(mp: *mut Machine) -> u64 {
 /// Returns the result, or 0 with the exception raised in `exc`.
 #[no_mangle]
 pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
+    // SAFETY: generated code passes the machine record.
+    let nargs = (nargs as usize).min(ARG_SLOTS);
+    let prev_nargs = unsafe {
+        let m = &mut *mp;
+        let prev = m.prim_nargs;
+        m.prim_nargs = nargs;
+        prev
+    };
     // At the end of a time slice another thread runs first; an exception thrown to this one
     // meanwhile is raised in place of the primitive.
     if super::conc::safe_point(mp) {
+        // SAFETY: machine is valid for the running thread.
+        unsafe { (*mp).prim_nargs = prev_nargs };
         return 0;
     }
-    // SAFETY: generated code passes the machine record.
+    // SAFETY: re-derive after safe_point (which may have switched coroutines and back).
     let m = unsafe { &mut *mp };
+    if let Some(op) = m.conc_prims[id as usize] {
+        let r = op.run_fast(mp);
+        // SAFETY: re-derive after possible coroutine switch.
+        unsafe { (*mp).prim_nargs = prev_nargs };
+        return r;
+    }
     let ordinary = m.ordinary_prims[id as usize];
     // A primitive builds its result from several allocations, holding the earlier objects in Rust
     // locals; a collection between them would move those objects. So the collection happens before
     // it runs, and the room it needs is reserved then.
     m.reserve(PRIM_SLACK);
-    let nargs = (nargs as usize).min(ARG_SLOTS);
     let r = if let Some(op) = m.int_prims[id as usize] {
         op.run(m)
     } else { match ordinary {
         Some(name) => super::prims::run_ordinary(m, id as usize, name, nargs),
         None => super::prims::run_ccall(m, id as usize, nargs),
     }};
+    // SAFETY: re-derive in case the primitive switched coroutines.
+    let m = unsafe { &mut *mp };
+    m.prim_nargs = prev_nargs;
     // Generated code takes a primitive's result as a value: a thunk (a result that is a variable of
     // the program, not yet evaluated) is evaluated here first.
     if r != 0 && matches!(heap::kind_of(m.heap_get(r, 0)), kind::THUNK | kind::IND) {

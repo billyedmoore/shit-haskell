@@ -390,12 +390,34 @@ pub fn char_code_value(m: &mut Machine, c: u32) -> Word {
     p
 }
 
+/// Static nullary constructor cells for every constructor in `RTS_CONS` (same order as `RTS_CONS`).
+static STATIC_RTS_NULLARY: [[Word; 2]; crate::native::RTS_CONS.len()] = {
+    let mut cells = [[0; 2]; crate::native::RTS_CONS.len()];
+    let mut i = 0;
+    while i < crate::native::RTS_CONS.len() {
+        cells[i] = [heap::header(kind::CON, 0, i as u32), 0];
+        i += 1;
+    }
+    cells
+};
+
+/// Returns the static cell for a nullary constructor in `RTS_CONS` by index.
+#[inline(always)]
+pub fn static_rts_nullary(id: usize) -> Word {
+    STATIC_RTS_NULLARY[id].as_ptr() as Word
+}
+
 /// A constructor object of the named constructor with the fields given (pointers).
 pub fn con_value(m: &mut Machine, name: &str, arity: usize, fields: &[Word]) -> Word {
     // The runtime's own constructors (tuples of IO results, lists, Bool) have the first ids, in
     // `RTS_CONS` order (codegen registers them first): found without hashing the name.
     let id = match crate::native::RTS_CONS.iter().position(|c| *c == name) {
-        Some(i) => i as u32,
+        Some(i) => {
+            if arity == 0 {
+                return static_rts_nullary(i);
+            }
+            i as u32
+        }
         None => match m.con_ids.get(name) {
             Some(&i) => i,
             // A constructor the program does not mention: it matches no alternative.
