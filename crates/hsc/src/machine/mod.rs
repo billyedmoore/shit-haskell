@@ -57,8 +57,8 @@ pub struct Machine {
     pub exc: Word,
     /// The tables of the program.
     pub prog: Program,
-    /// Constructor name -> id, for the constructors the runtime builds.
-    pub con_ids: std::collections::HashMap<String, u32>,
+    /// Constructor name -> id, lazily populated on first non-RTS lookup.
+    pub con_ids: std::collections::HashMap<&'static str, u32>,
     /// Extra roots the runtime keeps (stable pointers and similar), by index.
     pub stable: Vec<Word>,
     /// The weak pointers' states, by the index in a weak object's header (see `prims_misc`).
@@ -80,7 +80,7 @@ pub struct Machine {
     /// The global closures (the GC roots `globals` points to).
     pub global_vec: Vec<Word>,
     /// The bindings the runtime uses, by name: their index among the globals.
-    pub rts_globals: std::collections::HashMap<String, usize>,
+    pub rts_globals: std::collections::HashMap<&'static str, usize>,
     /// The program's name, as the runtime reports errors.
     pub prog_name: String,
     /// The bodies of the program in address order, with their names (for diagnostics).
@@ -102,8 +102,8 @@ pub struct Machine {
 /// The tables the generated program provides (see `native::codegen`).
 pub struct Program {
     pub globals: Vec<(i64, usize)>,
-    pub con_names: Vec<String>,
-    pub prim_names: Vec<String>,
+    pub con_names: Vec<&'static str>,
+    pub prim_names: Vec<&'static str>,
 }
 
 thread_local! {
@@ -122,20 +122,22 @@ impl Machine {
         let base = heap.addr(0);
         let limit = base + (words as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
-        let int_prims = prog.prim_names.iter().map(|name| prims_num::IntOp::classify(name)).collect();
-        let conc_prims = prog.prim_names.iter().map(|name| conc::ConcOp::classify(name)).collect();
-        // Every primitive but a C call takes the ordinary path, which remembers the module that
-        // ran it (the names live as long as the program).
-        let ordinary_prims: Vec<Option<&'static str>> = prog
-            .prim_names
-            .iter()
-            .map(|name| {
-                prims::ordinary_name(name)
-                    .or_else(|| crate::ccall::parse(name).is_none().then(|| &*Box::leak(name.clone().into_boxed_str())))
-            })
-            .collect();
-        let ccall_plans = vec![prims::CPlan::Unknown; prog.prim_names.len()];
-        let ordinary_count = ordinary_prims.len();
+        let nprims = prog.prim_names.len();
+        let mut int_prims = Vec::with_capacity(nprims);
+        let mut conc_prims = Vec::with_capacity(nprims);
+        let mut ordinary_prims = Vec::with_capacity(nprims);
+        for &name in &prog.prim_names {
+            int_prims.push(prims_num::IntOp::classify(name));
+            conc_prims.push(conc::ConcOp::classify(name));
+            ordinary_prims.push(
+                prims::ordinary_name(name).or_else(|| crate::ccall::parse(name).is_none().then_some(name)),
+            );
+        }
+        let ccall_plans = vec![prims::CPlan::Unknown; nprims];
+        // `prims::con_value` takes the runtime's constructors' ids from their position.
+        for (i, c) in crate::native::RTS_CONS.iter().enumerate() {
+            assert_eq!(prog.con_names.get(i).copied(), Some(*c), "internal: runtime constructor {c} out of place");
+        }
         let mut m = Box::new(Machine {
             hp: base,
             hplim: limit,
@@ -166,7 +168,7 @@ impl Machine {
             prog_name: std::env::args().next().and_then(|a| std::path::Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "main".into()),
             saved_args: Vec::new(),
             prim_failed: false,
-            ordinary_module: vec![0; ordinary_count],
+            ordinary_module: vec![0; nprims],
             ordinary_prims,
             int_prims,
             conc_prims,
@@ -175,15 +177,19 @@ impl Machine {
         });
         m.stack = stack;
         m.sp = m.stack.as_mut_ptr() as Word + (STACK_WORDS as Word) * 8;
-        for (i, n) in m.prog.con_names.iter().enumerate() {
-            m.con_ids.insert(n.clone(), i as u32);
-        }
-        // `prims::con_value` takes the runtime's constructors' ids from their position.
-        for (i, c) in crate::native::RTS_CONS.iter().enumerate() {
-            assert_eq!(m.con_ids.get(*c), Some(&(i as u32)), "internal: runtime constructor {c} out of place");
-        }
         set_current(&mut *m);
         m
+    }
+
+    /// Lazily resolves a non-RTS constructor name to its program ID.
+    pub fn lookup_con_id(&mut self, name: &str) -> Option<u32> {
+        if self.con_ids.is_empty() && !self.prog.con_names.is_empty() {
+            self.con_ids.reserve(self.prog.con_names.len());
+            for (i, &n) in self.prog.con_names.iter().enumerate() {
+                self.con_ids.insert(n, i as u32);
+            }
+        }
+        self.con_ids.get(name).copied()
     }
 
     /// Allocates `words` words without collecting (the heap has room at start-up).
@@ -241,7 +247,7 @@ impl Machine {
         self.exc = 0;
         self.prim_failed = false;
         let p = self.alloc(2);
-        let id = self.con_ids.get("GHC.Internal.Exception.ErrorCall").copied().unwrap_or(0);
+        let id = self.lookup_con_id("GHC.Internal.Exception.ErrorCall").unwrap_or(0);
         self.heap_set(p, heap::header(kind::CON, 0, id));
         p
     }
@@ -254,7 +260,7 @@ impl Machine {
     /// The name of the constructor of an evaluated object.
     pub fn con_name(&self, p: Word) -> &str {
         let id = heap::aux_of(self.heap_get(p, 0)) as usize;
-        self.prog.con_names.get(id).map(|s| s.as_str()).unwrap_or("")
+        self.prog.con_names.get(id).copied().unwrap_or("")
     }
 
     /// Whether a scrutinee (evaluated) matches a literal pattern given as text, by kind.

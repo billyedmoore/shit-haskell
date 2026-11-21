@@ -175,8 +175,8 @@ pub fn run_ccall(m: &mut Machine, id: usize, nargs: usize) -> Word {
         CPlan::Unknown => {}
     }
     // The first call (or an own version that declined): as `run`, recording what ran.
-    let name = m.prog.prim_names[id].clone();
-    let Some((sig, ret, sym)) = crate::ccall::parse(&name) else { return run(m, &name, nargs) };
+    let name = m.prog.prim_names[id];
+    let Some((sig, ret, sym)) = crate::ccall::parse(name) else { return run(m, name, nargs) };
     let c = std::rc::Rc::new(CCall {
         sig: sig.to_string(),
         ret,
@@ -418,11 +418,7 @@ pub fn con_value(m: &mut Machine, name: &str, arity: usize, fields: &[Word]) -> 
             }
             i as u32
         }
-        None => match m.con_ids.get(name) {
-            Some(&i) => i,
-            // A constructor the program does not mention: it matches no alternative.
-            None => u32::MAX,
-        },
+        None => m.lookup_con_id(name).unwrap_or(u32::MAX),
     };
     let p = m.alloc(1 + arity);
     m.heap_set(p, heap::header(kind::CON, arity as u32, id));

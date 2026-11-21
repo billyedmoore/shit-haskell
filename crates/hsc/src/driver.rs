@@ -2210,8 +2210,10 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let mut roots: Vec<&str> = vec![entry];
     roots.extend_from_slice(crate::native::RTS_GLOBALS);
     let t = std::time::Instant::now();
-    let binds = crate::native::reachable(binds, &roots);
-    let prog = crate::native::stg::Lowering::program(&binds, numeric);
+    let mut binds = crate::native::reachable(binds, &roots);
+    let mut numeric = numeric.clone();
+    crate::native::lift::lambda_lift(&mut binds, &mut numeric);
+    let prog = crate::native::stg::Lowering::program(&binds, &numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
     std::fs::write(&asm, &text).map_err(|e| e.to_string())?;
@@ -2256,7 +2258,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
         let mut args = vec![o.as_str()];
         args.extend(c_objs.iter().map(String::as_str));
         // The program's C symbols are found by name at run time (`crate::ccall`).
-        args.extend_from_slice(&[r.as_str(), "-rdynamic", "-o", out]);
+        args.extend_from_slice(&[r.as_str(), "-rdynamic", "-Wl,--gc-sections", "-o", out]);
         if !debug {
             args.push("-s");
         }

@@ -67,20 +67,27 @@ pub enum SAlt {
     Default(SExpr),
 }
 
-/// A closure: a function of `arity` arguments, or a thunk (arity 0), with its captured atoms.
+/// Maximum number of raw worker arguments passed directly in `CACHE_REGS`.
+pub const MAX_REG_RAW_ARGS: usize = 6;
+
+/// A closure: a function of `arity` stack arguments, or a thunk (arity 0), with its captured atoms.
 #[derive(Clone, Debug)]
 pub struct SClosure {
+    /// Stack arguments (boxed parameters, plus any raw parameters beyond `MAX_REG_RAW_ARGS`).
     pub arity: u32,
     /// The atoms, in the enclosing frame, that are captured, in capture order.
     pub captures: Vec<Atom>,
-    /// The number of frame slots: slot 0 is the closure, then the arguments, then the locals.
+    /// The number of frame slots: slot 0 is the closure, then the stack arguments, then the locals.
     pub nslots: u32,
     /// The raw (unboxed) slots, numbered `RAW | i` (see `RAW`), apart from those.
     pub nraw: u32,
-    /// A worker's raw parameters: the argument slot each arrives in, and its raw slot.
+    /// A worker's raw parameters: `(arg_slot, raw_slot)`. `arg_slot == 0` means the raw parameter
+    /// arrives directly in a cache register (`CACHE_REGS[i]`) rather than on the stack.
     pub raw_args: Vec<(u32, u32)>,
     /// The body returns its (numeric) result raw in R1, not a pointer (see `raw_returns`).
     pub ret_raw: bool,
+    /// Whether the body (or nested closure captures) ever reads slot 0 (`Slot(0)` or `Free(_)`).
+    pub uses_closure: bool,
     pub body: SExpr,
 }
 
@@ -422,8 +429,9 @@ impl Lowering {
         self.closure_with(e, None, None)
     }
 
-    /// `closure_of`, with the parameters `raw` marks bound to raw slots (a worker): each still has
-    /// its argument slot, which it arrives in.
+    /// `closure_of`, with the parameters `raw` marks bound to raw slots (a worker): the first
+    /// `MAX_REG_RAW_ARGS` raw parameters arrive in cache registers (`arg_slot == 0`), and any
+    /// further ones arrive in stack argument slots.
     fn closure_with(&mut self, e: &Core, raw: Option<(&[bool], &[u8])>, ret_raw: Option<u8>) -> SClosure {
         let mut body = Body::new();
         body.ret_raw = ret_raw;
@@ -438,26 +446,37 @@ impl Lowering {
                     cur = b;
                 }
                 let top = self.bodies.last_mut().expect("body");
+                let mut stack_arity = 0u32;
+                let mut reg_raws = 0usize;
                 for (i, p) in params.iter().enumerate() {
-                    let s = top.fresh_slot();
-                    top.locals.insert(p.clone(), s);
-                    if let Some((r, kinds)) = raw.filter(|(r, _)| r[i]) {
-                        let _ = r;
+                    if let Some((_, kinds)) = raw.filter(|(r, _)| r[i]) {
                         let kind = if kinds.get(i) == Some(&NUM_CHAR) { RAW_CHAR } else { 0 };
                         let r = RAW | kind | top.nraw;
                         top.nraw += 1;
                         top.locals.insert(p.clone(), r);
-                        raw_args.push((s, r));
+                        if reg_raws < MAX_REG_RAW_ARGS {
+                            reg_raws += 1;
+                            raw_args.push((0, r));
+                        } else {
+                            let s = top.fresh_slot();
+                            stack_arity += 1;
+                            raw_args.push((s, r));
+                        }
+                    } else {
+                        let s = top.fresh_slot();
+                        stack_arity += 1;
+                        top.locals.insert(p.clone(), s);
                     }
                 }
-                (params.len() as u32, cur)
+                (stack_arity, cur)
             }
             other => (0, other),
         };
         let body = self.strict(body_expr);
         let b = self.bodies.pop().expect("body");
-        let captures = b.captures.iter().map(|(_, a)| a.clone()).collect();
-        SClosure { arity, captures, nslots: b.nslots, nraw: b.nraw, raw_args, ret_raw: b.ret_raw.is_some(), body }
+        let captures: Vec<Atom> = b.captures.iter().map(|(_, a)| a.clone()).collect();
+        let uses_closure = !captures.is_empty() || expr_uses_closure(&body);
+        SClosure { arity, captures, nslots: b.nslots, nraw: b.nraw, raw_args, ret_raw: b.ret_raw.is_some(), uses_closure, body }
     }
 
     /// Resolves a variable in the current body: a slot, a captured variable (captured now from
@@ -803,6 +822,30 @@ impl Lowering {
                 Atom::Slot(s)
             }
         }
+    }
+}
+
+/// Whether `e` (or the capture list of any nested closure it allocates) reads slot 0 or a free variable.
+fn expr_uses_closure(e: &SExpr) -> bool {
+    let atom = |a: &Atom| matches!(a, Atom::Slot(0) | Atom::Free(_));
+    match e {
+        SExpr::Atom(a) => atom(a),
+        SExpr::App(f, args) => atom(f) || args.iter().any(atom),
+        SExpr::CallWorker(_, args) | SExpr::Con(_, args) | SExpr::Prim(_, args) | SExpr::Jump(_, args) => {
+            args.iter().any(atom)
+        }
+        SExpr::Let(binds, body) => {
+            binds.iter().any(|(_, c)| c.captures.iter().any(atom)) || expr_uses_closure(body)
+        }
+        SExpr::Case(scrut, _, alts) => {
+            expr_uses_closure(scrut)
+                || alts.iter().any(|a| match a {
+                    SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => expr_uses_closure(b),
+                })
+        }
+        SExpr::Closure(c) => c.captures.iter().any(atom),
+        SExpr::Fail(_) => false,
+        SExpr::Join(_, _, code, body) => expr_uses_closure(code) || expr_uses_closure(body),
     }
 }
 
