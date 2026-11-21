@@ -678,7 +678,11 @@ impl Parser {
                     if !s.is_empty() && s.bytes().all(|b| b == b'|') {
                         trail += s.len();
                         self.bump();
-                    } else if s.len() > 1 && s.ends_with('#') && s[..s.len() - 1].bytes().all(|b| b == b'|') {
+                    } else if s.len() > 1
+                        && s.ends_with('#')
+                        && s[..s.len() - 1].bytes().all(|b| b == b'|')
+                        && *self.peek_raw(1) == Tok::Special(')')
+                    {
                         trail += s.len() - 1;
                         self.bump();
                         closed_hash = true;
