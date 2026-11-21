@@ -289,33 +289,42 @@ hscReify (Name (OccName occ) flavour) = do
 -- declared in a module's data-declaration table).
 hscBuiltinReify :: String -> NameFlavour -> Maybe Info
 hscBuiltinReify occ flavour = case flavour of
-  NameG DataName _ _ -> case occ of
-    "()" -> Just (DataConI unitCon (TupleT 0) unitTy)
-    "[]" -> let v = mkName "a" in Just (DataConI nilCon (ForallT [PlainTV v SpecifiedSpec] [] (AppT ListT (VarT v))) listTy)
-    ":" -> let v = mkName "a"
+  NameG DataName _ (ModName m) -> case occ of
+    "()" | isTupleMod m -> Just (DataConI unitCon (TupleT 0) unitTy)
+    "[]" | isListMod m -> let v = mkName "a" in Just (DataConI nilCon (ForallT [PlainTV v SpecifiedSpec] [] (AppT ListT (VarT v))) listTy)
+    ":"  | isListMod m -> let v = mkName "a"
            in Just (DataConI consCon (ForallT [PlainTV v SpecifiedSpec] [] (arr (VarT v) (arr (AppT ListT (VarT v)) (AppT ListT (VarT v))))) listTy)
-    _ | isTuple occ ->
+    _ | isTupleMod m && isTuple occ ->
         let n = length occ - 1
             vs = [mkName ("a" ++ show i) | i <- [0 .. n - 1]]
             res = foldl AppT (TupleT n) (map VarT vs)
             ty = ForallT [PlainTV v SpecifiedSpec | v <- vs] [] (arrs vs res)
         in Just (DataConI (mkNameG_d "ghc-internal" "GHC.Tuple" occ) ty (mkNameG_tc "ghc-internal" "GHC.Tuple" occ))
     _ -> Nothing
-  _ -> case occ of
-    "()" -> Just (TyConI (DataD [] unitTy [] Nothing [NormalC unitCon []] []))
-    "Unit" -> Just (TyConI (DataD [] unitTy [] Nothing [NormalC unitCon []] []))
-    "[]" -> let v = mkName "a"
-            in Just (TyConI (DataD [] listTy [PlainTV v BndrReq] Nothing [NormalC nilCon [], InfixC (lazy, VarT v) consCon (lazy, AppT ListT (VarT v))] []))
-    "List" -> let v = mkName "a"
+  _ ->
+    let okTuple = case flavour of
+          NameG _ _ (ModName m) -> isTupleMod m
+          _ -> True
+        okList = case flavour of
+          NameG _ _ (ModName m) -> isListMod m
+          _ -> True
+    in case occ of
+      "()"   | okTuple -> Just (TyConI (DataD [] unitTy [] Nothing [NormalC unitCon []] []))
+      "Unit" | okTuple -> Just (TyConI (DataD [] unitTy [] Nothing [NormalC unitCon []] []))
+      "[]"   | okList -> let v = mkName "a"
               in Just (TyConI (DataD [] listTy [PlainTV v BndrReq] Nothing [NormalC nilCon [], InfixC (lazy, VarT v) consCon (lazy, AppT ListT (VarT v))] []))
-    _ | isTuple occ ->
-        let n = length occ - 1
-            vs = [mkName ("a" ++ show i) | i <- [0 .. n - 1]]
-            tname = mkNameG_tc "ghc-internal" "GHC.Tuple" occ
-            cname = mkNameG_d "ghc-internal" "GHC.Tuple" occ
-        in Just (TyConI (DataD [] tname [PlainTV v BndrReq | v <- vs] Nothing [NormalC cname [(lazy, VarT v) | v <- vs]] []))
-    _ -> Nothing
+      "List" | okList -> let v = mkName "a"
+                in Just (TyConI (DataD [] listTy [PlainTV v BndrReq] Nothing [NormalC nilCon [], InfixC (lazy, VarT v) consCon (lazy, AppT ListT (VarT v))] []))
+      _ | okTuple && isTuple occ ->
+          let n = length occ - 1
+              vs = [mkName ("a" ++ show i) | i <- [0 .. n - 1]]
+              tname = mkNameG_tc "ghc-internal" "GHC.Tuple" occ
+              cname = mkNameG_d "ghc-internal" "GHC.Tuple" occ
+          in Just (TyConI (DataD [] tname [PlainTV v BndrReq | v <- vs] Nothing [NormalC cname [(lazy, VarT v) | v <- vs]] []))
+      _ -> Nothing
   where
+    isTupleMod m = m == "GHC.Tuple" || m == "GHC.Internal.Tuple" || m == "GHC.Prim" || m == "Builtin"
+    isListMod m = m == "GHC.Types" || m == "GHC.Internal.Types" || m == "Builtin"
     lazy = Bang NoSourceUnpackedness NoSourceStrictness
     arr a b = AppT (AppT ArrowT a) b
     arrs [] r = r
