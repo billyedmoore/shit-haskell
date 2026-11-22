@@ -55,13 +55,16 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
     if std::env::var_os("HSC_NO_INLINE_PRAGMAS").is_none() {
         rules.inlines = extract_inlines(binds);
     }
+    // Strict constructor fields (`data T = C !Int`): inferred once from the untouched constructor
+    // wrapper bindings so `Core::Case` knows unpacked strict fields are already in WHNF.
+    let strict_cons = extract_strict_cons(binds);
     // The passes are GHC's phases 2, 1 and 0: the second inlines the bodies the first
     // simplified; the last cleans up after the calls by value.
-    pass(binds, 2, &rules, None);
-    pass(binds, 1, &rules, None);
+    pass(binds, 2, &rules, &strict_cons, None);
+    pass(binds, 1, &rules, &strict_cons, None);
     float_closed_dicts(binds, 1);
     call_by_value(binds);
-    pass(binds, 0, &rules, None);
+    pass(binds, 0, &rules, &strict_cons, None);
     // Fusion in phase 0 makes local loops: their calls by value, and a clean-up of the
     // bindings that changed.
     // Loops made in phase 0 (`eftIntFB` inlined into a fused consumer) take their extra
@@ -73,12 +76,49 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
         if changed.is_empty() {
             break;
         }
-        pass(binds, 0, &rules, Some(&changed));
+        pass(binds, 0, &rules, &strict_cons, Some(&changed));
     }
     // `oneShot` was kept as a marker (see `into_one_shot`); it is the identity.
     for b in binds.iter_mut() {
         strip_one_shot(&mut b.body);
     }
+}
+
+/// Identifies constructors whose wrapper binding forces one or more fields before building the
+/// `Core::Con` (`\c0..ck -> case c_i of _ -> ... -> Con(name, [c0..ck])`).
+fn extract_strict_cons(binds: &[TopBind]) -> HashMap<String, Vec<bool>> {
+    let mut out = HashMap::new();
+    for b in binds {
+        let mut params = Vec::new();
+        let mut cur = &b.body;
+        while let Core::Lam(p, inner) = cur {
+            params.push(p.as_str());
+            cur = inner;
+        }
+        if params.is_empty() {
+            continue;
+        }
+        let mut forced = HashSet::new();
+        while let Core::Case(s, _, alts) = cur {
+            let (Core::Var(v), [Alt::Default(next)]) = (&**s, &alts[..]) else { break };
+            forced.insert(v.as_str());
+            cur = next;
+        }
+        if forced.is_empty() {
+            continue;
+        }
+        let Core::Con(con, args) = cur else { continue };
+        if con != &b.name || args.len() != params.len() {
+            continue;
+        }
+        if args.iter().zip(&params).all(|(a, p)| matches!(a, Core::Var(v) if v == p)) {
+            let flags: Vec<bool> = params.iter().map(|p| forced.contains(p)).collect();
+            if flags.iter().any(|&f| f) {
+                out.insert(b.name.clone(), flags);
+            }
+        }
+    }
+    out
 }
 
 /// Replaces `oneShot e` by `e`.
@@ -489,7 +529,13 @@ fn strip_one_shot(c: &mut Core) {
 }
 
 /// One simplifier pass over the bindings (`only`: just those).
-fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<String>>) {
+fn pass(
+    binds: &mut [TopBind],
+    phase: u32,
+    rules: &Rules,
+    strict_cons: &HashMap<String, Vec<bool>>,
+    only: Option<&HashSet<String>>,
+) {
     if std::env::var_os("HSC_NO_ETA").is_none() {
         let _ = eta_expand(binds, only, rules);
     }
@@ -661,6 +707,7 @@ fn pass(binds: &mut [TopBind], phase: u32, rules: &Rules, only: Option<&HashSet<
                 templates: &templates,
                 this: &bind.name,
                 rules,
+                strict_cons,
                 phase,
                 rule_budget: RULE_BUDGET,
                 atoms: HashMap::new(),
@@ -708,6 +755,8 @@ struct Simp<'a> {
     this: &'a str,
     /// The rewrite rules, and the phase (2, 1, 0) of this pass.
     rules: &'a Rules,
+    /// Constructors whose wrapper forces specific fields before constructing the value.
+    strict_cons: &'a HashMap<String, Vec<bool>>,
     phase: u32,
     /// The rewrites left to this binding in this round.
     rule_budget: usize,
@@ -810,6 +859,9 @@ impl Simp<'_> {
                 } else {
                     *bindings = kept;
                     self.strict_let(c);
+                    if self.float_let_into_case(c) {
+                        self.changed = true;
+                    }
                 }
             }
             Core::Case(s, binder, alts) => {
@@ -899,12 +951,49 @@ impl Simp<'_> {
                     return;
                 }
                 self.tag_to_enum(c);
-                let Core::Case(_, binder, alts) = c else { return };
-                self.evaluated.insert(binder.clone());
+                let Core::Case(s, binder, alts) = c else { return };
+                let mut added: Vec<String> = Vec::new();
+                if self.evaluated.insert(binder.clone()) {
+                    added.push(binder.clone());
+                }
+                match s.as_ref() {
+                    Core::Var(v) => {
+                        if self.evaluated.insert(v.clone()) {
+                            added.push(v.clone());
+                        }
+                    }
+                    Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
+                        for a in args {
+                            if let Core::Var(v) = a {
+                                if self.evaluated.insert(v.clone()) {
+                                    added.push(v.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 for a in alts {
                     match a {
-                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => self.expr(b),
+                        Alt::Con(con, vars, b) => {
+                            let mut alt_added: Vec<String> = Vec::new();
+                            if let Some(flags) = self.strict_cons.get(con.as_str()) {
+                                for (v, &is_strict) in vars.iter().zip(flags) {
+                                    if is_strict && self.evaluated.insert(v.clone()) {
+                                        alt_added.push(v.clone());
+                                    }
+                                }
+                            }
+                            self.expr(b);
+                            for v in alt_added {
+                                self.evaluated.remove(&v);
+                            }
+                        }
+                        Alt::Lit(_, b) | Alt::Default(b) => self.expr(b),
                     }
+                }
+                for v in added {
+                    self.evaluated.remove(&v);
                 }
             }
             // Representation identities (Int# and Word# share it; Core is untyped, so coercions
@@ -1000,12 +1089,115 @@ impl Simp<'_> {
         self.changed = true;
     }
 
+    /// Floats a single non-recursive `let x = rhs` past any non-interfering inner lets into the
+    /// alternatives of an inner `case scrut of alts` when `scrut` does not mention `x` and either:
+    /// - only one alternative mentions `x` (zero duplication, avoids allocation on other paths), or
+    /// - two alternatives mention `x`, `rhs` is a small thunk, and at least one branch strictly
+    ///   uses `x` (turning `filter`/list-comprehension tail thunks into direct tail calls on the
+    ///   rejected branch while delaying thunk allocation to the accepted branch).
+    fn float_let_into_case(&mut self, c: &mut Core) -> bool {
+        let Core::Let(bs, body) = c else { return false };
+        let [(x, rhs)] = &bs[..] else { return false };
+        if mentions(rhs, x) || self.pending.keys().any(|k| mentions(rhs, k)) {
+            return false;
+        }
+        // Walk past intervening lets that neither mention `x` nor shadow a free var of `rhs`.
+        let mut depth = 0usize;
+        let mut cur: &Core = body;
+        while let Core::Let(ibs, ibody) = cur {
+            if ibs.iter().any(|(n, r)| n == x || mentions(r, x) || mentions(rhs, n)) {
+                return false;
+            }
+            depth += 1;
+            cur = ibody;
+        }
+        let Core::Case(scrut, binder, alts) = cur else { return false };
+        if mentions(scrut, x) || binder == x || mentions(rhs, binder) {
+            return false;
+        }
+        let mut used_idxs = Vec::new();
+        for (i, a) in alts.iter().enumerate() {
+            let (shadowed, abody) = match a {
+                Alt::Con(_, vars, b) => {
+                    if vars.iter().any(|v| v == x) {
+                        (true, b)
+                    } else {
+                        if vars.iter().any(|v| mentions(rhs, v)) && mentions(b, x) {
+                            return false;
+                        }
+                        (false, b)
+                    }
+                }
+                Alt::Lit(_, b) | Alt::Default(b) => (false, b),
+            };
+            if !shadowed && mentions(abody, x) {
+                used_idxs.push(i);
+            }
+        }
+        let should_float = match used_idxs.len() {
+            1 => true,
+            2 => {
+                !self.is_value(rhs)
+                    && size(rhs, 36) <= 35
+                    && used_idxs.iter().any(|&i| {
+                        let abody = match &alts[i] {
+                            Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => b,
+                        };
+                        matches!(abody, Core::Var(v) if v == x) || forced_total(abody).contains(x.as_str())
+                    })
+            }
+            _ => false,
+        };
+        if !should_float {
+            return false;
+        }
+        let Core::Let(mut bs, inner) = take(c) else { unreachable!() };
+        let (x, rhs) = bs.pop().expect("one binding");
+        *c = *inner;
+        let mut target = &mut *c;
+        for _ in 0..depth {
+            let Core::Let(_, ibody) = target else { unreachable!() };
+            target = ibody;
+        }
+        let Core::Case(_, _, alts) = target else { unreachable!() };
+        if used_idxs.len() == 1 {
+            let abody = match &mut alts[used_idxs[0]] {
+                Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => b,
+            };
+            *abody = Core::Let(vec![(x, rhs)], Box::new(take(abody)));
+        } else {
+            let i0 = used_idxs[0];
+            let i1 = used_idxs[1];
+            *self.fresh += 1;
+            let tag = format!("~fl{}", self.fresh);
+            let x2 = format!("{x}{tag}");
+            let mut rhs2 = rhs.clone();
+            let mut map = HashMap::new();
+            freshen(&mut rhs2, &tag, &mut map);
+            let abody0 = match &mut alts[i0] {
+                Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => b,
+            };
+            *abody0 = Core::Let(vec![(x.clone(), rhs)], Box::new(take(abody0)));
+            let abody1 = match &mut alts[i1] {
+                Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => b,
+            };
+            subst(abody1, &x, &Core::Var(x2.clone()));
+            *abody1 = Core::Let(vec![(x2, rhs2)], Box::new(take(abody1)));
+        }
+        true
+    }
+
     /// `case (case s of alts1) as b of _ -> body` with `body` small: `body` (a fresh copy) after
     /// each result of the inner case, which then needs no join point.
     fn push_small_case(&mut self, c: &mut Core) -> bool {
-        let Core::Case(s, _, alts) = c else { return false };
+        let Core::Case(s, b, alts) = c else { return false };
         let [Alt::Default(body)] = &alts[..] else { return false };
-        if !matches!(**s, Core::Case(..)) || size(body, PUSH_SIZE + 1) > PUSH_SIZE || results(s, PUSH_RESULTS) > PUSH_RESULTS {
+        let limit = if results(s, 3) <= 2 && app_head_mentions(body, b) {
+            PUSH_CALL_SIZE
+        } else {
+            PUSH_SIZE
+        };
+        if !matches!(**s, Core::Case(..)) || size(body, limit + 1) > limit || results(s, PUSH_RESULTS) > PUSH_RESULTS {
             return false;
         }
         // A single-use binding waiting for its occurrence (see `pending`) must keep one.
@@ -1909,7 +2101,38 @@ fn local_arities(e: &Core, out: &mut HashMap<String, usize>) {
 
 /// The largest outer case body copied to each result of an inner case, and the most results.
 const PUSH_SIZE: usize = 30;
+/// Larger threshold when pushing into <= 2 results saturates a call to the outer case binder
+/// (e.g. `foldl'` over `eftIntFB`, eliminating PAP allocation and indirect `hsc_apply`).
+const PUSH_CALL_SIZE: usize = 90;
 const PUSH_RESULTS: usize = 4;
+
+/// Whether `var` appears in the function head of an application inside `e`.
+fn app_head_mentions(e: &Core, var: &str) -> bool {
+    match e {
+        Core::App(f, a) => {
+            let mut h: &Core = f;
+            while let Core::App(f2, _) = h {
+                h = f2;
+            }
+            matches!(h, Core::Var(v) if v == var) || app_head_mentions(f, var) || app_head_mentions(a, var)
+        }
+        Core::Lam(x, b) => x != var && app_head_mentions(b, var),
+        Core::Let(bs, body) => {
+            !bs.iter().any(|(n, _)| n == var)
+                && (bs.iter().any(|(_, r)| app_head_mentions(r, var)) || app_head_mentions(body, var))
+        }
+        Core::Case(s, b, alts) => {
+            app_head_mentions(s, var)
+                || (b != var
+                    && alts.iter().any(|a| match a {
+                        Alt::Con(_, vs, body) => !vs.iter().any(|v| v == var) && app_head_mentions(body, var),
+                        Alt::Lit(_, body) | Alt::Default(body) => app_head_mentions(body, var),
+                    }))
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| app_head_mentions(a, var)),
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => false,
+    }
+}
 
 /// The results of an expression (the ends of its cases and lets), counted until past `limit`.
 fn results(e: &Core, limit: usize) -> usize {
@@ -2765,6 +2988,25 @@ fn forced_total(e: &Core) -> HashSet<String> {
     forced_d(e, &HashMap::new(), false).0
 }
 
+/// Whether `f` is a compiler-generated pattern-match failure function (`patError`, etc.).
+fn is_pat_error_call(f: &str) -> bool {
+    let Some((mod_name, base)) = f.rsplit_once('.') else { return false };
+    matches!(
+        mod_name,
+        "GHC.Internal.Control.Exception.Base"
+            | "Control.Exception.Base"
+            | "GHC.Control.Exception.Base"
+    ) && matches!(
+        base,
+        "patError"
+            | "irrefutPatError"
+            | "nonExhaustiveGuardsError"
+            | "recSelError"
+            | "recConError"
+            | "recUpdError"
+    )
+}
+
 /// What `forced` answers, and whether the expression certainly fails (a pattern-match failure
 /// is bottom, as GHC takes it: a failing alternative constrains nothing). Calls of functions that
 /// raise are not counted as failing.
@@ -2786,12 +3028,16 @@ fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>, bottom: bool) -> (Has
             }
             args.reverse();
             if let Core::Var(f) = head {
-                out.insert(f.clone());
-                if let Some(s) = strict.get(f) {
-                    if args.len() >= s.len() {
-                        for (a, st) in args.iter().zip(s) {
-                            if *st {
-                                out.extend(forced(a, strict));
+                if bottom && !args.is_empty() && is_pat_error_call(f) {
+                    fails = true;
+                } else {
+                    out.insert(f.clone());
+                    if let Some(s) = strict.get(f) {
+                        if args.len() >= s.len() {
+                            for (a, st) in args.iter().zip(s) {
+                                if *st {
+                                    out.extend(forced(a, strict));
+                                }
                             }
                         }
                     }
@@ -2939,9 +3185,10 @@ mod rule_tests {
         let literals = HashMap::new();
         let mut fresh = 0;
         let no_arities = HashMap::new();
+        let no_strict_cons = HashMap::new();
         let mut s = Simp {
             once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates,
-            this: "Test.x", rules: &rules, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
+            this: "Test.x", rules: &rules, strict_cons: &no_strict_cons, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
             fresh: &mut fresh, budget: 0, changed: false,
         };
         s.rewrite(&mut e).then_some(e)
@@ -2985,5 +3232,92 @@ mod rule_tests {
         let Core::Let(bs, body) = out else { panic!("{out:?}") };
         assert_eq!(bs[0].1, app(v("T.g"), vec![v("a")]));
         assert_eq!(*body, pair(v(&bs[0].0), v(&bs[0].0)));
+    }
+
+    #[test]
+    fn strict_con_fields_eliminate_redundant_inner_case() {
+        // data Box = Box !Int  => wrapper: \x -> case x of _ -> Con("T.Box", [x])
+        // consumer: \b -> case b of Box x -> case x of _ -> x
+        let wrapper = TopBind {
+            name: "T.Box".into(),
+            body: Core::Lam(
+                "x".into(),
+                Box::new(Core::Case(
+                    Box::new(v("x")),
+                    "b0".into(),
+                    vec![Alt::Default(Core::Con("T.Box".into(), vec![v("x")]))],
+                )),
+            ),
+        };
+        let consumer = TopBind {
+            name: "T.get".into(),
+            body: Core::Lam(
+                "b".into(),
+                Box::new(Core::Case(
+                    Box::new(v("b")),
+                    "b1".into(),
+                    vec![Alt::Con(
+                        "T.Box".into(),
+                        vec!["y".into()],
+                        Core::Case(Box::new(v("y")), "b2".into(), vec![Alt::Default(v("y"))]),
+                    )],
+                )),
+            ),
+        };
+        let mut binds = vec![wrapper, consumer];
+        simplify(&mut binds);
+        let get_body = &binds.iter().find(|b| b.name == "T.get").expect("T.get").body;
+        let Core::Lam(_, body) = get_body else { panic!("expected lam: {get_body:?}") };
+        let Core::Case(_, _, alts) = body.as_ref() else { panic!("expected outer case: {body:?}") };
+        let Alt::Con(_, vars, inner) = &alts[0] else { panic!("expected con alt: {alts:?}") };
+        assert_eq!(inner, &v(&vars[0]), "redundant inner case on strict field should be eliminated");
+    }
+
+    #[test]
+    fn float_let_into_single_case_alt_exposes_direct_forcing() {
+        // \x -> let z = T.work x in case x of T.A -> T.use z; T.B -> 0#
+        // `z` is only used in `T.A`, so it floats into `T.A` and avoids allocating a thunk in `T.B`.
+        let mut binds = vec![TopBind {
+            name: "T.f".into(),
+            body: Core::Lam(
+                "x".into(),
+                Box::new(Core::Let(
+                    vec![("z".into(), app(v("T.work"), vec![v("x")]))],
+                    Box::new(Core::Case(
+                        Box::new(v("x")),
+                        "b0".into(),
+                        vec![
+                            Alt::Con("T.A".into(), vec![], app(v("T.use"), vec![v("z")])),
+                            Alt::Con("T.B".into(), vec![], Core::Lit(Lit::Int(0))),
+                        ],
+                    )),
+                )),
+            ),
+        }];
+        simplify(&mut binds);
+        let Core::Lam(_, body) = &binds[0].body else { panic!("expected lam: {:?}", binds[0].body) };
+        assert!(
+            matches!(body.as_ref(), Core::Case(..)),
+            "expected let to float inside case alt: {body:?}",
+        );
+    }
+
+    #[test]
+    fn certainly_evaluated_treats_pat_error_alt_as_bottom() {
+        // case x of T.A -> y; _ -> patError "non-exhaustive"
+        // Because the fallback is `patError`, `y` is certainly evaluated.
+        let e = Core::Case(
+            Box::new(v("x")),
+            "b0".into(),
+            vec![
+                Alt::Con("T.A".into(), vec![], v("y")),
+                Alt::Default(app(
+                    v("GHC.Internal.Control.Exception.Base.patError"),
+                    vec![Core::Lit(Lit::Str("x".into()))],
+                )),
+            ],
+        );
+        let eval = certainly_evaluated(&e);
+        assert!(eval.contains("x") && eval.contains("y"), "expected both x and y evaluated: {eval:?}");
     }
 }

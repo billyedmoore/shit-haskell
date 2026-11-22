@@ -59,6 +59,8 @@ foreign import prim "integerQuot" integerQuot :: Integer -> Integer -> Integer
 foreign import prim "integerRem" integerRem :: Integer -> Integer -> Integer
 foreign import prim "integerDiv" integerDiv :: Integer -> Integer -> Integer
 foreign import prim "integerMod" integerMod :: Integer -> Integer -> Integer
+foreign import prim "integerQuotRem" integerQuotRem# :: Integer -> Integer -> (# Integer, Integer #)
+foreign import prim "integerDivMod" integerDivMod# :: Integer -> Integer -> (# Integer, Integer #)
 foreign import prim "integerEq" integerEqB :: Integer -> Integer -> Bool
 foreign import prim "integerLt" integerLt :: Integer -> Integer -> Bool
 foreign import prim "integerLe" integerLe :: Integer -> Integer -> Bool
@@ -236,16 +238,10 @@ integerEncodeFloat# :: Integer -> Int# -> Float#
 integerEncodeFloat# m e = double2Float# (integerEncodeDouble# m e)
 
 integerQuotRem :: Integer -> Integer -> (Integer, Integer)
-integerQuotRem a b = (integerQuot a b, integerRem a b)
-
-integerQuotRem# :: Integer -> Integer -> (# Integer, Integer #)
-integerQuotRem# a b = (# integerQuot a b, integerRem a b #)
+integerQuotRem a b = case integerQuotRem# a b of (# q, r #) -> (q, r)
 
 integerDivMod :: Integer -> Integer -> (Integer, Integer)
-integerDivMod a b = (integerDiv a b, integerMod a b)
-
-integerDivMod# :: Integer -> Integer -> (# Integer, Integer #)
-integerDivMod# a b = (# integerDiv a b, integerMod a b #)
+integerDivMod a b = case integerDivMod# a b of (# q, r #) -> (q, r)
 
 -- | Extended gcd: (g, x, y) with a*x + b*y = g.
 integerGcde :: Integer -> Integer -> (Integer, Integer, Integer)

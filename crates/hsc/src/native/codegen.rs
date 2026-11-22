@@ -205,6 +205,8 @@ pub struct Gen {
     uses_charlike: bool,
     /// PC-relative 32-bit `.rodata` lookup/jump tables `(label, entries)`.
     rodata_tables: Vec<(String, Vec<String>)>,
+    /// Out-of-line cold stubs (yield, GC, slow paths, failures) flushed after each closure body.
+    cold_out: String,
 }
 
 /// A raw slot's number held in a register; `dirty` when the slot itself may not have it yet.
@@ -362,7 +364,13 @@ fn bind_words(b: &SBind) -> usize {
         SBind::Closure(c) => closure_words(c),
         SBind::Con(_, args) if args.is_empty() => 0,
         SBind::Con(_, args) => (args.len() + 1).max(2),
+        SBind::BoxRaw(_) => 2,
     }
+}
+
+/// Physical raw slot index (ignoring the `RAW` and `RAW_CHAR` tag bits).
+fn raw_idx(k: u32) -> u32 {
+    k & !(RAW | RAW_CHAR)
 }
 
 /// Whether an atom is a raw slot (an unboxed number).
@@ -419,7 +427,17 @@ impl Gen {
             known_kind: HashMap::new(),
             uses_charlike: false,
             rodata_tables: Vec::new(),
+            cold_out: String::new(),
         }
+    }
+
+    /// Emits cold assembly (GC/yield/slow/failure paths) into a separate buffer appended after
+    /// the enclosing closure's hot body. Safe to nest: inner cold blocks append first.
+    fn emit_cold(&mut self, f: impl FnOnce(&mut Self)) {
+        let saved = std::mem::take(&mut self.out);
+        f(self);
+        let chunk = std::mem::replace(&mut self.out, saved);
+        self.cold_out.push_str(&chunk);
     }
 
     #[inline]
@@ -926,7 +944,9 @@ impl Gen {
         self.current_name = name.to_string();
         self.cur_nslots = c.nslots;
         self.known_kind.clear();
-        if let Some((con_id, field_word)) = self.selector_info(c) {
+        self.cold_out.clear();
+        let sel_info = self.selector_info(c);
+        if let Some((con_id, field_word)) = sel_info {
             self.selectors.push((label.to_string(), con_id, field_word));
         }
         if self.direct_thunk_tail_call(label, c) {
@@ -947,6 +967,29 @@ impl Gen {
             None
         };
         self.put_label(label);
+        // Frameless fast path for single-capture selector thunks (e.g. `fst`/`snd` in `break`):
+        // if `Free(0)` is already the target `CON` (or 1-hop `IND` to it), extract the field and
+        // tail-jump to `hsc_eval` without allocating a stack frame.
+        if let Some((con_id, field_word)) = sel_info {
+            let sel_slow = self.label("sel_slow");
+            let sel_chk = self.label("sel_chk");
+            self.emit("movq 16(%r14), %rax");
+            self.emit("testq %rax, %rax");
+            let _ = writeln!(self.out, "    je {sel_slow}");
+            let _ = writeln!(self.out, "    cmpb ${IND}, (%rax)");
+            let _ = writeln!(self.out, "    jne {sel_chk}");
+            self.emit("movq 8(%rax), %rax");
+            self.emit("testq %rax, %rax");
+            let _ = writeln!(self.out, "    je {sel_slow}");
+            self.put_label(&sel_chk);
+            let _ = writeln!(self.out, "    cmpb ${CON}, (%rax)");
+            let _ = writeln!(self.out, "    jne {sel_slow}");
+            let _ = writeln!(self.out, "    cmpl ${con_id}, 4(%rax)");
+            let _ = writeln!(self.out, "    jne {sel_slow}");
+            let _ = writeln!(self.out, "    movq {}(%rax), %r14", 8 * field_word as i64);
+            self.emit("jmp hsc_eval");
+            self.put_label(&sel_slow);
+        }
         // R1 is the closure (if used); stack arguments sit above the new frame.
         if f.s > f.a {
             let _ = writeln!(self.out, "    subq ${}, %rbp", 8 * (f.s - f.a) as i64);
@@ -996,20 +1039,28 @@ impl Gen {
         }
         // A function's entry is a preemption point (inline arithmetic has none, and every loop
         // goes through one): at the end of a time slice another thread runs, and an exception
-        // thrown to this one is raised.
+        // thrown to this one is raised. Yield stub is emitted out-of-line in `cold_out`.
         if has_params {
-            let go = self.next_id();
+            let yield_lbl = self.label("yield");
+            let resume_lbl = self.label("resume");
             self.emit("cmpb $0, hsc_preempt(%rip)");
-            let _ = writeln!(self.out, "    je .L{go}");
-            // The cached numbers are stored around the call (the registers do not survive it).
+            let _ = writeln!(self.out, "    jne {yield_lbl}");
+            self.put_label(&resume_lbl);
             let cached = self.cache.clone();
-            self.save_cache(&cached, p);
-            self.zero_unsafe_slots(p, false);
-            self.rt_call("hsc_yield", p, 0);
-            self.reload_cache(&cached, p);
-            let _ = writeln!(self.out, ".L{go}:");
+            self.emit_cold(|g| {
+                g.put_label(&yield_lbl);
+                g.save_cache(&cached, p);
+                g.zero_unsafe_slots(p, false);
+                g.rt_call("hsc_yield", p, 0);
+                g.reload_cache(&cached, p);
+                let _ = writeln!(g.out, "    jmp {resume_lbl}");
+            });
         }
         self.expr(&c.body, p);
+        if !self.cold_out.is_empty() {
+            self.out.push_str(&self.cold_out);
+            self.cold_out.clear();
+        }
         self.current_self = None;
     }
 
@@ -1072,17 +1123,29 @@ impl Gen {
             SExpr::CallWorker(_, args) | SExpr::Con(_, args) | SExpr::Prim(_, args) => args.iter().for_each(|a| atom(a, &mut out)),
             SExpr::Let(binds, body) => {
                 for (_, b) in binds {
-                    b.atoms().iter().for_each(|a| atom(a, &mut out));
+                    if let SBind::BoxRaw(r) = b {
+                        out.push(*r);
+                    } else {
+                        b.atoms().iter().for_each(|a| atom(a, &mut out));
+                    }
                 }
                 out.extend(self.find_raw_uses(body, joins));
             }
-            SExpr::Case(scrut, _, alts) => {
-                out.extend(self.find_raw_uses(scrut, joins));
+            SExpr::Case(scrut, bslot, alts) => {
+                let mut alt_uses = Vec::new();
                 for a in alts {
                     match a {
-                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => out.extend(self.find_raw_uses(b, joins)),
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => {
+                            alt_uses.extend(self.find_raw_uses(b, joins));
+                        }
                     }
                 }
+                if *bslot & RAW != 0 {
+                    let b_idx = raw_idx(*bslot);
+                    alt_uses.retain(|&s| s == ALL_LIVE || raw_idx(s) != b_idx);
+                }
+                out.extend(alt_uses);
+                out.extend(self.find_raw_uses(scrut, joins));
             }
             SExpr::Closure(c) => c.captures.iter().for_each(|a| atom(a, &mut out)),
             SExpr::Fail(_) => {}
@@ -1152,6 +1215,7 @@ impl Gen {
             SExpr::CallWorker(_, args) => args.iter().all(plain),
             SExpr::Let(binds, _) => binds.iter().all(|(_, b)| b.atoms().iter().all(plain)),
             SExpr::Con(_, args) => args.iter().all(plain),
+            SExpr::Join(..) => true,
             _ => false,
         }
     }
@@ -1198,7 +1262,8 @@ impl Gen {
 
     /// Records that `reg` holds raw slot `k`'s number; `dirty` when the slot does not have it.
     fn cache_put(&mut self, k: u32, reg: &'static str, dirty: bool) {
-        self.cache.retain(|c| c.slot != k && c.reg != reg);
+        let idx = raw_idx(k);
+        self.cache.retain(|c| raw_idx(c.slot) != idx && c.reg != reg);
         self.cache.push(Cached { slot: k, reg, dirty });
     }
 
@@ -1341,20 +1406,126 @@ impl Gen {
         self.cache_put(dest, d, true);
     }
 
-    /// A comparison whose result only a case on it then uses (`case a <# b of 1# -> x; _ -> y`):
-    /// a compare and conditional jumps, without the 0 or 1. Answers whether it applied.
+    /// Extracts a two-way comparison-and-branch `case (a op b) as r of _ -> case r of 0# -> f; _ -> t`
+    /// (or `1# -> t; _ -> f`) returning `(cc, is_char, args, true_body, false_body)` when `r` is dead.
+    fn extract_two_way_cmp<'a>(
+        &self,
+        e: &'a SExpr,
+        p: Pos,
+    ) -> Option<(&'static str, bool, &'a [Atom], &'a SExpr, &'a SExpr)> {
+        let SExpr::Case(scrut, bslot, alts) = e else { return None };
+        if *bslot & RAW == 0 {
+            return None;
+        }
+        let SExpr::Prim(name, args) = scrut.as_ref() else { return None };
+        if args.len() != 2 {
+            return None;
+        }
+        let (cc, is_char) = match int_op(name)? {
+            K::Cmp(set) => (&set[3..], false),
+            K::CharCmp(set) => (&set[3..], true),
+            _ => return None,
+        };
+        let in_kind = if is_char { CHAR } else { INT };
+        let lit_ok = |l: &SLit| matches!((l, in_kind), (SLit::Int(_), INT) | (SLit::Char(_), CHAR));
+        if args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
+            return None;
+        }
+        let [SAlt::Default(SExpr::Case(inner_scrut, _, inner_alts))] = &alts[..] else { return None };
+        if !matches!(inner_scrut.as_ref(), SExpr::Atom(Atom::Slot(s)) if *s == *bslot) {
+            return None;
+        }
+        let end = inner_alts.iter().position(|a| matches!(a, SAlt::Default(_))).map_or(inner_alts.len(), |i| i + 1);
+        let inner_alts = &inner_alts[..end];
+        let body_of = |a: &SAlt| match a {
+            SAlt::Lit(_, e) | SAlt::Default(e) | SAlt::Con(_, _, e) => e as *const SExpr,
+        };
+        let uses_b = inner_alts.iter().any(|a| {
+            self.raw_uses
+                .get(&body_of(a))
+                .is_none_or(|u| u.binary_search(bslot).is_ok() || u.binary_search(&ALL_LIVE).is_ok())
+        });
+        if uses_b || (p.mode == Mode::Scrut && self.live.last().is_none_or(|l| l.contains(bslot) || l.contains(&ALL_LIVE))) {
+            return None;
+        }
+        match inner_alts {
+            [SAlt::Lit(Lit::Int(0), f_body), SAlt::Default(t_body)]
+            | [SAlt::Lit(Lit::Int(0), f_body), SAlt::Lit(Lit::Int(1), t_body), ..] => {
+                Some((cc, is_char, args, t_body, f_body))
+            }
+            [SAlt::Lit(Lit::Int(1), t_body), SAlt::Default(f_body)]
+            | [SAlt::Lit(Lit::Int(1), t_body), SAlt::Lit(Lit::Int(0), f_body), ..] => {
+                Some((cc, is_char, args, t_body, f_body))
+            }
+            _ => None,
+        }
+    }
+
+    fn negate_cc(cc: &'static str) -> &'static str {
+        match cc {
+            "e" => "ne", "ne" => "e", "l" => "ge", "le" => "g", "g" => "le", "ge" => "l",
+            "b" => "ae", "be" => "a", "a" => "be", "ae" => "b",
+            other => panic!("internal: condition {other}"),
+        }
+    }
+
+    fn flip_cc(cc: &'static str) -> &'static str {
+        match cc {
+            "e" => "e", "ne" => "ne", "l" => "g", "g" => "l", "le" => "ge", "ge" => "le",
+            "b" => "a", "a" => "b", "be" => "ae", "ae" => "be",
+            other => panic!("internal: condition {other}"),
+        }
+    }
+
+    /// Checks whether `branch` is a nested comparison on the same `(a0, a1)` pair (or swapped),
+    /// returning `(cc2, t2, f2)` so both comparisons share a single `cmpq`/`cmpl`.
+    fn nested_same_cmp<'a>(
+        &self,
+        branch: &'a SExpr,
+        args: &[Atom],
+        is_char: bool,
+        p: Pos,
+    ) -> Option<(&'static str, &'a SExpr, &'a SExpr)> {
+        let (cc2, is_char2, args2, t2, f2) = self.extract_two_way_cmp(branch, p)?;
+        if is_char2 != is_char {
+            return None;
+        }
+        if args2[0] == args[0] && args2[1] == args[1] {
+            Some((cc2, t2, f2))
+        } else if args2[0] == args[1] && args2[1] == args[0] {
+            Some((Self::flip_cc(cc2), t2, f2))
+        } else {
+            None
+        }
+    }
+
+    /// A comparison whose result only a case on it then uses (`case a <# b of 1# -> x; _ -> y`),
+    /// optionally wrapped in `SExpr::Join` bindings: a compare and conditional jumps, without the
+    /// 0 or 1. Answers whether it applied.
     fn compare_and_branch(&mut self, name: &str, args: &[Atom], b: u32, body: &SExpr, p: Pos) -> bool {
         let Some(k @ (K::Cmp(set) | K::CharCmp(set))) = int_op(name) else { return false };
-        let SExpr::Case(scrut, _, alts) = body else { return false };
+        let is_char = matches!(k, K::CharCmp(_));
+        let mut peeled_joins: Vec<(u32, &[u32], &SExpr)> = Vec::new();
+        let mut cur = body;
+        while let SExpr::Join(id, params, code, next) = cur {
+            peeled_joins.push((*id, params.as_slice(), code.as_ref()));
+            cur = next.as_ref();
+        }
+        let SExpr::Case(scrut, _, alts) = cur else { return false };
         if !matches!(scrut.as_ref(), SExpr::Atom(Atom::Slot(s)) if *s == b) {
             return false;
         }
         let end = alts.iter().position(|a| matches!(a, SAlt::Default(_))).map_or(alts.len(), |i| i + 1);
         let alts = &alts[..end];
-        let body_of = |a: &SAlt| match a {
-            SAlt::Lit(_, e) | SAlt::Default(e) | SAlt::Con(_, _, e) => e as *const SExpr,
+        let expr_uses_b = |e: &SExpr| {
+            self.raw_uses
+                .get(&(e as *const SExpr))
+                .is_none_or(|u| u.binary_search(&b).is_ok() || u.binary_search(&ALL_LIVE).is_ok())
         };
-        let uses_b = alts.iter().any(|a| self.raw_uses.get(&body_of(a)).is_none_or(|u| u.binary_search(&b).is_ok() || u.binary_search(&ALL_LIVE).is_ok()));
+        let uses_b = peeled_joins.iter().any(|(_, _, code)| expr_uses_b(code))
+            || alts.iter().any(|a| match a {
+                SAlt::Lit(_, e) | SAlt::Default(e) | SAlt::Con(_, _, e) => expr_uses_b(e),
+            });
         if uses_b || p.mode == Mode::Scrut && self.live.last().is_none_or(|l| l.contains(&b) || l.contains(&ALL_LIVE)) {
             return false;
         }
@@ -1371,7 +1542,7 @@ impl Gen {
                 "%rcx".to_string()
             }
         };
-        if matches!(k, K::CharCmp(_)) {
+        if is_char {
             let t = match s1 {
                 Src::Reg(r) => low32(r).to_string(),
                 Src::Imm(v) => format!("${}", v as u32 as i32),
@@ -1383,11 +1554,70 @@ impl Gen {
             self.emit(&format!("cmpq {t}, {lhs}"));
         }
         let cc = &set[3..];
-        let negated = match cc {
-            "e" => "ne", "ne" => "e", "l" => "ge", "le" => "g", "g" => "le", "ge" => "l",
-            "b" => "ae", "be" => "a", "a" => "be", "ae" => "b",
-            other => panic!("internal: condition {other}"),
+        let negated = Self::negate_cc(cc);
+        let join_defs: Vec<(String, &[u32], &SExpr)> = peeled_joins
+            .into_iter()
+            .map(|(id, params, code)| {
+                let l = self.label("join");
+                self.joins.insert(id, (l.clone(), params.to_vec()));
+                let mut uses = std::collections::HashSet::new();
+                self.slot_uses(code, &mut uses);
+                self.join_uses.insert(id, uses);
+                (l, params, code)
+            })
+            .collect();
+        let emit_joins = |g: &mut Self, safe_snap: u64| {
+            for (l, params, code) in join_defs.into_iter().rev() {
+                g.put_label(&l);
+                g.cache.clear();
+                g.safe_slots = safe_snap;
+                for &s in params {
+                    g.mark_slot_safe(s);
+                }
+                g.known_kind.clear();
+                g.expr(code, p);
+            }
         };
+        // 3-way compare fusion: if the false (or true) branch immediately compares the same pair,
+        // dispatch all three branches from this single `cmpq`/`cmpl`.
+        let two_way = match alts {
+            [SAlt::Lit(Lit::Int(0), f_body), SAlt::Default(t_body)]
+            | [SAlt::Lit(Lit::Int(0), f_body), SAlt::Lit(Lit::Int(1), t_body), ..] => Some((t_body, f_body)),
+            [SAlt::Lit(Lit::Int(1), t_body), SAlt::Default(f_body)]
+            | [SAlt::Lit(Lit::Int(1), t_body), SAlt::Lit(Lit::Int(0), f_body), ..] => Some((t_body, f_body)),
+            _ => None,
+        };
+        if let Some((t1, f1)) = two_way {
+            let fused = self
+                .nested_same_cmp(f1, args, is_char, p)
+                .map(|(cc2, t2, f2)| (cc, t1, cc2, t2, f2))
+                .or_else(|| {
+                    self.nested_same_cmp(t1, args, is_char, p)
+                        .map(|(cc2, t2, f2)| (negated, f1, cc2, t2, f2))
+                });
+            if let Some((j1, b1, j2, b2, b3)) = fused {
+                let l1 = self.label("alt");
+                let l2 = self.label("alt");
+                self.emit(&format!("j{j1} {l1}"));
+                self.emit(&format!("j{j2} {l2}"));
+                let snapshot = self.cache.clone();
+                let safe_snap = self.safe_slots;
+                let kind_snap = self.known_kind.clone();
+                self.expr(b3, p);
+                self.put_label(&l1);
+                self.cache = snapshot.clone();
+                self.safe_slots = safe_snap;
+                self.known_kind = kind_snap.clone();
+                self.expr(b1, p);
+                self.put_label(&l2);
+                self.cache = snapshot;
+                self.safe_slots = safe_snap;
+                self.known_kind = kind_snap;
+                self.expr(b2, p);
+                emit_joins(self, safe_snap);
+                return true;
+            }
+        }
         let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
         for (a, l) in alts.iter().zip(&labels) {
             match a {
@@ -1412,13 +1642,15 @@ impl Gen {
                 self.expr(body, p);
             }
         }
+        emit_joins(self, safe_snap);
         true
     }
 
     /// A comparison with at least one boxed operand whose raw result is immediately branched on
-    /// (`case a <# b as r of _ -> case r of 0# -> f; _ -> t`): checks the boxed operand tags
-    /// inline, compares payloads and branches directly without materializing 0/1 or spilling to
-    /// the frame, with an out-of-line slow path for thunks/indirections.
+    /// (`case a <# b as r of _ -> case r of 0# -> f; _ -> t`), optionally wrapped in `SExpr::Join`
+    /// bindings: checks the boxed operand tags inline, compares payloads and branches directly
+    /// without materializing 0/1 or spilling to the frame, with an out-of-line slow path for
+    /// thunks/indirections.
     fn boxed_compare_and_branch(
         &mut self,
         name: &str,
@@ -1428,25 +1660,34 @@ impl Gen {
         p: Pos,
     ) -> bool {
         let Some(k @ (K::Cmp(set) | K::CharCmp(set))) = int_op(name) else { return false };
-        let in_kind = if matches!(k, K::CharCmp(_)) { CHAR } else { INT };
+        let is_char = matches!(k, K::CharCmp(_));
+        let in_kind = if is_char { CHAR } else { INT };
         let lit_ok = |l: &SLit| matches!((l, in_kind), (SLit::Int(_), INT) | (SLit::Char(_), CHAR));
         if args.len() != 2 || args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
             return false;
         }
-        let [SAlt::Default(SExpr::Case(inner_scrut, _, inner_alts))] = alts else { return false };
+        let [SAlt::Default(outer_body)] = alts else { return false };
+        let mut peeled_joins: Vec<(u32, &[u32], &SExpr)> = Vec::new();
+        let mut cur = outer_body;
+        while let SExpr::Join(id, params, code, next) = cur {
+            peeled_joins.push((*id, params.as_slice(), code.as_ref()));
+            cur = next.as_ref();
+        }
+        let SExpr::Case(inner_scrut, _, inner_alts) = cur else { return false };
         if !matches!(inner_scrut.as_ref(), SExpr::Atom(Atom::Slot(s)) if *s == bslot) {
             return false;
         }
         let end = inner_alts.iter().position(|a| matches!(a, SAlt::Default(_))).map_or(inner_alts.len(), |i| i + 1);
         let inner_alts = &inner_alts[..end];
-        let body_of = |a: &SAlt| match a {
-            SAlt::Lit(_, e) | SAlt::Default(e) | SAlt::Con(_, _, e) => e as *const SExpr,
-        };
-        let uses_b = inner_alts.iter().any(|a| {
+        let expr_uses_b = |e: &SExpr| {
             self.raw_uses
-                .get(&body_of(a))
+                .get(&(e as *const SExpr))
                 .is_none_or(|u| u.binary_search(&bslot).is_ok() || u.binary_search(&ALL_LIVE).is_ok())
-        });
+        };
+        let uses_b = peeled_joins.iter().any(|(_, _, code)| expr_uses_b(code))
+            || inner_alts.iter().any(|a| match a {
+                SAlt::Lit(_, e) | SAlt::Default(e) | SAlt::Con(_, _, e) => expr_uses_b(e),
+            });
         if uses_b || (p.mode == Mode::Scrut && self.live.last().is_none_or(|l| l.contains(&bslot) || l.contains(&ALL_LIVE))) {
             return false;
         }
@@ -1460,12 +1701,15 @@ impl Gen {
         let mut emitted_slow = false;
         let mut newly_checked: Vec<u32> = Vec::new();
         let mut post_kind = self.known_kind.clone();
-        for a in args {
+        // Check tag and extract payload in one load per operand (avoiding double stack loads).
+        for (a, reg) in [(&args[0], "%rcx"), (&args[1], "%rdx")] {
             if is_raw(a) || matches!(a, Atom::Lit(_)) {
+                self.operand(a, p, reg);
                 continue;
             }
             if let Atom::Slot(s) = a {
-                if self.known_kind.get(s) == Some(&in_kind) {
+                if post_kind.get(s) == Some(&in_kind) {
+                    self.operand(a, p, reg);
                     continue;
                 }
                 if !newly_checked.contains(s) {
@@ -1473,24 +1717,122 @@ impl Gen {
                 }
                 post_kind.insert(*s, in_kind);
             }
-            self.load(a, p, "%rax");
-            let _ = writeln!(self.out, "    cmpb ${in_kind}, (%rax)");
+            self.load(a, p, reg);
+            let _ = writeln!(self.out, "    cmpb ${in_kind}, ({reg})");
             let _ = writeln!(self.out, "    jne {slow}");
+            let _ = writeln!(self.out, "    movq 8({reg}), {reg}");
             emitted_slow = true;
         }
-        self.operand(&args[0], p, "%rcx");
-        self.operand(&args[1], p, "%rdx");
-        match k {
-            K::Cmp(_) => self.emit("cmpq %rdx, %rcx"),
-            K::CharCmp(_) => self.emit("cmpl %edx, %ecx"),
-            _ => unreachable!(),
-        }
+        let cmp_ins = if is_char { "cmpl %edx, %ecx" } else { "cmpq %rdx, %rcx" };
+        self.emit(cmp_ins);
         let cc = &set[3..];
-        let negated = match cc {
-            "e" => "ne", "ne" => "e", "l" => "ge", "le" => "g", "g" => "le", "ge" => "l",
-            "b" => "ae", "be" => "a", "a" => "be", "ae" => "b",
-            other => panic!("internal: condition {other}"),
+        let negated = Self::negate_cc(cc);
+        let saved_cache = self.cache.clone();
+        let saved_safe = self.safe_slots;
+        let saved_kind = self.known_kind.clone();
+        let join_defs: Vec<(String, &[u32], &SExpr)> = peeled_joins
+            .into_iter()
+            .map(|(id, params, code)| {
+                let l = self.label("join");
+                self.joins.insert(id, (l.clone(), params.to_vec()));
+                let mut uses = std::collections::HashSet::new();
+                self.slot_uses(code, &mut uses);
+                self.join_uses.insert(id, uses);
+                (l, params, code)
+            })
+            .collect();
+        let emit_joins = |g: &mut Self| {
+            for (l, params, code) in join_defs.into_iter().rev() {
+                g.put_label(&l);
+                g.cache.clear();
+                g.safe_slots = saved_safe;
+                for &s in params {
+                    g.mark_slot_safe(s);
+                }
+                g.known_kind.clear();
+                g.expr(code, p);
+            }
         };
+
+        // 3-way compare fusion: `if a < b then b1 else if a > b then b2 else b3` shares one cmpq.
+        let two_way = match inner_alts {
+            [SAlt::Lit(Lit::Int(0), f_body), SAlt::Default(t_body)]
+            | [SAlt::Lit(Lit::Int(0), f_body), SAlt::Lit(Lit::Int(1), t_body), ..] => Some((t_body, f_body)),
+            [SAlt::Lit(Lit::Int(1), t_body), SAlt::Default(f_body)]
+            | [SAlt::Lit(Lit::Int(1), t_body), SAlt::Lit(Lit::Int(0), f_body), ..] => Some((t_body, f_body)),
+            _ => None,
+        };
+        if let Some((t1, f1)) = two_way {
+            let fused = self
+                .nested_same_cmp(f1, args, is_char, p)
+                .map(|(cc2, t2, f2)| (cc, 1i64, t1, cc2, t2, f2))
+                .or_else(|| {
+                    self.nested_same_cmp(t1, args, is_char, p)
+                        .map(|(cc2, t2, f2)| (negated, 0i64, f1, cc2, t2, f2))
+                });
+            if let Some((j1, prim_v1, b1, j2, b2, b3)) = fused {
+                let l1 = self.label("alt");
+                let l2 = self.label("alt");
+                let l3 = self.label("def");
+                let _ = writeln!(self.out, "    j{j1} {l1}");
+                let _ = writeln!(self.out, "    j{j2} {l2}");
+                self.put_label(&l3);
+                self.known_kind = post_kind.clone();
+                self.expr(b3, p);
+                self.put_label(&l1);
+                self.cache = saved_cache.clone();
+                self.safe_slots = saved_safe;
+                self.known_kind = post_kind.clone();
+                self.expr(b1, p);
+                self.put_label(&l2);
+                self.cache = saved_cache.clone();
+                self.safe_slots = saved_safe;
+                self.known_kind = post_kind.clone();
+                self.expr(b2, p);
+                emit_joins(self);
+                if emitted_slow {
+                    let cont = self.label("k");
+                    let live = self.case_live(alts, bslot, p);
+                    self.emit_cold(|g| {
+                        g.put_label(&slow);
+                        g.save_cache(&saved_cache, p);
+                        g.cache.clear();
+                        g.safe_slots = saved_safe;
+                        g.known_kind = saved_kind;
+                        g.zero_unsafe_slots(p, true);
+                        g.emit("subq $8, %rbp");
+                        let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                        g.emit("movq %rax, (%rbp)");
+                        let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
+                        g.live.push(live.clone());
+                        g.slow_only = true;
+                        g.prim(name, args, sp);
+                        g.live.pop();
+                        let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
+                        let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                        g.put_label(&cont);
+                        g.emit("addq $8, %rbp");
+                        for &s in &newly_checked {
+                            if live.contains(&s) || live.contains(&ALL_LIVE) {
+                                g.chase_ind_slot(s, p);
+                            }
+                        }
+                        g.reload_cache(&saved_cache, p);
+                        g.cache = saved_cache;
+                        g.emit("movq 8(%r14), %rcx");
+                        let _ = writeln!(g.out, "    cmpq ${prim_v1}, %rcx");
+                        let _ = writeln!(g.out, "    je {l1}");
+                        g.operand(&args[0], p, "%rcx");
+                        g.operand(&args[1], p, "%rdx");
+                        g.emit(cmp_ins);
+                        let _ = writeln!(g.out, "    j{j2} {l2}");
+                        let _ = writeln!(g.out, "    jmp {l3}");
+                    });
+                }
+                return true;
+            }
+        }
+
         let labels: Vec<String> = inner_alts.iter().map(|_| self.label("alt")).collect();
         for (a, l) in inner_alts.iter().zip(&labels) {
             match a {
@@ -1503,8 +1845,6 @@ impl Gen {
                 _ => {}
             }
         }
-        let saved_cache = self.cache.clone();
-        let saved_safe = self.safe_slots;
         let def_lbl = self.label("def");
         self.put_label(&def_lbl);
         self.known_kind = post_kind.clone();
@@ -1521,42 +1861,46 @@ impl Gen {
                 self.expr(body, p);
             }
         }
+        emit_joins(self);
         if emitted_slow {
-            // Cold slow path: evaluate via runtime primitive, chase any IND in live checked slots
-            // so `post_kind` holds identically on slow returns, then branch on its 0/1 result.
+            // Cold slow path (emitted out-of-line): evaluate via runtime primitive, chase any IND
+            // in live checked slots so `post_kind` holds identically on slow returns.
             let cont = self.label("k");
-            self.put_label(&slow);
-            self.save_cache(&saved_cache, p);
-            self.cache.clear();
-            self.safe_slots = saved_safe;
-            self.zero_unsafe_slots(p, true);
-            self.emit("subq $8, %rbp");
-            let _ = writeln!(self.out, "    leaq {cont}(%rip), %rax");
-            self.emit("movq %rax, (%rbp)");
-            let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
-            let live = self.case_live(inner_alts, p);
-            self.live.push(live.clone());
-            self.slow_only = true;
-            self.prim(name, args, sp);
-            self.live.pop();
-            let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
-            let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
-            self.put_label(&cont);
-            self.emit("addq $8, %rbp");
-            for &s in &newly_checked {
-                if live.contains(&s) || live.contains(&ALL_LIVE) {
-                    self.chase_ind_slot(s, p);
+            let live = self.case_live(alts, bslot, p);
+            self.emit_cold(|g| {
+                g.put_label(&slow);
+                g.save_cache(&saved_cache, p);
+                g.cache.clear();
+                g.safe_slots = saved_safe;
+                g.known_kind = saved_kind;
+                g.zero_unsafe_slots(p, true);
+                g.emit("subq $8, %rbp");
+                let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                g.emit("movq %rax, (%rbp)");
+                let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
+                g.live.push(live.clone());
+                g.slow_only = true;
+                g.prim(name, args, sp);
+                g.live.pop();
+                let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
+                let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                g.put_label(&cont);
+                g.emit("addq $8, %rbp");
+                for &s in &newly_checked {
+                    if live.contains(&s) || live.contains(&ALL_LIVE) {
+                        g.chase_ind_slot(s, p);
+                    }
                 }
-            }
-            self.reload_cache(&saved_cache, p);
-            self.emit("movq 8(%r14), %rcx");
-            for (a, l) in inner_alts.iter().zip(&labels) {
-                if let SAlt::Lit(Lit::Int(v @ (0 | 1)), _) = a {
-                    let _ = writeln!(self.out, "    cmpq ${v}, %rcx");
-                    let _ = writeln!(self.out, "    je {l}");
+                g.reload_cache(&saved_cache, p);
+                g.emit("movq 8(%r14), %rcx");
+                for (a, l) in inner_alts.iter().zip(&labels) {
+                    if let SAlt::Lit(Lit::Int(v @ (0 | 1)), _) = a {
+                        let _ = writeln!(g.out, "    cmpq ${v}, %rcx");
+                        let _ = writeln!(g.out, "    je {l}");
+                    }
                 }
-            }
-            let _ = writeln!(self.out, "    jmp {def_lbl}");
+                let _ = writeln!(g.out, "    jmp {def_lbl}");
+            });
         }
         true
     }
@@ -1700,7 +2044,15 @@ impl Gen {
                         }
                     }
                     self.mark_slot_safe(*slot);
-                    self.known_kind.remove(slot);
+                    match b {
+                        SBind::BoxRaw(r) => {
+                            let kind = if *r & RAW_CHAR != 0 { CHAR } else { INT };
+                            self.known_kind.insert(*slot, kind);
+                        }
+                        _ => {
+                            self.known_kind.remove(slot);
+                        }
+                    }
                 }
                 for ((_, b), base) in binds.iter().zip(offs) {
                     match b {
@@ -1714,6 +2066,18 @@ impl Gen {
                             for (i, a) in args.iter().enumerate() {
                                 self.load(a, p, "%rdx");
                                 let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (base + 1 + i));
+                            }
+                        }
+                        SBind::BoxRaw(r) => {
+                            let kind = if *r & RAW_CHAR != 0 { CHAR } else { INT };
+                            let hdr = header(kind, 1, 0);
+                            let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
+                            let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * base);
+                            if let Some(reg) = self.cached(*r) {
+                                let _ = writeln!(self.out, "    movq {reg}, {}(%rax)", 8 * (base + 1));
+                            } else {
+                                let _ = writeln!(self.out, "    movq {}, %rdx", p.slot(*r));
+                                let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (base + 1));
                             }
                         }
                     }
@@ -1840,8 +2204,13 @@ impl Gen {
                 match scrut.as_ref() {
                     SExpr::Atom(a @ Atom::Slot(s)) if self.known_kind.contains_key(s) => {
                         let known_k = self.known_kind[s];
-                        self.load(a, p, "%r14");
-                        let live = self.case_live(alts, p);
+                        let need_r14 = raw_binder
+                            || *bslot != UNUSED_SLOT
+                            || !matches!(&alts[..], [SAlt::Default(_)]);
+                        if need_r14 {
+                            self.load(a, p, "%r14");
+                        }
+                        let live = self.case_live(alts, *bslot, p);
                         self.live.push(live);
                         self.clear_dead(std::slice::from_ref(a), Pos { mode: Mode::Scrut, ..p });
                         self.live.pop();
@@ -1922,50 +2291,85 @@ impl Gen {
                     }
                     _ => {}
                 }
-                let cont = self.label("k");
-                let mut fast_body: Option<String> = None;
-                let mut mv_ref_slot: Option<u32> = None;
-                let mut write_mv_wrote_bslot = false;
-                let mut prim_out_kind: Option<u8> = None;
-                let mut fast_kind = saved_kind.clone();
-                // A variable that is already a value (not a thunk or an indirection) goes straight
-                // to the alternatives, without the return address and `hsc_eval`.
-                let ready = match scrut.as_ref() {
+                let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
+                let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
+                let mut post_cache = saved_cache.clone();
+                if raw_binder {
+                    let b_idx = raw_idx(*bslot);
+                    post_cache.retain(|c| raw_idx(c.slot) != b_idx);
+                }
+                // Fast paths whose cold slow path lives in `cold_out` so the hot path falls straight through.
+                match scrut.as_ref() {
                     SExpr::Atom(a @ (Atom::Slot(_) | Atom::Free(_) | Atom::Global(_))) => {
                         let ready = self.label("ready");
+                        let slow_chk = self.label("chk");
                         let eval = self.label("eval");
                         let value = self.label("value");
-                        // An indirection (an updated thunk, as a captured variable often is) is
-                        // followed here: only a thunk needs the evaluation.
-                        let check = self.label("chk");
+                        let cont = self.label("k");
                         self.load(a, p, "%r14");
-                        self.put_label(&check);
                         self.emit("testq %r14, %r14");
                         let _ = writeln!(self.out, "    je {value}");
-                        // Kinds 1..7 (CON, INT, DOUBLE, CHAR, INTEGER, FUN, PAP) are all values.
+                        // Kinds 1..7 (CON, INT, DOUBLE, CHAR, INTEGER, FUN, PAP) fall straight through.
                         let _ = writeln!(self.out, "    cmpb ${THUNK}, (%r14)");
-                        let _ = writeln!(self.out, "    jb {value}");
-                        let _ = writeln!(self.out, "    je {eval}");
-                        let _ = writeln!(self.out, "    cmpb ${IND}, (%r14)");
-                        let _ = writeln!(self.out, "    jne {value}");
-                        self.emit("movq 8(%r14), %r14");
-                        let _ = writeln!(self.out, "    jmp {check}");
-                        // A value: as on the slow path, its slot is cleared when nothing uses it
-                        // after (only here: the slow path loads the slot again).
+                        let _ = writeln!(self.out, "    jae {slow_chk}");
                         self.put_label(&value);
-                        let live = self.case_live(alts, p);
-                        self.live.push(live);
+                        let live = self.case_live(alts, *bslot, p);
+                        self.live.push(live.clone());
                         self.clear_dead(std::slice::from_ref(a), Pos { mode: Mode::Scrut, ..p });
                         self.live.pop();
-                        fast_kind = self.known_kind.clone();
-                        let _ = writeln!(self.out, "    jmp {ready}");
-                        self.put_label(&eval);
-                        Some(ready)
+                        let fast_kind = self.known_kind.clone();
+                        self.emit_cold(|g| {
+                            g.put_label(&slow_chk);
+                            let _ = writeln!(g.out, "    je {eval}");
+                            let _ = writeln!(g.out, "    cmpb ${IND}, (%r14)");
+                            let _ = writeln!(g.out, "    jne {value}");
+                            g.emit("movq 8(%r14), %r14");
+                            g.emit("testq %r14, %r14");
+                            let _ = writeln!(g.out, "    je {value}");
+                            let _ = writeln!(g.out, "    cmpb ${THUNK}, (%r14)");
+                            let _ = writeln!(g.out, "    jb {value}");
+                            let _ = writeln!(g.out, "    jmp {slow_chk}");
+                            g.put_label(&eval);
+                            g.save_cache(&saved_cache, p);
+                            g.cache.clear();
+                            g.safe_slots = saved_safe;
+                            g.known_kind = saved_kind;
+                            g.zero_unsafe_slots(p, true);
+                            g.emit("subq $8, %rbp");
+                            let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                            g.emit("movq %rax, (%rbp)");
+                            g.live.push(live);
+                            g.expr(scrut, sp);
+                            g.live.pop();
+                            let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                            g.put_label(&cont);
+                            g.emit("addq $8, %rbp");
+                            g.reload_cache(&post_cache, p);
+                            let _ = writeln!(g.out, "    jmp {ready}");
+                        });
+                        self.put_label(&ready);
+                        self.cache = post_cache;
+                        self.safe_slots = saved_safe;
+                        self.known_kind = fast_kind;
+                        if raw_binder {
+                            let reg = self.fresh_reg(p, &[]);
+                            let _ = writeln!(self.out, "    movq 8(%r14), {reg}");
+                            self.cache_put(*bslot, reg, true);
+                            let [SAlt::Default(body)] = &alts[..] else {
+                                panic!("internal: raw binder with alternatives")
+                            };
+                            self.expr(body, p);
+                            return;
+                        }
+                        if *bslot != UNUSED_SLOT {
+                            let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                            self.mark_slot_safe(*bslot);
+                            self.known_kind.remove(bslot);
+                        }
+                        self.alts(alts, *bslot, p, None);
+                        return;
                     }
-                    // A primitive with an inline fast path is computed in place (before the return
-                    // address, which only its slow path needs).
                     SExpr::Prim(name, args) => {
-                        let mut matched_mv = false;
                         if !raw_binder && !args.is_empty() && !is_raw(&args[0]) && !matches!(args[0], Atom::Lit(_)) {
                             let non_alloc = |a: &Atom| {
                                 !is_raw(a)
@@ -1983,6 +2387,16 @@ impl Gen {
                                         if !uses.contains(bslot) {
                                             let body_lbl = self.label("mv_body");
                                             let slow = self.label("slow");
+                                            let cont = self.label("k");
+                                            let live = self.case_live(alts, *bslot, p);
+                                            let mut fast_kind = saved_kind.clone();
+                                            let mv_ref_slot = match args[0] {
+                                                Atom::Slot(s) => {
+                                                    fast_kind.insert(s, REF);
+                                                    Some(s)
+                                                }
+                                                _ => None,
+                                            };
                                             self.load(&args[0], p, "%rax");
                                             let _ = writeln!(self.out, "    cmpb ${REF}, (%rax)");
                                             let _ = writeln!(self.out, "    jne {slow}");
@@ -1993,15 +2407,53 @@ impl Gen {
                                                 self.emit("movq 8(%rax), %rcx");
                                                 let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(slots[1]));
                                             }
-                                            let _ = writeln!(self.out, "    jmp {body_lbl}");
-                                            self.put_label(&slow);
-                                            self.slow_only = true;
-                                            fast_body = Some(body_lbl);
-                                            if let Atom::Slot(s) = args[0] {
-                                                mv_ref_slot = Some(s);
-                                                fast_kind.insert(s, REF);
+                                            self.emit_cold(|g| {
+                                                g.put_label(&slow);
+                                                g.save_cache(&saved_cache, p);
+                                                g.cache.clear();
+                                                g.safe_slots = saved_safe;
+                                                g.known_kind = saved_kind;
+                                                g.zero_unsafe_slots(p, true);
+                                                g.emit("subq $8, %rbp");
+                                                let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                                                g.emit("movq %rax, (%rbp)");
+                                                g.live.push(live.clone());
+                                                g.slow_only = true;
+                                                g.expr(scrut, sp);
+                                                g.live.pop();
+                                                let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                                                g.put_label(&cont);
+                                                g.emit("addq $8, %rbp");
+                                                if let Some(rs) = mv_ref_slot {
+                                                    if live.contains(&rs) || live.contains(&ALL_LIVE) {
+                                                        g.chase_ind_slot(rs, p);
+                                                    }
+                                                }
+                                                g.reload_cache(&saved_cache, p);
+                                                if slots[0] != UNUSED_SLOT {
+                                                    g.emit("movq 8(%r14), %rcx");
+                                                    let _ = writeln!(g.out, "    movq %rcx, {}(%rbp)", p.slot_off(slots[0]));
+                                                }
+                                                if slots[1] != UNUSED_SLOT {
+                                                    g.emit("movq 16(%r14), %rcx");
+                                                    let _ = writeln!(g.out, "    movq %rcx, {}(%rbp)", p.slot_off(slots[1]));
+                                                }
+                                                let _ = writeln!(g.out, "    jmp {body_lbl}");
+                                            });
+                                            self.put_label(&body_lbl);
+                                            self.cache = saved_cache;
+                                            self.safe_slots = saved_safe;
+                                            self.known_kind = fast_kind;
+                                            if slots[0] != UNUSED_SLOT {
+                                                self.mark_slot_safe(slots[0]);
+                                                self.known_kind.remove(&slots[0]);
                                             }
-                                            matched_mv = true;
+                                            if slots[1] != UNUSED_SLOT {
+                                                self.mark_slot_safe(slots[1]);
+                                                self.known_kind.remove(&slots[1]);
+                                            }
+                                            self.expr(body, p);
+                                            return;
                                         }
                                     }
                                 }
@@ -2010,84 +2462,197 @@ impl Gen {
                                     if !matches!(body, SExpr::Fail(_)) {
                                         let mut uses = std::collections::HashSet::new();
                                         self.slot_uses(body, &mut uses);
+                                        let write_bslot = *bslot != UNUSED_SLOT && uses.contains(bslot);
                                         let body_lbl = self.label("mv_body");
                                         let slow = self.label("slow");
+                                        let cont = self.label("k");
+                                        let live = self.case_live(alts, *bslot, p);
+                                        let mut fast_kind = saved_kind.clone();
+                                        let mv_ref_slot = match args[0] {
+                                            Atom::Slot(s) => {
+                                                fast_kind.insert(s, REF);
+                                                Some(s)
+                                            }
+                                            _ => None,
+                                        };
                                         self.load(&args[0], p, "%rax");
                                         let _ = writeln!(self.out, "    cmpb ${REF}, (%rax)");
                                         let _ = writeln!(self.out, "    jne {slow}");
                                         self.load(&args[1], p, "%rcx");
                                         self.emit("movq %rcx, 8(%rax)");
-                                        if *bslot != UNUSED_SLOT && uses.contains(bslot) {
+                                        if write_bslot {
                                             let unit_id = self.con_id("Builtin.()");
                                             let unit_lbl = self.nullary_con(unit_id);
                                             let _ = writeln!(self.out, "    leaq {unit_lbl}(%rip), %rcx");
                                             let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*bslot));
-                                            write_mv_wrote_bslot = true;
                                         }
-                                        let _ = writeln!(self.out, "    jmp {body_lbl}");
-                                        self.put_label(&slow);
-                                        self.slow_only = true;
-                                        fast_body = Some(body_lbl);
-                                        if let Atom::Slot(s) = args[0] {
-                                            mv_ref_slot = Some(s);
-                                            fast_kind.insert(s, REF);
+                                        self.emit_cold(|g| {
+                                            g.put_label(&slow);
+                                            g.save_cache(&saved_cache, p);
+                                            g.cache.clear();
+                                            g.safe_slots = saved_safe;
+                                            g.known_kind = saved_kind;
+                                            g.zero_unsafe_slots(p, true);
+                                            g.emit("subq $8, %rbp");
+                                            let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                                            g.emit("movq %rax, (%rbp)");
+                                            g.live.push(live.clone());
+                                            g.slow_only = true;
+                                            g.expr(scrut, sp);
+                                            g.live.pop();
+                                            let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                                            g.put_label(&cont);
+                                            g.emit("addq $8, %rbp");
+                                            if let Some(rs) = mv_ref_slot {
+                                                if live.contains(&rs) || live.contains(&ALL_LIVE) {
+                                                    g.chase_ind_slot(rs, p);
+                                                }
+                                            }
+                                            g.reload_cache(&saved_cache, p);
+                                            if write_bslot {
+                                                let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                                            }
+                                            let _ = writeln!(g.out, "    jmp {body_lbl}");
+                                        });
+                                        self.put_label(&body_lbl);
+                                        self.cache = saved_cache;
+                                        self.safe_slots = saved_safe;
+                                        self.known_kind = fast_kind;
+                                        if write_bslot {
+                                            self.mark_slot_safe(*bslot);
+                                            self.known_kind.remove(bslot);
                                         }
-                                        matched_mv = true;
+                                        self.expr(body, p);
+                                        return;
                                     }
                                 }
                             }
                         }
-                        if matched_mv {
-                            None
-                        } else {
-                            let ready = self.label("ready");
-                            let slow = self.label("slow");
-                            self.fast_done = Some(ready.clone());
-                            // A raw binder takes the number straight from the inline path.
-                            self.raw_dest = raw_binder.then_some(*bslot);
-                            let fast = self.int_fast_path(name, args, p, &slow);
-                            self.raw_dest = None;
-                            self.fast_done = None;
-                            if fast {
-                                if !raw_binder {
-                                    prim_out_kind = int_op(name).and_then(|k| match k {
-                                        K::TagToEnum => None,
-                                        K::Chr => Some(CHAR),
-                                        _ => Some(INT),
-                                    });
-                                }
-                                self.put_label(&slow);
-                                self.slow_only = true;
-                                Some(ready)
+                        let ready = self.label("ready");
+                        let slow = self.label("slow");
+                        // Empty `fast_done` lets `int_fast_path` fall straight through to `ready`.
+                        self.fast_done = Some(String::new());
+                        self.raw_dest = raw_binder.then_some(*bslot);
+                        let fast = self.int_fast_path(name, args, p, &slow);
+                        self.raw_dest = None;
+                        self.fast_done = None;
+                        if fast {
+                            let prim_out_kind = if !raw_binder {
+                                int_op(name).and_then(|k| match k {
+                                    K::TagToEnum => None,
+                                    K::Chr => Some(CHAR),
+                                    _ => Some(INT),
+                                })
                             } else {
                                 None
+                            };
+                            let cont = self.label("k");
+                            let live = self.case_live(alts, *bslot, p);
+                            self.emit_cold(|g| {
+                                g.put_label(&slow);
+                                g.save_cache(&saved_cache, p);
+                                g.cache.clear();
+                                g.safe_slots = saved_safe;
+                                g.known_kind = saved_kind.clone();
+                                g.zero_unsafe_slots(p, true);
+                                g.emit("subq $8, %rbp");
+                                let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                                g.emit("movq %rax, (%rbp)");
+                                g.live.push(live);
+                                g.slow_only = true;
+                                g.expr(scrut, sp);
+                                g.live.pop();
+                                let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                                g.put_label(&cont);
+                                g.emit("addq $8, %rbp");
+                                g.reload_cache(&post_cache, p);
+                                if raw_binder {
+                                    g.emit("movq 8(%r14), %rcx");
+                                    let _ = writeln!(g.out, "    movq %rcx, {}(%rbp)", p.slot_off(*bslot));
+                                }
+                                let _ = writeln!(g.out, "    jmp {ready}");
+                            });
+                            self.put_label(&ready);
+                            self.cache = post_cache;
+                            self.safe_slots = saved_safe;
+                            self.known_kind = saved_kind;
+                            if raw_binder {
+                                let [SAlt::Default(body)] = &alts[..] else {
+                                    panic!("internal: raw binder with alternatives")
+                                };
+                                self.expr(body, p);
+                                return;
                             }
+                            // Fuse `case (x op y) as v of _ -> case writeMutVar# mv v s of _ -> body`
+                            // when `mv` is already proven REF: write `%r14` straight into `8(%rax)`
+                            // without a spill/reload round-trip through the frame.
+                            if *bslot != UNUSED_SLOT {
+                                if let [SAlt::Default(SExpr::Case(wscrut, wbslot, walts))] = &alts[..] {
+                                    if let (
+                                        SExpr::Prim(wname, wargs),
+                                        [SAlt::Default(wbody)],
+                                    ) = (wscrut.as_ref(), &walts[..])
+                                    {
+                                        if wname == "writeMutVar#"
+                                            && wargs.len() == 3
+                                            && !matches!(wbody, SExpr::Fail(_))
+                                            && matches!(&wargs[0], Atom::Slot(mv) if self.known_kind.get(mv) == Some(&REF))
+                                            && matches!(&wargs[1], Atom::Slot(vs) if *vs == *bslot)
+                                        {
+                                            let mut uses = std::collections::HashSet::new();
+                                            self.slot_uses(wbody, &mut uses);
+                                            let outer_uses_v = p.mode == Mode::Scrut
+                                                && self.live.last().is_none_or(|l| l.contains(bslot) || l.contains(&ALL_LIVE));
+                                            if uses.contains(bslot) || outer_uses_v {
+                                                let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                                                self.mark_slot_safe(*bslot);
+                                                if let Some(k) = prim_out_kind {
+                                                    self.known_kind.insert(*bslot, k);
+                                                } else {
+                                                    self.known_kind.remove(bslot);
+                                                }
+                                            }
+                                            self.load(&wargs[0], p, "%rax");
+                                            self.emit("movq %r14, 8(%rax)");
+                                            if *wbslot != UNUSED_SLOT && uses.contains(wbslot) {
+                                                let unit_id = self.con_id("Builtin.()");
+                                                let unit_lbl = self.nullary_con(unit_id);
+                                                let _ = writeln!(self.out, "    leaq {unit_lbl}(%rip), %rcx");
+                                                let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*wbslot));
+                                                self.mark_slot_safe(*wbslot);
+                                                self.known_kind.remove(wbslot);
+                                            }
+                                            self.expr(wbody, p);
+                                            return;
+                                        }
+                                    }
+                                }
+                                let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                                self.mark_slot_safe(*bslot);
+                                if let Some(k) = prim_out_kind {
+                                    self.known_kind.insert(*bslot, k);
+                                } else {
+                                    self.known_kind.remove(bslot);
+                                }
+                            }
+                            self.alts(alts, *bslot, p, None);
+                            return;
                         }
                     }
-                    _ => None,
-                };
-                let has_fast = ready.is_some() || fast_body.is_some();
-                if has_fast {
-                    // Cold slow path: preserve cached raw registers across the call and zero any
-                    // uninitialized local pointer slots before exposing the frame to GC.
-                    self.save_cache(&saved_cache, p);
-                    self.cache.clear();
-                    self.safe_slots = saved_safe;
-                    self.zero_unsafe_slots(p, true);
-                    self.known_kind = saved_kind.clone();
-                } else {
-                    if !matches!(scrut.as_ref(), SExpr::CallWorker(..)) && !self.cache.is_empty() {
-                        self.flush(p);
-                    }
-                    self.zero_unsafe_slots(p, true);
+                    _ => {}
                 }
+                // General case scrutinee (no inline fast path).
+                let cont = self.label("k");
+                if !matches!(scrut.as_ref(), SExpr::CallWorker(..)) && !self.cache.is_empty() {
+                    self.flush(p);
+                }
+                self.zero_unsafe_slots(p, true);
                 // Push the return address (its frame is this body's, above it).
                 self.emit("subq $8, %rbp");
                 let _ = writeln!(self.out, "    leaq {cont}(%rip), %rax");
                 self.emit("movq %rax, (%rbp)");
-                let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
                 // What the alternatives (and, for a nested case, what follows it) still use.
-                let live = self.case_live(alts, p);
+                let live = self.case_live(alts, *bslot, p);
                 self.live.push(live.clone());
                 self.expr(scrut, sp);
                 self.live.pop();
@@ -2095,47 +2660,22 @@ impl Gen {
                 // at -8. Control reaches the label only by a return, never by falling through. A case
                 // in a scrutinee (nested) has the outer case's return address above it, not the
                 // frame: its own frame is empty (the collector reads the outer one's next).
-                let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
                 let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
                 self.put_label(&cont);
                 self.emit("addq $8, %rbp");
-                if has_fast {
-                    if let Some(rs) = mv_ref_slot {
-                        if live.contains(&rs) || live.contains(&ALL_LIVE) {
-                            self.chase_ind_slot(rs, p);
-                        }
-                    }
-                    let mut post_cache = saved_cache;
-                    if raw_binder {
-                        post_cache.retain(|c| c.slot != *bslot);
-                    }
-                    self.reload_cache(&post_cache, p);
-                    self.cache = post_cache;
-                    self.safe_slots = saved_safe;
-                    self.known_kind = fast_kind;
-                } else {
-                    self.cache.clear();
-                    self.known_kind = saved_kind;
-                    if !live.contains(&ALL_LIVE) {
-                        self.known_kind.retain(|k, _| live.contains(k));
-                    }
+                self.cache.clear();
+                self.known_kind = saved_kind;
+                if !live.contains(&ALL_LIVE) {
+                    self.known_kind.retain(|k, _| live.contains(k));
                 }
                 if raw_binder {
-                    // A cell (the runtime's answer, or the evaluated variable): its number goes to
-                    // the raw binder. An inline primitive stored it already and continues after.
-                    let stored = matches!(scrut.as_ref(), SExpr::Prim(..));
-                    if !stored {
-                        if let Some(ready) = &ready {
-                            self.put_label(ready);
-                        }
-                    }
                     if self.returns_raw(scrut) {
                         // A worker returning raw answered the number itself in %r14: keep it in
                         // a cache register so straight-line arithmetic reads it without spilling.
                         let reg = CACHE_REGS[0];
                         let _ = writeln!(self.out, "    movq %r14, {reg}");
                         self.cache_put(*bslot, reg, true);
-                    } else if stored {
+                    } else if matches!(scrut.as_ref(), SExpr::Prim(..)) {
                         self.emit("movq 8(%r14), %rcx");
                         let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*bslot));
                     } else {
@@ -2143,30 +2683,16 @@ impl Gen {
                         let _ = writeln!(self.out, "    movq 8(%r14), {reg}");
                         self.cache_put(*bslot, reg, true);
                     }
-                    if stored {
-                        if let Some(ready) = ready {
-                            self.put_label(&ready);
-                        }
-                    }
                     let [SAlt::Default(body)] = &alts[..] else { panic!("internal: raw binder with alternatives") };
                     self.expr(body, p);
                     return;
                 }
-                if let Some(ready) = ready {
-                    self.put_label(&ready);
-                }
                 if *bslot != UNUSED_SLOT {
                     let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
-                    if fast_body.is_none() || write_mv_wrote_bslot {
-                        self.mark_slot_safe(*bslot);
-                    }
-                    if let Some(k) = prim_out_kind {
-                        self.known_kind.insert(*bslot, k);
-                    } else {
-                        self.known_kind.remove(bslot);
-                    }
+                    self.mark_slot_safe(*bslot);
+                    self.known_kind.remove(bslot);
                 }
-                self.alts(alts, *bslot, p, fast_body.as_deref());
+                self.alts(alts, *bslot, p, None);
             }
             SExpr::Closure(c) => {
                 self.alloc(closure_words(c), p);
@@ -2188,6 +2714,7 @@ impl Gen {
                 let join_safe = self.safe_slots;
                 self.expr(body, p);
                 self.put_label(&l);
+                self.cache.clear();
                 self.safe_slots = join_safe;
                 for &s in params {
                     self.mark_slot_safe(s);
@@ -2271,13 +2798,13 @@ impl Gen {
         }
         let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
         let mut skipped_alts = std::collections::HashSet::new();
-        let mut has_default = false;
+        let mut fail_lbl: Option<String> = None;
         let end = alts.iter().position(|a| matches!(a, SAlt::Default(_))).unwrap_or(alts.len());
         let all_int = end >= 8 && alts[..end].iter().all(|a| matches!(a, SAlt::Lit(Lit::Int(_), _)));
         let all_char = !all_int && end >= 8 && alts[..end].iter().all(|a| matches!(a, SAlt::Lit(Lit::Char(_), _)));
         if all_int || all_char {
             let has_def = end < alts.len();
-            let def_lbl = if has_def { labels[end].clone() } else { self.label("def") };
+            let def_lbl = if has_def { labels[end].clone() } else { self.label("fail") };
             let kind = if all_char { CHAR } else { INT };
             let _ = writeln!(self.out, "    cmpb ${kind}, (%r14)");
             let _ = writeln!(self.out, "    jne {def_lbl}");
@@ -2388,10 +2915,22 @@ impl Gen {
                 self.emit_lit_bsearch("%rax", &bsearch, &def_lbl);
             }
             if !has_def {
-                self.put_label(&def_lbl);
+                fail_lbl = Some(def_lbl);
             }
-            has_default = has_def;
+        } else if let [SAlt::Con(name, _, _)] = alts {
+            // Single-constructor match: invert to `jne fail` (cold) so alt 0 falls straight through.
+            let id = self.con_id(name);
+            let fl = self.label("fail");
+            let _ = writeln!(self.out, "    cmpl ${id}, 4(%r14)");
+            let _ = writeln!(self.out, "    jne {fl}");
+            fail_lbl = Some(fl);
+        } else if let [SAlt::Con(name, _, _), SAlt::Default(_)] = alts {
+            // Con + Default: invert to `jne default` so alt 0 falls straight through.
+            let id = self.con_id(name);
+            let _ = writeln!(self.out, "    cmpl ${id}, 4(%r14)");
+            let _ = writeln!(self.out, "    jne {}", labels[1]);
         } else {
+            let mut has_default = false;
             let con_count = alts.iter().filter(|a| matches!(a, SAlt::Con(..))).count();
             let load_con_tag = con_count >= 2 && alts.iter().all(|a| matches!(a, SAlt::Con(..) | SAlt::Default(_)));
             if load_con_tag {
@@ -2444,18 +2983,16 @@ impl Gen {
                     }
                 }
             }
+            if !has_default {
+                let fl = self.label("fail");
+                let _ = writeln!(self.out, "    jmp {fl}");
+                fail_lbl = Some(fl);
+            }
         }
         let alt_cache = self.cache.clone();
         let alt_safe = self.safe_slots;
         let alt_kind = self.known_kind.clone();
-        if !has_default {
-            // Diagnostic: the scrutinee is left in the record for the failure's message.
-            if bslot != UNUSED_SLOT {
-                let _ = writeln!(self.out, "    movq {}(%rbp), %rax", p.slot_off(bslot));
-                let _ = writeln!(self.out, "    movq %rax, {}(%rbx)", mach::R1);
-            } else {
-                let _ = writeln!(self.out, "    movq %r14, {}(%rbx)", mach::R1);
-            }
+        if let Some(fl) = fail_lbl {
             let names: Vec<String> = alts
                 .iter()
                 .map(|a| match a {
@@ -2465,7 +3002,18 @@ impl Gen {
                 })
                 .collect();
             let fail_msg = format!("Non-exhaustive patterns in case [{}]", names.join(" | "));
-            self.fail(&fail_msg, p);
+            self.emit_cold(|g| {
+                g.safe_slots = alt_safe;
+                g.put_label(&fl);
+                // Diagnostic: the scrutinee is left in the record for the failure's message.
+                if bslot != UNUSED_SLOT {
+                    let _ = writeln!(g.out, "    movq {}(%rbp), %rax", p.slot_off(bslot));
+                    let _ = writeln!(g.out, "    movq %rax, {}(%rbx)", mach::R1);
+                } else {
+                    let _ = writeln!(g.out, "    movq %r14, {}(%rbx)", mach::R1);
+                }
+                g.fail(&fail_msg, p);
+            });
         }
         for (idx, (a, l)) in alts.iter().zip(&labels).enumerate() {
             if skipped_alts.contains(&idx) {
@@ -2474,9 +3022,9 @@ impl Gen {
             self.cache = alt_cache.clone();
             self.safe_slots = alt_safe;
             self.known_kind = alt_kind.clone();
-            self.put_label(l);
             match a {
                 SAlt::Con(_, slots, body) => {
+                    self.put_label(l);
                     for (i, s) in slots.iter().enumerate() {
                         if *s == UNUSED_SLOT {
                             continue;
@@ -2494,16 +3042,21 @@ impl Gen {
                     self.expr(body, p);
                 }
                 SAlt::Default(SExpr::Fail(msg)) => {
-                    // Diagnostic: a pattern failure leaves the scrutinee in the record.
-                    if bslot != UNUSED_SLOT {
-                        let _ = writeln!(self.out, "    movq {}(%rbp), %rax", p.slot_off(bslot));
-                        let _ = writeln!(self.out, "    movq %rax, {}(%rbx)", mach::R1);
-                    } else {
-                        let _ = writeln!(self.out, "    movq %r14, {}(%rbx)", mach::R1);
-                    }
-                    self.fail(msg, p);
+                    self.emit_cold(|g| {
+                        g.safe_slots = alt_safe;
+                        g.put_label(l);
+                        // Diagnostic: a pattern failure leaves the scrutinee in the record.
+                        if bslot != UNUSED_SLOT {
+                            let _ = writeln!(g.out, "    movq {}(%rbp), %rax", p.slot_off(bslot));
+                            let _ = writeln!(g.out, "    movq %rax, {}(%rbx)", mach::R1);
+                        } else {
+                            let _ = writeln!(g.out, "    movq %r14, {}(%rbx)", mach::R1);
+                        }
+                        g.fail(msg, p);
+                    });
                 }
                 SAlt::Lit(_, body) | SAlt::Default(body) => {
+                    self.put_label(l);
                     if idx == 0 {
                         if let Some(fb) = fast_body {
                             self.put_label(fb);
@@ -2645,24 +3198,29 @@ impl Gen {
         l
     }
 
-    /// Allocates `words` words into %rax. A full heap calls the collector with the frame as it is,
-    /// preserving any live `CACHE_REGS` across the cold GC path.
+    /// Allocates `words` words into %rax. A full heap calls the collector out-of-line in `cold_out`
+    /// with the frame as it is, preserving any live `CACHE_REGS` across the cold GC path.
     fn alloc(&mut self, words: usize, p: Pos) {
         // Every object has at least two words (the collector relies on it).
         let words = words.max(2);
-        let ok = self.next_id();
+        let gc_lbl = self.label("gc");
+        let done_lbl = self.label("gc_done");
         let _ = writeln!(self.out, "    leaq {}(%r12), %rax", 8 * words);
         self.emit("cmpq %r13, %rax");
-        let _ = writeln!(self.out, "    jbe .L{ok}");
-        let cached = self.cache.clone();
-        self.save_cache(&cached, p);
-        self.zero_unsafe_slots(p, false);
-        let _ = writeln!(self.out, "    movl ${words}, %esi");
-        self.rt_call("hsc_gc", p, 1);
-        self.reload_cache(&cached, p);
-        let _ = writeln!(self.out, ".L{ok}:");
+        let _ = writeln!(self.out, "    ja {gc_lbl}");
+        self.put_label(&done_lbl);
         self.emit("movq %r12, %rax");
         let _ = writeln!(self.out, "    leaq {}(%r12), %r12", 8 * words);
+        let cached = self.cache.clone();
+        self.emit_cold(|g| {
+            g.put_label(&gc_lbl);
+            g.save_cache(&cached, p);
+            g.zero_unsafe_slots(p, false);
+            let _ = writeln!(g.out, "    movl ${words}, %esi");
+            g.rt_call("hsc_gc", p, 1);
+            g.reload_cache(&cached, p);
+            let _ = writeln!(g.out, "    jmp {done_lbl}");
+        });
     }
 
     /// Fills the closure at word `base` of the block in %rax; its body is generated separately.
@@ -2712,11 +3270,21 @@ impl Gen {
             return;
         }
         let slow = self.label("slow");
+        let saved_safe = self.safe_slots;
         // A case scrutinee whose fast path was already emitted in place has only its slow path.
         let fast = !std::mem::take(&mut self.slow_only) && self.int_fast_path(name, args, p, &slow);
         if fast {
-            self.put_label(&slow);
+            self.emit_cold(|g| {
+                g.safe_slots = saved_safe;
+                g.put_label(&slow);
+                g.emit_prim_rt(name, args, p);
+            });
+            return;
         }
+        self.emit_prim_rt(name, args, p);
+    }
+
+    fn emit_prim_rt(&mut self, name: &str, args: &[Atom], p: Pos) {
         self.zero_unsafe_slots(p, true);
         let id = self.prim_id(name);
         for (i, a) in args.iter().enumerate() {
@@ -2836,15 +3404,27 @@ impl Gen {
             self.emit("shlq $4, %rcx");
             self.emit("leaq hsc_charlike(%rip), %r14");
             self.emit("addq %rcx, %r14");
+            let fallthrough = self.fast_done.as_deref() == Some("");
+            let chdone = fallthrough.then(|| self.label("chdone"));
             self.fast_ret(p);
-            self.put_label(&slow_alloc);
-            self.alloc(2, p);
-            self.emit("movq %rax, %r14");
-            self.operand(&args[0], p, "%rcx");
-            self.emit("movl %ecx, %ecx");
-            self.emit(&format!("movq ${}, (%r14)", header(CHAR, 1, 0)));
-            self.emit("movq %rcx, 8(%r14)");
-            self.fast_ret(p);
+            let saved_fast_done = self.fast_done.clone();
+            if let Some(ref done) = chdone {
+                self.fast_done = Some(done.clone());
+            }
+            self.emit_cold(|g| {
+                g.put_label(&slow_alloc);
+                g.alloc(2, p);
+                g.emit("movq %rax, %r14");
+                g.operand(&args[0], p, "%rcx");
+                g.emit("movl %ecx, %ecx");
+                g.emit(&format!("movq ${}, (%r14)", header(CHAR, 1, 0)));
+                g.emit("movq %rcx, 8(%r14)");
+                g.fast_ret(p);
+            });
+            self.fast_done = saved_fast_done;
+            if let Some(done) = chdone {
+                self.put_label(&done);
+            }
             return true;
         }
         // A boxed result's cell is allocated first: a collection moves the boxed operands, so
@@ -3377,11 +3957,13 @@ impl Gen {
             IOp::Neg => self.emit("negq %rcx"),
             IOp::Cmp(_) | IOp::ToInt => unreachable!(),
         }
-        let ok = self.label("iok");
-        let _ = writeln!(self.out, "    jno {ok}");
-        self.emit("subq $32, %r12");
-        let _ = writeln!(self.out, "    jmp {slow}");
-        self.put_label(&ok);
+        let ovf = self.label("iovf");
+        let _ = writeln!(self.out, "    jo {ovf}");
+        self.emit_cold(|g| {
+            g.put_label(&ovf);
+            g.emit("subq $32, %r12");
+            let _ = writeln!(g.out, "    jmp {slow}");
+        });
         let _ = writeln!(self.out, "    movq ${}, (%r14)", header(INT, 1, 0));
         self.emit("movq %rcx, 8(%r14)");
         let _ = writeln!(self.out, "    movabsq ${hdr_is}, %rcx");
@@ -3414,14 +3996,18 @@ impl Gen {
         self.emit(&format!("movq 8({reg}), {reg}"));
     }
 
-    /// The slots used after a case's scrutinee: by its alternatives and, for a case in a
-    /// scrutinee, by what follows the enclosing one.
-    fn case_live(&self, alts: &[SAlt], p: Pos) -> std::collections::HashSet<u32> {
+    /// The slots used after a case's scrutinee: by its alternatives (excluding `bslot` if it is a
+    /// raw binder being defined here) and, for a case in a scrutinee, by what follows the enclosing one.
+    fn case_live(&self, alts: &[SAlt], bslot: u32, p: Pos) -> std::collections::HashSet<u32> {
         let mut live = std::collections::HashSet::new();
         for a in alts {
             match a {
                 SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => self.slot_uses(b, &mut live),
             }
+        }
+        if bslot & RAW != 0 {
+            let b_idx = raw_idx(bslot);
+            live.retain(|&s| s == ALL_LIVE || s & RAW == 0 || raw_idx(s) != b_idx);
         }
         if p.mode == Mode::Scrut {
             if let Some(outer) = self.live.last() {
@@ -3491,17 +4077,29 @@ impl Gen {
             SExpr::Con(_, args) | SExpr::Prim(_, args) => args.iter().for_each(|a| atom(a, out)),
             SExpr::Let(binds, body) => {
                 for (_, b) in binds {
-                    b.atoms().iter().for_each(|a| atom(a, out));
+                    if let SBind::BoxRaw(r) = b {
+                        out.insert(*r);
+                    } else {
+                        b.atoms().iter().for_each(|a| atom(a, out));
+                    }
                 }
                 self.slot_uses_in(body, out, local);
             }
-            SExpr::Case(s, _, alts) => {
-                self.slot_uses_in(s, out, local);
+            SExpr::Case(s, bslot, alts) => {
+                let mut alt_uses = std::collections::HashSet::new();
                 for a in alts {
                     match a {
-                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => self.slot_uses_in(b, out, local),
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => {
+                            self.slot_uses_in(b, &mut alt_uses, local);
+                        }
                     }
                 }
+                if *bslot & RAW != 0 {
+                    let b_idx = raw_idx(*bslot);
+                    alt_uses.retain(|&k| k == ALL_LIVE || k & RAW == 0 || raw_idx(k) != b_idx);
+                }
+                out.extend(alt_uses);
+                self.slot_uses_in(s, out, local);
             }
             SExpr::Closure(c) => c.captures.iter().for_each(|a| atom(a, out)),
             SExpr::Fail(_) => {}
@@ -3528,9 +4126,10 @@ impl Gen {
     }
 
     /// The end of an inline primitive: its value (in R1) is returned, or, for a case scrutinee
-    /// computed in place, goes straight to the alternatives.
+    /// computed in place, goes straight to the alternatives (falling through when `fast_done` is `""`).
     fn fast_ret(&mut self, p: Pos) {
         match self.fast_done.clone() {
+            Some(l) if l.is_empty() => {}
             Some(l) => self.emit(&format!("jmp {l}")),
             None => self.ret(p),
         }
@@ -4033,7 +4632,8 @@ mod nullary_constructor_tests {
         let mut gen = Gen::new();
         gen.expr(&SExpr::Con("Test.Box".into(), vec![Atom::Lit(SLit::Int(42))]), position(Mode::Tail));
         assert!(gen.nullary_cons.is_empty());
-        assert!(gen.out.contains("hsc_gc"));
+        assert!(gen.out.contains("ja .Lgc"));
+        assert!(gen.cold_out.contains("hsc_gc"));
         assert!(gen.out.contains("movq %rcx, 8(%rax)"));
     }
 }
@@ -4417,7 +5017,7 @@ mod sprint6_codegen_tests {
         ]);
         let asm = Gen::program(&prog);
         assert!(asm.contains("addq %rdx, %rcx"), "expected inline addq for integerAdd:\n{asm}");
-        assert!(asm.contains("jno "), "expected overflow branch for integerAdd:\n{asm}");
+        assert!(asm.contains("jo .Liovf"), "expected out-of-line overflow branch for integerAdd:\n{asm}");
         assert!(asm.contains("subq $32, %r12"), "expected bump-pointer rollback on overflow:\n{asm}");
         assert!(asm.contains("cmoveq "), "expected inline comparison for integerEq:\n{asm}");
     }
@@ -4468,10 +5068,13 @@ mod sprint6_codegen_tests {
         let table = asm.split_once("hsc_globals:\n").unwrap().1;
         let lbl = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
         let g0_start = asm.find(&format!("{lbl}:\n")).expect("g0 label");
-        let g0_end = asm[g0_start..].find("jmp *(%rbp)").expect("g0 ret");
-        let g0 = &asm[g0_start..g0_start + g0_end];
-        assert_eq!(g0.matches("call hsc_gc_rt").count(), 1, "expected single fused GC check:\n{g0}");
-        assert!(g0.contains("leaq 48(%r12), %rax"), "expected 6-word (48-byte) combined bump:\n{g0}");
+        let g0_ret = asm[g0_start..].find("jmp *(%rbp)").expect("g0 ret");
+        let g0_hot = &asm[g0_start..g0_start + g0_ret];
+        let g0_end = asm[g0_start..].find(".section .rodata").expect("rodata");
+        let g0_all = &asm[g0_start..g0_start + g0_end];
+        assert_eq!(g0_hot.matches("call hsc_gc_rt").count(), 0, "GC stub should be out-of-line:\n{g0_hot}");
+        assert_eq!(g0_all.matches("call hsc_gc_rt").count(), 1, "expected single fused GC check:\n{g0_all}");
+        assert!(g0_hot.contains("leaq 48(%r12), %rax"), "expected 6-word (48-byte) combined bump:\n{g0_hot}");
     }
 
     #[test]
@@ -4502,6 +5105,131 @@ mod sprint6_codegen_tests {
         assert!(g0.contains("cmpq %rdx, %rcx"), "expected inline boxed cmpq:\n{g0}");
         assert!(g0.contains("jge "), "expected direct conditional jump without setl:\n{g0}");
         assert!(!g0.contains("setl "), "should not materialize 0/1 with setl:\n{g0}");
+    }
+
+    #[test]
+    fn boxed_compare_peels_join_and_fuses_three_way_comparison() {
+        // case (x <# y) as raw0 of _ ->
+        //   join j = 30# in
+        //   case raw0 of
+        //     1# -> 10#
+        //     _  -> case (x ># y) as raw1 of _ ->
+        //             case raw1 of
+        //               1# -> 20#
+        //               _  -> jump j
+        let inner_gt = SExpr::Case(
+            Box::new(SExpr::Prim(">#".into(), vec![Atom::Slot(1), Atom::Slot(2)])),
+            RAW | 1,
+            vec![SAlt::Default(SExpr::Case(
+                Box::new(SExpr::Atom(Atom::Slot(RAW | 1))),
+                RAW | 2,
+                vec![
+                    SAlt::Lit(Lit::Int(1), SExpr::Atom(Atom::Lit(SLit::Int(20)))),
+                    SAlt::Default(SExpr::Jump(7, vec![])),
+                ],
+            ))],
+        );
+        let body = SExpr::Case(
+            Box::new(SExpr::Prim("<#".into(), vec![Atom::Slot(1), Atom::Slot(2)])),
+            RAW | 0,
+            vec![SAlt::Default(SExpr::Join(
+                7,
+                vec![],
+                Box::new(SExpr::Atom(Atom::Lit(SLit::Int(30)))),
+                Box::new(SExpr::Case(
+                    Box::new(SExpr::Atom(Atom::Slot(RAW | 0))),
+                    RAW | 3,
+                    vec![
+                        SAlt::Lit(Lit::Int(1), SExpr::Atom(Atom::Lit(SLit::Int(10)))),
+                        SAlt::Default(inner_gt),
+                    ],
+                )),
+            ))],
+        );
+        let prog = make_prog(vec![SGlobal {
+            name: "Test.cmp3".into(),
+            closure: simple_closure(2, 3, 4, body),
+            worker: None,
+        }]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbl = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let g0_start = asm.find(&format!("{lbl}:\n")).expect("g0 label");
+        let g0_end = asm[g0_start..].find(".section .rodata").unwrap_or(asm.len() - g0_start);
+        let g0 = &asm[g0_start..g0_start + g0_end];
+        // One cmpq in the hot path followed directly by jl and jg (no second cmpq in hot path).
+        let hot = g0.split(".Ljoin").next().unwrap_or(g0);
+        assert_eq!(hot.matches("cmpq %rdx, %rcx").count(), 1, "expected single 3-way cmpq:\n{hot}");
+        assert!(hot.contains("jl .Lalt") && hot.contains("jg .Lalt"), "expected fused jl + jg:\n{hot}");
+    }
+
+    #[test]
+    fn box_raw_fuses_with_con_into_single_heap_check() {
+        // let b = BoxRaw(r0) in Con(":", [b, xs]) => 2 + 3 = 5 words (40 bytes) in one check.
+        let r0 = RAW | 0;
+        let body = SExpr::Let(
+            vec![(2, SBind::BoxRaw(r0))],
+            Box::new(SExpr::Con("Builtin.:".into(), vec![Atom::Slot(2), Atom::Slot(1)])),
+        );
+        let mut closure = simple_closure(1, 3, 1, body);
+        closure.raw_args = vec![(0, r0)];
+        let prog = make_prog(vec![SGlobal {
+            name: "Test.boxcon".into(),
+            closure,
+            worker: None,
+        }]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbl = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let g0_start = asm.find(&format!("{lbl}:\n")).expect("g0 label");
+        let g0_end = asm[g0_start..].find(".section .rodata").unwrap_or(asm.len() - g0_start);
+        let g0 = &asm[g0_start..g0_start + g0_end];
+        assert!(g0.contains("leaq 40(%r12), %rax"), "expected combined 5-word (40-byte) bump:\n{g0}");
+        assert_eq!(g0.matches("call hsc_gc_rt").count(), 1, "expected single GC check:\n{g0}");
+    }
+
+    #[test]
+    fn int_fast_path_fuses_directly_into_known_ref_write_mutvar() {
+        // case readMutVar# mv s of (s1, x) -> case (x +# 1#) as v of _ -> case writeMutVar# mv v s1 of _ -> s1
+        let body = SExpr::Case(
+            Box::new(SExpr::Prim("readMutVar#".into(), vec![Atom::Slot(1), Atom::Slot(2)])),
+            UNUSED_SLOT,
+            vec![SAlt::Con(
+                "Builtin.(,)".into(),
+                vec![3, 4],
+                SExpr::Case(
+                    Box::new(SExpr::Prim("+#".into(), vec![Atom::Slot(4), Atom::Lit(SLit::Int(1))])),
+                    5,
+                    vec![SAlt::Default(SExpr::Case(
+                        Box::new(SExpr::Prim("writeMutVar#".into(), vec![Atom::Slot(1), Atom::Slot(5), Atom::Slot(3)])),
+                        6,
+                        vec![SAlt::Default(SExpr::Atom(Atom::Slot(3)))],
+                    ))],
+                ),
+            )],
+        );
+        let prog = make_prog(vec![SGlobal {
+            name: "Test.incRef".into(),
+            closure: simple_closure(2, 7, 0, body),
+            worker: None,
+        }]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbl = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let g0_start = asm.find(&format!("{lbl}:\n")).expect("g0 label");
+        let g0_end = asm[g0_start..].find(".section .rodata").unwrap_or(asm.len() - g0_start);
+        let g0 = &asm[g0_start..g0_start + g0_end];
+        assert!(
+            g0.contains("movq %r14, 8(%rax)"),
+            "expected direct %r14 store into known-REF MutVar:\n{g0}",
+        );
+        // Only the readMutVar# checks REF tag; writeMutVar# skips the second cmpb $REF.
+        let hot = g0.split(".Lslow").next().unwrap_or(g0);
+        assert_eq!(
+            hot.matches(&format!("cmpb ${REF},")).count(),
+            1,
+            "expected single REF tag check in hot path:\n{hot}",
+        );
     }
 }
 
