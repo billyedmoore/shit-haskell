@@ -1494,6 +1494,13 @@ impl Checker {
             Lit::Str(s) => {
                 let str_ty = Ty::list(Ty::con("GHC.Types.Char"));
                 self.unify_at(&str_ty, ty)?;
+                if s.chars().count() <= 8 {
+                    let mut pat = CPat::Con("Builtin.[]".into(), vec![]);
+                    for c in s.chars().rev() {
+                        pat = CPat::Con("Builtin.:".into(), vec![CPat::Lit(CLit::Char(c)), pat]);
+                    }
+                    return Ok(pat);
+                }
                 (Core::Lit(CLit::Str(s.clone())), str_ty, false)
             }
         };

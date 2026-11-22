@@ -31,12 +31,13 @@ pub enum SLit {
     Frac(String),
 }
 
-/// A heap object bound in `SExpr::Let`: either a closure (function/thunk) or a constructor
-/// allocated directly in weak head normal form.
+/// A heap object bound in `SExpr::Let`: a closure (function/thunk), a constructor allocated
+/// directly in weak head normal form, or a boxed cell materialized from a raw slot.
 #[derive(Clone, Debug)]
 pub enum SBind {
     Closure(SClosure),
     Con(String, Vec<Atom>),
+    BoxRaw(u32),
 }
 
 impl SBind {
@@ -44,6 +45,7 @@ impl SBind {
         match self {
             SBind::Closure(c) => &c.captures,
             SBind::Con(_, args) => args,
+            SBind::BoxRaw(_) => &[],
         }
     }
 }
@@ -590,7 +592,12 @@ fn workers_with_strict(binds: &[TopBind], numeric: &NumericParams) -> (Workers, 
                 }
             }
             for (i, p) in params.iter().enumerate() {
-                if raw[i] && !raw_uses(body, p, &w, &strict_map, &init_whnf) {
+                if raw[i]
+                    && !raw_uses(body, p, &w, &strict_map, &init_whnf)
+                    && !(mentions(body, &name)
+                        && no_bad_raw_case(body, p)
+                        && has_unboxed_recursive_path(body, p, &name, &w, &strict_map, &init_whnf))
+                {
                     raw[i] = false;
                     changed = true;
                 }
@@ -605,6 +612,199 @@ fn workers_with_strict(binds: &[TopBind], numeric: &NumericParams) -> (Workers, 
         if !changed {
             return (w, strict_map);
         }
+    }
+}
+
+/// Whether `e` never scrutinizes `x` with a `Case` whose alternatives cannot match a raw slot
+/// (anything other than `Int`/`Char` literals or `Default`).
+fn no_bad_raw_case(e: &Core, x: &str) -> bool {
+    match e {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => true,
+        Core::App(f, a) => no_bad_raw_case(f, x) && no_bad_raw_case(a, x),
+        Core::Lam(p, b) => p == x || no_bad_raw_case(b, x),
+        Core::Let(binds, body) => {
+            if binds.iter().any(|(n, _)| n == x) {
+                return true;
+            }
+            binds.iter().all(|(_, r)| no_bad_raw_case(r, x)) && no_bad_raw_case(body, x)
+        }
+        Core::Case(s, b, alts) => {
+            let mut cur = s.as_ref();
+            while let Core::Prim(p, args) = cur {
+                if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 {
+                    cur = &args[0];
+                } else {
+                    break;
+                }
+            }
+            if matches!(cur, Core::Var(v) if v == x) {
+                let alts_ok = alts
+                    .iter()
+                    .all(|a| matches!(a, Alt::Lit(Lit::Int(_) | Lit::Char(_), _) | Alt::Default(_)));
+                if !alts_ok {
+                    return false;
+                }
+            } else if !no_bad_raw_case(s, x) {
+                return false;
+            }
+            b == x
+                || alts.iter().all(|a| match a {
+                    Alt::Con(_, vars, body) => vars.iter().any(|v| v == x) || no_bad_raw_case(body, x),
+                    Alt::Lit(_, body) | Alt::Default(body) => no_bad_raw_case(body, x),
+                })
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| no_bad_raw_case(a, x)),
+    }
+}
+
+/// Whether `e` contains an exact worker call to `target` along an evaluated path.
+fn has_self_raw_call(
+    e: &Core,
+    target: &str,
+    w: &Workers,
+    strict_map: &Workers,
+    whnf: &std::collections::HashSet<String>,
+) -> bool {
+    match e {
+        Core::App(..) => {
+            let (f, args) = spine(e);
+            matches!(f, Core::Var(g) if g == target && can_call_worker(g.as_str(), &args, w, strict_map, whnf))
+        }
+        Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+            if let Core::Var(v) = &args[0] {
+                let mut next = whnf.clone();
+                next.insert(v.clone());
+                has_self_raw_call(&args[1], target, w, strict_map, &next)
+            } else {
+                has_self_raw_call(&args[1], target, w, strict_map, whnf)
+            }
+        }
+        Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+            has_self_raw_call(&args[0], target, w, strict_map, whnf)
+        }
+        Core::Let(binds, body) => {
+            let mut next = whnf.clone();
+            for (n, _) in binds {
+                next.remove(n);
+            }
+            has_self_raw_call(body, target, w, strict_map, &next)
+        }
+        Core::Case(s, b, alts) => {
+            if has_self_raw_call(s, target, w, strict_map, whnf) {
+                return true;
+            }
+            let mut base_whnf = whnf.clone();
+            add_case_whnf(s, b, &mut base_whnf);
+            alts.iter().any(|a| match a {
+                Alt::Con(_, vars, body) => {
+                    let mut alt_whnf = base_whnf.clone();
+                    for v in vars {
+                        alt_whnf.remove(v);
+                    }
+                    has_self_raw_call(body, target, w, strict_map, &alt_whnf)
+                }
+                Alt::Lit(_, body) | Alt::Default(body) => has_self_raw_call(body, target, w, strict_map, &base_whnf),
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Whether `e` keeps `x` unboxed along at least one recursive path back to `target` without
+/// boxing `x` before the branch, allowing colder alternatives (e.g. constructing a solution in
+/// backtracking search) to box `x` on demand via `SBind::BoxRaw`.
+fn has_unboxed_recursive_path(
+    e: &Core,
+    x: &str,
+    target: &str,
+    w: &Workers,
+    strict_map: &Workers,
+    whnf: &std::collections::HashSet<String>,
+) -> bool {
+    match e {
+        Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+            if mentions(&args[0], x) {
+                return false;
+            }
+            if let Core::Var(v) = &args[0] {
+                let mut next = whnf.clone();
+                next.insert(v.clone());
+                has_unboxed_recursive_path(&args[1], x, target, w, strict_map, &next)
+            } else {
+                has_unboxed_recursive_path(&args[1], x, target, w, strict_map, whnf)
+            }
+        }
+        Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+            has_unboxed_recursive_path(&args[0], x, target, w, strict_map, whnf)
+        }
+        Core::Let(binds, body) => {
+            if binds.iter().any(|(n, _)| n == x) {
+                return false;
+            }
+            let mut next = whnf.clone();
+            for (n, _) in binds {
+                next.remove(n);
+            }
+            if is_join(binds, body) {
+                let mut code_whnf = whnf.clone();
+                let mut cur = &binds[0].1;
+                let mut shadowed = false;
+                while let Core::Lam(p, inner) = cur {
+                    if p == x {
+                        shadowed = true;
+                    }
+                    code_whnf.remove(p);
+                    cur = inner;
+                }
+                (shadowed || raw_uses_in(cur, x, w, strict_map, &code_whnf, true))
+                    && has_unboxed_recursive_path(body, x, target, w, strict_map, &next)
+            } else {
+                binds.iter().all(|(_, r)| !mentions(r, x))
+                    && has_unboxed_recursive_path(body, x, target, w, strict_map, &next)
+            }
+        }
+        Core::Case(s, b, alts) => {
+            let scrut_is_x = matches!(&**s, Core::Var(v) if v == x);
+            if !scrut_is_x && !raw_uses_in(s, x, w, strict_map, whnf, false) {
+                return false;
+            }
+            if b == x {
+                return false;
+            }
+            let mut base_whnf = whnf.clone();
+            add_case_whnf(s, b, &mut base_whnf);
+            alts.iter().any(|a| match a {
+                Alt::Con(_, vars, body) => {
+                    if scrut_is_x || vars.iter().any(|v| v == x) {
+                        return false;
+                    }
+                    let mut alt_whnf = base_whnf.clone();
+                    for v in vars {
+                        alt_whnf.remove(v);
+                    }
+                    (raw_uses_in(body, x, w, strict_map, &alt_whnf, true)
+                        && has_self_raw_call(body, target, w, strict_map, &alt_whnf))
+                        || has_unboxed_recursive_path(body, x, target, w, strict_map, &alt_whnf)
+                }
+                Alt::Lit(l, body) => {
+                    if scrut_is_x && (!matches!(l, Lit::Int(_) | Lit::Char(_)) || mentions(body, b)) {
+                        return false;
+                    }
+                    (raw_uses_in(body, x, w, strict_map, &base_whnf, true)
+                        && has_self_raw_call(body, target, w, strict_map, &base_whnf))
+                        || has_unboxed_recursive_path(body, x, target, w, strict_map, &base_whnf)
+                }
+                Alt::Default(body) => {
+                    if scrut_is_x && mentions(body, b) {
+                        return false;
+                    }
+                    (raw_uses_in(body, x, w, strict_map, &base_whnf, true)
+                        && has_self_raw_call(body, target, w, strict_map, &base_whnf))
+                        || has_unboxed_recursive_path(body, x, target, w, strict_map, &base_whnf)
+                }
+            })
+        }
+        _ => false,
     }
 }
 
@@ -634,6 +834,8 @@ struct Body {
     capture_index: HashMap<String, u32>,
     /// The join points in scope, to their id and arity.
     joins: HashMap<String, (u32, usize)>,
+    /// Objects for the non-atomic arguments of the operation being lowered in this body.
+    pending: Vec<(u32, SBind)>,
     /// Variables known to be in WHNF (or raw) at the current point in this body.
     whnf: std::collections::HashSet<String>,
     /// Where the expression being lowered is (see `Ctx`).
@@ -655,8 +857,6 @@ pub struct Lowering {
     index: HashMap<String, u32>,
     /// The stack of bodies being lowered: the innermost is last.
     bodies: Vec<Body>,
-    /// Objects for the non-atomic arguments of the operation being lowered, to be allocated before it.
-    pending: Vec<(u32, SBind)>,
     /// The next join point id (unique in the program).
     next_join: u32,
     /// The functions with workers (see `workers`).
@@ -679,6 +879,7 @@ impl Body {
             captures: Vec::new(),
             capture_index: HashMap::new(),
             joins: HashMap::new(),
+            pending: Vec::new(),
             whnf: std::collections::HashSet::new(),
             ctx: Ctx::Tail,
             ret_raw: None,
@@ -705,7 +906,6 @@ impl Lowering {
         let mut lw = Lowering {
             index: index.clone(),
             bodies: Vec::new(),
-            pending: Vec::new(),
             next_join: 0,
             workers,
             worker_strict,
@@ -788,9 +988,33 @@ impl Lowering {
         };
         let body = self.strict(body_expr);
         let b = self.bodies.pop().expect("body");
+        debug_assert!(b.pending.is_empty(), "internal: unconsumed pending bindings");
         let captures: Vec<Atom> = b.captures.iter().map(|(_, a)| a.clone()).collect();
         let uses_closure = !captures.is_empty() || expr_uses_closure(&body);
-        SClosure { arity, captures, nslots: b.nslots, nraw: b.nraw, raw_args, ret_raw: b.ret_raw.is_some(), uses_closure, body }
+        let mut closure = SClosure {
+            arity,
+            captures,
+            nslots: b.nslots,
+            nraw: b.nraw,
+            raw_args,
+            ret_raw: b.ret_raw.is_some(),
+            uses_closure,
+            body,
+        };
+        compact_raw_slots(&mut closure);
+        closure
+    }
+
+    fn pending_len(&self) -> usize {
+        self.bodies.last().expect("body").pending.len()
+    }
+
+    /// Boxes raw slot `r` in body `depth` by scheduling `SBind::BoxRaw(r)` on its pending list.
+    fn box_raw_at(&mut self, depth: usize, r: u32) -> Atom {
+        let b = &mut self.bodies[depth];
+        let s = b.fresh_slot();
+        b.pending.push((s, SBind::BoxRaw(r)));
+        Atom::Slot(s)
     }
 
     /// Resolves a variable in the current body: a slot, a captured variable (captured now from
@@ -816,8 +1040,14 @@ impl Lowering {
         if depth == 0 {
             return None;
         }
-        // Capture from the enclosing body.
-        let outer = self.resolve_at(depth - 1, name)?;
+        // Capture from the enclosing body; raw slots cannot be captured directly by a closure
+        // (the collector traces closure captures as heap pointers), so box on demand in the outer body.
+        let mut outer = self.resolve_at(depth - 1, name)?;
+        if let Atom::Slot(r) = outer {
+            if r & RAW != 0 {
+                outer = self.box_raw_at(depth - 1, r);
+            }
+        }
         let b = &mut self.bodies[depth];
         let i = b.captures.len() as u32;
         b.captures.push((name.to_string(), outer));
@@ -902,7 +1132,7 @@ impl Lowering {
             },
             Core::Lit(l) => SExpr::Atom(Atom::Lit(slit(l))),
             Core::App(..) => {
-                let mark = self.pending.len();
+                let mark = self.pending_len();
                 let (f, args) = spine(e);
                 if let Some(id) = match f { Core::Var(v) => self.join(v, args.len()), _ => None } {
                     let aa = args.iter().map(|a| self.atom(a)).collect();
@@ -933,7 +1163,11 @@ impl Lowering {
                     (None, None) => call,
                 }
             }
-            Core::Lam(..) => SExpr::Closure(Box::new(self.closure_of(e))),
+            Core::Lam(..) => {
+                let mark = self.pending_len();
+                let c = self.closure_of(e);
+                self.allocating(mark, SExpr::Closure(Box::new(c)))
+            }
             Core::Let(binds, body) if is_join(binds, body) => {
                 let (name, rhs) = &binds[0];
                 let saved_whnf = self.bodies.last().expect("body").whnf.clone();
@@ -1016,12 +1250,26 @@ impl Lowering {
                     b.nraw = scrut_raw_base;
                     t
                 };
+                let scrut_raw_slot = match &scrut {
+                    SExpr::Atom(Atom::Slot(r)) if r & RAW != 0 => Some(*r),
+                    _ => None,
+                };
                 let needs_bslot = raw
                     || alts_free_mention(alts, binder)
                     || alts.iter().any(|a| {
                         matches!(a, Alt::Lit(l, _) if !matches!(l, Lit::Int(_) | Lit::Char(_) | Lit::Double(_)))
                     });
-                let bslot = if raw {
+                let mut saved_binder_local: Option<Option<u32>> = None;
+                let bslot = if let Some(r) = scrut_raw_slot {
+                    // Codegen skips writing `bslot` when scrutinizing a raw atom; alias `binder`
+                    // directly to the raw slot so any use in the alts reads (or boxes) `r`.
+                    if alts_free_mention(alts, binder) {
+                        let b = self.bodies.last_mut().expect("body");
+                        b.joins.remove(binder);
+                        saved_binder_local = Some(b.locals.insert(binder.clone(), r));
+                    }
+                    UNUSED_SLOT
+                } else if raw {
                     self.bind_raw(binder, char)
                 } else if needs_bslot {
                     self.bind_local(binder)
@@ -1052,13 +1300,23 @@ impl Lowering {
                     raw_top = raw_top.max(b.nraw);
                 }
                 let b = self.bodies.last_mut().expect("body");
+                if let Some(prev) = saved_binder_local {
+                    match prev {
+                        Some(s) => {
+                            b.locals.insert(binder.clone(), s);
+                        }
+                        None => {
+                            b.locals.remove(binder);
+                        }
+                    }
+                }
                 b.nslots = top;
                 b.nraw = raw_top;
                 b.whnf = saved_whnf;
                 SExpr::Case(Box::new(scrut), bslot, lowered)
             }
             Core::Con(name, args) => {
-                let mark = self.pending.len();
+                let mark = self.pending_len();
                 let atoms = args.iter().map(|a| self.atom(a)).collect();
                 self.allocating(mark, SExpr::Con(name.clone(), atoms))
             }
@@ -1116,7 +1374,7 @@ impl Lowering {
                     }
                     return self.strict(&wrapped);
                 }
-                let mark = self.pending.len();
+                let mark = self.pending_len();
                 let atoms = args.iter().map(|a| self.atom(a)).collect();
                 let prim = self.allocating(mark, SExpr::Prim(name.clone(), atoms));
                 match self.raw_result() {
@@ -1125,8 +1383,12 @@ impl Lowering {
                 }
             }
             Core::Prim(name, args) => {
-                let mark = self.pending.len();
-                let atoms = args.iter().map(|a| self.atom(a)).collect();
+                let mark = self.pending_len();
+                let accepts_raw = raw_operand_prim(name);
+                let atoms = args
+                    .iter()
+                    .map(|a| if accepts_raw { self.raw_or_boxed_atom(a) } else { self.atom(a) })
+                    .collect();
                 let prim = self.allocating(mark, SExpr::Prim(name.clone(), atoms));
                 match self.raw_result() {
                     // A primitive's result returned raw: its number (stored raw, or unboxed).
@@ -1172,7 +1434,7 @@ impl Lowering {
                 }
             }
         }
-        let mark = self.pending.len();
+        let mark = self.pending_len();
         let Atom::Global(gi) = self.atom(f) else { return None };
         let aa: Vec<Atom> = args.iter().zip(atoms).map(|(a, at)| at.unwrap_or_else(|| self.atom(a))).collect();
         let mut e = self.allocating(mark, SExpr::CallWorker(gi, aa));
@@ -1184,10 +1446,11 @@ impl Lowering {
 
     /// Wraps an operation with the allocations of the objects its arguments needed.
     fn allocating(&mut self, mark: usize, op: SExpr) -> SExpr {
-        if self.pending.len() == mark {
+        let b = self.bodies.last_mut().expect("body");
+        if b.pending.len() == mark {
             return op;
         }
-        let bindings: Vec<(u32, SBind)> = self.pending.drain(mark..).collect();
+        let bindings: Vec<(u32, SBind)> = b.pending.drain(mark..).collect();
         SExpr::Let(bindings, Box::new(op))
     }
 
@@ -1219,7 +1482,7 @@ impl Lowering {
     /// then closures and direct constructors are lowered into one batched `SExpr::Let`.
     fn let_binds(&mut self, binds: &[(String, Core)]) -> Vec<(u32, SBind)> {
         let slots: Vec<u32> = binds.iter().map(|(n, _)| self.bind_local(n)).collect();
-        let mark = self.pending.len();
+        let mark = self.pending_len();
         let mut out = Vec::with_capacity(binds.len());
         for (slot, (_, rhs)) in slots.into_iter().zip(binds) {
             if let Core::Con(con, args) = rhs {
@@ -1229,7 +1492,7 @@ impl Lowering {
                 out.push((slot, SBind::Closure(self.closure_of(rhs))));
             }
         }
-        let mut all: Vec<(u32, SBind)> = self.pending.drain(mark..).collect();
+        let mut all: Vec<(u32, SBind)> = self.bodies.last_mut().expect("body").pending.drain(mark..).collect();
         all.extend(out);
         all
     }
@@ -1254,12 +1517,26 @@ impl Lowering {
         }
     }
 
-    /// An argument: a variable or literal is passed as it is; a constructor is allocated directly
-    /// in WHNF (zero heap allocation for nullary constructors, exposing nested selector thunks);
-    /// anything else becomes a closure.
-    fn atom(&mut self, e: &Core) -> Atom {
+    /// An operand for a primitive that can accept either a raw slot or a boxed atom.
+    fn raw_or_boxed_atom(&mut self, e: &Core) -> Atom {
         match e {
             Core::Var(v) => self.resolve(v),
+            other => self.atom(other),
+        }
+    }
+
+    /// A boxed argument: a variable or literal is passed as it is (boxing a raw slot on demand);
+    /// a constructor is allocated directly in WHNF (zero heap allocation for nullary constructors,
+    /// exposing nested selector thunks); anything else becomes a closure.
+    fn atom(&mut self, e: &Core) -> Atom {
+        match e {
+            Core::Var(v) => match self.resolve(v) {
+                Atom::Slot(r) if r & RAW != 0 => {
+                    let depth = self.bodies.len() - 1;
+                    self.box_raw_at(depth, r)
+                }
+                other => other,
+            },
             // Numbers, small Integers and characters are static objects; the others are built when they are used.
             Core::Lit(l @ (Lit::Int(_) | Lit::Double(_) | Lit::Char(_))) => Atom::Lit(slit(l)),
             Core::Lit(Lit::Integer(s)) if s.parse::<i64>().is_ok() => Atom::Lit(SLit::Integer(s.clone())),
@@ -1267,7 +1544,7 @@ impl Lowering {
                 let atoms: Vec<Atom> = args.iter().map(|a| self.atom(a)).collect();
                 let b = self.bodies.last_mut().expect("body");
                 let s = b.fresh_slot();
-                self.pending.push((s, SBind::Con(con.clone(), atoms)));
+                b.pending.push((s, SBind::Con(con.clone(), atoms)));
                 Atom::Slot(s)
             }
             other => {
@@ -1275,11 +1552,241 @@ impl Lowering {
                 let c = self.closure_of(other);
                 let b = self.bodies.last_mut().expect("body");
                 let s = b.fresh_slot();
-                self.pending.push((s, SBind::Closure(c)));
+                b.pending.push((s, SBind::Closure(c)));
                 Atom::Slot(s)
             }
         }
     }
+}
+
+/// Compacts raw slot indices in `c` via backward liveness + interference-graph greedy coloring
+/// so dead sequential raw temporaries reuse slots and shrink the frame size (e.g. `fib`: 7 -> 2).
+fn compact_raw_slots(c: &mut SClosure) {
+    let n = c.nraw as usize;
+    if n <= 1 || n > 64 {
+        return;
+    }
+    let all_mask: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let mut adj = [0u64; 64];
+    let mut active = 0u64;
+
+    let raw_bit = |s: u32| -> u64 {
+        if s & RAW != 0 {
+            1u64 << (s & !(RAW | RAW_CHAR))
+        } else {
+            0
+        }
+    };
+    let atom_bit = |a: &Atom| -> u64 {
+        match a {
+            Atom::Slot(s) => raw_bit(*s),
+            _ => 0,
+        }
+    };
+    let interfere = |adj: &mut [u64; 64], def: usize, live: u64| {
+        let m = live & !(1u64 << def);
+        adj[def] |= m;
+        let mut rem = m;
+        while rem != 0 {
+            let j = rem.trailing_zeros() as usize;
+            adj[j] |= 1u64 << def;
+            rem &= rem - 1;
+        }
+    };
+
+    fn liveness(
+        e: &SExpr,
+        live_after: u64,
+        all_mask: u64,
+        joins: &mut HashMap<u32, u64>,
+        adj: &mut [u64; 64],
+        active: &mut u64,
+        atom_bit: &impl Fn(&Atom) -> u64,
+        interfere: &impl Fn(&mut [u64; 64], usize, u64),
+    ) -> u64 {
+        match e {
+            SExpr::Atom(a) => {
+                let u = atom_bit(a);
+                *active |= u;
+                live_after | u
+            }
+            SExpr::App(f, args) => {
+                let u = args.iter().fold(atom_bit(f), |m, a| m | atom_bit(a));
+                *active |= u;
+                live_after | u
+            }
+            SExpr::CallWorker(_, args) | SExpr::Con(_, args) | SExpr::Prim(_, args) => {
+                let u = args.iter().fold(0u64, |m, a| m | atom_bit(a));
+                *active |= u;
+                live_after | u
+            }
+            SExpr::Let(binds, body) => {
+                let body_in = liveness(body, live_after, all_mask, joins, adj, active, atom_bit, interfere);
+                let mut u = 0u64;
+                for (_, b) in binds {
+                    match b {
+                        SBind::BoxRaw(r) => u |= 1u64 << (*r & !(RAW | RAW_CHAR)),
+                        _ => {
+                            for a in b.atoms() {
+                                u |= atom_bit(a);
+                            }
+                        }
+                    }
+                }
+                *active |= u;
+                body_in | u
+            }
+            SExpr::Case(scrut, bslot, alts) => {
+                let mut alts_in = 0u64;
+                for a in alts {
+                    let b = match a {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => b,
+                    };
+                    alts_in |= liveness(b, live_after, all_mask, joins, adj, active, atom_bit, interfere);
+                }
+                if *bslot & RAW != 0 {
+                    let d = (*bslot & !(RAW | RAW_CHAR)) as usize;
+                    *active |= 1u64 << d;
+                    interfere(adj, d, alts_in);
+                    alts_in &= !(1u64 << d);
+                }
+                liveness(scrut, alts_in, all_mask, joins, adj, active, atom_bit, interfere)
+            }
+            SExpr::Closure(cl) => {
+                let u = cl.captures.iter().fold(0u64, |m, a| m | atom_bit(a));
+                *active |= u;
+                live_after | u
+            }
+            SExpr::Fail(_) => live_after,
+            SExpr::Join(id, _, code, body) => {
+                let code_in = liveness(code, live_after, all_mask, joins, adj, active, atom_bit, interfere);
+                joins.insert(*id, code_in);
+                liveness(body, live_after, all_mask, joins, adj, active, atom_bit, interfere)
+            }
+            SExpr::Jump(id, args) => {
+                let u = args.iter().fold(0u64, |m, a| m | atom_bit(a));
+                *active |= u;
+                let j = joins.get(id).copied().unwrap_or(all_mask);
+                j | u
+            }
+        }
+    }
+
+    let mut joins = HashMap::new();
+    let body_in = liveness(&c.body, 0, all_mask, &mut joins, &mut adj, &mut active, &atom_bit, &interfere);
+    let mut raw_args_mask = 0u64;
+    for &(_, r) in &c.raw_args {
+        let d = (r & !(RAW | RAW_CHAR)) as usize;
+        raw_args_mask |= 1u64 << d;
+        active |= 1u64 << d;
+    }
+    for &(_, r) in &c.raw_args {
+        let d = (r & !(RAW | RAW_CHAR)) as usize;
+        interfere(&mut adj, d, body_in | raw_args_mask);
+    }
+
+    let mut color = [u32::MAX; 64];
+    let mut max_color = 0u32;
+    let mut colored_any = false;
+    // Keep raw_args in their original 0.. order when possible.
+    for &(_, r) in &c.raw_args {
+        let i = (r & !(RAW | RAW_CHAR)) as usize;
+        if color[i] == u32::MAX {
+            let mut used = 0u64;
+            let mut nb = adj[i];
+            while nb != 0 {
+                let j = nb.trailing_zeros() as usize;
+                if color[j] != u32::MAX {
+                    used |= 1u64 << color[j];
+                }
+                nb &= nb - 1;
+            }
+            let col = (!used).trailing_zeros();
+            color[i] = col;
+            max_color = max_color.max(col);
+            colored_any = true;
+        }
+    }
+    for i in 0..n {
+        if (active & (1u64 << i)) == 0 || color[i] != u32::MAX {
+            continue;
+        }
+        let mut used = 0u64;
+        let mut nb = adj[i];
+        while nb != 0 {
+            let j = nb.trailing_zeros() as usize;
+            if color[j] != u32::MAX {
+                used |= 1u64 << color[j];
+            }
+            nb &= nb - 1;
+        }
+        let col = (!used).trailing_zeros();
+        color[i] = col;
+        max_color = max_color.max(col);
+        colored_any = true;
+    }
+
+    let new_nraw = if colored_any { max_color + 1 } else { 0 };
+    if new_nraw >= c.nraw {
+        return;
+    }
+
+    let remap = |s: &mut u32| {
+        if *s & RAW != 0 {
+            let idx = (*s & !(RAW | RAW_CHAR)) as usize;
+            let col = color[idx];
+            debug_assert!(col != u32::MAX, "internal: uncolored raw slot {idx}");
+            *s = RAW | (*s & RAW_CHAR) | col;
+        }
+    };
+    let remap_atom = |a: &mut Atom| {
+        if let Atom::Slot(s) = a {
+            remap(s);
+        }
+    };
+    fn rewrite_expr(e: &mut SExpr, remap: &impl Fn(&mut u32), remap_atom: &impl Fn(&mut Atom)) {
+        match e {
+            SExpr::Atom(a) => remap_atom(a),
+            SExpr::App(f, args) => {
+                remap_atom(f);
+                args.iter_mut().for_each(remap_atom);
+            }
+            SExpr::CallWorker(_, args) | SExpr::Con(_, args) | SExpr::Prim(_, args) | SExpr::Jump(_, args) => {
+                args.iter_mut().for_each(remap_atom);
+            }
+            SExpr::Let(binds, body) => {
+                for (_, b) in binds {
+                    match b {
+                        SBind::Closure(cl) => cl.captures.iter_mut().for_each(remap_atom),
+                        SBind::Con(_, args) => args.iter_mut().for_each(remap_atom),
+                        SBind::BoxRaw(r) => remap(r),
+                    }
+                }
+                rewrite_expr(body, remap, remap_atom);
+            }
+            SExpr::Case(scrut, bslot, alts) => {
+                rewrite_expr(scrut, remap, remap_atom);
+                remap(bslot);
+                for a in alts {
+                    match a {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => rewrite_expr(b, remap, remap_atom),
+                    }
+                }
+            }
+            SExpr::Closure(cl) => cl.captures.iter_mut().for_each(remap_atom),
+            SExpr::Fail(_) => {}
+            SExpr::Join(_, _, code, body) => {
+                rewrite_expr(code, remap, remap_atom);
+                rewrite_expr(body, remap, remap_atom);
+            }
+        }
+    }
+
+    for (_, r) in &mut c.raw_args {
+        remap(r);
+    }
+    rewrite_expr(&mut c.body, &remap, &remap_atom);
+    c.nraw = new_nraw;
 }
 
 /// Whether `e` (or the capture list of any nested closure it allocates) reads slot 0 or a free variable.
@@ -2668,6 +3175,141 @@ mod raw_slot_tests {
             panic!("expected outer Case after float_let_into_case, got {:?}", binds[2].body);
         };
         assert!(matches!(&float_alts[1], Alt::Default(Core::Case(..))), "Default branch should inline small Case RHS: {:?}", float_alts[1]);
+    }
+
+    fn app(f: Core, a: Core) -> Core {
+        Core::App(Box::new(f), Box::new(a))
+    }
+
+    #[test]
+    fn cold_boxing_promotes_backtracking_loop_but_not_all_branch_boxing() {
+        // 1. Backtracking loop (`go n q = case q ># n of 1# -> Nil; _ -> case flag of 0# -> go n (q +# 1#); _ -> Cons q (go n (q +# 1#))`):
+        //    `n` and `q` stay unboxed on the recursive `0#` branch and box on demand (`SBind::BoxRaw`)
+        //    on the cold `Cons` branch -> gets raw worker `[true, true]`.
+        let step = app(app(var("Test.go"), var("n")), prim("+#", vec![var("q"), Core::Lit(Lit::Int(1))]));
+        let cold_cons = Core::Con("Builtin.:".into(), vec![var("q"), step.clone()]);
+        let go_body = Core::Lam(
+            "n".into(),
+            Box::new(Core::Lam(
+                "q".into(),
+                Box::new(case(
+                    prim(">#", vec![var("q"), var("n")]),
+                    "cmp",
+                    Core::Case(
+                        Box::new(var("cmp")),
+                        "cb1".into(),
+                        vec![
+                            Alt::Lit(Lit::Int(1), Core::Con("Builtin.[]".into(), vec![])),
+                            Alt::Default(Core::Case(
+                                Box::new(var("Test.flag")),
+                                "fb".into(),
+                                vec![
+                                    Alt::Lit(Lit::Int(0), step),
+                                    Alt::Default(cold_cons),
+                                ],
+                            )),
+                        ],
+                    ),
+                )),
+            )),
+        );
+        // 2. Tree insert (`ins k t = case k <# 0# of 1# -> Node k (ins k t); _ -> Node k (ins k t)`):
+        //    every branch boxes `k` into a constructor/thunk -> must NOT get a raw worker.
+        let rec_node = Core::Con("Test.Node".into(), vec![var("k"), app(app(var("Test.ins"), var("k")), var("t"))]);
+        let ins_body = Core::Lam(
+            "k".into(),
+            Box::new(Core::Lam(
+                "t".into(),
+                Box::new(case(
+                    prim("<#", vec![var("k"), Core::Lit(Lit::Int(0))]),
+                    "cmp2",
+                    Core::Case(
+                        Box::new(var("cmp2")),
+                        "cb2".into(),
+                        vec![
+                            Alt::Lit(Lit::Int(1), rec_node.clone()),
+                            Alt::Default(rec_node),
+                        ],
+                    ),
+                )),
+            )),
+        );
+        let binds = vec![
+            TopBind { name: "Test.flag".into(), body: Core::Lit(Lit::Int(0)) },
+            TopBind { name: "Test.go".into(), body: go_body },
+            TopBind { name: "Test.ins".into(), body: ins_body },
+        ];
+        let numeric = NumericParams {
+            params: [
+                ("Test.go".to_string(), vec![NUM_INT, NUM_INT]),
+                ("Test.ins".to_string(), vec![NUM_INT, 0]),
+            ]
+            .into_iter()
+            .collect(),
+            results: HashMap::new(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (go_worker, go_raw) = prog.globals[1].worker.as_ref().expect("go should get raw worker");
+        assert_eq!(go_raw, &vec![true, true]);
+        fn has_box_raw(e: &SExpr) -> bool {
+            match e {
+                SExpr::Let(bs, b) => bs.iter().any(|(_, bind)| matches!(bind, SBind::BoxRaw(_))) || has_box_raw(b),
+                SExpr::Case(s, _, alts) => {
+                    has_box_raw(s)
+                        || alts.iter().any(|a| match a {
+                            SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => has_box_raw(b),
+                        })
+                }
+                SExpr::Join(_, _, c, b) => has_box_raw(c) || has_box_raw(b),
+                _ => false,
+            }
+        }
+        assert!(has_box_raw(&go_worker.body), "expected SBind::BoxRaw on cold branch: {:?}", go_worker.body);
+        assert!(prog.globals[2].worker.is_none(), "ins boxes on every branch and should not get raw worker");
+    }
+
+    #[test]
+    fn compact_raw_slots_shrinks_sequential_fib_temporaries() {
+        // fib n = case n <# 2# of 1# -> n; _ -> case fib (n -# 1#) of a -> case fib (n -# 2#) of b -> a +# b
+        let fib_body = Core::Lam(
+            "n".into(),
+            Box::new(case(
+                prim("<#", vec![var("n"), Core::Lit(Lit::Int(2))]),
+                "c",
+                Core::Case(
+                    Box::new(var("c")),
+                    "cb".into(),
+                    vec![
+                        Alt::Lit(Lit::Int(1), var("n")),
+                        Alt::Default(case(
+                            prim("-#", vec![var("n"), Core::Lit(Lit::Int(1))]),
+                            "n1",
+                            case(
+                                app(var("Test.fib"), var("n1")),
+                                "a",
+                                case(
+                                    prim("-#", vec![var("n"), Core::Lit(Lit::Int(2))]),
+                                    "n2",
+                                    case(
+                                        app(var("Test.fib"), var("n2")),
+                                        "b",
+                                        prim("+#", vec![var("a"), var("b")]),
+                                    ),
+                                ),
+                            ),
+                        )),
+                    ],
+                ),
+            )),
+        );
+        let binds = vec![TopBind { name: "Test.fib".into(), body: fib_body }];
+        let numeric = NumericParams {
+            params: [("Test.fib".to_string(), vec![NUM_INT])].into_iter().collect(),
+            results: [("Test.fib".to_string(), (1, NUM_INT))].into_iter().collect(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, _) = prog.globals[0].worker.as_ref().expect("fib worker");
+        assert!(worker.nraw <= 2, "expected compacted nraw <= 2 for fib, got {}", worker.nraw);
     }
 }
 
