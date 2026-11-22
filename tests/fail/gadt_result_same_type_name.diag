@@ -1,0 +1,4 @@
+4:9: error:
+Constructor ‘Mk’ must return its parent type
+Expected a result headed by ‘Main.Maybe’
+Actual result: ‘GHC.Internal.Maybe.Maybe GHC.Types.Int’

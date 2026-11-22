@@ -1,0 +1,4 @@
+5:9: error:
+Constructor ‘Mk’ must return its parent type
+Expected a result headed by ‘T’
+Actual result: ‘F’

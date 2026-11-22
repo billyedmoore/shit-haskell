@@ -557,7 +557,30 @@ impl Checker {
                 }
             }
             let res = match &c.gadt_result {
-                Some(t) => self.convert_type(t, &mut vars)?,
+                Some(t) => {
+                    let result = self.convert_type(t, &mut vars)?;
+                    let (head, _) = result.split_apps();
+                    // A data-family instance has a synthetic representation name. Its
+                    // constructor returns the public family application instead.
+                    if !dd.name.starts_with("R:") && !matches!(head, Ty::Con(name) if name == &tycon) {
+                        let parent = Ty::Con(tycon.clone());
+                        let expected = self.show(&parent);
+                        let (expected, actual) = if expected == self.show(head) {
+                            let show = |ty| super::types::show_ty_qualified(&self.metas, ty);
+                            (show(&parent), show(&result))
+                        } else {
+                            (expected, self.show(&result))
+                        };
+                        return Err(TcError {
+                            loc: t.loc(),
+                            msg: format!(
+                                "Constructor ‘{}’ must return its parent type\nExpected a result headed by ‘{expected}’\nActual result: ‘{actual}’",
+                                c.name
+                            ),
+                        });
+                    }
+                    result
+                }
                 None => result_head.clone(),
             };
             let mut preds = Vec::new();
