@@ -108,6 +108,7 @@ pub struct Extensions {
     on: BTreeSet<String>,
     pub(crate) warnings: crate::diagnostic::WarningOptions,
     pub(crate) tabs: Option<(crate::syntax::ast::Loc, usize)>,
+    pub(crate) unknown_pragmas: Vec<(crate::syntax::ast::Loc, String)>,
 }
 
 impl Default for Extensions {
@@ -122,6 +123,7 @@ impl Extensions {
             on: GHC2021.iter().map(|s| s.to_string()).collect(),
             warnings: Default::default(),
             tabs: None,
+            unknown_pragmas: Vec::new(),
         }
     }
 

@@ -14,6 +14,7 @@ mod quote;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::diagnostic::one_edit_apart;
 use crate::syntax::ast::*;
 use crate::syntax::extensions::Extensions;
 use fixity::{resolve, Tk};
@@ -91,6 +92,7 @@ pub struct Renamer<'a> {
     rebindable: bool,
     partial_type_signatures: bool,
     named_wildcards: bool,
+    empty_data_decls: bool,
     /// Fixities declared for local operators (`where infixl 3 <!>`), by their unique local name.
     local_fixities: HashMap<String, (Assoc, u8)>,
     vals: HashMap<String, Vec<Entity>>,
@@ -190,6 +192,7 @@ pub fn rename_module(
         rebindable: extensions.is_on("RebindableSyntax"),
         partial_type_signatures: extensions.is_on("PartialTypeSignatures"),
         named_wildcards: extensions.is_on("NamedWildCards"),
+        empty_data_decls: extensions.is_on("EmptyDataDecls"),
         local_fixities: HashMap::new(),
         vals: HashMap::new(),
         types: HashMap::new(),
@@ -1174,6 +1177,12 @@ impl<'a> Renamer<'a> {
             }
             Decl::Data(mut dd) => {
                 check_type_binders(&dd.tyvars, dd.loc)?;
+                if !dd.newtype && !self.boot && dd.cons.is_empty() && !self.empty_data_decls {
+                    return Err(RnError {
+                        loc: dd.loc,
+                        msg: format!("Data type ‘{}’ has no constructors\nEnable EmptyDataDecls to permit this declaration.", dd.name),
+                    });
+                }
                 if dd.newtype {
                     check_newtype(&dd)?;
                 }
@@ -2465,29 +2474,6 @@ impl<'a> Renamer<'a> {
             }
         }
         Ok(out)
-    }
-}
-
-/// Match one insertion, deletion, substitution or adjacent transposition.
-fn one_edit_apart(a: &str, b: &str) -> bool {
-    let mut a = a.chars().peekable();
-    let mut b = b.chars().peekable();
-    while a.peek().is_some() && a.peek() == b.peek() {
-        a.next();
-        b.next();
-    }
-    match (a.next(), b.next()) {
-        (None, Some(_)) => b.next().is_none(),
-        (Some(_), None) => a.next().is_none(),
-        (Some(x), Some(y)) => {
-            if a.peek() == Some(&y) && b.peek() == Some(&x) && a.clone().skip(1).eq(b.clone().skip(1)) {
-                return true;
-            }
-            a.clone().eq(b.clone())
-                || a.clone().eq(std::iter::once(y).chain(b.clone()))
-                || std::iter::once(x).chain(a).eq(b)
-        }
-        (None, None) => false,
     }
 }
 

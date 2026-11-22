@@ -27,7 +27,18 @@ pub struct Lexed {
     pub(crate) tabs: Option<(super::ast::Loc, usize)>,
     pub(crate) saw_binary: bool,
     pub(crate) numeric_separator: Option<super::ast::Loc>,
+    pub(crate) unknown_pragmas: Vec<(super::ast::Loc, String)>,
 }
+
+/// Known pragma names, including GHC's spelling variants and legacy pragmas it ignores.
+pub(crate) const KNOWN_PRAGMAS: &[&str] = &[
+    "ANN", "CFILES", "COLUMN", "COMPLETE", "CONTRACT", "CTYPE", "DEPRECATED",
+    "INCLUDE", "INCOHERENT", "INLINABLE", "INLINE", "INLINEABLE", "LANGUAGE", "LINE",
+    "MINIMAL", "NOINLINE", "NOTINLINE", "NOUNPACK", "OPAQUE", "OPTIONS", "OPTIONS_CATCH",
+    "OPTIONS_DERIVE", "OPTIONS_GHC", "OPTIONS_HADDOCK", "OPTIONS_HUGS", "OPTIONS_JHC",
+    "OPTIONS_NHC98", "OPTIONS_YHC", "OVERLAPPABLE", "OVERLAPPING", "OVERLAPS", "RULES",
+    "SCC", "SOURCE", "SPECIALISE", "SPECIALIZE", "UNPACK", "WARNING",
+];
 
 const SYMBOL_CHARS: &str = "!#$%&*+./<=>?@\\^|-~:";
 
@@ -131,6 +142,7 @@ pub(crate) fn lex_with_binary(src: &str, magic_hash: bool, unicode: bool, binary
         tabs: lx.tabs,
         saw_binary: lx.saw_binary,
         numeric_separator: lx.numeric_separator,
+        unknown_pragmas: lx.unknown_pragmas,
     })
 }
 
@@ -156,6 +168,7 @@ struct Lexer {
     binary: bool,
     saw_binary: bool,
     numeric_separator: Option<super::ast::Loc>,
+    unknown_pragmas: Vec<(super::ast::Loc, String)>,
 }
 
 impl Lexer {
@@ -173,6 +186,7 @@ impl Lexer {
             binary: true,
             saw_binary: false,
             numeric_separator: None,
+            unknown_pragmas: Vec::new(),
         }
     }
 
@@ -351,6 +365,12 @@ impl Lexer {
             .collect::<String>()
             .to_ascii_uppercase();
         let name_len = name.len();
+        if !name.is_empty() && !KNOWN_PRAGMAS.contains(&name.as_str()) {
+            let padding = body.len() - body.trim_start().len();
+            let at = super::ast::Loc { line, col: col as u32 + 3 }.after(&body[..padding]);
+            self.unknown_pragmas.push((at, name));
+            return Ok(nl);
+        }
         let name = if name == "NOTINLINE" { "NOINLINE".to_string() } else { name };
         if ["LANGUAGE", "OPTIONS_GHC", "RULES", "INLINE", "NOINLINE"].contains(&name.as_str()) {
             let body_start = body.len() - body.trim_start().len() + name_len;

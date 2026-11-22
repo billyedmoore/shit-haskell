@@ -1,4 +1,4 @@
-{-# LANGUAGE NoPolyKinds, RoleAnnotations #-}
+{-# LANGUAGE NoPolyKinds, RoleAnnotations, NoEmptyDataDecls #-}
 module CacheBootGndContext where
 data N a
 type role N representational

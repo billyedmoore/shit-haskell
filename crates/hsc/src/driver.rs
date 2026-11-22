@@ -1639,6 +1639,18 @@ impl Driver {
         let mut warnings: Vec<_> = self.checker.warnings.iter().filter_map(|(loc, msg, flag)| {
             exts.warnings.level(*flag).map(|fatal| (*loc, msg.clone(), *flag, fatal))
         }).collect();
+        if let Some(fatal) = exts.warnings.level(Warning::UnrecognisedPragmas) {
+            for (loc, name) in &exts.unknown_pragmas {
+                let mut message = format!("Unrecognised pragma ‘{name}’");
+                let suggestions: Vec<_> = crate::syntax::lexer::KNOWN_PRAGMAS.iter()
+                    .filter(|known| crate::diagnostic::one_edit_apart(name, known))
+                    .take(3).map(|known| format!("‘{known}’")).collect();
+                if !suggestions.is_empty() {
+                    message.push_str(&format!("\nPerhaps you meant {}.", suggestions.join(" or ")));
+                }
+                warnings.push((*loc, message, Warning::UnrecognisedPragmas, fatal));
+            }
+        }
         if let (Some((loc, count)), Some(fatal)) = (exts.tabs, exts.warnings.level(Warning::Tabs)) {
             let mut message = "Tab character found here.".to_string();
             if count > 1 {

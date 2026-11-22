@@ -8,16 +8,18 @@ pub(crate) enum Warning {
     Tabs,
     MissingSignatures,
     MissingFields,
+    UnrecognisedPragmas,
 }
 
 impl Warning {
-    const ALL: [Self; 3] = [Self::Tabs, Self::MissingSignatures, Self::MissingFields];
+    const ALL: [Self; 4] = [Self::Tabs, Self::MissingSignatures, Self::MissingFields, Self::UnrecognisedPragmas];
 
     fn name(self) -> &'static str {
         match self {
             Self::Tabs => "tabs",
             Self::MissingSignatures => "missing-signatures",
             Self::MissingFields => "missing-fields",
+            Self::UnrecognisedPragmas => "unrecognised-pragmas",
         }
     }
 }
@@ -33,6 +35,7 @@ impl Default for WarningOptions {
         let mut enabled = [false; Warning::ALL.len()];
         enabled[Warning::Tabs as usize] = true;
         enabled[Warning::MissingFields as usize] = true;
+        enabled[Warning::UnrecognisedPragmas as usize] = true;
         Self { enabled, fatal: [false; Warning::ALL.len()] }
     }
 }
@@ -124,4 +127,27 @@ fn format_at(path: &Path, source: Option<&str>, loc: Loc, label: &str, message: 
     let marker = "^".repeat(width);
     let _ = write!(out, "\n{space:gutter$} |\n{line} | {expanded}\n{space:gutter$} | {space:offset$}{marker}", space = "");
     out
+}
+
+/// Match one insertion, deletion, substitution or adjacent transposition.
+pub(crate) fn one_edit_apart(a: &str, b: &str) -> bool {
+    let mut a = a.chars().peekable();
+    let mut b = b.chars().peekable();
+    while a.peek().is_some() && a.peek() == b.peek() {
+        a.next();
+        b.next();
+    }
+    match (a.next(), b.next()) {
+        (None, Some(_)) => b.next().is_none(),
+        (Some(_), None) => a.next().is_none(),
+        (Some(x), Some(y)) => {
+            if a.peek() == Some(&y) && b.peek() == Some(&x) && a.clone().skip(1).eq(b.clone().skip(1)) {
+                return true;
+            }
+            a.clone().eq(b.clone())
+                || a.clone().eq(std::iter::once(y).chain(b.clone()))
+                || std::iter::once(x).chain(a).eq(b)
+        }
+        (None, None) => false,
+    }
 }

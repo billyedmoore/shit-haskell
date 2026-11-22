@@ -106,6 +106,7 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     // indented, and ignored).
     let inline_pragmas: Vec<lexer::Pragma> =
         lexed.pragmas.iter().filter(|p| (p.name == "INLINE" || p.name == "NOINLINE") && p.col == 1).cloned().collect();
+    exts.unknown_pragmas = lexed.unknown_pragmas;
     let mut tokens = lexed.tokens;
     if th_quotes {
         tokens = quote_brackets(tokens);

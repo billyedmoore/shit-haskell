@@ -1,6 +1,6 @@
 //! Expressions, statements and case alternatives.
 
-use super::{group_binds, PResult, Parser};
+use super::{group_binds, PResult, ParseError, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
 
@@ -177,7 +177,7 @@ impl Parser {
                 if self.at_kw(Kw::Case) {
                     self.require_ext("LambdaCase")?;
                     self.bump();
-                    let alts = self.block(|p| p.alt())?;
+                    let alts = self.case_alternatives(loc)?;
                     return Ok(Expr::LamCase(alts, loc));
                 }
                 let mut pats = Vec::new();
@@ -226,7 +226,7 @@ impl Parser {
                 self.bump();
                 let scrut = self.expr()?;
                 self.expect_kw(Kw::Of)?;
-                let alts = self.block(|p| p.alt())?;
+                let alts = self.case_alternatives(loc)?;
                 Ok(Expr::Case(Box::new(scrut), alts, loc))
             }
             Tok::Kw(Kw::Do) if self.real() => {
@@ -1000,6 +1000,18 @@ impl Parser {
     }
 
     /// A case alternative: `pat -> e` or `pat | guard -> e`, with optional `where`.
+    fn case_alternatives(&mut self, loc: Loc) -> PResult<Vec<Alt>> {
+        let alts = self.block(|p| p.alt())?;
+        if alts.is_empty() && !self.exts.is_on("EmptyCase") {
+            return Err(ParseError {
+                line: loc.line,
+                col: loc.col,
+                msg: "A case expression without alternatives requires EmptyCase".into(),
+            });
+        }
+        Ok(alts)
+    }
+
     pub(super) fn alt(&mut self) -> PResult<Alt> {
         let loc = self.loc();
         let e = self.infix_expr()?;
