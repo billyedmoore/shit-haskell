@@ -235,17 +235,10 @@ integerTake (W# n) i = integerAnd i (integerSub (integerShiftL# integerOne n) in
 integerEncodeFloat# :: Integer -> Int# -> Float#
 integerEncodeFloat# m e = double2Float# (integerEncodeDouble# m e)
 
-integerQuotRem :: Integer -> Integer -> (Integer, Integer)
-integerQuotRem a b = (integerQuot a b, integerRem a b)
-
-integerQuotRem# :: Integer -> Integer -> (# Integer, Integer #)
-integerQuotRem# a b = (# integerQuot a b, integerRem a b #)
-
-integerDivMod :: Integer -> Integer -> (Integer, Integer)
-integerDivMod a b = (integerDiv a b, integerMod a b)
-
-integerDivMod# :: Integer -> Integer -> (# Integer, Integer #)
-integerDivMod# a b = (# integerDiv a b, integerMod a b #)
+foreign import prim "integerQuotRem" integerQuotRem :: Integer -> Integer -> (Integer, Integer)
+foreign import prim "integerQuotRem" integerQuotRem# :: Integer -> Integer -> (# Integer, Integer #)
+foreign import prim "integerDivMod" integerDivMod :: Integer -> Integer -> (Integer, Integer)
+foreign import prim "integerDivMod" integerDivMod# :: Integer -> Integer -> (# Integer, Integer #)
 
 -- | Extended gcd: (g, x, y) with a*x + b*y = g.
 integerGcde :: Integer -> Integer -> (Integer, Integer, Integer)

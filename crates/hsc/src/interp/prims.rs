@@ -248,6 +248,15 @@ fn call_named(rt: &Runtime, name: &str, args: &[Cell]) -> RR {
                 _ => a.div_mod(&b).1,
             })
         }
+        "integerQuotRem" | "integerDivMod" => {
+            let a = integer(rt, &args[0])?;
+            let b = integer(rt, &args[1])?;
+            if b.is_zero() {
+                return divide_by_zero();
+            }
+            let (q, r) = if name == "integerQuotRem" { a.quot_rem(&b) } else { a.div_mod(&b) };
+            Ok(con_value("Builtin.(,)", vec![integer_con(q), integer_con(r)]))
+        }
         "integerEq" => {
             let (a, b) = (integer(rt, &args[0])?, integer(rt, &args[1])?);
             Ok(bool_value(*a == *b))

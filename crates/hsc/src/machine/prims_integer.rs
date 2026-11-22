@@ -27,6 +27,8 @@ pub enum IntegerOp {
     Rem,
     Div,
     Mod,
+    QuotRem,
+    DivMod,
     Negate,
     Abs,
     Signum,
@@ -47,6 +49,8 @@ impl IntegerOp {
             "integerRem" => Self::Rem,
             "integerDiv" => Self::Div,
             "integerMod" => Self::Mod,
+            "integerQuotRem" => Self::QuotRem,
+            "integerDivMod" => Self::DivMod,
             "integerNegate" => Self::Negate,
             "integerAbs" => Self::Abs,
             "integerSignum" => Self::Signum,
@@ -69,6 +73,8 @@ impl IntegerOp {
             Self::Rem => op_divop(m, DivKind::Rem),
             Self::Div => op_divop(m, DivKind::Div),
             Self::Mod => op_divop(m, DivKind::Mod),
+            Self::QuotRem => op_quotrem(m, false),
+            Self::DivMod => op_quotrem(m, true),
             Self::Negate => op_negate(m),
             Self::Abs => op_abs(m),
             Self::Signum => op_signum(m),
@@ -851,6 +857,169 @@ fn finish_divop(
             }
         }
     }
+}
+
+/// Single-pass `integerQuotRem` / `integerDivMod` returning a `Builtin.(,)` pair `(q, r)`.
+fn op_quotrem(m: &mut Machine, is_divmod: bool) -> Option<Word> {
+    let (a, b) = force_two(m)?;
+    Some(match (a, b) {
+        (IntView::Small(x), IntView::Small(y)) => {
+            if y == 0 {
+                m.exc = m.error_value("divide by zero");
+                return Some(0);
+            }
+            if x == i64::MIN && y == -1 {
+                m.reserve(14);
+                let qv = encode_u128(m, false, 1u128 << 63);
+                m.args[0] = qv;
+                let rv = is_value(m, 0);
+                m.args[1] = rv;
+                m.reserve(3);
+                return Some(super::prims_num::con_pair(m, m.args[0], m.args[1]));
+            }
+            let mut q = x / y;
+            let mut r = x % y;
+            if is_divmod && r != 0 && (x < 0) != (y < 0) {
+                q -= 1;
+                r += y;
+            }
+            m.reserve(14);
+            let qv = is_value(m, q);
+            let rv = is_value(m, r);
+            super::prims_num::con_pair(m, qv, rv)
+        }
+        (IntView::Big { neg: an, len: alen, .. }, IntView::Small(y)) => {
+            quotrem_big_by_small(m, an, alen, y, is_divmod)
+        }
+        (IntView::Small(x), IntView::Big { neg: bn, bp: bbp, len: blen }) => {
+            if x == 0 {
+                m.reserve(12);
+                let z = is_value(m, 0);
+                return Some(super::prims_num::con_pair(m, z, z));
+            }
+            let (xn, xm) = small_sign_mag(x);
+            let b_limbs = unsafe { limbs_of(bbp, blen) };
+            let (q, r) = divrem_mag64(&[xm], b_limbs);
+            finish_quotrem(m, xn, bn, b_limbs, q, r, is_divmod)
+        }
+        (IntView::Big { neg: an, bp: abp, len: alen }, IntView::Big { neg: bn, bp: bbp, len: blen }) => {
+            let (q, r) = unsafe { divrem_mag64(limbs_of(abp, alen), limbs_of(bbp, blen)) };
+            let b_limbs = unsafe { limbs_of(bbp, blen) };
+            finish_quotrem(m, an, bn, b_limbs, q, r, is_divmod)
+        }
+    })
+}
+
+/// Fast single-pass `Big quotRem Small` / `Big divMod Small` without allocating a Rust `Vec`.
+fn quotrem_big_by_small(
+    m: &mut Machine,
+    a_neg: bool,
+    a_len: usize,
+    b: i64,
+    is_divmod: bool,
+) -> Word {
+    if b == 0 {
+        m.exc = m.error_value("divide by zero");
+        return 0;
+    }
+    let (b_neg, d) = small_sign_mag(b);
+    let d128 = d as u128;
+    let q_neg = a_neg != b_neg;
+    m.reserve(a_len + 16);
+    let src_bp = follow_ind(m, m.heap_get(m.args[0], 1));
+    let saved_hp = m.hp;
+    let dst_bp = m.alloc(1 + a_len);
+    let mut rem = 0u128;
+    // SAFETY: `src_bp` has `a_len` limbs; `dst_bp` has `1 + a_len` words.
+    let mut words = unsafe {
+        let src = (src_bp as *const u64).add(1);
+        let dst = (dst_bp as *mut u64).add(1);
+        for i in (0..a_len).rev() {
+            let cur = (rem << 64) | (*src.add(i) as u128);
+            *dst.add(i) = (cur / d128) as u64;
+            rem = cur % d128;
+        }
+        let mut w = a_len;
+        while w > 0 && *dst.add(w - 1) == 0 {
+            w -= 1;
+        }
+        w
+    };
+    let (r_neg, r_u64) = if is_divmod && rem != 0 && q_neg {
+        unsafe {
+            let dst = (dst_bp as *mut u64).add(1);
+            let mut carry = 1u64;
+            for i in 0..words {
+                let (s, c) = (*dst.add(i)).overflowing_add(carry);
+                *dst.add(i) = s;
+                carry = c as u64;
+                if carry == 0 {
+                    break;
+                }
+            }
+            if carry != 0 {
+                *dst.add(words) = carry;
+                words += 1;
+            }
+        }
+        (b_neg, d - (rem as u64))
+    } else {
+        (a_neg, rem as u64)
+    };
+    if words < a_len {
+        m.hp -= 8 * (a_len - words) as Word;
+    }
+    let qv = if words == 0 {
+        m.hp = saved_hp;
+        is_value(m, 0)
+    } else if words == 1 {
+        let w = m.heap_get(dst_bp, 1);
+        if !q_neg && w <= i64::MAX as u64 {
+            m.hp = saved_hp;
+            is_value(m, w as i64)
+        } else if q_neg && w <= (i64::MAX as u64) + 1 {
+            m.hp = saved_hp;
+            is_value(m, 0i64.wrapping_sub(w as i64))
+        } else {
+            m.heap_set(dst_bp, heap::header(kind::BYTES, 1, 8));
+            con1_id(m, if q_neg { CON_IN } else { CON_IP }, dst_bp)
+        }
+    } else {
+        m.heap_set(dst_bp, heap::header(kind::BYTES, words as u32, 8 * words as u32));
+        con1_id(m, if q_neg { CON_IN } else { CON_IP }, dst_bp)
+    };
+    m.args[0] = qv;
+    let rv = if r_u64 == 0 {
+        is_value(m, 0)
+    } else {
+        encode_u128(m, r_neg, r_u64 as u128)
+    };
+    m.args[1] = rv;
+    m.reserve(3);
+    super::prims_num::con_pair(m, m.args[0], m.args[1])
+}
+
+fn finish_quotrem(
+    m: &mut Machine,
+    a_neg: bool,
+    b_neg: bool,
+    b_limbs: &[u64],
+    q: Vec<u64>,
+    r: Vec<u64>,
+    is_divmod: bool,
+) -> Word {
+    let q_neg = a_neg != b_neg;
+    let (q_out_neg, q_limbs, r_out_neg, r_limbs) = if is_divmod && !r.is_empty() && q_neg {
+        (true, add_mag64(&q, &[1]), b_neg, sub_mag64(b_limbs, &r))
+    } else {
+        (q_neg, q, a_neg, r)
+    };
+    let qv = encode_u64_limbs(m, q_out_neg, &q_limbs);
+    m.args[0] = qv;
+    let rv = encode_u64_limbs(m, r_out_neg, &r_limbs);
+    m.args[1] = rv;
+    m.reserve(3);
+    super::prims_num::con_pair(m, m.args[0], m.args[1])
 }
 
 #[inline]
