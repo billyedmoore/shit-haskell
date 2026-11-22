@@ -56,6 +56,9 @@ impl Parser {
                 Ok(Decl::Default { types, loc })
             }
             Tok::Kw(Kw::Foreign) if self.real() => self.foreign_decl(loc),
+            Tok::VarId(name) if name == "foreign" && self.real() && *self.peek_raw(1) == Tok::Kw(Kw::Import) => {
+                self.err("A foreign import requires ForeignFunctionInterface")
+            }
             _ if self.exts.is_on("TemplateHaskell") => self.splice_or_value_decl(loc),
             _ => self.value_decl(),
         }
@@ -1329,11 +1332,13 @@ impl Parser {
         self.bump();
         // An unsafe call keeps the runtime to itself; a safe one (the default) lets other threads
         // run while it is in C: `%unsafe` marks the former in the entity.
-        let mut unsafe_call = false;
-        let mut interruptible = false;
-        if self.at_varid("safe") || self.at_varid("unsafe") || self.at_varid("interruptible") {
-            unsafe_call = self.at_varid("unsafe");
-            interruptible = self.at_varid("interruptible");
+        let safety_marker = import && *self.peek_raw(1) != Tok::Res(ROp::DColon);
+        let unsafe_call = safety_marker && self.at_varid("unsafe");
+        let interruptible = safety_marker && self.at_varid("interruptible");
+        if interruptible && !self.exts.is_on("InterruptibleFFI") {
+            return self.err("An ‘interruptible’ foreign import requires InterruptibleFFI");
+        }
+        if unsafe_call || interruptible || (safety_marker && self.at_varid("safe")) {
             self.bump();
         }
         let entity = match self.tok().clone() {

@@ -76,8 +76,11 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     let magic = exts.is_on("MagicHash");
     let unicode = exts.is_on("UnicodeSyntax");
     let binary = exts.is_on("BinaryLiterals");
-    let lexed = if (!magic && src.contains('#')) || (unicode && !src.is_ascii()) || (!binary && lexed.saw_binary) {
-        lexer::lex_with_binary(src, magic, unicode, binary).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?
+    let foreign_interface = exts.is_on("ForeignFunctionInterface");
+    let lexed = if (!magic && src.contains('#')) || (unicode && !src.is_ascii()) || (!binary && lexed.saw_binary)
+        || (!foreign_interface && src.contains("foreign"))
+    {
+        lexer::lex_for_module(src, &exts).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?
     } else {
         lexed
     };
@@ -86,7 +89,7 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     // the source lexed again.
     let lexed = if exts.is_on("QuasiQuotes") {
         match rewrite_quasiquotes(src, th_quotes) {
-            Some(rewritten) => lexer::lex_with_binary(&rewritten, magic, unicode, binary).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
+            Some(rewritten) => lexer::lex_for_module(&rewritten, &exts).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
             None => lexed,
         }
     } else {
@@ -118,7 +121,7 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     })?;
     // Rewrite rules: each pragma's body is lexed on its own, at the pragma's lines.
     for p in rule_pragmas {
-        let Ok(lexed) = lexer::lex_with(&p.body, magic, unicode) else { continue };
+        let Ok(lexed) = lexer::lex_for_module(&p.body, &exts) else { continue };
         let tokens: Vec<token::Token> = lexed
             .tokens
             .into_iter()
@@ -131,7 +134,7 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
         module.rules.extend(parser::parse_rules(tokens, &exts));
     }
     for p in inline_pragmas {
-        let Ok(lexed) = lexer::lex_with(&p.body, magic, unicode) else { continue };
+        let Ok(lexed) = lexer::lex_for_module(&p.body, &exts) else { continue };
         let tokens: Vec<token::Token> = lexed.tokens.into_iter().map(|mut t| {
             if t.line == 1 {
                 t.col += p.body_loc.col - 1;

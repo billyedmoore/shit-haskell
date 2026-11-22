@@ -54,7 +54,7 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '\''
 }
 
-fn keyword(word: &str) -> Option<Kw> {
+fn keyword(word: &str, foreign_interface: bool) -> Option<Kw> {
     Some(match word {
         "case" => Kw::Case,
         "class" => Kw::Class,
@@ -63,7 +63,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "deriving" => Kw::Deriving,
         "do" => Kw::Do,
         "else" => Kw::Else,
-        "foreign" => Kw::Foreign,
+        "foreign" if foreign_interface => Kw::Foreign,
         "if" => Kw::If,
         "import" => Kw::Import,
         "in" => Kw::In,
@@ -129,21 +129,14 @@ pub fn lex(src: &str) -> Result<Lexed, LexError> {
 /// that `(# q, r#)` closes its unboxed tuple. With `unicode` (UnicodeSyntax), `∷ ⇒ → ← ∀ ★` are
 /// the reserved symbols they stand for; without it they are ordinary operators.
 pub fn lex_with(src: &str, magic_hash: bool, unicode: bool) -> Result<Lexed, LexError> {
-    lex_with_binary(src, magic_hash, unicode, true)
+    Lexer::new(src.chars().collect(), magic_hash, unicode).finish()
 }
 
-pub(crate) fn lex_with_binary(src: &str, magic_hash: bool, unicode: bool, binary: bool) -> Result<Lexed, LexError> {
-    let mut lx = Lexer::new(src.chars().collect(), magic_hash, unicode);
-    lx.binary = binary;
-    lx.run()?;
-    Ok(Lexed {
-        tokens: lx.toks,
-        pragmas: lx.pragmas,
-        tabs: lx.tabs,
-        saw_binary: lx.saw_binary,
-        numeric_separator: lx.numeric_separator,
-        unknown_pragmas: lx.unknown_pragmas,
-    })
+pub(crate) fn lex_for_module(src: &str, exts: &super::extensions::Extensions) -> Result<Lexed, LexError> {
+    let mut lexer = Lexer::new(src.chars().collect(), exts.is_on("MagicHash"), exts.is_on("UnicodeSyntax"));
+    lexer.binary = exts.is_on("BinaryLiterals");
+    lexer.foreign_interface = exts.is_on("ForeignFunctionInterface");
+    lexer.finish()
 }
 
 /// Measures the token starting at a diagnostic position on one displayed line.
@@ -166,6 +159,7 @@ struct Lexer {
     unicode: bool,
     tabs: Option<(super::ast::Loc, usize)>,
     binary: bool,
+    foreign_interface: bool,
     saw_binary: bool,
     numeric_separator: Option<super::ast::Loc>,
     unknown_pragmas: Vec<(super::ast::Loc, String)>,
@@ -184,10 +178,23 @@ impl Lexer {
             unicode,
             tabs: None,
             binary: true,
+            foreign_interface: true,
             saw_binary: false,
             numeric_separator: None,
             unknown_pragmas: Vec::new(),
         }
+    }
+
+    fn finish(mut self) -> Result<Lexed, LexError> {
+        self.run()?;
+        Ok(Lexed {
+            tokens: self.toks,
+            pragmas: self.pragmas,
+            tabs: self.tabs,
+            saw_binary: self.saw_binary,
+            numeric_separator: self.numeric_separator,
+            unknown_pragmas: self.unknown_pragmas,
+        })
     }
 
     fn peek(&self, k: usize) -> Option<char> {
@@ -491,7 +498,7 @@ impl Lexer {
                             .iter()
                             .take_while(|c| is_ident_char(**c))
                             .collect();
-                        if keyword(&next_word).is_some() {
+                        if keyword(&next_word, self.foreign_interface).is_some() {
                             if quals.is_empty() {
                                 return Ok(Tok::ConId(word));
                             }
@@ -518,7 +525,7 @@ impl Lexer {
                 });
             }
             if quals.is_empty() {
-                if let Some(kw) = keyword(&word) {
+                if let Some(kw) = keyword(&word, self.foreign_interface) {
                     return Ok(Tok::Kw(kw));
                 }
                 return Ok(Tok::VarId(word));

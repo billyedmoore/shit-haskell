@@ -152,6 +152,7 @@ impl Extensions {
                 // GHC's Haskell98 also allows a nested block at its enclosing block's column (as
                 // GHC always did; Cabal's default language) and n+k patterns.
                 if item == "Haskell98" {
+                    self.on.remove("ForeignFunctionInterface");
                     self.on.insert("NondecreasingIndentation".to_string());
                     self.on.insert("NPlusKPatterns".to_string());
                 }
