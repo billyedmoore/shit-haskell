@@ -1214,7 +1214,8 @@ impl Checker {
                 let key = self.resolve_key(&qkey(q));
                 if let (Some((prim, boxed)), 1) = (boxing_types(&key), args.len()) {
                     self.unify_at(ty, &Ty::con(boxed))?;
-                    return self.check_pat(&args[0], &Ty::con(prim));
+                    let inner = self.check_pat(&args[0], &Ty::con(prim))?;
+                    return Ok(CPat::Bang(Box::new(inner)));
                 }
                 let (arg_tys, dict_pats) = self.con_pattern_types(&key, args.len(), ty)?;
                 let newtype = self.env.datacons.get(&key).is_some_and(|d| d.newtype);

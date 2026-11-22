@@ -1288,6 +1288,81 @@ impl Simp<'_> {
                     self.expr(c);
                     return;
                 }
+                // `case quotRemInt# a b of (q, r) -> body` (when the tuple binder is unused)
+                // decomposes into inline `quotInt#` and `a -# (q *# b)` so `q` and `r` stay raw
+                // in registers and constant divisors (like `10` in `Show`) use magic multiplication.
+                if let Core::Case(s, binder, alts) = c {
+                    let is_pair_case = matches!(
+                        &alts[..],
+                        [Alt::Con(k, vs, _)] | [Alt::Con(k, vs, _), Alt::Default(_)]
+                            if k == "Builtin.(,)" && vs.len() == 2
+                    );
+                    if is_pair_case
+                        && matches!(&**s, Core::Prim(p, args) if p == "quotRemInt#" && args.len() == 2)
+                    {
+                        let binder_unused = match &alts[0] {
+                            Alt::Con(_, _, body) => !mentions(body, binder),
+                            _ => false,
+                        };
+                        if binder_unused {
+                            let Core::Case(s, _, mut alts) = take(c) else { unreachable!() };
+                            let Core::Prim(_, mut args) = *s else { unreachable!() };
+                            let b_arg = args.pop().unwrap();
+                            let a_arg = args.pop().unwrap();
+                            let Alt::Con(_, mut vs, body) = alts.remove(0) else { unreachable!() };
+                            let r = vs.pop().unwrap();
+                            let q = vs.pop().unwrap();
+                            let mut wrap = Vec::new();
+                            let a_atom = if is_atom(&a_arg) && !mentions(&a_arg, &q) {
+                                a_arg
+                            } else {
+                                *self.fresh += 1;
+                                let v = format!("qr~{}", self.fresh);
+                                wrap.push((v.clone(), a_arg));
+                                Core::Var(v)
+                            };
+                            let b_atom = if is_atom(&b_arg) && !mentions(&b_arg, &q) {
+                                b_arg
+                            } else {
+                                *self.fresh += 1;
+                                let v = format!("qr~{}", self.fresh);
+                                wrap.push((v.clone(), b_arg));
+                                Core::Var(v)
+                            };
+                            let q_used = mentions(&body, &q);
+                            let r_used = mentions(&body, &r);
+                            let mut out = if q_used && r_used {
+                                let prod = Core::Prim("*#".into(), vec![Core::Var(q.clone()), b_atom.clone()]);
+                                let rem = Core::Prim("-#".into(), vec![a_atom.clone(), prod]);
+                                let inner = Core::Case(Box::new(rem), r, vec![Alt::Default(body)]);
+                                Core::Case(
+                                    Box::new(Core::Prim("quotInt#".into(), vec![a_atom, b_atom])),
+                                    q,
+                                    vec![Alt::Default(inner)],
+                                )
+                            } else if r_used {
+                                Core::Case(
+                                    Box::new(Core::Prim("remInt#".into(), vec![a_atom, b_atom])),
+                                    r,
+                                    vec![Alt::Default(body)],
+                                )
+                            } else {
+                                Core::Case(
+                                    Box::new(Core::Prim("quotInt#".into(), vec![a_atom, b_atom])),
+                                    q,
+                                    vec![Alt::Default(body)],
+                                )
+                            };
+                            for (v, e) in wrap.into_iter().rev() {
+                                out = Core::Case(Box::new(e), v, vec![Alt::Default(out)]);
+                            }
+                            *c = out;
+                            self.changed = true;
+                            self.expr(c);
+                            return;
+                        }
+                    }
+                }
                 self.tag_to_enum(c);
                 let Core::Case(s, binder, alts) = c else { return };
                 let mut added: Vec<String> = Vec::new();
@@ -1311,7 +1386,7 @@ impl Simp<'_> {
                     }
                     _ => {}
                 }
-                for a in alts {
+                for a in &mut *alts {
                     match a {
                         Alt::Con(con, vars, b) => {
                             let mut alt_added: Vec<String> = Vec::new();
@@ -1333,6 +1408,20 @@ impl Simp<'_> {
                 for v in added {
                     self.evaluated.remove(&v);
                 }
+                // `case v as b of _ -> body` is redundant when `body` immediately forces `v` (or
+                // `b`) before any other demand (e.g. from `I#`/`C#` pattern matching wrapping a
+                // strict primitive such as `(I# x) == (I# y) = tagToEnum# (x ==# y)`).
+                if let (Core::Var(v), [Alt::Default(body)]) = (&**s, &alts[..]) {
+                    if forces_var_first(body, v, binder, &self.evaluated) {
+                        let v_expr = Core::Var(v.clone());
+                        let b_name = binder.clone();
+                        let Some(Alt::Default(mut body)) = alts.pop() else { unreachable!() };
+                        subst(&mut body, &b_name, &v_expr);
+                        *c = body;
+                        self.changed = true;
+                        return;
+                    }
+                }
             }
             // Representation identities (Int# and Word# share it; Core is untyped, so coercions
             // are nothing), and Integer conversions of small literals and of `IS`.
@@ -1342,6 +1431,15 @@ impl Simp<'_> {
             {
                 self.expr(&mut args[0]);
                 let integer = p.starts_with("integer");
+                if integer && matches!(&args[0], Core::Case(_, _, alts) if matches!(&alts[..], [Alt::Default(_)])) {
+                    let Core::Prim(p, mut args) = take(c) else { unreachable!() };
+                    let Core::Case(s, b, mut alts) = args.pop().unwrap() else { unreachable!() };
+                    let Some(Alt::Default(inner)) = alts.pop() else { unreachable!() };
+                    *c = Core::Case(s, b, vec![Alt::Default(Core::Prim(p, vec![inner]))]);
+                    self.changed = true;
+                    self.expr(c);
+                    return;
+                }
                 let folded = match &mut args[0] {
                     _ if !integer => Some(take(&mut args[0])),
                     Core::Lit(Lit::Integer(t)) => t.parse::<i64>().ok().map(|i| Core::Lit(Lit::Int(i))),
@@ -1626,7 +1724,7 @@ impl Simp<'_> {
             return true;
         }
         if !matches!(**f, Core::Case(..)) {
-            return false;
+            return self.strict_arg_case_float(c);
         }
         let Core::App(f, a) = take(c) else { unreachable!() };
         let Core::Case(s, b, mut alts) = *f else { unreachable!() };
@@ -1648,6 +1746,76 @@ impl Simp<'_> {
             Some((v, e)) => Core::Let(vec![(v, e)], Box::new(case)),
             None => case,
         };
+        true
+    }
+
+    /// Floats a single-default `case s as b of _ -> e` out of a known unconditionally-strict
+    /// argument of a saturated list/fusion function (e.g. `foldr k z (case n of _ -> build g)` ->
+    /// `case n of _ -> foldr k z (build g)`), allowing `fold/build` and related rules to fire.
+    fn strict_arg_case_float(&mut self, c: &mut Core) -> bool {
+        let mut nargs = 0usize;
+        let mut h = &*c;
+        while let Core::App(f, _) = h {
+            nargs += 1;
+            h = f;
+        }
+        let Core::Var(g) = h else { return false };
+        let mut target = g.as_str();
+        for _ in 0..8 {
+            match self.aliases.get(target) {
+                Some(next) => target = next.as_str(),
+                None => break,
+            }
+        }
+        let strict_pos = match (target, nargs) {
+            ("GHC.Internal.Base.foldr", 3) => 2,
+            ("GHC.Internal.List.foldr2", 4) => 2,
+            ("GHC.Internal.Base.map", 2) => 1,
+            ("GHC.Internal.List.filter", 2) => 1,
+            ("GHC.Internal.List.concat", 1) => 0,
+            ("GHC.Internal.List.length", 1) => 0,
+            ("GHC.Internal.List.foldl", 3) | ("GHC.Internal.List.foldl'", 3) => 2,
+            ("GHC.Internal.Base.++", 2) => 0,
+            ("GHC.Internal.List.take", 2)
+            | ("GHC.Internal.List.drop", 2)
+            | ("GHC.Internal.List.replicate", 2) => 0,
+            _ => return false,
+        };
+        // Locate argument `strict_pos` (0-indexed from left; `steps = nargs - 1 - strict_pos`
+        // `App` nodes down from the outer application).
+        let steps = nargs - 1 - strict_pos;
+        let mut cur = &*c;
+        for _ in 0..steps {
+            let Core::App(f, _) = cur else { return false };
+            cur = f;
+        }
+        let Core::App(_, arg) = cur else { return false };
+        let Core::Case(_, b, alts) = arg.as_ref() else { return false };
+        if !matches!(&alts[..], [Alt::Default(_)]) {
+            return false;
+        }
+        let binder = b.clone();
+        // Ensure `binder` is not mentioned in any sibling argument or head of the call.
+        let mut check = &*c;
+        for i in 0..nargs {
+            let Core::App(f, a) = check else { return false };
+            if i != steps && mentions(a, &binder) {
+                return false;
+            }
+            check = f;
+        }
+        // Extract the `Case` from position `strict_pos` and wrap the whole call in it.
+        let mut cur_mut = &mut *c;
+        for _ in 0..steps {
+            let Core::App(f, _) = cur_mut else { unreachable!() };
+            cur_mut = f;
+        }
+        let Core::App(_, arg_mut) = cur_mut else { unreachable!() };
+        let Core::Case(s, b, mut alts) = take(arg_mut) else { unreachable!() };
+        let Some(Alt::Default(inner)) = alts.pop() else { unreachable!() };
+        *arg_mut = Box::new(inner);
+        let call = take(c);
+        *c = Core::Case(s, b, vec![Alt::Default(call)]);
         true
     }
 
@@ -2851,6 +3019,116 @@ fn is_total_prim(p: &str, args: &[Core]) -> bool {
     (TOTAL.contains(&p) || divides) && args.iter().all(is_atom)
 }
 
+/// Primitives that unconditionally force all their arguments left-to-right before returning or
+/// failing.
+fn is_left_to_right_strict_prim(p: &str) -> bool {
+    STRICT_PRIMS.contains(&p)
+        || matches!(
+            p,
+            "quotRemInt#"
+                | "quotWord#"
+                | "remWord#"
+                | "quotRemWord#"
+                | "addIntC#"
+                | "subIntC#"
+                | "timesInt2#"
+                | "addWordC#"
+                | "subWordC#"
+                | "plusWord2#"
+                | "timesWord2#"
+                | "not#"
+                | "narrow8Int#"
+                | "narrow16Int#"
+                | "narrow32Int#"
+                | "narrow8Word#"
+                | "narrow16Word#"
+                | "narrow32Word#"
+                | "+##"
+                | "-##"
+                | "*##"
+                | "/##"
+                | "negateDouble#"
+                | "==##"
+                | "/=##"
+                | "<##"
+                | "<=##"
+                | ">##"
+                | ">=##"
+                | "int2Double#"
+                | "double2Int#"
+                | "plusFloat#"
+                | "minusFloat#"
+                | "timesFloat#"
+                | "divideFloat#"
+                | "negateFloat#"
+                | "eqFloat#"
+                | "neFloat#"
+                | "ltFloat#"
+                | "leFloat#"
+                | "gtFloat#"
+                | "geFloat#"
+                | "int2Float#"
+                | "float2Int#"
+                | "float2Double#"
+                | "double2Float#"
+                | "intToInteger"
+                | "integerToInt"
+                | "integerToWord"
+                | "integerAdd"
+                | "integerSub"
+                | "integerMul"
+                | "integerQuot"
+                | "integerRem"
+                | "integerDiv"
+                | "integerMod"
+                | "integerQuotRem"
+                | "integerDivMod"
+                | "integerNegate"
+                | "integerAbs"
+                | "integerSignum"
+                | "integerEq"
+                | "integerLt"
+                | "integerLe"
+        )
+}
+
+/// True when evaluating `a` cannot diverge, throw, or perform effects.
+fn is_strict_whnf_arg(a: &Core, evaluated: &HashSet<String>) -> bool {
+    match a {
+        Core::Lit(_) => true,
+        Core::Var(x) => evaluated.contains(x.as_str()),
+        Core::Prim(p, args) => {
+            is_total_prim(p, args) && args.iter().all(|x| is_strict_whnf_arg(x, evaluated))
+        }
+        _ => false,
+    }
+}
+
+/// True when evaluating `e` unconditionally forces `v` (or `b`) before any other potentially
+/// diverging/failing evaluation or effect.
+fn forces_var_first(e: &Core, v: &str, b: &str, evaluated: &HashSet<String>) -> bool {
+    let is_target = |x: &str| x == v || x == b;
+    match e {
+        Core::Var(x) => is_target(x),
+        Core::Case(s, _, _) => forces_var_first(s, v, b, evaluated),
+        Core::Let(bs, body) => {
+            !bs.iter().any(|(n, _)| is_target(n)) && forces_var_first(body, v, b, evaluated)
+        }
+        Core::Prim(p, args) if is_left_to_right_strict_prim(p) => {
+            for a in args {
+                if forces_var_first(a, v, b, evaluated) {
+                    return true;
+                }
+                if !is_strict_whnf_arg(a, evaluated) {
+                    return false;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// An `Int#` or `Word#` primitive on atoms that answers one of them, or a literal, whatever
 /// the other is: `x +# 0#` is `x`, `andI# x 0#` is `0#`, `orI# x x` is `x`.
 fn identity(p: &str, args: &[Core]) -> Option<Core> {
@@ -3760,5 +4038,80 @@ mod rule_tests {
         simplify(&mut binds);
         let spec = binds.iter().find(|b| b.name.contains("$spec$"));
         assert!(spec.is_some(), "expected static-arg specialisation binding in {:?}", binds.iter().map(|b| &b.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn quotrem_pair_decomposes_and_strict_arg_case_floats() {
+        // 1. case quotRemInt# x 10# of (q, r) -> q +# r  =>  no quotRemInt#, uses quotInt#
+        let qr_bind = TopBind {
+            name: "T.qr".into(),
+            body: Core::Lam(
+                "x".into(),
+                Box::new(Core::Case(
+                    Box::new(Core::Prim("quotRemInt#".into(), vec![v("x"), Core::Lit(Lit::Int(10))])),
+                    "pair".into(),
+                    vec![Alt::Con(
+                        "Builtin.(,)".into(),
+                        vec!["q".into(), "r".into()],
+                        Core::Prim("+#".into(), vec![v("q"), v("r")]),
+                    )],
+                )),
+            ),
+        };
+        // 2. Strict-first-arg function `f` applied to a `case a of _ -> b` argument floats the case outside `f`.
+        //    Make `f` recursive so it is not trivially inlined into `T.caller`.
+        let strict_fn = TopBind {
+            name: "T.f".into(),
+            body: Core::Lam(
+                "n".into(),
+                Box::new(Core::Case(
+                    Box::new(v("n")),
+                    "bn".into(),
+                    vec![
+                        Alt::Lit(Lit::Int(0), Core::Lit(Lit::Int(0))),
+                        Alt::Default(app(v("T.f"), vec![Core::Prim("-#".into(), vec![v("n"), Core::Lit(Lit::Int(1))])])),
+                    ],
+                )),
+            ),
+        };
+        let caller = TopBind {
+            name: "T.caller".into(),
+            body: Core::Lam(
+                "x".into(),
+                Box::new(app(
+                    v("T.f"),
+                    vec![Core::Case(
+                        Box::new(v("x")),
+                        "bx".into(),
+                        vec![Alt::Default(Core::Prim("+#".into(), vec![v("x"), Core::Lit(Lit::Int(1))]))],
+                    )],
+                )),
+            ),
+        };
+        let mut binds = vec![qr_bind, strict_fn, caller];
+        simplify(&mut binds);
+        fn has_prim(e: &Core, name: &str) -> bool {
+            match e {
+                Core::Prim(p, args) => p == name || args.iter().any(|a| has_prim(a, name)),
+                Core::App(f, a) => has_prim(f, name) || has_prim(a, name),
+                Core::Lam(_, b) => has_prim(b, name),
+                Core::Let(bs, b) => bs.iter().any(|(_, r)| has_prim(r, name)) || has_prim(b, name),
+                Core::Case(s, _, alts) => {
+                    has_prim(s, name)
+                        || alts.iter().any(|a| match a {
+                            Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => has_prim(b, name),
+                        })
+                }
+                Core::Con(_, args) => args.iter().any(|a| has_prim(a, name)),
+                _ => false,
+            }
+        }
+        assert!(!has_prim(&binds[0].body, "quotRemInt#"), "expected quotRemInt# decomposed: {:?}", binds[0].body);
+        assert!(has_prim(&binds[0].body, "quotInt#"), "expected quotInt# after decomposition: {:?}", binds[0].body);
+        assert!(
+            matches!(&binds[2].body, Core::Lam(_, b) if matches!(b.as_ref(), Core::Case(s, _, _) if matches!(s.as_ref(), Core::Prim(p, _) if p == "+#"))),
+            "expected Case(+#) floated out of strict call argument: {:?}",
+            binds[2].body,
+        );
     }
 }
