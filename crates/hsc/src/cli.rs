@@ -251,7 +251,7 @@ pub fn info(what: &str) -> String {
     let libdir = std::fs::canonicalize(&libdir).unwrap_or(libdir);
     let global = libdir.join("package.conf.d");
     match what {
-        "version" => format!("The Glorious Glasgow Haskell Compilation System, version {VERSION}\n"),
+        "version" => format!("The Shit Haskell Compilation System, version {VERSION}\n"),
         "numeric-version" => format!("{VERSION}\n"),
         "libdir" => format!("{}\n", libdir.display()),
         "global-db" => format!("{}\n", global.display()),
@@ -267,7 +267,7 @@ pub fn info(what: &str) -> String {
         }
         _ => {
             let fields: Vec<(&str, String)> = vec![
-                ("Project name", "The Glorious Glasgow Haskell Compilation System".into()),
+                ("Project name", "The Shit Haskell Compilation System".into()),
                 ("C compiler command", "gcc".into()),
                 ("C compiler flags", String::new()),
                 ("C++ compiler command", "g++".into()),
