@@ -509,6 +509,9 @@ impl Parser {
             return self.type_instance(loc);
         }
         if self.at_varid("role") {
+            if !self.exts.is_on("RoleAnnotations") {
+                return self.err("Role annotations require RoleAnnotations");
+            }
             // RoleAnnotations constrain coercions, which are not checked: the declaration is
             // skipped, up to the end of its line.
             self.bump();
@@ -519,6 +522,9 @@ impl Parser {
         }
         let head = self.btype()?;
         if self.at_res(ROp::DColon) {
+            if !self.exts.is_on("StandaloneKindSignatures") {
+                return self.err("A standalone kind signature requires StandaloneKindSignatures");
+            }
             // StandaloneKindSignatures: `type T :: kind`.
             self.bump();
             let kind = self.sigtype()?;
@@ -1147,7 +1153,7 @@ impl Parser {
         }
         let decls = if self.at_kw(Kw::Where) {
             self.bump();
-            group_binds(self.block(|p| p.class_body_decl())?)
+            group_binds(self.block(|p| p.class_body_decl(false))?)
         } else {
             Vec::new()
         };
@@ -1175,7 +1181,7 @@ impl Parser {
         names
     }
 
-    fn class_body_decl(&mut self) -> PResult<Decl> {
+    fn class_body_decl(&mut self, in_instance: bool) -> PResult<Decl> {
         if self.at_kw(Kw::Type) {
             self.require_type_families()?;
             // An associated type: `type F a [:: k]` declares it; `type F T = t` is an equation
@@ -1223,6 +1229,9 @@ impl Parser {
             });
         }
         if self.at_kw(Kw::Default) {
+            if !self.exts.is_on("DefaultSignatures") {
+                return self.err("A default method signature requires DefaultSignatures");
+            }
             self.bump();
             return match self.value_decl()? {
                 Decl::Sig { names, ty, loc } => Ok(Decl::DefaultSig { names, ty, loc }),
@@ -1233,7 +1242,17 @@ impl Parser {
             self.require_type_families()?;
             return self.err("associated data families are not supported yet");
         }
-        self.value_decl()
+        let decl = self.value_decl()?;
+        if let Decl::Sig { loc, .. } = &decl {
+            if in_instance && !self.exts.is_on("InstanceSigs") {
+                return Err(super::ParseError {
+                    line: loc.line,
+                    col: loc.col,
+                    msg: "A method signature inside an instance requires InstanceSigs".into(),
+                });
+            }
+        }
+        Ok(decl)
     }
 
     /// `instance forall a b. C a => ..`: the explicit binders of an instance head (its variables
@@ -1257,7 +1276,7 @@ impl Parser {
         let (head, unboxed_head) = self.instance_head()?;
         let decls = if self.at_kw(Kw::Where) {
             self.bump();
-            group_binds(self.block(|p| p.class_body_decl())?)
+            group_binds(self.block(|p| p.class_body_decl(true))?)
         } else {
             Vec::new()
         };
@@ -1272,6 +1291,9 @@ impl Parser {
     }
 
     fn standalone_deriving(&mut self, loc: Loc) -> PResult<Decl> {
+        if !self.exts.is_on("StandaloneDeriving") {
+            return self.err("A standalone deriving declaration requires StandaloneDeriving");
+        }
         self.expect_kw(Kw::Deriving)?;
         // DerivingVia: `deriving via (V) instance C T`, or `deriving via Maybe a instance ..`.
         let via = if self.at_varid("via") {

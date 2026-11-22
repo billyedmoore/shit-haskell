@@ -1,7 +1,7 @@
 //! Language extension sets. GHC 9.12 defaults to GHC2021 when no `{-# LANGUAGE #-}`
 //! or cabal setting selects another edition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Extensions enabled by the GHC2021 language edition.
 const GHC2021: &[&str] = &[
@@ -51,6 +51,12 @@ const GHC2021: &[&str] = &[
     "TypeApplications",
     "TypeOperators",
     "TypeSynonymInstances",
+];
+
+/// Extensions added by GHC2024 to the GHC2021 edition.
+const GHC2024_ADDITIONS: &[&str] = &[
+    "DataKinds", "DerivingStrategies", "DisambiguateRecordFields", "ExplicitNamespaces",
+    "GADTs", "MonoLocalBinds", "LambdaCase", "RoleAnnotations",
 ];
 
 /// Extensions enabled by the Haskell2010 language edition.
@@ -106,6 +112,7 @@ pub const KNOWN: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct Extensions {
     on: BTreeSet<String>,
+    overrides: BTreeMap<String, bool>,
     pub(crate) warnings: crate::diagnostic::WarningOptions,
     pub(crate) tabs: Option<(crate::syntax::ast::Loc, usize)>,
     pub(crate) unknown_pragmas: Vec<(crate::syntax::ast::Loc, String)>,
@@ -121,6 +128,7 @@ impl Extensions {
     pub fn ghc2021() -> Self {
         Extensions {
             on: GHC2021.iter().map(|s| s.to_string()).collect(),
+            overrides: BTreeMap::new(),
             warnings: Default::default(),
             tabs: None,
             unknown_pragmas: Vec::new(),
@@ -142,23 +150,28 @@ impl Extensions {
         if item.is_empty() {
             return Ok(());
         }
-        match item {
-            "GHC2021" => {
-                self.on = Extensions::ghc2021().on;
-                return Ok(());
+        let defaults: Option<BTreeSet<String>> = match item {
+            "GHC2021" => Some(GHC2021.iter().map(|s| s.to_string()).collect()),
+            "GHC2024" => Some(GHC2021.iter().chain(GHC2024_ADDITIONS).map(|s| s.to_string()).collect()),
+            "Haskell2010" | "Haskell98" => Some(HASKELL2010.iter().map(|s| s.to_string()).collect()),
+            _ => None,
+        };
+        if let Some(mut defaults) = defaults {
+            if item == "Haskell98" {
+                defaults.remove("ForeignFunctionInterface");
+                defaults.insert("NondecreasingIndentation".to_string());
+                defaults.insert("NPlusKPatterns".to_string());
             }
-            "Haskell2010" | "Haskell98" => {
-                self.on = HASKELL2010.iter().map(|s| s.to_string()).collect();
-                // GHC's Haskell98 also allows a nested block at its enclosing block's column (as
-                // GHC always did; Cabal's default language) and n+k patterns.
-                if item == "Haskell98" {
-                    self.on.remove("ForeignFunctionInterface");
-                    self.on.insert("NondecreasingIndentation".to_string());
-                    self.on.insert("NPlusKPatterns".to_string());
+            // The edition sets defaults. Explicit switches apply even when they precede it.
+            for (name, enabled) in &self.overrides {
+                if *enabled {
+                    defaults.insert(name.clone());
+                } else {
+                    defaults.remove(name);
                 }
-                return Ok(());
             }
-            _ => {}
+            self.on = defaults;
+            return Ok(());
         }
         // Old names of extensions.
         let canonical = |n: &str| -> String {
@@ -183,17 +196,24 @@ impl Extensions {
         let name = name.as_str();
         // RebindableSyntax implies NoImplicitPrelude, as in GHC.
         if enable && name == "RebindableSyntax" {
-            self.on.remove("ImplicitPrelude");
+            self.set_extension("ImplicitPrelude", false);
         }
+        self.set_extension(name, enable);
         if enable {
-            self.on.insert(name.to_string());
             for implied in implied_by(name) {
-                self.on.insert(implied.to_string());
+                self.set_extension(implied, true);
             }
+        }
+        Ok(())
+    }
+
+    fn set_extension(&mut self, name: &str, enabled: bool) {
+        self.overrides.insert(name.to_string(), enabled);
+        if enabled {
+            self.on.insert(name.to_string());
         } else {
             self.on.remove(name);
         }
-        Ok(())
     }
 }
 
@@ -209,6 +229,7 @@ fn implied_by(name: &str) -> &'static [&'static str] {
         "ScopedTypeVariables" => &["ExplicitForAll"],
         "TemplateHaskell" => &["TemplateHaskellQuotes"],
         "DerivingVia" => &["DerivingStrategies"],
+        "UnliftedDatatypes" => &["DataKinds", "StandaloneKindSignatures"],
         "Strict" => &["StrictData"],
         _ => &[],
     }
