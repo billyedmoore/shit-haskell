@@ -1,0 +1,2 @@
+do_last_statement.hs:4:3: error
+The last statement in a 'do' block must be an expression

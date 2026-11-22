@@ -305,7 +305,14 @@ impl Checker {
         for d in decls {
             if let Decl::Deriving(sd) = d {
                 self.loc = sd.loc;
-                derived.extend(self.standalone_derive(sd, &mut instance_locs)?);
+                let mut instances = self.standalone_derive(sd, &mut instance_locs)?;
+                for decl in &mut instances {
+                    if let Decl::Instance(id) = decl {
+                        id.unboxed_head = sd.unboxed_head;
+                        id.loc = sd.loc;
+                    }
+                }
+                derived.extend(instances);
             }
         }
         // The associated type equations of derived instances (`Rep T` of a derived Generic).
@@ -1771,8 +1778,6 @@ impl Checker {
                 Decl::Instance(mut id) => {
                     id.context = sd.context.clone();
                     id.head = sd.head.clone();
-                    id.unboxed_head = sd.unboxed_head;
-                    id.loc = sd.loc;
                     Decl::Instance(id)
                 }
                 other => other,
