@@ -26,7 +26,7 @@ const GHC2021: &[&str] = &[
     "FlexibleInstances",
     "ForeignFunctionInterface",
     "GADTSyntax",
-    "GeneralisedNewtypeDeriving",
+    "GeneralizedNewtypeDeriving",
     "HexFloatLiterals",
     "ImplicitPrelude",
     "ImportQualifiedPost",

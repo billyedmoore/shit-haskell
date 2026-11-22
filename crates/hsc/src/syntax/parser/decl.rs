@@ -1081,7 +1081,8 @@ impl Parser {
         let mut out = Vec::new();
         while self.at_kw(Kw::Deriving) {
             self.bump();
-            let strategy = self.deriving_strategy();
+            let strategy_loc = self.loc();
+            let strategy = self.deriving_strategy()?;
             let classes = if self.at_special('(') {
                 self.bump();
                 let mut cls = Vec::new();
@@ -1098,12 +1099,17 @@ impl Parser {
             } else {
                 vec![self.atype()?]
             };
-            let via = if self.at_varid("via") {
-                self.bump();
+            if self.at_varid("via") && strategy.is_some() {
+                return self.err("Use one deriving strategy per clause");
+            }
+            let via = if self.take_deriving_via()? {
                 Some(self.sigtype()?)
             } else {
                 None
             };
+            if !classes.is_empty() {
+                self.check_deriving_strategy(strategy, strategy_loc)?;
+            }
             out.push(Deriving {
                 strategy,
                 classes,
@@ -1113,20 +1119,48 @@ impl Parser {
         Ok(out)
     }
 
-    fn deriving_strategy(&mut self) -> Option<Strategy> {
-        if self.at_varid("stock") {
-            self.bump();
-            return Some(Strategy::Stock);
+    fn deriving_strategy(&mut self) -> PResult<Option<Strategy>> {
+        let strategy = if self.at_varid("stock") {
+            Strategy::Stock
+        } else if self.at_varid("anyclass") {
+            Strategy::Anyclass
+        } else if self.at_kw(Kw::Newtype) {
+            Strategy::Newtype
+        } else {
+            return Ok(None);
+        };
+        if !self.exts.is_on("DerivingStrategies") {
+            return self.err(format!("The ‘{}’ deriving strategy requires DerivingStrategies", self.tok().describe()));
         }
-        if self.at_varid("anyclass") {
-            self.bump();
-            return Some(Strategy::Anyclass);
+        self.bump();
+        Ok(Some(strategy))
+    }
+
+    fn take_deriving_via(&mut self) -> PResult<bool> {
+        if !self.at_varid("via") {
+            return Ok(false);
         }
-        if self.at_kw(Kw::Newtype) {
-            self.bump();
-            return Some(Strategy::Newtype);
+        if !self.exts.is_on("DerivingVia") {
+            return self.err("The ‘via’ deriving strategy requires DerivingVia");
         }
-        None
+        self.bump();
+        Ok(true)
+    }
+
+    fn check_deriving_strategy(&self, strategy: Option<Strategy>, loc: Loc) -> PResult<()> {
+        let (name, extension) = match strategy {
+            Some(Strategy::Anyclass) => ("anyclass", "DeriveAnyClass"),
+            Some(Strategy::Newtype) => ("newtype", "GeneralizedNewtypeDeriving"),
+            _ => return Ok(()),
+        };
+        if !self.exts.is_on(extension) {
+            return Err(super::ParseError {
+                line: loc.line,
+                col: loc.col,
+                msg: format!("The ‘{name}’ deriving strategy requires {extension}"),
+            });
+        }
+        Ok(())
     }
 
     // ----- classes and instances ---------------------------------------------
@@ -1296,17 +1330,18 @@ impl Parser {
         }
         self.expect_kw(Kw::Deriving)?;
         // DerivingVia: `deriving via (V) instance C T`, or `deriving via Maybe a instance ..`.
-        let via = if self.at_varid("via") {
-            self.bump();
+        let via = if self.take_deriving_via()? {
             Some(self.btype()?)
         } else {
             None
         };
-        let strategy = if via.is_some() { None } else { self.deriving_strategy() };
+        let strategy_loc = self.loc();
+        let strategy = if via.is_some() { None } else { self.deriving_strategy()? };
         self.expect_kw(Kw::Instance)?;
         self.skip_instance_forall();
         let context = self.try_context();
         let (head, unboxed_head) = self.instance_head()?;
+        self.check_deriving_strategy(strategy, strategy_loc)?;
         Ok(Decl::Deriving(StandaloneDeriving {
             strategy,
             via,
