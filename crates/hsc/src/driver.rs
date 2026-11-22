@@ -1542,6 +1542,10 @@ impl Driver {
         let located = |loc, msg: &str| crate::diagnostic::error(path, source, loc, msg);
         let boot = self.checker.boot;
         self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
+        self.checker.flexible_instances = exts.is_on("FlexibleInstances");
+        self.checker.type_synonym_instances = exts.is_on("TypeSynonymInstances");
+        self.checker.undecidable_superclasses = exts.is_on("UndecidableSuperClasses");
+        self.checker.extended_default_rules = exts.is_on("ExtendedDefaultRules");
         self.checker.overloaded_lists = exts.is_on("OverloadedLists");
         self.checker.monomorphism_restriction = exts.is_on("MonomorphismRestriction");
         self.checker.mono_local_binds = exts.is_on("MonoLocalBinds");

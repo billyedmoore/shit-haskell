@@ -180,6 +180,7 @@ impl Checker {
         self.deferred_eqs.clear();
         self.closed_locals.clear();
         self.dict_counter = 0;
+        self.numeric_defaults = None;
         let decls = &m.decls;
 
         // 0. Kinds of this module's type constructors.
@@ -296,6 +297,9 @@ impl Checker {
                 class_decls.push(cd);
             }
         }
+        if !self.undecidable_superclasses {
+            self.check_superclass_cycles(&class_decls)?;
+        }
         // Newtype deriving and standalone deriving, once this module's classes are known.
         let mut instance_locs = HashMap::new();
         for d in decls {
@@ -355,6 +359,9 @@ impl Checker {
             }
         }
         self.reduce_derived_contexts(&derived_insts);
+        if let Some(Decl::Default { types, loc }) = decls.iter().find(|d| matches!(d, Decl::Default { .. })) {
+            self.check_default_types(types, *loc)?;
+        }
         // 6. Top-level values.
         let is_rule = |d: &Decl| matches!(d, Decl::Fun { name, .. } if name.starts_with(crate::rename::RULE_PREFIX));
         let value_decls: Vec<Decl> = decls
@@ -627,6 +634,78 @@ impl Checker {
                     self.env.values[&format!("{}.{f}", self.module)].clone(),
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn check_default_types(&mut self, types: &[Type], loc: Loc) -> TR<()> {
+        let num = if self.env.classes.contains_key("GHC.Internal.Num.Num") { "GHC.Internal.Num.Num" } else { "Base.Num" };
+        let string = "GHC.Internal.Data.String.IsString";
+        let mut classes = vec![num];
+        if self.overloaded_strings {
+            classes.push(string);
+        }
+        classes.retain(|class| self.env.classes.contains_key(*class));
+
+        let mut defaults = Vec::with_capacity(types.len());
+        for t in types {
+            self.loc = t.loc();
+            let mut vars = Vec::new();
+            let ty = self.convert_type(t, &mut vars)?;
+            if let Some(var) = vars.first() {
+                return self.err(format!("Type variable ‘{var}’ is not in scope in this default declaration"));
+            }
+            let ty = self.normalize(&ty);
+            if !self.extended_default_rules && !classes.is_empty() && !classes.iter().any(|class| {
+                self.find_instance(&Pred { class: (*class).into(), args: vec![ty.clone()] }).is_some()
+            }) {
+                self.loc = loc;
+                let names: Vec<_> = classes.iter().map(|class| format!("‘{}’", super::types::unqualify(class))).collect();
+                return self.err(format!("The default type ‘{}’ is not an instance of {}", self.show(&ty), names.join(" or ")));
+            }
+            defaults.push(ty);
+        }
+        self.numeric_defaults = Some(defaults);
+        Ok(())
+    }
+
+    fn check_superclass_cycles(&self, decls: &[&ClassDecl]) -> TR<()> {
+        let keys: Vec<_> = decls.iter().map(|cd| format!("{}.{}", self.module, cd.name)).collect();
+        let names: HashMap<_, _> = keys.iter().enumerate().map(|(index, key)| (key.as_str(), index)).collect();
+        let mut edges = vec![Vec::new(); decls.len()];
+        for (index, name) in keys.iter().enumerate() {
+            let Some(info) = self.env.classes.get(name) else { continue };
+            for pred in &info.supers {
+                if pred.class == super::convert::CONSTRAINT_VAR || self.env.families.contains_key(&pred.class) {
+                    let cd = decls[index];
+                    let dependency = if pred.class == super::convert::CONSTRAINT_VAR {
+                        "a type variable".into()
+                    } else {
+                        format!("type family ‘{}’", super::types::unqualify(&pred.class))
+                    };
+                    return Err(TcError {
+                        loc: cd.loc,
+                        msg: format!(
+                            "Potential superclass cycle for ‘{}’ through {dependency}\nEnable UndecidableSuperClasses to permit this constraint.",
+                            cd.name
+                        ),
+                    });
+                }
+                if let Some(other) = names.get(pred.class.as_str()) {
+                    edges[index].push(*other);
+                }
+            }
+        }
+        if let Some(group) = cyclic_components(&edges).next() {
+            let first = decls[group[0]];
+            let classes: Vec<_> = group.iter().map(|&i| format!("‘{}’", decls[i].name)).collect();
+            return Err(TcError {
+                loc: first.loc,
+                msg: format!(
+                    "Superclass cycle involving {}\nEnable UndecidableSuperClasses to permit cyclic superclass constraints.",
+                    classes.join(", ")
+                ),
+            });
         }
         Ok(())
     }
@@ -1012,16 +1091,43 @@ impl Checker {
             Type::Con(q, _) => global_tycon_name(q),
             _ => return self.err("Malformed instance head"),
         };
-        if !self.env.classes.contains_key(&class) {
-            if id.overlap.as_deref() == Some(super::derive::DERIVED_MARK) {
+        let derived = id.overlap.as_deref() == Some(super::derive::DERIVED_MARK);
+        let Some(info) = self.env.classes.get(&class) else {
+            if derived {
                 // A derived instance of a class this library does not provide.
                 return Ok(());
             }
             return self.err(format!("‘{}’ is not a class", super::types::unqualify(&class)));
+        };
+        if args.len() != info.nparams as usize {
+            return self.err(format!(
+                "Instance of ‘{}’ expects {} class parameters, but the head supplies {}",
+                super::types::unqualify(&class), info.nparams, args.len()
+            ));
         }
         let mut tvs = Vec::new();
         let mut head = Vec::new();
         for a in &args {
+            if !derived && !self.type_synonym_instances {
+                let mut head = *a;
+                loop {
+                    match head {
+                        Type::App(f, _) | Type::Sig(f, _) => head = f,
+                        _ => break,
+                    }
+                }
+                if let Type::Con(q, loc) = head {
+                    if self.env.synonyms.contains_key(&global_tycon_name(q)) {
+                        return Err(TcError {
+                            loc: *loc,
+                            msg: format!(
+                                "Type synonym ‘{}’ is not allowed in this instance head\nEnable TypeSynonymInstances to permit it.",
+                                q.name
+                            ),
+                        });
+                    }
+                }
+            }
             // A head may name a data family instance: it is the representation type then.
             let converted = self.convert_type(a, &mut tvs)?;
             let normalized = self.normalize(&converted);
@@ -1031,6 +1137,15 @@ impl Checker {
                     msg: format!(
                         "A polymorphic type is not allowed in the head of an instance of ‘{}’",
                         super::types::unqualify(&class)
+                    ),
+                });
+            }
+            if !derived && !self.flexible_instances && !standard_instance_argument(&normalized) {
+                return Err(TcError {
+                    loc: a.loc(),
+                    msg: format!(
+                        "Illegal instance type ‘{}’\nUse a type constructor applied to distinct type variables, or enable FlexibleInstances.",
+                        self.show(&normalized)
                     ),
                 });
             }
@@ -1841,12 +1956,7 @@ fn check_type_synonym_cycles(module: &str, decls: &[Decl]) -> TR<()> {
         refs.dedup();
         refs
     }).collect();
-    for mut group in super::bind::tarjan(synonyms.len(), &edges) {
-        let first = group[0];
-        if group.len() == 1 && !edges[first].contains(&first) {
-            continue;
-        }
-        group.sort_unstable();
+    if let Some(group) = cyclic_components(&edges).next() {
         let mut msg = "Cycle in type synonym declarations".to_string();
         for &index in &group {
             let (name, _, loc) = synonyms[index];
@@ -1855,6 +1965,23 @@ fn check_type_synonym_cycles(module: &str, decls: &[Decl]) -> TR<()> {
         return Err(TcError { loc: synonyms[group[0]].2, msg });
     }
     Ok(())
+}
+
+fn cyclic_components(edges: &[Vec<usize>]) -> impl Iterator<Item = Vec<usize>> + '_ {
+    super::bind::tarjan(edges.len(), edges).into_iter().filter_map(|mut group| {
+        if group.len() == 1 && !edges[group[0]].contains(&group[0]) {
+            return None;
+        }
+        group.sort_unstable();
+        Some(group)
+    })
+}
+
+fn standard_instance_argument(ty: &Ty) -> bool {
+    let (head, args) = ty.split_apps();
+    let mut seen = std::collections::HashSet::new();
+    matches!(head, Ty::Con(name) if !name.starts_with('#'))
+        && args.iter().all(|arg| matches!(arg, Ty::Gen(id) if seen.insert(*id)))
 }
 
 fn contains_polytype(ty: &Ty) -> bool {

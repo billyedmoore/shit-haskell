@@ -1,0 +1,2 @@
+Illegal instance type ‘Maybe Int’
+enable FlexibleInstances

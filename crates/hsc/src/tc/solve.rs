@@ -1541,7 +1541,9 @@ impl Checker {
                 if !string_like && !preds_on_m.iter().any(|p| is_numeric_class(&p.class)) {
                     continue;
                 }
-                let cands: Vec<Ty> = if string_like {
+                let cands: Vec<Ty> = if let Some(defaults) = &self.numeric_defaults {
+                    defaults.clone()
+                } else if string_like {
                     vec![Ty::app(Ty::con(super::types::LIST), Ty::con("GHC.Types.Char"))]
                 } else {
                     DEFAULT_CANDIDATES.iter().map(|c| Ty::con(c)).collect()

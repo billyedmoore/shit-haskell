@@ -103,6 +103,12 @@ pub struct Checker {
     pub sig_kind_vars: HashMap<String, Vec<String>>,
     /// OverloadedStrings is on in the module being checked: string literals are `fromString`.
     pub overloaded_strings: bool,
+    pub flexible_instances: bool,
+    pub type_synonym_instances: bool,
+    pub undecidable_superclasses: bool,
+    pub extended_default_rules: bool,
+    /// The current module's explicit default types, including an empty list.
+    pub numeric_defaults: Option<Vec<Ty>>,
     /// OverloadedLists: list literals, sequences and list patterns go through `IsList`.
     pub overloaded_lists: bool,
     /// GeneralizedNewtypeDeriving: a newtype derives most classes through its representation.
@@ -181,6 +187,11 @@ impl Checker {
             scoped: Vec::new(),
             sig_kind_vars: HashMap::new(),
             overloaded_strings: false,
+            flexible_instances: true,
+            type_synonym_instances: true,
+            undecidable_superclasses: false,
+            extended_default_rules: false,
+            numeric_defaults: None,
             overloaded_lists: false,
             newtype_deriving: false,
             monomorphism_restriction: true,
