@@ -580,7 +580,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 6";
+const MAGIC: &str = "hsc-module-cache 7";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.
@@ -592,9 +592,11 @@ pub struct Entry {
     pub binds: Vec<TopBind>,
     pub env: EnvDelta,
     pub explicit_sigs: Vec<String>,
+    /// Nonfatal diagnostics produced when checking this module.
+    pub warnings: Vec<String>,
 }
 
-bin_struct!(Entry { boot_key, deps, iface, binds, env, explicit_sigs });
+bin_struct!(Entry { boot_key, deps, iface, binds, env, explicit_sigs, warnings });
 
 /// Dictionary names are part of the interface consumed by SOURCE importers. Their
 /// numbering can differ between a boot interface and its implementation. Include
@@ -812,11 +814,15 @@ mod tests {
         let name = GName { module: "Views".into(), name: "P".into() };
         let mut iface = Iface { module: "Views".into(), ..Iface::default() };
         iface.patsyns.insert(name.clone(), pattern.clone());
-        let mut entry = Entry { boot_key: None, deps: Vec::new(), iface, binds: Vec::new(), env: EnvDelta::default(), explicit_sigs: Vec::new() };
+        let mut entry = Entry {
+            boot_key: None, deps: Vec::new(), iface, binds: Vec::new(), env: EnvDelta::default(),
+            explicit_sigs: Vec::new(), warnings: vec!["Views.hs:4:1: warning: [-Wtabs]".into()],
+        };
         let path = std::env::temp_dir().join(format!("hsc-view-cache-{}.bin", std::process::id()));
         save(&path, &entry);
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.iface.patsyns[&name], pattern);
+        assert_eq!(loaded.warnings, entry.warnings);
         let before = std::fs::read(&path).unwrap();
         entry.iface.patsyns.get_mut(&name).unwrap().pat = Pat::View(
             Box::new(Expr::Let(Vec::new(), Box::new(view), l)), Box::new(Pat::Wild(l)), l);

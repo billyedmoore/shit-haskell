@@ -1,7 +1,7 @@
 //! Conversion of renamed syntactic types into checker types and schemes.
 
 use super::types::{Pred, Scheme, Ty};
-use super::{Checker, TR};
+use super::{Checker, TcError, TR};
 use crate::syntax::ast::{Lit, QName, Type};
 
 /// The global name of a renamed type-level name, e.g. `Prelude.Int` or `Builtin.[]`.
@@ -151,14 +151,34 @@ impl Checker {
         while let Type::App(f, _) = head {
             head = f;
         }
-        if let Type::Con(q, _) = head {
-            let name = global_tycon_name(q);
-            if !q.name.starts_with('?') && self.env.synonyms.contains_key(&name) {
-                let ty = self.convert_type(t, tvs)?;
-                return Ok(ty_to_preds(&ty));
+        let synonym = matches!(head, Type::Con(q, _) if !q.name.starts_with('?') && self.env.synonyms.contains_key(&global_tycon_name(q)));
+        let preds = if synonym {
+            ty_to_preds(&self.convert_type(t, tvs)?)
+        } else {
+            vec![self.convert_pred(t, tvs)?]
+        };
+        for pred in &preds {
+            if pred.class != "Builtin.()" && self.env.data_decls.contains_key(&pred.class) {
+                return Err(TcError {
+                    loc: t.loc(),
+                    msg: format!("Expected a constraint, but ‘{}’ is a type", self.show_pred(pred)),
+                });
+            }
+            if let Some(info) = self.class(&pred.class) {
+                if pred.args.len() != info.nparams as usize {
+                    let n = info.nparams;
+                    let plural = if n == 1 { "" } else { "s" };
+                    return Err(TcError {
+                        loc: t.loc(),
+                        msg: format!(
+                            "Class ‘{}’ expects {n} type argument{plural}, but has been given {}",
+                            super::types::unqualify(&pred.class), pred.args.len()
+                        ),
+                    });
+                }
             }
         }
-        Ok(vec![self.convert_pred(t, tvs)?])
+        Ok(preds)
     }
 
     /// Converts a context item such as `Show a` into a predicate.

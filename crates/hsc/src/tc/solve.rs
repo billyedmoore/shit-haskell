@@ -1731,6 +1731,8 @@ impl Checker {
         match self.metas.prune(t) {
             Ty::Meta(x) => x == m,
             Ty::App(f, x) => self.occurs_meta(m, &f) || self.occurs_meta(m, &x),
+            Ty::Qual(preds, body) | Ty::Forall(_, preds, body) =>
+                self.occurs_meta(m, &body) || preds.iter().flat_map(|p| &p.args).any(|arg| self.occurs_meta(m, arg)),
             _ => false,
         }
     }
@@ -1850,6 +1852,8 @@ fn skol_occurs(id: u32, t: &Ty) -> bool {
     match t {
         Ty::Skol(j, _) => *j == id,
         Ty::App(f, x) => skol_occurs(id, f) || skol_occurs(id, x),
+        Ty::Qual(preds, body) | Ty::Forall(_, preds, body) =>
+            skol_occurs(id, body) || preds.iter().flat_map(|p| &p.args).any(|arg| skol_occurs(id, arg)),
         _ => false,
     }
 }

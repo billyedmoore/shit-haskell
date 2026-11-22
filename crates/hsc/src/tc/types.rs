@@ -434,6 +434,8 @@ impl Metas {
         match self.prune(t) {
             Ty::Skol(y, _) => y == x,
             Ty::App(f, a) => self.skol_in_(x, &f) || self.skol_in_(x, &a),
+            Ty::Qual(preds, body) | Ty::Forall(_, preds, body) =>
+                self.skol_in_(x, &body) || preds.iter().flat_map(|p| &p.args).any(|arg| self.skol_in_(x, arg)),
             _ => false,
         }
     }

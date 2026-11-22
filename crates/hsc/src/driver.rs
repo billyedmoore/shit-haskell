@@ -909,7 +909,7 @@ impl Driver {
             self.checker.env.instances.iter().filter(|i| i.dict.starts_with(&prefix) && !implemented.contains(i.dict.as_str())).cloned().collect()
         } else { Vec::new() };
         let binds_before = self.binds.len();
-        self.compile_module(parsed, exts, &shown, Some(&src), None)?;
+        let warnings = self.compile_module(parsed, exts, &shown, Some(&src), None)?;
         let mut new_binds = self.binds.split_off(binds_before);
         if completing_boot {
             if !self.checker.complete_boot_instances(&boot_instances, &mut new_binds).map_err(|e| e.msg)? {
@@ -935,6 +935,7 @@ impl Driver {
                         binds: self.binds[binds_before..].to_vec(),
                         env,
                         explicit_sigs: Vec::new(),
+                        warnings,
                     };
                     if std::env::var_os("HSC_DEBUG_CACHE").is_some() {
                         let prefix = format!("{module}.");
@@ -1019,6 +1020,9 @@ impl Driver {
         self.binds.extend(entry.binds);
         self.loaded.insert(module.to_string());
         self.sources.push((module.to_string(), path.to_path_buf(), home));
+        for warning in entry.warnings {
+            eprintln!("{warning}");
+        }
         if let Some(n) = std::env::var_os("HSC_DEBUG_SCHEME") {
             let n = n.to_string_lossy().to_string();
             if let Some(s) = self.checker.env.values.get(&n) {
@@ -1517,7 +1521,7 @@ impl Driver {
 
     fn compile_module(
         &mut self, m: Module, exts: Extensions, path: &Path, source: Option<&str>, entry_name: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         let name = m.name.clone();
         // HSC_PROGRESS: each module compiled, with the compiler's resident memory then.
         if std::env::var_os("HSC_PROGRESS").is_some() {
@@ -1577,15 +1581,20 @@ impl Driver {
         let binds = self.checker.check_module_with_main(&renamed, entry.as_ref().map(|(key, name, loc)| (key.as_str(), *name, *loc)))
             .map_err(|e| located(e.loc, &e.msg))?;
         timing::add("typecheck", t);
-        if source.is_some() {
-            self.report_warnings(&renamed, &exts, path, source)?;
+        let warnings = if source.is_some() {
+            self.module_warnings(&renamed, &exts, path, source)?
+        } else {
+            Vec::new()
+        };
+        for warning in &warnings {
+            eprintln!("{warning}");
         }
         self.binds.extend(binds);
         self.ifaces.insert(name, iface);
-        Ok(())
+        Ok(warnings)
     }
 
-    fn report_warnings(&self, module: &Module, exts: &Extensions, path: &Path, source: Option<&str>) -> Result<(), String> {
+    fn module_warnings(&self, module: &Module, exts: &Extensions, path: &Path, source: Option<&str>) -> Result<Vec<String>, String> {
         use crate::diagnostic::Warning;
         let mut warnings = Vec::new();
         if let (Some((loc, count)), Some(fatal)) = (exts.tabs, exts.warnings.level(Warning::Tabs)) {
@@ -1634,16 +1643,13 @@ impl Driver {
         }
         warnings.sort_by_key(|(loc, ..)| *loc);
         let has_fatal = warnings.iter().any(|(_, _, _, fatal)| *fatal);
-        let rendered = warnings.into_iter().map(|(loc, msg, flag, fatal)| {
+        let rendered: Vec<_> = warnings.into_iter().map(|(loc, msg, flag, fatal)| {
             crate::diagnostic::warning(path, source, loc, &msg, flag, fatal)
-        });
+        }).collect();
         if has_fatal {
-            return Err(rendered.collect::<Vec<_>>().join("\n\n"));
+            return Err(rendered.join("\n\n"));
         }
-        for warning in rendered {
-            eprintln!("{warning}");
-        }
-        Ok(())
+        Ok(rendered)
     }
 }
 
@@ -2023,6 +2029,7 @@ mod cache_tests {
             binds: Vec::new(),
             env: crate::cache::EnvDelta::default(),
             explicit_sigs: Vec::new(),
+            warnings: Vec::new(),
         };
         assert!(!d.use_cached("A", entry, "source", &s.0.join("A.hs"), true));
         assert!(!d.loaded.contains("A"));
@@ -2033,6 +2040,7 @@ mod cache_tests {
             binds: Vec::new(),
             env: crate::cache::EnvDelta::default(),
             explicit_sigs: Vec::new(),
+            warnings: Vec::new(),
         };
         assert!(d.use_cached("A", entry, "source", &s.0.join("A.hs"), true));
     }

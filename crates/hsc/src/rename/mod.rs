@@ -1857,6 +1857,7 @@ impl<'a> Renamer<'a> {
                 dotdot,
                 loc,
             } => {
+                check_record_fields(&fields, loc)?;
                 // A record pattern synonym builds by its builder, its fields in the synonym's order.
                 let con_q = self.value_ref(&con, loc, true)?;
                 if let Some(def) = self.patsyn_of(&con_q).filter(|d| d.builder) {
@@ -1907,6 +1908,7 @@ impl<'a> Renamer<'a> {
                 }
             }
             Expr::RecUpd(e, fields, loc) => {
+                check_record_fields(&fields, loc)?;
                 let e = self.expr(*e)?;
                 // An update of a record pattern synonym's fields (`lbi { installedPkgs = i }`
                 // with `pattern LocalBuildInfo {..}`): a match on the synonym and its builder.
@@ -2066,6 +2068,7 @@ impl<'a> Renamer<'a> {
                 dotdot,
                 loc,
             } => {
+                check_record_fields(&fields, loc)?;
                 // `P{}` or `P{f = p}` on a pattern synonym: its prefix form, the named parameters
                 // given and the others wildcards.
                 let cq = self.value_ref(&con, loc, true)?;
@@ -2491,6 +2494,16 @@ fn check_group_signatures(decls: &[Decl]) -> RR<()> {
                     msg: format!("Duplicate {kind}s for ‘{name}’\nThe first declaration is at line {}, column {}.", first.line, first.col),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+fn check_record_fields<T>(fields: &[(QName, Option<T>)], loc: Loc) -> RR<()> {
+    let mut seen = HashSet::new();
+    for (field, _) in fields {
+        if !seen.insert(field.name.as_str()) {
+            return Err(RnError { loc, msg: format!("Field ‘{}’ is specified more than once in this record", field.name) });
         }
     }
     Ok(())

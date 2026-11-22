@@ -1024,7 +1024,17 @@ impl Checker {
         for a in &args {
             // A head may name a data family instance: it is the representation type then.
             let converted = self.convert_type(a, &mut tvs)?;
-            head.push(self.normalize(&converted));
+            let normalized = self.normalize(&converted);
+            if contains_polytype(&normalized) {
+                return Err(TcError {
+                    loc: a.loc(),
+                    msg: format!(
+                        "A polymorphic type is not allowed in the head of an instance of ‘{}’",
+                        super::types::unqualify(&class)
+                    ),
+                });
+            }
+            head.push(normalized);
         }
         let mut ctx = Vec::new();
         // An instance's context may hold quantified constraints (`(forall a. Show a => Show (m a))
@@ -1226,7 +1236,10 @@ impl Checker {
                     .find(|i| i.head == head_check && (i.kinds.is_empty() || i.kinds == kinds))
             })
             .cloned()
-            .expect("instance registered");
+            .ok_or_else(|| TcError {
+                loc: id.loc,
+                msg: format!("Could not resolve the instance for ‘{}’", self.show_pred(&Pred { class: class.clone(), args: head_check })),
+            })?;
         let info = self.class(&class).cloned().expect("class registered");
 
         // Skolemise the instance variables (named as in the source); the context is given.
@@ -1842,6 +1855,14 @@ fn check_type_synonym_cycles(module: &str, decls: &[Decl]) -> TR<()> {
         return Err(TcError { loc: synonyms[group[0]].2, msg });
     }
     Ok(())
+}
+
+fn contains_polytype(ty: &Ty) -> bool {
+    match ty {
+        Ty::Qual(..) | Ty::Forall(..) => true,
+        Ty::App(f, a) => contains_polytype(f) || contains_polytype(a),
+        _ => false,
+    }
 }
 
 fn simple_record_type(ty: &Ty, parameters: u32) -> bool {
