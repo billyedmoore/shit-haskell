@@ -517,6 +517,7 @@ impl Parser {
                 return self.err("Expected a datatype or class name after ‘type role’");
             };
             const ROLES: &[&str] = &["nominal", "representational", "phantom"];
+            let mut roles = 0;
             while self.real() && !self.at_eof() && !self.at_semi() && !self.at_special('}') {
                 match self.tok() {
                     Tok::Kw(Kw::Underscore) => {}
@@ -530,9 +531,10 @@ impl Parser {
                     }
                     _ => return self.unexpected(),
                 }
+                roles += 1;
                 self.bump();
             }
-            return Ok(Decl::RoleAnnotation { name, loc });
+            return Ok(Decl::RoleAnnotation { name, roles, loc });
         }
         let head = self.btype()?;
         if self.at_res(ROp::DColon) {

@@ -220,6 +220,7 @@ pub enum Decl {
     },
     RoleAnnotation {
         name: QName,
+        roles: usize,
         loc: Loc,
     },
     /// An open or closed type family, or a data family (always open).

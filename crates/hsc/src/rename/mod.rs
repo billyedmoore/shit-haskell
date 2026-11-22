@@ -273,7 +273,7 @@ impl<'a> Renamer<'a> {
             }
         }
         for decl in &m.decls {
-            let Decl::RoleAnnotation { name, loc } = decl else { continue };
+            let Decl::RoleAnnotation { name, roles, loc } = decl else { continue };
             let local = self.lookup_global(name, Ns::Type).ok().filter(|entity| entity.global.module == self.module);
             let Some(entity) = local else {
                 return Err(RnError {
@@ -284,11 +284,34 @@ impl<'a> Renamer<'a> {
                     ),
                 }.into());
             };
-            let datatype = m.decls.iter().any(|decl| matches!(decl, Decl::Data(data) if data.name == entity.global.name));
-            if entity.kind != EntKind::Class && !datatype {
+            let datatype = m.decls.iter().find_map(|decl| match decl {
+                Decl::Data(data) if data.name == entity.global.name => Some(data),
+                _ => None,
+            });
+            if entity.kind != EntKind::Class && datatype.is_none() {
                 return Err(RnError {
                     loc: *loc,
                     msg: format!("A role annotation applies to a datatype or class. ‘{}’ is a type synonym or family.", name.name),
+                }.into());
+            }
+            let arity = if entity.kind == EntKind::Class {
+                m.decls.iter().find_map(|decl| match decl {
+                    Decl::Class(class) if class.name == entity.global.name => Some(class.tyvars.len()),
+                    _ => None,
+                })
+            } else {
+                // GADT result kinds can add visible arguments through kind synonyms.
+                datatype.filter(|data| {
+                    !data.cons.is_empty() && data.cons.iter().all(|con| con.gadt_result.is_none())
+                }).map(|data| data.tyvars.len())
+            };
+            if let Some(arity) = arity.filter(|arity| arity != roles) {
+                return Err(RnError {
+                    loc: *loc,
+                    msg: format!(
+                        "Wrong number of roles in the annotation for ‘{}’\nThe declaration expects {arity}. This annotation supplies {roles}.",
+                        name.name
+                    ),
                 }.into());
             }
         }
@@ -2539,7 +2562,7 @@ fn check_group_signatures(decls: &[Decl]) -> RR<()> {
             Decl::DefaultSig { names, loc, .. } => ("default signature", names, loc),
             Decl::Fixity { ops, loc, .. } => ("fixity declaration", ops, loc),
             Decl::KindSig { name, loc, .. } => ("standalone kind signature", std::slice::from_ref(name), loc),
-            Decl::RoleAnnotation { name, loc } => ("role annotation", std::slice::from_ref(&name.name), loc),
+            Decl::RoleAnnotation { name, loc, .. } => ("role annotation", std::slice::from_ref(&name.name), loc),
             Decl::PatSynSig { names, loc, .. } => ("pattern synonym signature", names, loc),
             _ => continue,
         };
