@@ -512,13 +512,27 @@ impl Parser {
             if !self.exts.is_on("RoleAnnotations") {
                 return self.err("Role annotations require RoleAnnotations");
             }
-            // RoleAnnotations constrain coercions, which are not checked: the declaration is
-            // skipped, up to the end of its line.
             self.bump();
-            while self.real() {
+            let Type::Con(name, loc) = self.atype()? else {
+                return self.err("Expected a datatype or class name after ‘type role’");
+            };
+            const ROLES: &[&str] = &["nominal", "representational", "phantom"];
+            while self.real() && !self.at_eof() && !self.at_semi() && !self.at_special('}') {
+                match self.tok() {
+                    Tok::Kw(Kw::Underscore) => {}
+                    Tok::VarId(role) if ROLES.contains(&role.as_str()) => {}
+                    Tok::VarId(role) => {
+                        let hint = match ROLES.iter().find(|candidate| crate::diagnostic::one_edit_apart(role, candidate)) {
+                            Some(candidate) => format!("Did you mean ‘{candidate}’?"),
+                            None => "Use ‘nominal’, ‘representational’, ‘phantom’, or ‘_’.".into(),
+                        };
+                        return self.err(format!("Unknown role ‘{role}’\n{hint}"));
+                    }
+                    _ => return self.unexpected(),
+                }
                 self.bump();
             }
-            return Ok(Decl::Fixity { assoc: Assoc::None, prec: 9, ops: Vec::new(), loc });
+            return Ok(Decl::RoleAnnotation { name, loc });
         }
         let head = self.btype()?;
         if self.at_res(ROp::DColon) {

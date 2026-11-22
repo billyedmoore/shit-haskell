@@ -218,6 +218,10 @@ pub enum Decl {
         kind: Type,
         loc: Loc,
     },
+    RoleAnnotation {
+        name: QName,
+        loc: Loc,
+    },
     /// An open or closed type family, or a data family (always open).
     TypeFamily {
         name: String,

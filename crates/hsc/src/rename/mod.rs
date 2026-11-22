@@ -272,6 +272,26 @@ impl<'a> Renamer<'a> {
                 self.add_entity(s.clone(), true, Some(&self.module.clone()));
             }
         }
+        for decl in &m.decls {
+            let Decl::RoleAnnotation { name, loc } = decl else { continue };
+            let local = self.lookup_global(name, Ns::Type).ok().filter(|entity| entity.global.module == self.module);
+            let Some(entity) = local else {
+                return Err(RnError {
+                    loc: *loc,
+                    msg: format!(
+                        "The role annotation for ‘{}’ needs a declaration in this module\nWrite the annotation in the module that declares the datatype or class.",
+                        name.name
+                    ),
+                }.into());
+            };
+            let datatype = m.decls.iter().any(|decl| matches!(decl, Decl::Data(data) if data.name == entity.global.name));
+            if entity.kind != EntKind::Class && !datatype {
+                return Err(RnError {
+                    loc: *loc,
+                    msg: format!("A role annotation applies to a datatype or class. ‘{}’ is a type synonym or family.", name.name),
+                }.into());
+            }
+        }
         // Fixities declared in this module.
         for d in &m.decls {
             if let Decl::Fixity { assoc, prec, ops, loc } = d {
@@ -1375,6 +1395,7 @@ impl<'a> Renamer<'a> {
                     loc,
                 }
             }
+            annotation @ Decl::RoleAnnotation { .. } => annotation,
             Decl::TypeFamily {
                 name,
                 params,
@@ -2518,6 +2539,7 @@ fn check_group_signatures(decls: &[Decl]) -> RR<()> {
             Decl::DefaultSig { names, loc, .. } => ("default signature", names, loc),
             Decl::Fixity { ops, loc, .. } => ("fixity declaration", ops, loc),
             Decl::KindSig { name, loc, .. } => ("standalone kind signature", std::slice::from_ref(name), loc),
+            Decl::RoleAnnotation { name, loc } => ("role annotation", std::slice::from_ref(&name.name), loc),
             Decl::PatSynSig { names, loc, .. } => ("pattern synonym signature", names, loc),
             _ => continue,
         };
@@ -2810,6 +2832,7 @@ fn decl_loc(d: &Decl) -> Loc {
         | Decl::Default { loc, .. }
         | Decl::Foreign { loc, .. }
         | Decl::KindSig { loc, .. }
+        | Decl::RoleAnnotation { loc, .. }
         | Decl::TypeFamily { loc, .. }
         | Decl::TypeInstance { loc, .. } => *loc,
         Decl::Data(dd) => dd.loc,
