@@ -117,21 +117,9 @@ fn format_at(path: &Path, source: Option<&str>, loc: Loc, label: &str, message: 
         return out;
     }
     let gutter = line.to_string().len();
-    let width = tab_width.unwrap_or_else(|| token_width(&expanded, offset));
+    let width = tab_width.or_else(|| crate::syntax::lexer::first_token_width(expanded.chars().skip(offset)))
+        .unwrap_or(1);
     let marker = "^".repeat(width);
     let _ = write!(out, "\n{space:gutter$} |\n{line} | {expanded}\n{space:gutter$} | {space:offset$}{marker}", space = "");
     out
-}
-
-fn token_width(line: &str, col: usize) -> usize {
-    let mut token = line.chars().skip(col);
-    let Some(first) = token.next() else { return 1 };
-    let ident = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '\'' | '#');
-    if first.is_alphanumeric() || first == '_' {
-        1 + token.take_while(|&ch| ident(ch)).count()
-    } else if crate::syntax::lexer::is_symbol(first) {
-        1 + token.take_while(|&ch| crate::syntax::lexer::is_symbol(ch)).count()
-    } else {
-        1
-    }
 }

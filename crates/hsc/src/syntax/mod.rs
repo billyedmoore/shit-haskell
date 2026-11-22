@@ -75,8 +75,9 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     // UnicodeSyntax (the first lexing assumed MagicHash on and UnicodeSyntax off).
     let magic = exts.is_on("MagicHash");
     let unicode = exts.is_on("UnicodeSyntax");
-    let lexed = if (!magic && src.contains('#')) || (unicode && !src.is_ascii()) {
-        lexer::lex_with(src, magic, unicode).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?
+    let binary = exts.is_on("BinaryLiterals");
+    let lexed = if (!magic && src.contains('#')) || (unicode && !src.is_ascii()) || (!binary && lexed.saw_binary) {
+        lexer::lex_with_binary(src, magic, unicode, binary).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?
     } else {
         lexed
     };
@@ -85,12 +86,21 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     // the source lexed again.
     let lexed = if exts.is_on("QuasiQuotes") {
         match rewrite_quasiquotes(src, th_quotes) {
-            Some(rewritten) => lexer::lex_with(&rewritten, magic, unicode).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
+            Some(rewritten) => lexer::lex_with_binary(&rewritten, magic, unicode, binary).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
             None => lexed,
         }
     } else {
         lexed
     };
+    if !exts.is_on("NumericUnderscores") {
+        if let Some(loc) = lexed.numeric_separator {
+            return Err(SyntaxError {
+                line: loc.line,
+                col: loc.col,
+                msg: "Underscore separators in numeric literals require NumericUnderscores".into(),
+            });
+        }
+    }
     let rule_pragmas: Vec<lexer::Pragma> = lexed.pragmas.iter().filter(|p| p.name == "RULES").cloned().collect();
     // Top-level INLINE and NOINLINE pragmas (those in class, instance and local bodies are
     // indented, and ignored).

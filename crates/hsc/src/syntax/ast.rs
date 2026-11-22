@@ -472,23 +472,37 @@ impl Type {
         }
     }
 
-    pub fn first_wildcard(&self) -> Option<Loc> {
-        match self {
-            Self::Wild(loc) => Some(*loc),
-            Self::App(a, b) | Self::Fun(a, b) | Self::Sig(a, b) =>
-                a.first_wildcard().or_else(|| b.first_wildcard()),
-            Self::List(t, _) => t.first_wildcard(),
-            Self::Forall(vars, body) => vars.iter().filter_map(|v| v.kind.as_ref())
-                .find_map(Type::first_wildcard).or_else(|| body.first_wildcard()),
-            Self::Qual(ctx, body) =>
-                ctx.iter().find_map(Type::first_wildcard).or_else(|| body.first_wildcard()),
-            Self::Tuple(ts, _) => ts.iter().find_map(Type::first_wildcard),
-            Self::OpChain(items, _) => items.iter().find_map(|item| match item {
-                TypeOpItem::Operand(t) => t.first_wildcard(),
-                TypeOpItem::Op(..) => None,
-            }),
-            _ => None,
+    /// Named wildcards can be recognized when there are no enclosing type binders.
+    pub(crate) fn first_wildcard(&self, named: bool) -> Option<(&str, Loc)> {
+        fn find<'a>(ty: &'a Type, named: bool, bound: &mut Vec<&'a str>) -> Option<(&'a str, Loc)> {
+            match ty {
+                Type::Wild(loc) => Some(("_", *loc)),
+                Type::Var(name, loc) if named && name.starts_with('_') && !bound.contains(&name.as_str()) =>
+                    Some((name, *loc)),
+                Type::App(a, b) | Type::Fun(a, b) | Type::Sig(a, b) =>
+                    find(a, named, bound).or_else(|| find(b, named, bound)),
+                Type::List(t, _) => find(t, named, bound),
+                Type::Forall(vars, body) => {
+                    let depth = bound.len();
+                    let wildcard = vars.iter().find_map(|v| {
+                        let wildcard = v.kind.as_ref().and_then(|k| find(k, named, bound));
+                        bound.push(v.name.as_str());
+                        wildcard
+                    }).or_else(|| find(body, named, bound));
+                    bound.truncate(depth);
+                    wildcard
+                }
+                Type::Qual(ctx, body) =>
+                    ctx.iter().find_map(|t| find(t, named, bound)).or_else(|| find(body, named, bound)),
+                Type::Tuple(ts, _) => ts.iter().find_map(|t| find(t, named, bound)),
+                Type::OpChain(items, _) => items.iter().find_map(|item| match item {
+                    TypeOpItem::Operand(t) => find(t, named, bound),
+                    TypeOpItem::Op(..) => None,
+                }),
+                _ => None,
+            }
         }
+        find(self, named, &mut Vec::new())
     }
 }
 

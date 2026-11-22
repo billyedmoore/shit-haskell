@@ -1,0 +1,2 @@
+no_numeric_underscores.hs:3:14: error
+Underscore separators in numeric literals require NumericUnderscores

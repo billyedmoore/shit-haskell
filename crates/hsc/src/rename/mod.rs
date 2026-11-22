@@ -90,6 +90,7 @@ pub struct Renamer<'a> {
     /// RebindableSyntax: literals, negation, `if` and literal patterns use the names in scope.
     rebindable: bool,
     partial_type_signatures: bool,
+    named_wildcards: bool,
     /// Fixities declared for local operators (`where infixl 3 <!>`), by their unique local name.
     local_fixities: HashMap<String, (Assoc, u8)>,
     vals: HashMap<String, Vec<Entity>>,
@@ -188,6 +189,7 @@ pub fn rename_module(
         fixities,
         rebindable: extensions.is_on("RebindableSyntax"),
         partial_type_signatures: extensions.is_on("PartialTypeSignatures"),
+        named_wildcards: extensions.is_on("NamedWildCards"),
         local_fixities: HashMap::new(),
         vals: HashMap::new(),
         types: HashMap::new(),
@@ -1132,7 +1134,7 @@ impl<'a> Renamer<'a> {
                 }
                 Decl::Sig {
                     names,
-                    ty: self.partial_signature(ty)?,
+                    ty: self.partial_signature(ty, self.named_wildcards)?,
                     loc,
                 }
             }
@@ -1568,7 +1570,7 @@ impl<'a> Renamer<'a> {
                     }
                     Decl::Sig {
                         names: us,
-                        ty: self.partial_signature(ty)?,
+                        ty: self.partial_signature(ty, false)?,
                         loc,
                     }
                 }
@@ -1928,7 +1930,7 @@ impl<'a> Renamer<'a> {
                 }
                 Expr::RecUpd(Box::new(e), out, loc)
             }
-            Expr::Sig(e, t, loc) => Expr::Sig(Box::new(self.expr(*e)?), self.partial_signature(t)?, loc),
+            Expr::Sig(e, t, loc) => Expr::Sig(Box::new(self.expr(*e)?), self.partial_signature(t, false)?, loc),
             Expr::Wild(loc) => Expr::Wild(loc),
             Expr::AsPat(_, _, loc) | Expr::LazyPat(_, loc) | Expr::BangPat(_, loc) | Expr::ViewPat(_, _, loc) => {
                 return Err(RnError {
@@ -2130,7 +2132,7 @@ impl<'a> Renamer<'a> {
             }
             Pat::Lazy(p, loc) => Pat::Lazy(Box::new(self.pat(*p, mode)?), loc),
             Pat::Bang(p, loc) => Pat::Bang(Box::new(self.pat(*p, mode)?), loc),
-            Pat::Sig(p, t, loc) => Pat::Sig(Box::new(self.pat(*p, mode)?), self.partial_signature(t)?, loc),
+            Pat::Sig(p, t, loc) => Pat::Sig(Box::new(self.pat(*p, mode)?), self.partial_signature(t, false)?, loc),
             Pat::View(e, p, loc) => Pat::View(Box::new(self.expr(*e)?), Box::new(self.pat(*p, mode)?), loc),
             Pat::OpChain(items, loc) => {
                 let mut toks: Vec<Tk<Pat, QName>> = Vec::with_capacity(items.len());
@@ -2182,12 +2184,12 @@ impl<'a> Renamer<'a> {
 
     // ----- types ------------------------------------------------------------
 
-    fn partial_signature(&mut self, ty: Type) -> RR<Type> {
+    fn partial_signature(&mut self, ty: Type, named: bool) -> RR<Type> {
         if !self.partial_type_signatures {
-            if let Some(loc) = ty.first_wildcard() {
+            if let Some((name, loc)) = ty.first_wildcard(named) {
                 return Err(RnError {
                     loc,
-                    msg: "Found type wildcard ‘_’\nEnable PartialTypeSignatures to use an inferred type here.".into(),
+                    msg: format!("Found type wildcard ‘{name}’\nEnable PartialTypeSignatures to use an inferred type here."),
                 });
             }
         }
@@ -2195,7 +2197,7 @@ impl<'a> Renamer<'a> {
     }
 
     fn complete_signature(&mut self, ty: Type, context: &str) -> RR<Type> {
-        if let Some(loc) = ty.first_wildcard() {
+        if let Some((_, loc)) = ty.first_wildcard(false) {
             return Err(RnError { loc, msg: format!("Wildcard ‘_’ is not allowed in {context}") });
         }
         self.ty(ty)

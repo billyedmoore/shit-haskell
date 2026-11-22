@@ -25,6 +25,8 @@ pub struct Lexed {
     pub tokens: Vec<Token>,
     pub pragmas: Vec<Pragma>,
     pub(crate) tabs: Option<(super::ast::Loc, usize)>,
+    pub(crate) saw_binary: bool,
+    pub(crate) numeric_separator: Option<super::ast::Loc>,
 }
 
 const SYMBOL_CHARS: &str = "!#$%&*+./<=>?@\\^|-~:";
@@ -116,23 +118,28 @@ pub fn lex(src: &str) -> Result<Lexed, LexError> {
 /// that `(# q, r#)` closes its unboxed tuple. With `unicode` (UnicodeSyntax), `∷ ⇒ → ← ∀ ★` are
 /// the reserved symbols they stand for; without it they are ordinary operators.
 pub fn lex_with(src: &str, magic_hash: bool, unicode: bool) -> Result<Lexed, LexError> {
-    let mut lx = Lexer {
-        chars: src.chars().collect(),
-        pos: 0,
-        line: 1,
-        col: 1,
-        pragmas: Vec::new(),
-        toks: Vec::new(),
-        magic_hash,
-        unicode,
-        tabs: None,
-    };
+    lex_with_binary(src, magic_hash, unicode, true)
+}
+
+pub(crate) fn lex_with_binary(src: &str, magic_hash: bool, unicode: bool, binary: bool) -> Result<Lexed, LexError> {
+    let mut lx = Lexer::new(src.chars().collect(), magic_hash, unicode);
+    lx.binary = binary;
     lx.run()?;
     Ok(Lexed {
         tokens: lx.toks,
         pragmas: lx.pragmas,
         tabs: lx.tabs,
+        saw_binary: lx.saw_binary,
+        numeric_separator: lx.numeric_separator,
     })
+}
+
+/// Measures the token starting at a diagnostic position on one displayed line.
+pub(crate) fn first_token_width(chars: impl Iterator<Item = char>) -> Option<usize> {
+    let mut lexer = Lexer::new(chars.collect(), true, true);
+    lexer.peek(0)?;
+    lexer.lex_token().ok()?;
+    Some(lexer.pos)
 }
 
 struct Lexer {
@@ -146,9 +153,29 @@ struct Lexer {
     /// UnicodeSyntax: the Unicode forms of reserved symbols are those symbols.
     unicode: bool,
     tabs: Option<(super::ast::Loc, usize)>,
+    binary: bool,
+    saw_binary: bool,
+    numeric_separator: Option<super::ast::Loc>,
 }
 
 impl Lexer {
+    fn new(chars: Vec<char>, magic_hash: bool, unicode: bool) -> Self {
+        Self {
+            chars,
+            pos: 0,
+            line: 1,
+            col: 1,
+            pragmas: Vec::new(),
+            toks: Vec::new(),
+            magic_hash,
+            unicode,
+            tabs: None,
+            binary: true,
+            saw_binary: false,
+            numeric_separator: None,
+        }
+    }
+
     fn peek(&self, k: usize) -> Option<char> {
         self.chars.get(self.pos + k).copied()
     }
@@ -527,8 +554,21 @@ impl Lexer {
         })
     }
 
+    fn digit_sequence_len(&self, offset: usize, radix: u32) -> usize {
+        let mut end = 0;
+        for (i, &c) in self.chars[self.pos + offset..].iter().enumerate() {
+            if c.is_digit(radix) {
+                end = i + 1;
+            } else if c != '_' {
+                break;
+            }
+        }
+        end
+    }
+
     fn take_digits(&mut self) -> String {
-        self.take_while(|c| c.is_ascii_digit() || c == '_')
+        let len = self.digit_sequence_len(0, 10);
+        (0..len).map(|_| self.bump()).collect()
     }
 
     /// Counts and consumes the MagicHash suffix of a literal (`3#` is 1, `3##` is 2).
@@ -545,17 +585,22 @@ impl Lexer {
     }
 
     fn lex_number(&mut self) -> Result<Tok, LexError> {
+        let loc = super::ast::Loc { line: self.line, col: self.col };
         if self.peek(0) == Some('0') {
-            let radix = match (self.peek(1), self.peek(2)) {
-                (Some('x' | 'X'), Some(c)) if c.is_ascii_hexdigit() => Some(16),
-                (Some('o' | 'O'), Some(c)) if c.is_digit(8) => Some(8),
-                (Some('b' | 'B'), Some(c)) if c.is_digit(2) => Some(2),
+            let radix = match self.peek(1) {
+                Some('x' | 'X') => Some(16),
+                Some('o' | 'O') => Some(8),
+                Some('b' | 'B') if self.binary => Some(2),
                 _ => None,
             };
-            if let Some(r) = radix {
+            if let Some((r, len)) = radix.map(|r| (r, self.digit_sequence_len(2, r))).filter(|&(_, len)| len != 0) {
+                self.saw_binary |= r == 2;
                 self.bump();
                 self.bump();
-                let digits = self.take_while(|c| c == '_' || c.is_digit(r));
+                let digits: String = (0..len).map(|_| self.bump()).collect();
+                if digits.contains('_') {
+                    self.numeric_separator.get_or_insert(loc);
+                }
                 let hashes = self.take_hashes();
                 let value = to_decimal(&digits, r);
                 return Ok(match hashes {
@@ -590,6 +635,9 @@ impl Lexer {
             }
         }
         let hashes = self.take_hashes();
+        if text.contains('_') {
+            self.numeric_separator.get_or_insert(loc);
+        }
         let clean: String = text.chars().filter(|c| *c != '_').collect();
         Ok(match (is_float, hashes) {
             (false, 0) => Tok::Int(clean),
