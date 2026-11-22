@@ -63,6 +63,7 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
     pass(binds, 2, &rules, &strict_cons, None);
     pass(binds, 1, &rules, &strict_cons, None);
     float_closed_dicts(binds, 1);
+    specialise_static_args(binds, &rules);
     call_by_value(binds);
     pass(binds, 0, &rules, &strict_cons, None);
     // Fusion in phase 0 makes local loops: their calls by value, and a clean-up of the
@@ -119,6 +120,343 @@ fn extract_strict_cons(binds: &[TopBind]) -> HashMap<String, Vec<bool>> {
         }
     }
     out
+}
+
+/// Specialises small self-recursive top-level higher-order functions (e.g. `dropWhile`, `break`,
+/// `span`, `filter`) on static global function arguments (`dropWhile isSpace` → `dropWhile$spec`),
+/// turning indirect `hsc_apply` calls into direct calls (or inlined bodies) and shrinking recursive
+/// thunk captures.
+fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
+    const MAX_SPEC_SIZE: usize = 60;
+    const MAX_PER_FN: usize = 4;
+    const MAX_TOTAL: usize = 32;
+
+    let mut global_fns: HashSet<String> = HashSet::new();
+    for b in binds.iter() {
+        if !is_rule_binding(&b.name) && value_arity(&b.body) > 0 {
+            global_fns.insert(b.name.clone());
+        }
+    }
+
+    struct Cand {
+        arity: usize,
+        static_pos: Vec<bool>,
+        body: Core,
+    }
+
+    fn collect_self_calls(e: &Core, f: &str, out: &mut Vec<Option<Vec<Option<String>>>>) {
+        match e {
+            Core::Var(v) => {
+                if v == f {
+                    out.push(None);
+                }
+            }
+            Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(..) => {
+                let mut args = Vec::new();
+                let mut head = e;
+                while let Core::App(g, a) = head {
+                    args.push(&**a);
+                    head = g;
+                }
+                args.reverse();
+                match head {
+                    Core::Var(v) if v == f => {
+                        let call = args
+                            .iter()
+                            .map(|a| match a {
+                                Core::Var(x) => Some(x.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        out.push(Some(call));
+                    }
+                    other => collect_self_calls(other, f, out),
+                }
+                for a in args {
+                    collect_self_calls(a, f, out);
+                }
+            }
+            Core::Lam(_, b) => collect_self_calls(b, f, out),
+            Core::Let(bs, body) => {
+                for (_, r) in bs {
+                    collect_self_calls(r, f, out);
+                }
+                collect_self_calls(body, f, out);
+            }
+            Core::Case(s, _, alts) => {
+                collect_self_calls(s, f, out);
+                for a in alts {
+                    match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => collect_self_calls(b, f, out),
+                    }
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    collect_self_calls(a, f, out);
+                }
+            }
+        }
+    }
+
+    let mut cands: HashMap<String, Cand> = HashMap::new();
+    for b in binds.iter() {
+        if is_rule_binding(&b.name) || rules.by_head.contains_key(&b.name) {
+            continue;
+        }
+        let (ps, inner) = params(&b.body);
+        if ps.len() < 2 || size(&b.body, MAX_SPEC_SIZE + 1) > MAX_SPEC_SIZE {
+            continue;
+        }
+        if !mentions(inner, &b.name) {
+            continue;
+        }
+        let mut self_calls = Vec::new();
+        collect_self_calls(inner, &b.name, &mut self_calls);
+        if self_calls.is_empty() || self_calls.iter().any(|c| c.is_none()) {
+            continue;
+        }
+        let calls: Vec<Vec<Option<String>>> = self_calls.into_iter().flatten().collect();
+        let static_pos: Vec<bool> = ps
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                app_head_mentions(inner, p)
+                    && calls.iter().all(|c| matches!(c.get(i), Some(Some(v)) if v == p))
+            })
+            .collect();
+        if static_pos.iter().any(|&s| s) && static_pos.iter().any(|&s| !s) {
+            cands.insert(b.name.clone(), Cand { arity: ps.len(), static_pos, body: b.body.clone() });
+        }
+    }
+    if cands.is_empty() {
+        return;
+    }
+
+    fn rewrite_self(c: &mut Core, old_f: &str, new_f: &str, dropped: &[Option<String>]) {
+        let is_call = {
+            let mut h = &*c;
+            while let Core::App(g, _) = h {
+                h = g;
+            }
+            matches!(c, Core::App(..)) && matches!(h, Core::Var(v) if v == old_f)
+        };
+        if is_call {
+            let mut args = Vec::new();
+            let mut cur = take(c);
+            while let Core::App(g, a) = cur {
+                args.push(*a);
+                cur = *g;
+            }
+            args.reverse();
+            let mut e = Core::Var(new_f.to_string());
+            for (i, mut a) in args.into_iter().enumerate() {
+                if dropped.get(i).is_some_and(|k| k.is_some()) {
+                    continue;
+                }
+                rewrite_self(&mut a, old_f, new_f, dropped);
+                e = Core::App(Box::new(e), Box::new(a));
+            }
+            *c = e;
+            return;
+        }
+        match c {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(g, a) => {
+                rewrite_self(g, old_f, new_f, dropped);
+                rewrite_self(a, old_f, new_f, dropped);
+            }
+            Core::Lam(_, b) => rewrite_self(b, old_f, new_f, dropped),
+            Core::Let(bs, body) => {
+                for (_, r) in bs {
+                    rewrite_self(r, old_f, new_f, dropped);
+                }
+                rewrite_self(body, old_f, new_f, dropped);
+            }
+            Core::Case(s, _, alts) => {
+                rewrite_self(s, old_f, new_f, dropped);
+                for a in alts {
+                    match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => rewrite_self(b, old_f, new_f, dropped),
+                    }
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    rewrite_self(a, old_f, new_f, dropped);
+                }
+            }
+        }
+    }
+
+    struct SpecCtx<'a> {
+        cands: &'a HashMap<String, Cand>,
+        global_fns: &'a HashSet<String>,
+        created: HashMap<(String, Vec<Option<String>>), String>,
+        per_fn: HashMap<String, usize>,
+        new_binds: Vec<TopBind>,
+        fresh: u64,
+    }
+
+    impl SpecCtx<'_> {
+        fn visit(&mut self, c: &mut Core, cur_bind: &str) {
+            if matches!(c, Core::App(..)) {
+                let mut nargs = 0;
+                let mut head = &*c;
+                while let Core::App(g, _) = head {
+                    nargs += 1;
+                    head = g;
+                }
+                if let Core::Var(f) = head {
+                    if f != cur_bind {
+                        if let Some(cand) = self.cands.get(f.as_str()) {
+                            if nargs >= cand.arity {
+                                // Collect raw argument refs to check static function arguments.
+                                let mut arg_vars: Vec<Option<String>> = vec![None; nargs];
+                                let mut cur_e = &*c;
+                                let mut idx = nargs;
+                                while let Core::App(g, a) = cur_e {
+                                    idx -= 1;
+                                    if let Core::Var(v) = &**a {
+                                        arg_vars[idx] = Some(v.clone());
+                                    }
+                                    cur_e = g;
+                                }
+                                let spec_args: Vec<Option<String>> = (0..cand.arity)
+                                    .map(|i| {
+                                        if cand.static_pos[i] {
+                                            arg_vars[i]
+                                                .as_ref()
+                                                .filter(|g| g.as_str() != f.as_str() && self.global_fns.contains(g.as_str()))
+                                                .cloned()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                if spec_args.iter().any(|s| s.is_some()) && spec_args.iter().any(|s| s.is_none()) {
+                                    let f_name = f.clone();
+                                    let key = (f_name.clone(), spec_args.clone());
+                                    let spec_name = if let Some(existing) = self.created.get(&key) {
+                                        Some(existing.clone())
+                                    } else if self.new_binds.len() < MAX_TOTAL
+                                        && self.per_fn.get(&f_name).copied().unwrap_or(0) < MAX_PER_FN
+                                    {
+                                        self.fresh += 1;
+                                        let sname = format!("{f_name}$spec${}", self.fresh);
+                                        let mut cloned = cand.body.clone();
+                                        let mut lams = Vec::new();
+                                        let mut inner = cloned;
+                                        loop {
+                                            if one_shot_lambda(&inner).is_some() {
+                                                let Core::App(_, lam) = inner else { unreachable!() };
+                                                inner = *lam;
+                                            }
+                                            match inner {
+                                                Core::Lam(x, b) => {
+                                                    lams.push(x);
+                                                    inner = *b;
+                                                }
+                                                other => {
+                                                    inner = other;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        let mut fmap = HashMap::new();
+                                        freshen(&mut inner, &format!("~sp{}", self.fresh), &mut fmap);
+                                        for (p, g) in lams.iter().zip(&spec_args) {
+                                            if let Some(g) = g {
+                                                subst(&mut inner, p, &Core::Var(g.clone()));
+                                            }
+                                        }
+                                        rewrite_self(&mut inner, &f_name, &sname, &spec_args);
+                                        for (p, g) in lams.into_iter().zip(&spec_args).rev() {
+                                            if g.is_none() {
+                                                inner = Core::Lam(p, Box::new(inner));
+                                            }
+                                        }
+                                        cloned = inner;
+                                        *self.per_fn.entry(f_name.clone()).or_default() += 1;
+                                        self.created.insert(key, sname.clone());
+                                        self.new_binds.push(TopBind { name: sname.clone(), body: cloned });
+                                        Some(sname)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(sname) = spec_name {
+                                        let mut args = Vec::new();
+                                        let mut cur = take(c);
+                                        while let Core::App(g, a) = cur {
+                                            args.push(*a);
+                                            cur = *g;
+                                        }
+                                        args.reverse();
+                                        let mut e = Core::Var(sname);
+                                        for (i, mut a) in args.into_iter().enumerate() {
+                                            if spec_args.get(i).is_some_and(|k| k.is_some()) {
+                                                continue;
+                                            }
+                                            self.visit(&mut a, cur_bind);
+                                            e = Core::App(Box::new(e), Box::new(a));
+                                        }
+                                        *c = e;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            match c {
+                Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+                Core::App(f, a) => {
+                    self.visit(f, cur_bind);
+                    self.visit(a, cur_bind);
+                }
+                Core::Lam(_, b) => self.visit(b, cur_bind),
+                Core::Let(bs, body) => {
+                    for (_, r) in bs {
+                        self.visit(r, cur_bind);
+                    }
+                    self.visit(body, cur_bind);
+                }
+                Core::Case(s, _, alts) => {
+                    self.visit(s, cur_bind);
+                    for a in alts {
+                        match a {
+                            Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => self.visit(b, cur_bind),
+                        }
+                    }
+                }
+                Core::Con(_, args) | Core::Prim(_, args) => {
+                    for a in args {
+                        self.visit(a, cur_bind);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ctx = SpecCtx {
+        cands: &cands,
+        global_fns: &global_fns,
+        created: HashMap::new(),
+        per_fn: HashMap::new(),
+        new_binds: Vec::new(),
+        fresh: FRESH.load(std::sync::atomic::Ordering::Relaxed),
+    };
+    for b in binds.iter_mut() {
+        if is_rule_binding(&b.name) {
+            continue;
+        }
+        let name = b.name.clone();
+        ctx.visit(&mut b.body, &name);
+    }
+    FRESH.store(ctx.fresh, std::sync::atomic::Ordering::Relaxed);
+    binds.extend(ctx.new_binds);
 }
 
 /// Replaces `oneShot e` by `e`.
@@ -1478,6 +1816,12 @@ impl Simp<'_> {
                 *c = Core::Let(bs, Box::new(app));
                 self.changed = true;
             }
+            Core::Fail(..) => {
+                // Applying a pattern-match failure to an argument fails immediately when forced.
+                let Core::App(f, _) = take(c) else { unreachable!() };
+                *c = *f;
+                self.changed = true;
+            }
             _ => {}
         }
     }
@@ -1486,6 +1830,7 @@ impl Simp<'_> {
     fn select(&mut self, c: &mut Core) -> Option<Core> {
         let Core::Case(s, binder, alts) = c else { return None };
         match &**s {
+            Core::Fail(_) => Some(take(s)),
             Core::Var(v) if self.local_known.contains_key(v.as_str()) || self.known.contains_key(v.as_str()) => {
                 let (con, fields) = self.local_known.get(v.as_str()).unwrap_or_else(|| &self.known[v.as_str()]).clone();
                 let i = alts
@@ -3027,7 +3372,9 @@ fn forced_d(e: &Core, strict: &HashMap<String, Vec<bool>>, bottom: bool) -> (Has
                 head = f;
             }
             args.reverse();
-            if let Core::Var(f) = head {
+            if let Core::Fail(_) = head {
+                fails = bottom;
+            } else if let Core::Var(f) = head {
                 if bottom && !args.is_empty() && is_pat_error_call(f) {
                     fails = true;
                 } else {
@@ -3319,5 +3666,99 @@ mod rule_tests {
         );
         let eval = certainly_evaluated(&e);
         assert!(eval.contains("x") && eval.contains("y"), "expected both x and y evaluated: {eval:?}");
+    }
+
+    #[test]
+    fn fail_application_and_case_simplify_and_propagate_strictness() {
+        // App(Fail, x) -> Fail; Case(Fail, _, _) -> Fail; and App(Fail, _) is bottom in certainly_evaluated.
+        let mut binds = vec![
+            TopBind {
+                name: "T.appFail".into(),
+                body: Core::Lam(
+                    "x".into(),
+                    Box::new(Core::App(Box::new(Core::Fail("boom".into())), Box::new(v("x")))),
+                ),
+            },
+            TopBind {
+                name: "T.caseFail".into(),
+                body: Core::Case(
+                    Box::new(Core::Fail("boom".into())),
+                    "b0".into(),
+                    vec![Alt::Default(Core::Lit(Lit::Int(1)))],
+                ),
+            },
+        ];
+        simplify(&mut binds);
+        assert!(matches!(&binds[0].body, Core::Lam(_, b) if matches!(b.as_ref(), Core::Fail(_))));
+        assert!(matches!(&binds[1].body, Core::Fail(_)));
+
+        let e = Core::Case(
+            Box::new(v("x")),
+            "b0".into(),
+            vec![
+                Alt::Con("T.A".into(), vec![], v("y")),
+                Alt::Default(Core::App(Box::new(Core::Fail("pat".into())), Box::new(v("z")))),
+            ],
+        );
+        let eval = certainly_evaluated(&e);
+        assert!(eval.contains("x") && eval.contains("y"), "expected x and y evaluated: {eval:?}");
+    }
+
+    #[test]
+    fn specialise_static_args_creates_direct_specialisation_for_recursive_hof() {
+        // myDropWhile p xs = case xs of [] -> []; (:) h t -> case p h of True -> myDropWhile p t; _ -> xs
+        // pred c = c
+        // use ys = myDropWhile pred ys
+        let hof = TopBind {
+            name: "T.myDropWhile".into(),
+            body: Core::Lam(
+                "p".into(),
+                Box::new(Core::Lam(
+                    "xs".into(),
+                    Box::new(Core::Case(
+                        Box::new(v("xs")),
+                        "b0".into(),
+                        vec![
+                            Alt::Con("Builtin.[]".into(), vec![], Core::Con("Builtin.[]".into(), vec![])),
+                            Alt::Con(
+                                "Builtin.:".into(),
+                                vec!["h".into(), "t".into()],
+                                Core::Case(
+                                    Box::new(app(v("p"), vec![v("h")])),
+                                    "b1".into(),
+                                    vec![
+                                        Alt::Con(
+                                            "GHC.Types.True".into(),
+                                            vec![],
+                                            app(v("T.myDropWhile"), vec![v("p"), v("t")]),
+                                        ),
+                                        Alt::Default(v("xs")),
+                                    ],
+                                ),
+                            ),
+                        ],
+                    )),
+                )),
+            ),
+        };
+        let pred = TopBind {
+            name: "T.pred".into(),
+            body: Core::Lam(
+                "c".into(),
+                Box::new(Core::Case(
+                    Box::new(v("c")),
+                    "bc".into(),
+                    vec![Alt::Default(Core::Con("GHC.Types.True".into(), vec![]))],
+                )),
+            ),
+        };
+        let caller = TopBind {
+            name: "T.use".into(),
+            body: Core::Lam("ys".into(), Box::new(app(v("T.myDropWhile"), vec![v("T.pred"), v("ys")]))),
+        };
+        let mut binds = vec![hof, pred, caller];
+        simplify(&mut binds);
+        let spec = binds.iter().find(|b| b.name.contains("$spec$"));
+        assert!(spec.is_some(), "expected static-arg specialisation binding in {:?}", binds.iter().map(|b| &b.name).collect::<Vec<_>>());
     }
 }
