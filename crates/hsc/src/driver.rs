@@ -895,9 +895,15 @@ impl Driver {
         let boot_values: Vec<_> = boot_iface.iter().flat_map(|iface| &iface.exports)
             .filter(|e| e.kind == crate::rename::iface::EntKind::Var)
             .filter_map(|e| {
+                let name = e.occ();
                 let key = format!("{}.{}", e.global.module, e.global.name);
-                let ty = self.checker.env.values.get(&key).and_then(boot_value_type)?.clone();
-                Some((key, e.occ(), ty))
+                let signature_loc = parsed.decls.iter().find_map(|decl| match decl {
+                    Decl::Sig { names, loc, .. } if names.iter().any(|n| n == name) => Some(*loc),
+                    _ => None,
+                });
+                let scheme = self.checker.env.values.get(&key)
+                    .filter(|scheme| comparable_boot_signature(scheme, signature_loc.is_some()))?;
+                Some((key, name, scheme.clone(), signature_loc))
             })
             .collect();
         let module_loc = parsed.loc;
@@ -937,14 +943,20 @@ impl Driver {
                     }
                 }
             }
-            for (key, name, boot_type) in boot_values {
-                let Some(full_type) = self.checker.env.values.get(&key).and_then(boot_value_type) else { continue };
-                let boot_type = self.checker.normalize(&boot_type);
-                let full_type = self.checker.normalize(full_type);
-                if boot_type != full_type {
-                    return Err(crate::diagnostic::error(&shown, Some(&src), module_loc, &format!(
+            for (key, name, boot_scheme, signature_loc) in boot_values {
+                let Some(full_scheme) = self.checker.env.values.get(&key) else { continue };
+                if !comparable_boot_signature(full_scheme, signature_loc.is_some()) {
+                    continue;
+                }
+                let boot_type = self.checker.normalize(&boot_scheme.ty);
+                let full_type = self.checker.normalize(&full_scheme.ty);
+                if boot_scheme.nvars != full_scheme.nvars || boot_type != full_type {
+                    let (implementation, boot) = self.checker.show_type_pair(&full_type, &boot_type);
+                    let implementation = show_boot_signature(&self.checker, full_scheme.nvars, implementation);
+                    let boot = show_boot_signature(&self.checker, boot_scheme.nvars, boot);
+                    return Err(crate::diagnostic::error(&shown, Some(&src), signature_loc.unwrap_or(module_loc), &format!(
                         "The type of ‘{name}’ differs from its hs-boot signature\nImplementation: {name} :: {}\nHs-boot file:   {name} :: {}",
-                        self.checker.show(&full_type), self.checker.show(&boot_type)
+                        implementation, boot
                     )));
                 }
             }
@@ -1938,18 +1950,40 @@ fn check_boot_declarations(m: &mut Module) -> Result<(), (Loc, &'static str)> {
     Ok(())
 }
 
-/// Simple boot signatures can be compared directly. Polymorphic signatures
-/// need an equivalence check that accounts for local binders and constraints.
-fn boot_value_type(scheme: &crate::tc::types::Scheme) -> Option<&crate::tc::types::Ty> {
-    use crate::tc::types::Ty;
-    fn closed(ty: &Ty) -> bool {
-        match ty {
-            Ty::Con(_) => true,
-            Ty::App(f, a) => closed(f) && closed(a),
+/// Compare simple signatures by binder position. Inferred quantifiers and kind-only
+/// binders need extra information beyond the checker's type.
+fn comparable_boot_signature(scheme: &crate::tc::types::Scheme, allow_polymorphism: bool) -> bool {
+    use crate::tc::types::{tuple_arity, Ty, ARROW, LIST};
+    fn collect_variables(ty: &Ty, variables: &mut HashSet<u32>, allow_variables: bool) -> bool {
+        let (head, args) = ty.split_apps();
+        match head {
+            Ty::Con(name) => {
+                // Kind dependencies in arbitrary constructor arguments can change the order
+                // of implicit quantifiers. The type checker erases those dependencies here.
+                let allow_arguments = allow_variables
+                    && (name == ARROW || name == LIST || tuple_arity(name).is_some());
+                args.into_iter().all(|arg| collect_variables(arg, variables, allow_arguments))
+            }
+            Ty::Gen(i) if allow_variables && args.is_empty() => {
+                variables.insert(*i);
+                true
+            }
             _ => false,
         }
     }
-    (scheme.nvars == 0 && scheme.preds.is_empty() && closed(&scheme.ty)).then_some(&scheme.ty)
+    if !scheme.preds.is_empty() || (!allow_polymorphism && scheme.nvars != 0) {
+        return false;
+    }
+    let mut variables = HashSet::new();
+    collect_variables(&scheme.ty, &mut variables, allow_polymorphism) && variables.len() == scheme.nvars as usize
+}
+
+fn show_boot_signature(checker: &Checker, nvars: u32, body: String) -> String {
+    if nvars == 0 {
+        return body;
+    }
+    let variables: Vec<_> = (0..nvars).map(|i| checker.show(&crate::tc::types::Ty::Gen(i))).collect();
+    format!("forall {}. {body}", variables.join(" "))
 }
 
 #[cfg(test)]

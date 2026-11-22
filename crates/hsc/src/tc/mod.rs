@@ -227,6 +227,15 @@ impl Checker {
         types::show_ty(&self.metas, t)
     }
 
+    pub(crate) fn show_type_pair(&self, first: &Ty, second: &Ty) -> (String, String) {
+        let (a, b) = (self.show(first), self.show(second));
+        if a == b {
+            (types::show_ty_qualified(&self.metas, first), types::show_ty_qualified(&self.metas, second))
+        } else {
+            (a, b)
+        }
+    }
+
     pub fn show_pred(&self, p: &Pred) -> String {
         types::show_pred(&self.metas, p)
     }
@@ -674,12 +683,7 @@ impl Checker {
                 ))
             }
             Err(types::UnifyError::Mismatch) => {
-                let (a, e) = (self.show(actual), self.show(expected));
-                let (a, e) = if a == e {
-                    (types::show_ty_qualified(&self.metas, actual), types::show_ty_qualified(&self.metas, expected))
-                } else {
-                    (a, e)
-                };
+                let (a, e) = self.show_type_pair(actual, expected);
                 self.err(format!(
                     "Couldn't match expected type ‘{e}’ with actual type ‘{a}’"
                 ))
