@@ -73,12 +73,13 @@ pub unsafe fn run(table: *const NativeTable) -> i32 {
     if !t.selectors.is_null() && t.nselectors > 0 {
         m.selectors_raw = (t.selectors, t.nselectors as usize);
     }
-    // The global closures: functions of their arity, or thunks, allocated on the heap.
+    // The global closures: functions of their arity, or thunks, allocated directly in the old
+    // generation so minor collections do not need to scan `global_vec`.
     let mut gvec: Vec<Word> = Vec::with_capacity(nglobals);
     for i in 0..nglobals {
         let [kind_arity, off] = *t.globals.add(i);
         let code = globals_base.wrapping_add_signed(off as isize);
-        let p = m.alloc_no_gc(2);
+        let p = m.alloc_old_no_gc(2);
         if kind_arity > 0 {
             m.heap_set(p, heap::header(kind::FUN, 1, kind_arity as u32));
         } else {
@@ -185,6 +186,23 @@ pub extern "C" fn hsc_gc(m: *mut Machine, words: u64) {
     // SAFETY: generated code passes the machine record.
     let m = unsafe { &mut *m };
     m.collect(words as usize);
+}
+
+/// Slow path for the `hsc_upd_ret` generational write barrier: grows `mut_buf` and records an
+/// old-generation thunk updated to point into the nursery. Never triggers GC.
+#[no_mangle]
+pub extern "C" fn hsc_remember(m: *mut Machine, thunk: Word) {
+    // SAFETY: generated code passes the machine record and `mut_ptr` lies in `mut_buf`.
+    unsafe {
+        let m = &mut *m;
+        let used = m.mut_ptr.offset_from(m.mut_buf.as_mut_ptr()) as usize;
+        let new_len = (m.mut_buf.len() * 2).max(4096);
+        m.mut_buf.resize(new_len, 0);
+        m.mut_buf[used] = thunk;
+        let base = m.mut_buf.as_mut_ptr();
+        m.mut_ptr = base.add(used + 1);
+        m.mut_lim = base.add(m.mut_buf.len());
+    }
 }
 
 /// A preemption point at a function's entry (see `conc::safe_point`): answers 1 with an

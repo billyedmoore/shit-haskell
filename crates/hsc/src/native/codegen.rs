@@ -72,6 +72,10 @@ pub mod mach {
     pub const CODE: i64 = 56;
     pub const ARGS: i64 = 64;
     pub const TID: i64 = 192;
+    pub const NURSERY_BASE: i64 = 200;
+    pub const NURSERY_SPAN: i64 = 208;
+    pub const MUT_PTR: i64 = 216;
+    pub const MUT_LIM: i64 = 224;
 }
 
 /// Where an expression's result goes.
@@ -5751,8 +5755,33 @@ hsc_upd_ret:
     orq $9, %rdx
     movq %rdx, (%rcx)
     movq %r14, 8(%rcx)
+    movq %rcx, %rax
+    subq 200(%rbx), %rax
+    cmpq 208(%rbx), %rax
+    jae .Lupd_remember
+.Lupd_done:
     addq $16, %rbp
     jmp *(%rbp)
+.Lupd_remember:
+    movq %r14, %rax
+    subq 200(%rbx), %rax
+    cmpq 208(%rbx), %rax
+    jae .Lupd_done
+    movq 216(%rbx), %rax
+    cmpq 224(%rbx), %rax
+    jae .Lupd_remember_grow
+    movq %rcx, (%rax)
+    addq $8, %rax
+    movq %rax, 216(%rbx)
+    jmp .Lupd_done
+.Lupd_remember_grow:
+    movq %rbx, %rdi
+    movq %rcx, %rsi
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call hsc_remember
+    movq %r15, %rsp
+    jmp .Lupd_done
 
 hsc_apply:
     movq (%r14), %rax

@@ -21,17 +21,22 @@ use heap::{kind, Heap, Word};
 
 /// Words of the Haskell stack per thread: a large reserve, committed by the kernel on use.
 const STACK_WORDS: usize = 1 << 26;
-/// Words of the heap semispace at start.
-const HEAP_WORDS: usize = 1 << 22;
+/// Default nursery size (1 MiB).
+const NURSERY_WORDS: usize = 1 << 17;
+/// Initial old-generation semispace (32 MiB, faulted in as it fills). This leaves room for
+/// promotions while building large live structures before a major collection becomes necessary.
+const OLD_WORDS: usize = 1 << 22;
+/// Initial capacity (words) of the remembered-set buffer for old-gen `THUNK -> IND` updates.
+const MUT_BUF_WORDS: usize = 4096;
 /// Argument slots of the record (primitive operations take their arguments here).
 pub const ARG_SLOTS: usize = 16;
 
 /// The machine record. The first fields are the layout generated code uses.
 #[repr(C)]
 pub struct Machine {
-    /// Next free heap address.
+    /// Next free heap address (in the nursery).
     pub hp: Word,
-    /// The end of the heap.
+    /// The end of the nursery.
     pub hplim: Word,
     /// The Haskell stack pointer, saved on entering the runtime.
     pub sp: Word,
@@ -49,8 +54,20 @@ pub struct Machine {
     pub args: [Word; ARG_SLOTS],
     /// The number of the running Haskell thread (generated code marks the thunks it evaluates).
     pub tid: Word,
+    /// Start address of the nursery (for the `hsc_upd_ret` generational write barrier).
+    pub nursery_base: Word,
+    /// Byte length of the nursery (`nursery.len() * 8`).
+    pub nursery_span: Word,
+    /// Next free slot in `mut_buf` (remembered set for old-gen `THUNK -> IND` updates).
+    pub mut_ptr: *mut Word,
+    /// End of `mut_buf`.
+    pub mut_lim: *mut Word,
     // Runtime-only state from here on.
     pub heap: Heap,
+    /// Backing storage for `mut_ptr..mut_lim`.
+    pub mut_buf: Vec<Word>,
+    /// Reusable buffer of root-slot addresses (avoids allocating a `Vec` on every minor GC).
+    root_locs: Vec<*mut Word>,
     /// The Haskell stack: `stack_base..stack_top` words, growing down from the top.
     pub stack: Vec<Word>,
     /// The exception being raised (a pointer), if any.
@@ -150,14 +167,22 @@ thread_local! {
 impl Machine {
     /// A machine with the program's tables and the global closures allocated.
     pub fn new(prog: Program) -> Box<Machine> {
-        // HSC_HEAP_WORDS: the initial heap (a small one makes collections frequent, for testing).
-        let words = std::env::var("HSC_HEAP_WORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(HEAP_WORDS);
-        // At least room for the program's global closures and some slack, whatever was asked.
-        let words = words.max(4 * prog.nglobals + (1 << 14));
-        let heap = Heap::new(words);
-        let base = heap.addr(0);
-        let limit = base + (words as Word) * 8;
+        // HSC_HEAP_WORDS: the initial old-gen heap (a small one makes collections frequent, for testing).
+        let env_heap = std::env::var("HSC_HEAP_WORDS").ok().and_then(|v| v.parse::<usize>().ok());
+        let env_nursery = std::env::var("HSC_NURSERY_WORDS").ok().and_then(|v| v.parse::<usize>().ok());
+        let nursery_words = match (env_nursery, env_heap) {
+            (Some(n), _) => n.max(1024),
+            (None, Some(h)) => (h / 4).clamp(1024, NURSERY_WORDS),
+            (None, None) => NURSERY_WORDS,
+        };
+        let old_words = env_heap
+            .unwrap_or(OLD_WORDS)
+            .max(4 * prog.nglobals + nursery_words.saturating_mul(2));
+        let heap = Heap::new_generational(nursery_words, old_words);
+        let nursery_base = heap.nursery_addr(0);
+        let nursery_span = (heap.nursery.len() as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
+        let mut_buf = vec![0 as Word; MUT_BUF_WORDS];
         let nprims = prog.nprims;
         let ccall_plans = vec![prims::CPlan::Unknown; nprims];
         // `prims::con_value` takes the runtime's constructors' ids from their position.
@@ -169,8 +194,8 @@ impl Machine {
             );
         }
         let mut m = Box::new(Machine {
-            hp: base,
-            hplim: limit,
+            hp: nursery_base,
+            hplim: nursery_base + nursery_span,
             sp: 0,
             top: 0,
             globals: std::ptr::null_mut(),
@@ -178,14 +203,20 @@ impl Machine {
             nargs: 0,
             code: 0,
             args: [0; ARG_SLOTS],
+            tid: 1,
+            nursery_base,
+            nursery_span,
+            mut_ptr: std::ptr::null_mut(),
+            mut_lim: std::ptr::null_mut(),
             heap,
+            mut_buf,
+            root_locs: Vec::with_capacity(256),
             stack: Vec::new(),
             exc: 0,
             prog,
             con_ids: std::collections::HashMap::new(),
             stable: vec![0],
             weaks: Vec::new(),
-            tid: 1,
             sched: crate::sched::Sched::new(conc::SLICE_MS),
             coros: conc::Coros::default(),
             prim_nargs: 0,
@@ -206,6 +237,9 @@ impl Machine {
             selectors_loaded: false,
             bodies: entry::DiagnosticBodies::default(),
         });
+        m.mut_ptr = m.mut_buf.as_mut_ptr();
+        // SAFETY: `mut_buf.len()` is the exact allocated slice length.
+        m.mut_lim = unsafe { m.mut_ptr.add(m.mut_buf.len()) };
         m.stack = stack;
         m.sp = m.stack.as_mut_ptr() as Word + (STACK_WORDS as Word) * 8;
         set_current(&mut *m);
@@ -244,12 +278,27 @@ impl Machine {
         self.con_ids.get(name).copied()
     }
 
-    /// Allocates `words` words without collecting (the heap has room at start-up).
-    pub fn alloc_no_gc(&mut self, words: usize) -> Word {
-        let p = self.hp;
-        self.hp += (words as Word) * 8;
-        assert!(self.hp <= self.hplim, "heap exhausted at start-up");
-        p
+    /// Allocates `words` words directly in the old generation at start-up (for global closures,
+    /// so minor collections can skip scanning `global_vec`).
+    pub fn alloc_old_no_gc(&mut self, words: usize) -> Word {
+        let at = self.heap.old_hp;
+        self.heap.old_hp += words;
+        assert!(self.heap.old_hp <= self.heap.from.len(), "old heap exhausted at start-up");
+        self.heap.old_addr(at)
+    }
+
+    /// Write barrier for boxed `ARRAY` mutations: if `a` is in the old generation and not yet
+    /// queued for the next minor GC, marks bit 0 of its header `aux` field and pushes it to
+    /// `heap.dirty_arrays`.
+    #[inline]
+    pub fn record_old_array(&mut self, a: Word) {
+        if !self.heap.in_nursery(a) {
+            let h = self.heap_get(a, 0);
+            if heap::aux_of(h) == 0 {
+                self.heap_set(a, h | (1u64 << 32));
+                self.heap.dirty_arrays.push(a);
+            }
+        }
     }
 
     /// Writes a heap word at an address.
@@ -348,18 +397,27 @@ impl Machine {
     }
 
     /// Allocates a pinned byte array of `n` bytes, its data aligned to `align` (zeroed). Pinned
-    /// arrays are never moved; a collection is due when many bytes were pinned since the last.
+    /// arrays are never moved; a major collection is due when many bytes were pinned since the last.
     pub fn alloc_pinned_bytes(&mut self, n: usize, align: usize) -> Word {
         let budget = (self.heap.from.len() * 8).max(64 << 20);
         if self.heap.pinned_since_gc > budget {
-            self.collect(0);
+            self.collect_major(0);
         }
         let words = n.div_ceil(8);
         self.heap.alloc_pinned(1 + words, align, heap::header(kind::BYTES, words as u32, n as u32))
     }
 
-    /// Collects the heap, with every root the machine holds.
+    /// Collects the heap (minor GC when old-gen has room for the nursery, else major GC).
     pub fn collect(&mut self, need: usize) {
+        self.collect_impl(need, false);
+    }
+
+    /// Forces a major collection (reclaiming old-gen garbage and unreachable pinned objects).
+    pub fn collect_major(&mut self, need: usize) {
+        self.collect_impl(need, true);
+    }
+
+    fn collect_impl(&mut self, need: usize, force_major: bool) {
         if !self.selectors_loaded {
             self.selectors_loaded = true;
             let (raw, count) = self.selectors_raw;
@@ -376,13 +434,25 @@ impl Machine {
                 self.selectors = gc::SelectorTable::new(&entries);
             }
         }
-        // Roots: the stack (walked from sp), the globals, the record's arguments and registers,
-        // the exception, and the stable pointers.
-        let mut locs: Vec<*mut Word> = Vec::new();
+        let nursery_used = ((self.hp - self.nursery_base) / 8) as usize;
+        self.heap.hp = nursery_used;
+        // SAFETY: `mut_ptr` always lies within `mut_buf[..=mut_buf.len()]`.
+        let mut_used = unsafe { self.mut_ptr.offset_from(self.mut_buf.as_mut_ptr()) as usize };
+        let pinned_budget = (self.heap.from.len() * 8).max(64 << 20);
+        let need_major = force_major
+            || self.heap.needs_major()
+            || self.heap.pinned_since_gc > pinned_budget;
+
+        // Reuse `root_locs` across collections to avoid allocating a new root buffer each time.
+        let mut locs = std::mem::take(&mut self.root_locs);
+        locs.clear();
         stack_roots(self.sp, self.top, &mut locs);
-        for i in 0..self.prog.nglobals {
-            // SAFETY: the globals table has one slot per global, allocated with the machine.
-            locs.push(unsafe { self.globals.add(i) });
+        if need_major {
+            // Startup globals live in old-gen; minor GC skips them (old CAF updates are in `mut_buf`).
+            for i in 0..self.prog.nglobals {
+                // SAFETY: the globals table has one slot per global, allocated with the machine.
+                locs.push(unsafe { self.globals.add(i) });
+            }
         }
         for a in self.args.iter_mut() {
             locs.push(a as *mut Word);
@@ -406,17 +476,23 @@ impl Machine {
         for v in self.named.values_mut() {
             locs.push(v as *mut Word);
         }
-        // Copy the heap pointers into the collector's root vector and back.
-        let mut roots: Vec<Word> = locs.iter().map(|&p| unsafe { *p }).collect();
-        self.heap.hp = ((self.hp - self.heap.addr(0)) / 8) as usize;
-        gc::collect_with_selectors(&mut self.heap, &mut roots, need, &self.selectors);
-        for (p, v) in locs.iter().zip(roots) {
-            // SAFETY: each location is a live slot the collector was given.
-            unsafe { **p = v };
+
+        // SAFETY: the root slots above remain live and disjoint from the heap during collection.
+        unsafe {
+            if need_major {
+                gc::collect_major(&mut self.heap, &locs, need, &self.selectors);
+            } else {
+                gc::collect_minor(&mut self.heap, &locs, &self.mut_buf[..mut_used], need, &self.selectors);
+            }
         }
-        self.hp = self.heap.addr(self.heap.hp);
-        self.hplim = self.heap.addr(self.heap.from.len());
-        if std::env::var_os("HSC_GC_CENSUS").is_some() {
+        self.root_locs = locs;
+        self.mut_ptr = self.mut_buf.as_mut_ptr();
+        self.nursery_base = self.heap.nursery_addr(0);
+        self.nursery_span = (self.heap.nursery.len() as Word) * 8;
+        self.hp = self.nursery_base;
+        self.hplim = self.nursery_base + self.nursery_span;
+        static CENSUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CENSUS.get_or_init(|| std::env::var_os("HSC_GC_CENSUS").is_some()) {
             self.census();
         }
         assert!(self.hp + (need as Word) * 8 <= self.hplim, "heap exhausted");
@@ -428,7 +504,7 @@ impl Machine {
         let mut kinds: std::collections::HashMap<u8, (usize, usize)> = std::collections::HashMap::new();
         let mut codes: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
         let mut i = 0;
-        while i < self.heap.hp {
+        while i < self.heap.old_hp {
             let h = self.heap.from[i];
             let total = heap::total_words(h);
             let e = kinds.entry(heap::kind_of(h)).or_default();
@@ -460,13 +536,13 @@ impl Machine {
             let mut parent: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
             let mut target = None;
             let mut i = 0;
-            while i < self.heap.hp {
+            while i < self.heap.old_hp {
                 let h = self.heap.from[i];
                 let total = heap::total_words(h);
                 let (first, count) = heap::pointer_fields(h);
                 for f in first..first + count {
                     let v = self.heap.from[i + f];
-                    if self.heap.contains(v) {
+                    if self.heap.in_old(v) {
                         parent.entry(self.heap.index(v)).or_insert(i);
                     }
                 }
@@ -679,4 +755,28 @@ fn kind_is_whnf(k: u8) -> bool {
 
 pub fn is_whnf(h: Word) -> bool {
     kind_is_whnf(heap::kind_of(h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::codegen::mach;
+
+    #[test]
+    fn machine_field_offsets_match_codegen() {
+        assert_eq!(std::mem::offset_of!(Machine, hp) as i64, mach::HP);
+        assert_eq!(std::mem::offset_of!(Machine, hplim) as i64, mach::HPLIM);
+        assert_eq!(std::mem::offset_of!(Machine, sp) as i64, mach::SP);
+        assert_eq!(std::mem::offset_of!(Machine, top) as i64, mach::TOP);
+        assert_eq!(std::mem::offset_of!(Machine, globals) as i64, mach::GLOBALS);
+        assert_eq!(std::mem::offset_of!(Machine, r1) as i64, mach::R1);
+        assert_eq!(std::mem::offset_of!(Machine, nargs) as i64, mach::NARGS);
+        assert_eq!(std::mem::offset_of!(Machine, code) as i64, mach::CODE);
+        assert_eq!(std::mem::offset_of!(Machine, args) as i64, mach::ARGS);
+        assert_eq!(std::mem::offset_of!(Machine, tid) as i64, mach::TID);
+        assert_eq!(std::mem::offset_of!(Machine, nursery_base) as i64, mach::NURSERY_BASE);
+        assert_eq!(std::mem::offset_of!(Machine, nursery_span) as i64, mach::NURSERY_SPAN);
+        assert_eq!(std::mem::offset_of!(Machine, mut_ptr) as i64, mach::MUT_PTR);
+        assert_eq!(std::mem::offset_of!(Machine, mut_lim) as i64, mach::MUT_LIM);
+    }
 }

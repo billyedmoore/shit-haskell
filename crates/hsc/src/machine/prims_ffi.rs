@@ -337,9 +337,9 @@ pub fn run(m: &mut Machine, name: &str, nargs: usize) -> Option<Word> {
             }
             ret_int(m, pid as i64)
         }
-        // System.Mem: a collection now.
+        // System.Mem: a major collection now.
         "performGC" | "performMajorGC" | "performBlockingMajorGC" => {
-            m.collect(0);
+            m.collect_major(0);
             let u = unit(m);
             state_pair(m, u)
         }

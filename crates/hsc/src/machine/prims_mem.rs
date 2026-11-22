@@ -128,6 +128,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let a = m.args[0];
             let v = m.args[2];
             m.heap_set(a + 8 + 8 * i as Word, v);
+            m.record_old_array(a);
             unit(m)
         }
         "indexArray#" => {
@@ -367,6 +368,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             for (i, v) in vals.into_iter().enumerate() {
                 m.heap_set(dst + 8 * (1 + dof as usize + i) as Word, v);
             }
+            m.record_old_array(dst);
             unit(m)
         }
         "freezeArray#" | "thawArray#" | "cloneArray#" | "cloneMutableArray#" => {
@@ -541,6 +543,7 @@ fn atomic_access(m: &mut Machine, name: &str) -> Option<Word> {
             let failed = m.heap_get(slot, 0) != old;
             if !failed {
                 m.heap_set(slot, new);
+                m.record_old_array(a);
             }
             let f = int_value(m, failed as i64);
             // The allocation may have moved the array: the element is read again.
