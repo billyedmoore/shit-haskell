@@ -278,6 +278,7 @@ pub struct FamEqn {
 #[derive(Clone, Debug)]
 pub struct FamilyInfo {
     pub arity: usize,
+    pub data: bool,
     /// Closed families try their equations in order.
     pub closed: bool,
     pub equations: Vec<FamEqn>,

@@ -587,17 +587,18 @@ impl Checker {
     }
 
     /// Registers a family from its declaration.
-    pub fn register_family(&mut self, name: &str, arity: usize, closed: bool) {
+    pub fn register_family(&mut self, name: &str, arity: usize, closed: bool, data: bool) {
         self.metas.families.insert(name.to_string());
         // A SOURCE consumer may already have extended an open family declared in the
         // boot interface. Completing the declaration must retain those equations.
-        if !closed && self.env.families.get(name).is_some_and(|f| !f.closed && f.arity == arity) {
+        if !closed && self.env.families.get(name).is_some_and(|f| !f.closed && f.arity == arity && f.data == data) {
             return;
         }
         self.env.families.insert(
             name.to_string(),
             FamilyInfo {
                 arity,
+                data,
                 closed,
                 equations: Vec::new(),
                 injective: Vec::new(),
@@ -613,9 +614,10 @@ impl Checker {
     /// An equation, `default` for a class's default of an associated type (see `FamEqn`).
     pub fn add_family_equation_as(&mut self, name: &str, args: &[Type], rhs: &Type, loc: Loc, default: bool) -> TR<()> {
         self.loc = loc;
-        let Some(arity) = self.env.families.get(name).map(|family| family.arity) else {
+        let Some(family) = self.env.families.get(name) else {
             return self.err(format!("‘{}’ is not a type family", super::types::unqualify(name)));
         };
+        let (arity, data) = (family.arity, family.data);
         let short_name = super::types::unqualify(name);
         if default {
             let mut binders = std::collections::HashSet::new();
@@ -647,11 +649,31 @@ impl Checker {
             kinds.push(annotated_kind_name(a));
         }
         let mut rhs_ty = self.convert_type(rhs, &mut tvs)?;
+        let data_instance = matches!(rhs_ty.split_apps().0, Ty::Con(c) if super::types::unqualify(c).starts_with("R:"));
+        if data_instance != data {
+            let declaration = if data { "data family" } else { "type family" };
+            let instance = if data_instance { "data instance" } else { "type instance" };
+            return self.err(format!("The {instance} for ‘{short_name}’ conflicts with its {declaration} declaration"));
+        }
+        if !data && pats.len() != arity {
+            return self.err(format!(
+                "Wrong number of arguments in the equation for type family ‘{short_name}’\nThe declaration expects {arity}. This equation supplies {}.",
+                pats.len()
+            ));
+        }
+        for (arg, pat) in args.iter().zip(&pats) {
+            if let Some(application) = self.type_family_application(pat) {
+                self.loc = arg.loc();
+                return self.err(format!(
+                    "The type family application ‘{}’ cannot appear on the left-hand side of an equation for ‘{short_name}’",
+                    self.show(application)
+                ));
+            }
+        }
         // An instance with more arguments than the family's parameters (`data family F a :: Type
         // -> Type` with `data instance F X b = ..`): the extra variables are eta-reduced away, as
         // GHC does, so that `F X` reduces on its own (`F X b = R b` becomes `F X = R`).
-        let data_instance = matches!(rhs_ty.split_apps().0, Ty::Con(c) if super::types::unqualify(c).starts_with("R:"));
-        while data_instance && pats.len() > arity {
+        while pats.len() > arity {
             let Some(Ty::Gen(i)) = pats.last().cloned() else { break };
             let Ty::App(f, a) = rhs_ty.clone() else { break };
             let mentions = |t: &Ty| mentions_gen(t, i);
@@ -661,12 +683,6 @@ impl Checker {
             pats.pop();
             kinds.pop();
             rhs_ty = (*f).clone();
-        }
-        if !data_instance && pats.len() != arity {
-            return self.err(format!(
-                "Wrong number of arguments in the equation for type family ‘{short_name}’\nThe declaration expects {arity}. This equation supplies {}.",
-                pats.len()
-            ));
         }
         let eqn = FamEqn {
             nvars: tvs.len() as u32,
@@ -679,6 +695,15 @@ impl Checker {
             info.equations.push(eqn);
         }
         Ok(())
+    }
+
+    /// Find a type synonym family in a pattern. Data families can appear in patterns.
+    fn type_family_application<'t>(&self, t: &'t Ty) -> Option<&'t Ty> {
+        let (head, args) = t.split_apps();
+        if matches!(head, Ty::Con(name) if self.env.families.get(name).is_some_and(|family| !family.data)) {
+            return Some(t);
+        }
+        args.into_iter().find_map(|arg| self.type_family_application(arg))
     }
 }
 

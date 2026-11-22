@@ -198,9 +198,9 @@ impl Checker {
             }
         }
         for d in &family_decls {
-            if let Decl::TypeFamily { name, params, equations, injective, .. } = d {
+            if let Decl::TypeFamily { name, params, equations, data, injective, .. } = d {
                 let key = format!("{}.{name}", self.module);
-                self.register_family(&key, params.len(), equations.is_some());
+                self.register_family(&key, params.len(), equations.is_some(), *data);
                 let positions: Vec<usize> =
                     params.iter().enumerate().filter(|(_, p)| injective.contains(&p.name)).map(|(i, _)| i).collect();
                 if let Some(f) = self.env.families.get_mut(&key) {

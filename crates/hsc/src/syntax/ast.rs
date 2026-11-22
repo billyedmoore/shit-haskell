@@ -218,11 +218,12 @@ pub enum Decl {
         kind: Type,
         loc: Loc,
     },
-    /// A type family: open (`equations` is `None`) or closed.
+    /// An open or closed type family, or a data family (always open).
     TypeFamily {
         name: String,
         params: Vec<TyVarBind>,
         equations: Option<Vec<TypeEquation>>,
+        data: bool,
         /// The parameters an injectivity annotation (`= r | r -> a b`) names.
         injective: Vec<String>,
         loc: Loc,

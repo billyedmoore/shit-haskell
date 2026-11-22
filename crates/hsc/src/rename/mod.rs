@@ -1379,6 +1379,7 @@ impl<'a> Renamer<'a> {
                 name,
                 params,
                 equations,
+                data,
                 injective,
                 loc,
             } => {
@@ -1394,6 +1395,7 @@ impl<'a> Renamer<'a> {
                     name,
                     params,
                     equations,
+                    data,
                     injective,
                     loc,
                 }

@@ -12,9 +12,8 @@ impl Parser {
             Tok::Kw(Kw::Data) if self.real() => {
                 self.bump();
                 if self.at_varid("family") {
-                    // A data family is an open type family; its instances are data types.
                     self.bump();
-                    return self.type_family(loc, module);
+                    return self.type_family(loc, module, true);
                 }
                 if self.at_kw(Kw::Instance) {
                     self.bump();
@@ -495,7 +494,7 @@ impl Parser {
         self.expect_kw(Kw::Type)?;
         if self.at_varid("family") {
             self.bump();
-            return self.type_family(loc, module);
+            return self.type_family(loc, module, false);
         }
         if self.at_kw(Kw::Instance) {
             self.bump();
@@ -536,7 +535,7 @@ impl Parser {
     }
 
     /// `F a b [:: kind] [where equations]`, after `type family` or `data family`.
-    fn type_family(&mut self, loc: Loc, module: &str) -> PResult<Decl> {
+    fn type_family(&mut self, loc: Loc, module: &str, data: bool) -> PResult<Decl> {
         let head = self.btype()?;
         let (name, params) = self.decl_head(head)?;
         if self.at_res(ROp::DColon) {
@@ -553,6 +552,9 @@ impl Parser {
             }
         }
         let equations = if self.at_kw(Kw::Where) {
+            if data {
+                return self.err("Define instances of a data family with separate ‘data instance’ declarations");
+            }
             self.bump();
             Some(self.block(|p| {
                 let (head, equation) = p.type_equation()?;
@@ -578,6 +580,7 @@ impl Parser {
             name,
             params,
             equations,
+            data,
             injective,
             loc,
         })
@@ -1154,7 +1157,7 @@ impl Parser {
     fn class_body_decl(&mut self) -> PResult<Decl> {
         if self.at_kw(Kw::Type) {
             // An associated type: `type F a [:: k]` declares it; `type F T = t` is an equation
-            // (an instance's definition, or a class default, which is accepted and ignored).
+            // (an instance's definition or a class default).
             let loc = self.loc();
             self.bump();
             if self.at_kw(Kw::Instance) {
@@ -1173,7 +1176,7 @@ impl Parser {
                 if self.atype().is_ok() && self.at_res(ROp::Bar) {
                     let injective = self.injectivity();
                     let (name, params) = self.decl_head(head)?;
-                    return Ok(Decl::TypeFamily { name, params, equations: None, injective, loc });
+                    return Ok(Decl::TypeFamily { name, params, equations: None, data: false, injective, loc });
                 }
                 (self.pos, self.ctx, self.semi_done) = save;
                 let (name, equation) = self.equation_from(head)?;
@@ -1192,6 +1195,7 @@ impl Parser {
                 name,
                 params,
                 equations: None,
+                data: false,
                 injective: Vec::new(),
                 loc,
             });

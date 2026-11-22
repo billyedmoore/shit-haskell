@@ -437,7 +437,7 @@ bin_struct!(Synonym { nparams, rhs });
 bin_struct!(ClassInfo { name, nparams, supers, methods, defaults, default_schemes, dict_con, fundeps });
 bin_struct!(InstInfo { class, nvars, ctx, head, dict, kinds });
 bin_struct!(FamEqn { nvars, args, rhs, kinds, default });
-bin_struct!(FamilyInfo { arity, closed, equations, injective });
+bin_struct!(FamilyInfo { arity, data, closed, equations, injective });
 
 bin_enum!(CLit { 0 => Integer(a), 1 => Int(a), 2 => Double(a), 3 => Frac(a), 4 => Char(a), 5 => Str(a), 6 => Addr(a) });
 bin_enum!(Core {
@@ -580,7 +580,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 7";
+const MAGIC: &str = "hsc-module-cache 8";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.
@@ -744,7 +744,7 @@ mod tests {
         let mut kinds = EnvMap::default();
         env.values.insert("Boot.old".into(), Scheme::mono(Ty::con("Old")));
         env.families.insert("Boot.F".into(), FamilyInfo {
-            arity: 1, closed: false, equations: vec![equation("Old")], injective: Vec::new(),
+            arity: 1, data: false, closed: false, equations: vec![equation("Old")], injective: Vec::new(),
         });
         kinds.insert("Boot.T".into(), Kind::Star);
         (env, kinds)
@@ -906,6 +906,9 @@ mod tests {
         env.fields.get_or_insert_default("M.field".into()).push(("M.Con".into(), 0));
         env.fields.get_or_insert_default("M.field".into()).push(("M.Other".into(), 1));
         env.families.get_mut("Boot.F").unwrap().equations.push(equation("New"));
+        env.families.insert("M.Storage".into(), FamilyInfo {
+            arity: 1, data: true, closed: false, equations: Vec::new(), injective: Vec::new(),
+        });
         kinds.insert("M.T".into(), Kind::Star);
         env.instances.push(InstInfo {
             class: "M.C".into(), nvars: 0, ctx: Vec::new(), head: vec![Ty::con("M.T")],
@@ -938,6 +941,7 @@ mod tests {
         assert_eq!(env.values["Boot.old"].ty, Ty::con("Old"));
         assert_eq!(env.fields["M.field"].len(), 2);
         assert_eq!(env.families["Boot.F"].equations.len(), 2);
+        assert!(env.families["M.Storage"].data);
         assert_eq!(env.instances.for_class("M.C").count(), 1);
         let loaded = snapshot(&env, &kinds);
         env.values.insert("Next.value".into(), Scheme::mono(Ty::con("Next")));
@@ -962,10 +966,10 @@ mod tests {
         env.values.insert("M.value".into(), Scheme::mono(Ty::con("Boot")));
         env.tycons.insert("M.T".into(), TyConInfo { arity: 0, cons: Vec::new() });
         env.families.insert("M.F".into(), FamilyInfo {
-            arity: 1, closed: true, equations: Vec::new(), injective: Vec::new(),
+            arity: 1, data: false, closed: true, equations: Vec::new(), injective: Vec::new(),
         });
         env.families.insert("M.Sub.F".into(), FamilyInfo {
-            arity: 1, closed: false, equations: vec![equation("SubOld")], injective: Vec::new(),
+            arity: 1, data: false, closed: false, equations: vec![equation("SubOld")], injective: Vec::new(),
         });
         kinds.insert("M.T".into(), Kind::Star);
         for dict in ["Other.a", "M.dict", "Other.b"] {
@@ -1030,7 +1034,7 @@ mod tests {
     fn boot_family_context_is_not_cached_as_a_declaration() {
         let (mut env, kinds) = boot_env();
         env.families.insert("M.Open".into(), FamilyInfo {
-            arity: 1, closed: false, equations: Vec::new(), injective: Vec::new(),
+            arity: 1, data: false, closed: false, equations: Vec::new(), injective: Vec::new(),
         });
         assert!(boot_cacheable(&env, "M"));
         env.families.get_mut("M.Open").unwrap().equations.push(equation("Consumer"));
