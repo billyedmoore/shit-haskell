@@ -236,6 +236,30 @@ impl<'a> Renamer<'a> {
         // Top-level entities of this module.
         check_group_signatures(&m.decls)?;
         self.collect_own(&m.decls)?;
+        let mut previous_default: Option<Loc> = None;
+        for decl in &m.decls {
+            match decl {
+                Decl::PatSynSig { names, loc, .. } => {
+                    for name in names {
+                        if !self.own.iter().any(|e| e.kind == EntKind::PatSyn && e.occ() == name) {
+                            return Err(RnError {
+                                loc: *loc,
+                                msg: format!("The pattern synonym signature for ‘{name}’ lacks an accompanying binding"),
+                            }.into());
+                        }
+                    }
+                }
+                Decl::Default { loc, .. } => {
+                    if let Some(first) = previous_default.replace(*loc) {
+                        return Err(RnError {
+                            loc: *loc,
+                            msg: format!("Multiple default declarations for class ‘Num’\nThe first declaration is at line {}, column {}.", first.line, first.col),
+                        }.into());
+                    }
+                }
+                _ => {}
+            }
+        }
         let own = self.own.clone();
         for e in &own {
             self.add_entity(e.clone(), true, Some(&self.module.clone()));
@@ -1133,6 +1157,10 @@ impl<'a> Renamer<'a> {
                 }
             }
             Decl::Data(mut dd) => {
+                check_type_binders(&dd.tyvars, dd.loc)?;
+                if dd.newtype {
+                    check_newtype(&dd)?;
+                }
                 dd.tyvars = self.tyvar_binds(std::mem::take(&mut dd.tyvars))?;
                 dd.context = self.types(dd.context)?;
                 for c in &mut dd.cons {
@@ -1161,13 +1189,17 @@ impl<'a> Renamer<'a> {
                 }
                 Decl::Data(dd)
             }
-            Decl::TypeSyn { name, tyvars, rhs, loc } => Decl::TypeSyn {
-                name,
-                tyvars: self.tyvar_binds(tyvars)?,
-                rhs: self.ty(rhs)?,
-                loc,
-            },
+            Decl::TypeSyn { name, tyvars, rhs, loc } => {
+                check_type_binders(&tyvars, loc)?;
+                Decl::TypeSyn {
+                    name,
+                    tyvars: self.tyvar_binds(tyvars)?,
+                    rhs: self.ty(rhs)?,
+                    loc,
+                }
+            }
             Decl::Class(mut cd) => {
+                check_type_binders(&cd.tyvars, cd.loc)?;
                 cd.context = self.types(cd.context)?;
                 let mut decls = Vec::new();
                 for d in std::mem::take(&mut cd.decls) {
@@ -1190,6 +1222,22 @@ impl<'a> Renamer<'a> {
             }
             Decl::Instance(mut id) => {
                 check_group_signatures(&id.decls)?;
+                let methods_with_bindings: HashSet<_> = id.decls.iter().filter_map(|decl| match decl {
+                    Decl::Fun { name, .. } => Some(name.as_str()),
+                    _ => None,
+                }).collect();
+                for decl in &id.decls {
+                    if let Decl::Sig { names, loc, .. } = decl {
+                        for name in names {
+                            if !methods_with_bindings.contains(name.as_str()) {
+                                return Err(RnError {
+                                    loc: *loc,
+                                    msg: format!("The instance method signature for ‘{name}’ lacks an accompanying binding"),
+                                });
+                            }
+                        }
+                    }
+                }
                 id.context = self.types(id.context)?;
                 id.head = self.ty(id.head)?;
                 let class = instance_class(&id.head);
@@ -1259,11 +1307,19 @@ impl<'a> Renamer<'a> {
                 ty: self.ty(ty)?,
                 loc,
             },
-            Decl::KindSig { name, kind, loc } => Decl::KindSig {
-                name,
-                kind: self.complete_signature(kind, "a standalone kind signature")?,
-                loc,
-            },
+            Decl::KindSig { name, kind, loc } => {
+                if !self.own.iter().any(|e| !e.kind.is_value() && e.occ() == name) {
+                    return Err(RnError {
+                        loc,
+                        msg: format!("The standalone kind signature for ‘{name}’ lacks an accompanying declaration"),
+                    });
+                }
+                Decl::KindSig {
+                    name,
+                    kind: self.complete_signature(kind, "a standalone kind signature")?,
+                    loc,
+                }
+            }
             Decl::TypeFamily {
                 name,
                 params,
@@ -2420,10 +2476,12 @@ fn one_edit_apart(a: &str, b: &str) -> bool {
 fn check_group_signatures(decls: &[Decl]) -> RR<()> {
     let mut seen = HashMap::new();
     for decl in decls {
-        let (kind, names, loc) = match decl {
+        let (kind, names, loc): (&str, &[String], &Loc) = match decl {
             Decl::Sig { names, loc, .. } => ("type signature", names, loc),
             Decl::DefaultSig { names, loc, .. } => ("default signature", names, loc),
             Decl::Fixity { ops, loc, .. } => ("fixity declaration", ops, loc),
+            Decl::KindSig { name, loc, .. } => ("standalone kind signature", std::slice::from_ref(name), loc),
+            Decl::PatSynSig { names, loc, .. } => ("pattern synonym signature", names, loc),
             _ => continue,
         };
         for name in names {
@@ -2434,6 +2492,45 @@ fn check_group_signatures(decls: &[Decl]) -> RR<()> {
                 });
             }
         }
+    }
+    Ok(())
+}
+
+fn check_type_binders(binders: &[TyVarBind], loc: Loc) -> RR<()> {
+    let mut names = HashSet::new();
+    for binder in binders {
+        if !names.insert(binder.name.as_str()) {
+            return Err(RnError { loc, msg: format!("Type variable ‘{}’ is bound more than once", binder.name) });
+        }
+    }
+    Ok(())
+}
+
+fn check_newtype(decl: &DataDecl) -> RR<()> {
+    let [con] = decl.cons.as_slice() else {
+        return Err(RnError {
+            loc: decl.loc,
+            msg: format!("Newtype ‘{}’ must have exactly one constructor, but has {}", decl.name, decl.cons.len()),
+        });
+    };
+    let (count, strict) = match &con.fields {
+        ConFields::Positional(fields) => (fields.len(), fields.iter().any(|field| field.strict)),
+        ConFields::Record(groups) => (
+            groups.iter().map(|(names, _)| names.len()).sum(),
+            groups.iter().any(|(_, field)| field.strict),
+        ),
+    };
+    if count != 1 {
+        return Err(RnError {
+            loc: con.loc,
+            msg: format!("Newtype constructor ‘{}’ must have exactly one field, but has {count}", con.name),
+        });
+    }
+    if strict {
+        return Err(RnError {
+            loc: con.loc,
+            msg: format!("Newtype constructor ‘{}’ cannot have a strictness annotation on its field", con.name),
+        });
     }
     Ok(())
 }

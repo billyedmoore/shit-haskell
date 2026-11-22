@@ -305,6 +305,7 @@ impl Parser {
                 break;
             } else if self.at_res(ROp::At) && self.raw().space_before && !self.raw().space_after {
                 let loc = self.loc();
+                self.require_ext("TypeApplications")?;
                 self.bump();
                 let t = self.atype()?;
                 e = Expr::TyApp(Box::new(e), t, loc);

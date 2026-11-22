@@ -76,6 +76,7 @@ impl Parser {
                 t = Type::App(Box::new(t), Box::new(a));
             } else if self.real() && self.at_res(ROp::At) && self.raw().space_before && !self.raw().space_after {
                 // A visible kind argument `T @k`: kinds are not checked, so it is dropped.
+                self.require_ext("TypeApplications")?;
                 self.bump();
                 self.atype()?;
             } else {

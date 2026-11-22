@@ -754,7 +754,7 @@ fn qualify_pat(p: &Pat, module: &str) -> Pat {
 }
 
 /// Strongly connected components, dependencies first (Tarjan's algorithm).
-fn tarjan(n: usize, edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+pub(super) fn tarjan(n: usize, edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     struct St {
         index: Vec<Option<usize>>,
         low: Vec<usize>,

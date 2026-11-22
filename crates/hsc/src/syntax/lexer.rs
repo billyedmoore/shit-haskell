@@ -18,6 +18,7 @@ pub struct Pragma {
     pub line: u32,
     /// The column of its `{-#` (1 for one at a module's top level).
     pub col: u32,
+    pub(crate) body_loc: super::ast::Loc,
 }
 
 pub struct Lexed {
@@ -322,20 +323,25 @@ impl Lexer {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect::<String>()
             .to_ascii_uppercase();
+        let name_len = name.len();
         let name = if name == "NOTINLINE" { "NOINLINE".to_string() } else { name };
         if ["LANGUAGE", "OPTIONS_GHC", "RULES", "INLINE", "NOINLINE"].contains(&name.as_str()) {
+            let body_start = body.len() - body.trim_start().len() + name_len;
+            let after_name = &body[body_start..];
+            let padding = after_name.len() - after_name.trim_start().len();
+            let body_loc = super::ast::Loc { line, col: col as u32 + 3 }.after(&body[..body_start + padding]);
             // A RULES body keeps its line breaks (its rules' positions count lines from here).
             let rest = if name == "RULES" {
-                let at = body.len() - body.trim_start().len() + name.len();
-                body[at.min(body.len())..].to_string()
+                after_name.to_string()
             } else {
-                trimmed[name.len().min(trimmed.len())..].trim().to_string()
+                after_name.trim().to_string()
             };
             self.pragmas.push(Pragma {
                 name,
                 body: rest,
                 line,
                 col: col as u32,
+                body_loc,
             });
         }
         Ok(nl)

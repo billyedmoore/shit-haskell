@@ -1,0 +1,3 @@
+{-# LANGUAGE LambdaCase, #-}
+
+main = pure ()

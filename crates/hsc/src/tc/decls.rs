@@ -183,6 +183,7 @@ impl Checker {
         let decls = &m.decls;
 
         // 0. Kinds of this module's type constructors.
+        check_type_synonym_cycles(&m.name, decls)?;
         self.check_kinds(decls)?;
 
         // Type families: declared first, so that equations and uses can refer to them.
@@ -1784,6 +1785,63 @@ impl Checker {
             })
             .collect())
     }
+}
+
+fn check_type_synonym_cycles(module: &str, decls: &[Decl]) -> TR<()> {
+    let synonyms: Vec<_> = decls.iter().filter_map(|decl| match decl {
+        Decl::TypeSyn { name, rhs, loc, .. } => Some((name.as_str(), rhs, *loc)),
+        _ => None,
+    }).collect();
+    if synonyms.is_empty() {
+        return Ok(());
+    }
+    let names: HashMap<_, _> = synonyms.iter().enumerate().map(|(i, (name, _, _))| (*name, i)).collect();
+    fn dependencies(ty: &Type, module: &str, names: &HashMap<&str, usize>, out: &mut Vec<usize>) {
+        let mut add = |ty: &Type| dependencies(ty, module, names, out);
+        match ty {
+            Type::Con(q, _) if q.qual.as_deref() == Some(module) => {
+                if let Some(&index) = names.get(q.name.as_str()) {
+                    out.push(index);
+                }
+            }
+            Type::App(a, b) | Type::Fun(a, b) | Type::Sig(a, b) => {
+                add(a);
+                add(b);
+            }
+            Type::List(t, _) => add(t),
+            Type::Tuple(ts, _) => ts.iter().for_each(add),
+            Type::Qual(ctx, body) => {
+                ctx.iter().for_each(&mut add);
+                add(body);
+            }
+            Type::Forall(binders, body) => {
+                binders.iter().filter_map(|b| b.kind.as_ref()).for_each(&mut add);
+                add(body);
+            }
+            _ => {}
+        }
+    }
+    let edges: Vec<_> = synonyms.iter().map(|(_, rhs, _)| {
+        let mut refs = Vec::new();
+        dependencies(rhs, module, &names, &mut refs);
+        refs.sort_unstable();
+        refs.dedup();
+        refs
+    }).collect();
+    for mut group in super::bind::tarjan(synonyms.len(), &edges) {
+        let first = group[0];
+        if group.len() == 1 && !edges[first].contains(&first) {
+            continue;
+        }
+        group.sort_unstable();
+        let mut msg = "Cycle in type synonym declarations".to_string();
+        for &index in &group {
+            let (name, _, loc) = synonyms[index];
+            msg.push_str(&format!("\n‘{name}’ is declared at line {}, column {}.", loc.line, loc.col));
+        }
+        return Err(TcError { loc: synonyms[group[0]].2, msg });
+    }
+    Ok(())
 }
 
 fn simple_record_type(ty: &Ty, parameters: u32) -> bool {

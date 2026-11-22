@@ -46,26 +46,29 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     // in the file is ignored (base16's stray `{-# LANGUAGE lenientLoop #-}`).
     let header_end = lexed.tokens.first().map(|t| (t.line, t.col));
     for p in lexed.pragmas.iter().filter(|p| header_end.is_none_or(|end| (p.line, p.col) < end)) {
-        if p.name == "OPTIONS_GHC" {
-            for flag in p.body.split_whitespace() {
-                exts.warnings.apply(flag);
+        let at = |loc: ast::Loc, msg| SyntaxError { line: loc.line, col: loc.col, msg };
+        match p.name.as_str() {
+            "LANGUAGE" => {
+                let mut loc = p.body_loc;
+                for part in p.body.split(',') {
+                    let item = part.trim();
+                    let start = loc.after(&part[..part.len() - part.trim_start().len()]);
+                    if item.is_empty() {
+                        return Err(at(start, "Expected an extension name in the LANGUAGE pragma".into()));
+                    }
+                    exts.apply(item).map_err(|msg| at(start, msg))?;
+                    loc = loc.after(part).after(",");
+                }
             }
-        }
-        let items: Vec<String> = match p.name.as_str() {
-            "LANGUAGE" => p.body.split(',').map(|s| s.trim().to_string()).collect(),
-            "OPTIONS_GHC" => p
-                .body
-                .split_whitespace()
-                .filter_map(|w| w.strip_prefix("-X").map(str::to_string))
-                .collect(),
-            _ => Vec::new(),
-        };
-        for item in items {
-            exts.apply(&item).map_err(|msg| SyntaxError {
-                line: p.line,
-                col: 1,
-                msg,
-            })?;
+            "OPTIONS_GHC" => {
+                for flag in p.body.split_whitespace() {
+                    exts.warnings.apply(flag);
+                    if let Some(ext) = flag.strip_prefix("-X") {
+                        exts.apply(ext).map_err(|msg| at(p.body_loc, msg))?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // Names end in `#` only with MagicHash; Unicode symbols are reserved ones only with

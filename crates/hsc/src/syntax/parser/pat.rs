@@ -1,6 +1,6 @@
 //! Patterns are parsed as expressions and converted here.
 
-use super::{PResult, Parser};
+use super::{PResult, ParseError, Parser};
 use crate::syntax::ast::*;
 
 impl Parser {
@@ -62,7 +62,16 @@ impl Parser {
             Expr::AsPat(name, inner, loc) => Pat::As(name, Box::new(self.expr_to_pat(*inner)?), loc),
             Expr::LazyPat(inner, loc) => Pat::Lazy(Box::new(self.expr_to_pat(*inner)?), loc),
             Expr::ViewPat(f, inner, loc) => Pat::View(f, Box::new(self.expr_to_pat(*inner)?), loc),
-            Expr::BangPat(inner, loc) => Pat::Bang(Box::new(self.expr_to_pat(*inner)?), loc),
+            Expr::BangPat(inner, loc) => {
+                if !self.exts.is_on("BangPatterns") {
+                    return Err(ParseError {
+                        line: loc.line,
+                        col: loc.col,
+                        msg: "Illegal bang pattern\nEnable BangPatterns to use ‘!’ in a pattern.".into(),
+                    });
+                }
+                Pat::Bang(Box::new(self.expr_to_pat(*inner)?), loc)
+            }
             Expr::Sig(inner, ty, loc) => Pat::Sig(Box::new(self.expr_to_pat(*inner)?), ty, loc),
             Expr::RecCon {
                 con,

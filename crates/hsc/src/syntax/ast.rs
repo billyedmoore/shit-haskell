@@ -7,6 +7,23 @@ pub struct Loc {
     pub col: u32,
 }
 
+impl Loc {
+    pub(crate) fn after(self, text: &str) -> Self {
+        let mut loc = self;
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    loc.line += 1;
+                    loc.col = 1;
+                }
+                '\t' => loc.col = ((loc.col - 1) / 8 + 1) * 8 + 1,
+                _ => loc.col += 1,
+            }
+        }
+        loc
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct QName {
     pub qual: Option<String>,
