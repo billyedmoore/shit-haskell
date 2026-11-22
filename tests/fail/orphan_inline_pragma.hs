@@ -1,0 +1,3 @@
+{-# INLINE id #-}
+
+main = pure ()

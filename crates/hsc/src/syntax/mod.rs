@@ -132,8 +132,14 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     for p in inline_pragmas {
         let Ok(lexed) = lexer::lex_with(&p.body, magic, unicode) else { continue };
         let tokens: Vec<token::Token> = lexed.tokens.into_iter().map(|mut t| {
-            t.line += p.line - 1;
-            t.end_line += p.line - 1;
+            if t.line == 1 {
+                t.col += p.body_loc.col - 1;
+            }
+            if t.end_line == 1 {
+                t.end_col += p.body_loc.col - 1;
+            }
+            t.line += p.body_loc.line - 1;
+            t.end_line += p.body_loc.line - 1;
             t
         }).collect();
         module.inlines.extend(parser::parse_inline(&tokens, p.name == "INLINE"));

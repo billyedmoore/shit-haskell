@@ -384,9 +384,23 @@ impl<'a> Renamer<'a> {
         }
 
         // INLINE and NOINLINE pragmas on the module's globals, as marker bindings.
+        let mut inline_sites = HashMap::new();
         for (i, p) in m.inlines.iter().enumerate() {
-            let Ok(q) = self.value_ref_in_scope(&p.name, p.loc, false) else { continue };
-            let Some(module) = q.qual.as_deref().filter(|m| *m == self.module) else { continue };
+            let pragma = if p.inline { "INLINE" } else { "NOINLINE" };
+            let q = self.value_ref_in_scope(&p.name, p.loc, false).ok();
+            let module = q.as_ref().and_then(|q| q.qual.as_deref()).filter(|m| *m == self.module);
+            let (Some(q), Some(module)) = (&q, module) else {
+                return Err(RnError {
+                    loc: p.loc,
+                    msg: format!("The {pragma} pragma for ‘{}’ lacks an accompanying binding", display_qname(&p.name)),
+                }.into());
+            };
+            if let Some(first) = inline_sites.insert(q.name.clone(), p.loc) {
+                return Err(RnError {
+                    loc: p.loc,
+                    msg: format!("Duplicate {pragma} pragma for ‘{}’\nThe earlier pragma is at line {}, column {}.", q.name, first.line, first.col),
+                }.into());
+            }
             let target = format!("{module}.{}", q.name);
             if let Ok(d) = self.rename_top_decl(inline_binding(i, &target, p)) {
                 decls.push(d);
