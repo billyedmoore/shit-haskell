@@ -74,6 +74,7 @@ const ORDINARY_NAMES: &[&str] = &[
     // Integer arithmetic (an `Integer` accumulator calls these at every step).
     "integerAdd", "integerSub", "integerMul", "integerNegate", "integerAbs", "integerSignum",
     "integerEq", "integerLe", "integerLt", "integerQuot", "integerRem", "integerDiv", "integerMod",
+    "integerQuotRem", "integerDivMod",
     "integerToInt", "integerAnd", "integerOr", "integerXor", "integerShiftL", "integerShiftR",
     "integerToDouble", "integerGcd", "integerTestBit", "integerPopCount",
 ];
@@ -381,9 +382,24 @@ pub fn char_value(m: &mut Machine, c: char) -> Word {
     char_code_value(m, c as u32)
 }
 
+/// Static `CHAR` cells for ASCII/Latin-1 code points (`0..256`), matching codegen's `hsc_charlike`.
+static CHARLIKE: [[Word; 2]; 256] = {
+    let mut cells = [[0; 2]; 256];
+    let mut i = 0;
+    while i < 256 {
+        cells[i] = [heap::header(CHAR, 1, 0), i as Word];
+        i += 1;
+    }
+    cells
+};
+
 /// A boxed character by its code point: any value up to 0x10FFFF, surrogates included (GHC's
 /// `Char` holds them, as the roundtrip encodings do).
+#[inline(always)]
 pub fn char_code_value(m: &mut Machine, c: u32) -> Word {
+    if c < 256 {
+        return CHARLIKE[c as usize].as_ptr() as Word;
+    }
     let p = m.alloc(2);
     m.heap_set(p, heap::header(CHAR, 1, 0));
     m.heap_set(p + 8, c as Word);

@@ -130,6 +130,42 @@ fn raw_operand_prim(p: &str) -> bool {
 /// A raw slot holding a `Char#` (its boxed form is a CHAR cell); others hold `Int#`/`Word#`.
 pub const RAW_CHAR: u32 = 1 << 30;
 
+/// Sentinel slot index for an unused (dead) `Case` binder or `SAlt::Con` field.
+/// High bits (`RAW`, `RAW_CHAR`) are clear so `slot & RAW == 0` stays false.
+pub const UNUSED_SLOT: u32 = 0x3fff_ffff;
+
+/// Whether a Core application of `g` to `nargs` arguments is a known diverging error call.
+fn is_diverging_call(g: &str, nargs: usize) -> bool {
+    let Some((mod_name, base)) = g.rsplit_once('.') else { return false };
+    let std_err_mod = matches!(
+        mod_name,
+        "GHC.Internal.Control.Exception.Base"
+            | "Control.Exception.Base"
+            | "GHC.Control.Exception.Base"
+            | "GHC.Internal.Err"
+            | "GHC.Err"
+            | "Prelude"
+    );
+    if !std_err_mod {
+        return false;
+    }
+    match base {
+        "patError"
+        | "irrefutPatError"
+        | "recSelError"
+        | "recConError"
+        | "recUpdError"
+        | "nonExhaustiveGuardsError"
+        | "noMethodBindingError"
+        | "absentError"
+        | "typeError"
+        | "errorWithoutStackTrace" => nargs >= 1,
+        "error" => nargs >= 2,
+        "undefined" => nargs >= 1,
+        _ => false,
+    }
+}
+
 /// The functions with a worker taking some parameters raw: by name, which parameters.
 pub type Workers = HashMap<String, Vec<bool>>;
 
@@ -384,8 +420,9 @@ fn raw_returns(
                 matches!(
                     f,
                     Core::Var(g)
-                        if out.contains_key(g.as_str())
-                            && can_call_worker(g.as_str(), &args, w_all, strict_map, whnf)
+                        if is_diverging_call(g.as_str(), args.len())
+                            || (out.contains_key(g.as_str())
+                                && can_call_worker(g.as_str(), &args, w_all, strict_map, whnf))
                 )
             }
             Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
@@ -881,6 +918,7 @@ impl Lowering {
                     }
                 };
                 let raw_here = self.ctx() == Ctx::RawScrut || self.raw_result().is_some();
+                let diverging = matches!(f, Core::Var(g) if is_diverging_call(g.as_str(), args.len()));
                 match (callee_raw, self.raw_result()) {
                     // A raw result where a raw one is taken: passed on as it is.
                     (Some(_), _) if raw_here => call,
@@ -888,6 +926,8 @@ impl Lowering {
                     // cycle passes through here: a worker returning raw tail-calls only others that
                     // do, see `raw_returns`.)
                     (Some(kind), _) => self.through_raw(call, kind),
+                    // A diverging call never returns, so no unboxing continuation is needed.
+                    (None, Some(_)) if diverging => call,
                     // A boxed result returned raw: unboxed after the return.
                     (None, Some(kind)) => self.through_raw(call, kind),
                     (None, None) => call,
@@ -963,15 +1003,38 @@ impl Lowering {
                 let char = matches!(scrut.as_ref(), Core::Prim(p, _) if p == "chr#") || raw_call == Some(NUM_CHAR);
                 let flat_alts = if !raw { flatten_case_alts(scrut, binder, alts) } else { None };
                 let alts: &[Alt] = flat_alts.as_deref().unwrap_or(alts);
+                // Temporaries allocated only to evaluate the scrutinee are dead once it returns.
+                let (scrut_base, scrut_raw_base) = {
+                    let b = self.bodies.last().expect("body");
+                    (b.nslots, b.nraw)
+                };
                 let scrut = self.strict_in(scrut, if raw { Ctx::RawScrut } else { Ctx::Scrut });
-                let bslot = if raw { self.bind_raw(binder, char) } else { self.bind_local(binder) };
+                let (scrut_top, scrut_raw_top) = {
+                    let b = self.bodies.last_mut().expect("body");
+                    let t = (b.nslots, b.nraw);
+                    b.nslots = scrut_base;
+                    b.nraw = scrut_raw_base;
+                    t
+                };
+                let needs_bslot = raw
+                    || alts_free_mention(alts, binder)
+                    || alts.iter().any(|a| {
+                        matches!(a, Alt::Lit(l, _) if !matches!(l, Lit::Int(_) | Lit::Char(_) | Lit::Double(_)))
+                    });
+                let bslot = if raw {
+                    self.bind_raw(binder, char)
+                } else if needs_bslot {
+                    self.bind_local(binder)
+                } else {
+                    UNUSED_SLOT
+                };
                 // Only one alternative runs, so their locals share the slots after the binder: the
                 // frame needs the largest alternative's, not their sum.
                 let (base, raw_base) = {
                     let b = self.bodies.last().expect("body");
                     (b.nslots, b.nraw)
                 };
-                let (mut top, mut raw_top) = (base, raw_base);
+                let (mut top, mut raw_top) = (scrut_top.max(base), scrut_raw_top.max(raw_base));
                 let mut lowered = Vec::with_capacity(alts.len());
                 for a in alts {
                     let b = self.bodies.last_mut().expect("body");
@@ -1001,15 +1064,28 @@ impl Lowering {
             }
             // `seq a b` evaluates a, then answers b; the identities answer their argument.
             Core::Prim(name, args) if name == "seq" && args.len() == 2 => {
-                let slot = self.bind_local(&format!("seq%{}", self.bodies.len()));
+                let (base, raw_base) = {
+                    let b = self.bodies.last().expect("body");
+                    (b.nslots, b.nraw)
+                };
                 let scrut = self.strict_in(&args[0], Ctx::Scrut);
+                let (scrut_top, scrut_raw_top) = {
+                    let b = self.bodies.last_mut().expect("body");
+                    let t = (b.nslots, b.nraw);
+                    b.nslots = base;
+                    b.nraw = raw_base;
+                    t
+                };
                 let saved_whnf = self.bodies.last().expect("body").whnf.clone();
                 if let Core::Var(v) = &args[0] {
                     self.bodies.last_mut().expect("body").whnf.insert(v.clone());
                 }
                 let body = self.strict(&args[1]);
-                self.bodies.last_mut().expect("body").whnf = saved_whnf;
-                SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(body)])
+                let b = self.bodies.last_mut().expect("body");
+                b.nslots = b.nslots.max(scrut_top);
+                b.nraw = b.nraw.max(scrut_raw_top);
+                b.whnf = saved_whnf;
+                SExpr::Case(Box::new(scrut), UNUSED_SLOT, vec![SAlt::Default(body)])
             }
             Core::Prim(name, args) if IDENTITY_PRIMS.contains(&name.as_str()) && args.len() == 1 => {
                 self.strict(&args[0])
@@ -1161,7 +1237,16 @@ impl Lowering {
     fn alt(&mut self, a: &Alt) -> SAlt {
         match a {
             Alt::Con(name, vars, body) => {
-                let slots = vars.iter().map(|v| self.bind_local(v)).collect();
+                let slots = vars
+                    .iter()
+                    .map(|v| {
+                        if free_mentions(body, v) {
+                            self.bind_local(v)
+                        } else {
+                            UNUSED_SLOT
+                        }
+                    })
+                    .collect();
                 SAlt::Con(name.clone(), slots, self.strict(body))
             }
             Alt::Lit(l, body) => SAlt::Lit(l.clone(), self.strict(body)),
@@ -1287,7 +1372,8 @@ const IDENTITY_PRIMS: [&str; 6] = ["unsafeCoerce", "unsafeCoerce#", "lazy", "one
 fn strict_integer_arity(name: &str) -> Option<usize> {
     match name {
         "integerAdd" | "integerSub" | "integerMul" | "integerQuot" | "integerRem" | "integerDiv"
-        | "integerMod" | "integerEq" | "integerLt" | "integerLe" => Some(2),
+        | "integerMod" | "integerQuotRem" | "integerDivMod" | "integerEq" | "integerLt"
+        | "integerLe" => Some(2),
         "integerNegate" | "integerAbs" | "integerSignum" | "integerToInt" | "intToInteger" => Some(1),
         _ => None,
     }
@@ -1363,6 +1449,34 @@ fn mentions(e: &Core, j: &str) -> bool {
 fn alts_mention(alts: &[Alt], v: &str) -> bool {
     alts.iter().any(|a| match a {
         Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => mentions(b, v),
+    })
+}
+
+/// Whether `v` occurs free in `e` (respecting shadowing by `Lam`, `Let`, `Case`, and `Alt::Con`).
+fn free_mentions(e: &Core, v: &str) -> bool {
+    match e {
+        Core::Var(x) => x == v,
+        Core::Lit(_) | Core::Fail(_) => false,
+        Core::App(f, a) => free_mentions(f, v) || free_mentions(a, v),
+        Core::Lam(x, b) => x != v && free_mentions(b, v),
+        Core::Let(binds, body) => {
+            if binds.iter().any(|(n, _)| n == v) {
+                false
+            } else {
+                binds.iter().any(|(_, r)| free_mentions(r, v)) || free_mentions(body, v)
+            }
+        }
+        Core::Case(s, b, alts) => {
+            free_mentions(s, v) || (b != v && alts_free_mention(alts, v))
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| free_mentions(a, v)),
+    }
+}
+
+fn alts_free_mention(alts: &[Alt], v: &str) -> bool {
+    alts.iter().any(|a| match a {
+        Alt::Con(_, vars, b) => !vars.iter().any(|x| x == v) && free_mentions(b, v),
+        Alt::Lit(_, b) | Alt::Default(b) => free_mentions(b, v),
     })
 }
 
