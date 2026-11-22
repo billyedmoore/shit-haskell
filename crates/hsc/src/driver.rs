@@ -1676,6 +1676,27 @@ impl Driver {
             message.push_str("\nUse spaces for indentation.");
             warnings.push((loc, message, Warning::Tabs, fatal));
         }
+        if let Some(fatal) = exts.warnings.level(Warning::MissingDerivingStrategies) {
+            let message = if exts.is_on("DerivingStrategies") {
+                "No deriving strategy specified\nWrite an explicit strategy for this clause."
+            } else {
+                "No deriving strategy specified\nEnable DerivingStrategies to write an explicit strategy."
+            };
+            let mut report = |loc| warnings.push((loc, message.to_string(), Warning::MissingDerivingStrategies, fatal));
+            for decl in &module.decls {
+                match decl {
+                    Decl::Data(data) => {
+                        for clause in &data.deriving {
+                            if clause.strategy.is_none() && clause.via.is_none() {
+                                report(clause.loc);
+                            }
+                        }
+                    }
+                    Decl::Deriving(clause) if clause.strategy.is_none() && clause.via.is_none() => report(clause.loc),
+                    _ => {}
+                }
+            }
+        }
         if let Some(fatal) = exts.warnings.level(Warning::MissingSignatures) {
             let signed: HashSet<_> = module.decls.iter().filter_map(|decl| match decl {
                 Decl::Sig { names, .. } => Some(names.iter().map(String::as_str)),

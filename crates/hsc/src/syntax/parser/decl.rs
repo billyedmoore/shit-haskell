@@ -1096,6 +1096,7 @@ impl Parser {
     fn deriving_clauses(&mut self) -> PResult<Vec<Deriving>> {
         let mut out = Vec::new();
         while self.at_kw(Kw::Deriving) {
+            let loc = self.loc();
             self.bump();
             let strategy_loc = self.loc();
             let strategy = self.deriving_strategy()?;
@@ -1127,6 +1128,7 @@ impl Parser {
                 self.check_deriving_strategy(strategy, strategy_loc)?;
             }
             out.push(Deriving {
+                loc,
                 strategy,
                 classes,
                 via,

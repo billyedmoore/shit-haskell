@@ -552,6 +552,7 @@ pub enum Strategy {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Deriving {
+    pub loc: Loc,
     pub strategy: Option<Strategy>,
     pub classes: Vec<Type>,
     pub via: Option<Type>,

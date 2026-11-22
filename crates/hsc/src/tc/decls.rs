@@ -1848,7 +1848,7 @@ impl Checker {
                             true,
                         ),
                     ],
-                    deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
+                    deriving: vec![Deriving { loc: sd.loc, strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
                     loc: sd.loc,
                 };
                 let here = std::mem::replace(&mut self.module, "Builtin".to_string());
@@ -1883,7 +1883,7 @@ impl Checker {
                     infix: false,
                     loc: Loc { line: 0, col: 0 },
                 }],
-                deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
+                deriving: vec![Deriving { loc: sd.loc, strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
                 loc: sd.loc,
             };
             let here = std::mem::replace(&mut self.module, "Builtin".to_string());
@@ -1901,7 +1901,7 @@ impl Checker {
             return self.err(format!("Cannot derive an instance for ‘{}’: its declaration is not known", super::types::unqualify(&tycon)));
         };
         let synthetic = DataDecl {
-            deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: sd.via.clone() }],
+            deriving: vec![Deriving { loc: sd.loc, strategy: sd.strategy.clone(), classes: vec![cls], via: sd.via.clone() }],
             loc: sd.loc,
             ..dd
         };

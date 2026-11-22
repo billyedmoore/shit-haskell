@@ -1083,7 +1083,7 @@ impl Conv<'_> {
                 Some(s) => self.strategy(&s)?,
                 None => None,
             };
-            out.push(Deriving { strategy, classes: self.cxt(&da[1])?, via: None });
+            out.push(Deriving { loc: self.loc, strategy, classes: self.cxt(&da[1])?, via: None });
         }
         Ok(out)
     }

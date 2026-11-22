@@ -1,0 +1,2 @@
+missing_deriving_strategy_standalone.hs:5:1: error: [-Wmissing-deriving-strategies]
+No deriving strategy specified

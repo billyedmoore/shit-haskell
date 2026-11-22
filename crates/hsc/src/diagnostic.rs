@@ -9,10 +9,14 @@ pub(crate) enum Warning {
     MissingSignatures,
     MissingFields,
     UnrecognisedPragmas,
+    MissingDerivingStrategies,
 }
 
 impl Warning {
-    const ALL: [Self; 4] = [Self::Tabs, Self::MissingSignatures, Self::MissingFields, Self::UnrecognisedPragmas];
+    const ALL: [Self; 5] = [
+        Self::Tabs, Self::MissingSignatures, Self::MissingFields, Self::UnrecognisedPragmas,
+        Self::MissingDerivingStrategies,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -20,6 +24,7 @@ impl Warning {
             Self::MissingSignatures => "missing-signatures",
             Self::MissingFields => "missing-fields",
             Self::UnrecognisedPragmas => "unrecognised-pragmas",
+            Self::MissingDerivingStrategies => "missing-deriving-strategies",
         }
     }
 }
@@ -43,8 +48,13 @@ impl Default for WarningOptions {
 impl WarningOptions {
     pub(crate) fn apply(&mut self, flag: &str) {
         match flag {
-            "-Wall" | "-Weverything" => self.enabled.fill(true),
-            "-w" | "-Wno-all" | "-Wno-everything" => self.enabled.fill(false),
+            "-Wall" | "-Wno-all" => {
+                for warning in Warning::ALL.into_iter().filter(|w| *w != Warning::MissingDerivingStrategies) {
+                    self.enabled[warning as usize] = flag == "-Wall";
+                }
+            }
+            "-Weverything" => self.enabled.fill(true),
+            "-w" | "-Wno-everything" => self.enabled.fill(false),
             "-Werror" => self.fatal.fill(true),
             "-Wwarn" | "-Wno-error" => self.fatal.fill(false),
             _ => {
