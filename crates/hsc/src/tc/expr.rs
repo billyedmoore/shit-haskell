@@ -381,7 +381,22 @@ impl Checker {
                 None => {
                     let x = self.meta();
                     let y = self.meta();
-                    self.unify_at(&tf, &Ty::fun(x.clone(), y.clone()))?;
+                    if let Err(err) = self.unify_at(&tf, &Ty::fun(x.clone(), y.clone())) {
+                        let result = self.normalize(&tf);
+                        if matches!(result.split_apps().0, Ty::Con(c) if !self.env.families.contains_key(c)) {
+                            if let Expr::Var(q, _) | Expr::Con(q, _) = head {
+                                let name = q.name.split('%').next().unwrap_or(&q.name);
+                                let used = params.len();
+                                let word = if used == 1 { "argument" } else { "arguments" };
+                                let supplied = spine.len();
+                                let ty = self.show(&result);
+                                return Err(super::TcError { loc: head.loc(), msg: format!(
+                                    "Too many arguments for ‘{name}’\nThis call supplies {supplied}. After {used} {word}, the type is ‘{ty}’."
+                                ) });
+                            }
+                        }
+                        return Err(err);
+                    }
                     (x, y)
                 }
             };
@@ -1927,6 +1942,24 @@ impl Checker {
             };
             // A field of a rank-N type is checked like a constructor argument of that type.
             args[pos] = Some(self.check_arg(&value, &arg_tys[pos])?);
+        }
+        let missing_fields = args.iter().enumerate().filter_map(|(i, arg)| arg.is_none().then_some(i));
+        let field_name = |i: usize| info.fields.get(i).map_or_else(
+                || format!("argument {}", i + 1),
+                |field| format!("‘{}’", crate::rename::iface::field_label(field)),
+            );
+        let missing_strict: Vec<_> = missing_fields.clone().filter(|&i| info.strict.get(i) == Some(&true))
+            .map(|i| format!("{} :: {}", field_name(i), self.show(&arg_tys[i]))).collect();
+        if !missing_strict.is_empty() {
+            return Err(super::TcError {
+                loc,
+                msg: format!("Record construction for ‘{}’ must supply its strict fields\nMissing: {}", con.name, missing_strict.join(", ")),
+            });
+        }
+        let missing_lazy: Vec<_> = missing_fields.map(field_name).collect();
+        if !missing_lazy.is_empty() {
+            self.warnings.push((loc, format!("Fields left uninitialized in ‘{}’: {}", con.name, missing_lazy.join(", ")),
+                crate::diagnostic::Warning::MissingFields));
         }
         let core = args.into_iter().enumerate().fold(con_core, |acc, (i, a)| {
             let a = a.unwrap_or_else(|| {

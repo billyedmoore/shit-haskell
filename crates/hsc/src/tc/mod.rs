@@ -76,6 +76,7 @@ pub struct Checker {
     pub dict_counter: u64,
     pub module: String,
     pub loc: Loc,
+    pub(crate) warnings: Vec<(Loc, String, crate::diagnostic::Warning)>,
     /// Variables bound by the pattern currently being checked, with their types.
     pub pat_bound: Vec<(String, Ty)>,
     /// Top-level Core bindings produced for the current module.
@@ -175,6 +176,7 @@ impl Checker {
             dict_counter: 0,
             module: BUILTIN.to_string(),
             loc: Loc::default(),
+            warnings: Vec::new(),
             pat_bound: Vec::new(),
             out: Vec::new(),
             user_module: false,

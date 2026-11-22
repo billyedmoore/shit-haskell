@@ -2576,9 +2576,13 @@ fn check_arities(name: &str, clauses: &[Clause], loc: Loc) -> RR<()> {
     if let Some(first) = clauses.first() {
         let n = first.pats.len();
         if let Some(bad) = clauses.iter().find(|c| c.pats.len() != n) {
+            let unit = if n == 1 { "argument" } else { "arguments" };
             return Err(RnError {
                 loc: bad.loc,
-                msg: format!("Equations for ‘{name}’ have different numbers of arguments"),
+                msg: format!(
+                    "Equations for ‘{name}’ have different numbers of arguments\nThe equation on line {} takes {n} {unit}. This equation takes {}.",
+                    first.loc.line, bad.pats.len()
+                ),
             });
         }
     }

@@ -1,0 +1,3 @@
+too_many_arguments.hs:1:8: error
+Too many arguments for ‘putStrLn’
+This call supplies 2. After 1 argument, the type is ‘IO ()’.

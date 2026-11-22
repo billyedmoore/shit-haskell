@@ -3,19 +3,21 @@ use std::path::Path;
 
 use crate::syntax::ast::Loc;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Warning {
     Tabs,
     MissingSignatures,
+    MissingFields,
 }
 
 impl Warning {
-    const ALL: [Self; 2] = [Self::Tabs, Self::MissingSignatures];
+    const ALL: [Self; 3] = [Self::Tabs, Self::MissingSignatures, Self::MissingFields];
 
     fn name(self) -> &'static str {
         match self {
             Self::Tabs => "tabs",
             Self::MissingSignatures => "missing-signatures",
+            Self::MissingFields => "missing-fields",
         }
     }
 }
@@ -30,6 +32,7 @@ impl Default for WarningOptions {
     fn default() -> Self {
         let mut enabled = [false; Warning::ALL.len()];
         enabled[Warning::Tabs as usize] = true;
+        enabled[Warning::MissingFields as usize] = true;
         Self { enabled, fatal: [false; Warning::ALL.len()] }
     }
 }
@@ -38,8 +41,7 @@ impl WarningOptions {
     pub(crate) fn apply(&mut self, flag: &str) {
         match flag {
             "-Wall" | "-Weverything" => self.enabled.fill(true),
-            "-w" | "-Wno-everything" => self.enabled.fill(false),
-            "-Wno-all" => self.enabled[Warning::MissingSignatures as usize] = false,
+            "-w" | "-Wno-all" | "-Wno-everything" => self.enabled.fill(false),
             "-Werror" => self.fatal.fill(true),
             "-Wwarn" | "-Wno-error" => self.fatal.fill(false),
             _ => {

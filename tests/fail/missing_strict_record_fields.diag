@@ -1,0 +1,2 @@
+Record construction for ‘Record’ must supply its strict fields
+Missing: ‘count’ :: Int, ‘ready’ :: Bool

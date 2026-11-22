@@ -1636,7 +1636,9 @@ impl Driver {
 
     fn module_warnings(&self, module: &Module, exts: &Extensions, path: &Path, source: Option<&str>) -> Result<Vec<String>, String> {
         use crate::diagnostic::Warning;
-        let mut warnings = Vec::new();
+        let mut warnings: Vec<_> = self.checker.warnings.iter().filter_map(|(loc, msg, flag)| {
+            exts.warnings.level(*flag).map(|fatal| (*loc, msg.clone(), *flag, fatal))
+        }).collect();
         if let (Some((loc, count)), Some(fatal)) = (exts.tabs, exts.warnings.level(Warning::Tabs)) {
             let mut message = "Tab character found here.".to_string();
             if count > 1 {
@@ -1682,6 +1684,7 @@ impl Driver {
             }
         }
         warnings.sort_by_key(|(loc, ..)| *loc);
+        warnings.dedup();
         let has_fatal = warnings.iter().any(|(_, _, _, fatal)| *fatal);
         let rendered: Vec<_> = warnings.into_iter().map(|(loc, msg, flag, fatal)| {
             crate::diagnostic::warning(path, source, loc, &msg, flag, fatal)

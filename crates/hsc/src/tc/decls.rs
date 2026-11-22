@@ -181,6 +181,7 @@ impl Checker {
         self.closed_locals.clear();
         self.dict_counter = 0;
         self.numeric_defaults = None;
+        self.warnings.clear();
         let decls = &m.decls;
 
         // 0. Kinds of this module's type constructors.

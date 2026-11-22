@@ -1,0 +1,2 @@
+error: [-Wmissing-fields]
+Fields left uninitialized in ‘Record’: ‘note’
