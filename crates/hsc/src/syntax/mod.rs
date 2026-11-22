@@ -16,6 +16,12 @@ pub struct SyntaxError {
     pub msg: String,
 }
 
+impl SyntaxError {
+    pub fn render(&self, path: &std::path::Path, source: &str) -> String {
+        crate::diagnostic::error(path, Some(source), ast::Loc { line: self.line, col: self.col }, &self.msg)
+    }
+}
+
 /// Parses one module. `flags` are compiler flags such as `-XLambdaCase`; pragmas
 /// in the source are applied on top of them.
 pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, Extensions), SyntaxError> {
@@ -25,7 +31,9 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
         msg: e.msg,
     })?;
     let mut exts = Extensions::ghc2021();
+    exts.tabs = lexed.tabs;
     for flag in flags {
+        exts.warnings.apply(flag);
         if let Some(x) = flag.strip_prefix("-X") {
             exts.apply(x).map_err(|msg| SyntaxError {
                 line: 0,
@@ -38,6 +46,11 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     // in the file is ignored (base16's stray `{-# LANGUAGE lenientLoop #-}`).
     let header_end = lexed.tokens.first().map(|t| (t.line, t.col));
     for p in lexed.pragmas.iter().filter(|p| header_end.is_none_or(|end| (p.line, p.col) < end)) {
+        if p.name == "OPTIONS_GHC" {
+            for flag in p.body.split_whitespace() {
+                exts.warnings.apply(flag);
+            }
+        }
         let items: Vec<String> = match p.name.as_str() {
             "LANGUAGE" => p.body.split(',').map(|s| s.trim().to_string()).collect(),
             "OPTIONS_GHC" => p

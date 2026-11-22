@@ -724,7 +724,9 @@ impl Gen {
         for (l, h, w) in rel_statics {
             let _ = writeln!(g.out, "{l}:\n    .quad {h}, {w}");
         }
-        let main_index = prog.index.get("hsc$main").or_else(|| prog.index.get("Main.main")).copied().unwrap_or(0);
+        let main_index = prog.index.get("hsc$main")
+            .or_else(|| prog.index.get(crate::core::MAIN_ENTRY))
+            .or_else(|| prog.index.get("Main.main")).copied().unwrap_or(0);
         // The table the runtime reads (`machine::entry::NativeTable`).
         let _ = writeln!(
             g.out,

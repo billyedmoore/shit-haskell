@@ -1212,7 +1212,7 @@ impl Parser {
         self.expect_kw(Kw::Instance)?;
         self.skip_instance_forall();
         let context = self.try_context();
-        let head = self.btype()?;
+        let (head, unboxed_head) = self.instance_head()?;
         let decls = if self.at_kw(Kw::Where) {
             self.bump();
             group_binds(self.block(|p| p.class_body_decl())?)
@@ -1223,6 +1223,7 @@ impl Parser {
             overlap: None,
             context,
             head,
+            unboxed_head,
             decls,
             loc,
         }))
@@ -1241,14 +1242,26 @@ impl Parser {
         self.expect_kw(Kw::Instance)?;
         self.skip_instance_forall();
         let context = self.try_context();
-        let head = self.btype()?;
+        let (head, unboxed_head) = self.instance_head()?;
         Ok(Decl::Deriving(StandaloneDeriving {
             strategy,
             via,
             context,
             head,
+            unboxed_head,
             loc,
         }))
+    }
+
+    fn instance_head(&mut self) -> PResult<(Type, bool)> {
+        let start = self.pos;
+        let head = self.btype()?;
+        let unboxed_head = self.exts.is_on("UnboxedTuples")
+            && self.toks[start..self.pos].windows(2).any(|pair| {
+                pair[0].tok == Tok::Special('(')
+                    && matches!(&pair[1].tok, Tok::VarSym(op) if op == "#" || op == "##")
+            });
+        Ok((head, unboxed_head))
     }
 
     fn foreign_decl(&mut self, loc: Loc) -> PResult<Decl> {

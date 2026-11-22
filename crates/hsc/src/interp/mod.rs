@@ -495,7 +495,7 @@ fn lit_matches(rt: &Runtime, v: &Value, l: &Lit) -> Result<bool, RtError> {
 /// Runs `Main.main`, returning the process exit code.
 pub fn run_main(rt: &Runtime) -> i32 {
     conc::set_runtime(rt);
-    let Some(main_cell) = rt.global("Main.main") else {
+    let Some(main_cell) = rt.global(crate::core::MAIN_ENTRY).or_else(|| rt.global("Main.main")) else {
         eprintln!("{}: The IO action ‘main’ is not defined in module ‘Main’", rt.prog_name);
         return 1;
     };

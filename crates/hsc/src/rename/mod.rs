@@ -15,6 +15,7 @@ mod quote;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::syntax::ast::*;
+use crate::syntax::extensions::Extensions;
 use fixity::{resolve, Tk};
 use iface::{EntKind, Entity, GName, Iface, PatSynDef};
 
@@ -29,6 +30,15 @@ pub const BUILTIN: &str = "Builtin";
 pub struct RnError {
     pub loc: Loc,
     pub msg: String,
+}
+
+#[derive(Debug)]
+pub struct RnErrors(pub Vec<RnError>);
+
+impl From<RnError> for RnErrors {
+    fn from(err: RnError) -> Self {
+        Self(vec![err])
+    }
 }
 
 type RR<T> = Result<T, RnError>;
@@ -79,6 +89,7 @@ pub struct Renamer<'a> {
     fixities: HashMap<GName, (Assoc, u8)>,
     /// RebindableSyntax: literals, negation, `if` and literal patterns use the names in scope.
     rebindable: bool,
+    partial_type_signatures: bool,
     /// Fixities declared for local operators (`where infixl 3 <!>`), by their unique local name.
     local_fixities: HashMap<String, (Assoc, u8)>,
     vals: HashMap<String, Vec<Entity>>,
@@ -157,11 +168,12 @@ fn rule_binding(i: usize, r: crate::syntax::ast::Rule) -> Decl {
 pub fn rename_module(
     mut m: Module,
     ifaces: &BTreeMap<String, Iface>,
-    implicit_prelude: bool,
+    extensions: &Extensions,
     boot: bool,
-    rebindable: bool,
-) -> RR<(Module, Iface)> {
-    name_duplicate_fields(&mut m.decls);
+) -> Result<(Module, Iface), RnErrors> {
+    if extensions.is_on("DuplicateRecordFields") {
+        name_duplicate_fields(&mut m.decls);
+    }
     // Global names are unique, so the fixities of every loaded module can be merged. This
     // matters for re-exports: `Prelude` exports operators whose fixities `Base` declares.
     let mut fixities = HashMap::new();
@@ -174,7 +186,8 @@ pub fn rename_module(
         module: m.name.clone(),
         ifaces,
         fixities,
-        rebindable,
+        rebindable: extensions.is_on("RebindableSyntax"),
+        partial_type_signatures: extensions.is_on("PartialTypeSignatures"),
         local_fixities: HashMap::new(),
         vals: HashMap::new(),
         types: HashMap::new(),
@@ -194,11 +207,11 @@ pub fn rename_module(
     rn.fixities.insert(GName::new(BUILTIN, ":"), (Assoc::Right, 5));
     // The promoted cons in types (`x ': xs`, or `x : xs` with DataKinds) associates as `:` does.
     rn.fixities.insert(GName::new(BUILTIN, "':"), (Assoc::Right, 5));
-    rn.run(m, implicit_prelude)
+    rn.run(m, extensions.is_on("ImplicitPrelude"))
 }
 
 impl<'a> Renamer<'a> {
-    fn run(&mut self, m: Module, implicit_prelude: bool) -> RR<(Module, Iface)> {
+    fn run(&mut self, m: Module, implicit_prelude: bool) -> Result<(Module, Iface), RnErrors> {
         // Imports, including the implicit Prelude import.
         let explicit_prelude = m.imports.iter().any(|i| i.module == PRELUDE);
         let mut imports = m.imports.clone();
@@ -221,6 +234,7 @@ impl<'a> Renamer<'a> {
         }
 
         // Top-level entities of this module.
+        check_group_signatures(&m.decls)?;
         self.collect_own(&m.decls)?;
         let own = self.own.clone();
         for e in &own {
@@ -237,7 +251,7 @@ impl<'a> Renamer<'a> {
                         return Err(RnError {
                             loc: *loc,
                             msg: format!("The fixity signature for ‘{op}’ lacks an accompanying binding"),
-                        });
+                        }.into());
                     }
                     self.fixities
                         .insert(GName::new(self.module.clone(), op.clone()), (*assoc, *prec));
@@ -309,11 +323,17 @@ impl<'a> Renamer<'a> {
 
         // Rename declarations.
         let mut decls = Vec::with_capacity(m.decls.len());
-        for d in m.decls.into_iter().filter(|d| !matches!(d, Decl::PatSyn { .. } | Decl::PatSynSig { .. })) {
-            decls.push(self.top_decl(d)?);
+        let mut errors = Vec::new();
+        let ordinary = m.decls.into_iter().filter(|d| !matches!(d, Decl::PatSyn { .. } | Decl::PatSynSig { .. }));
+        for d in ordinary.chain(builders) {
+            match self.rename_top_decl(d) {
+                Ok(decl) => decls.push(decl),
+                Err(err) => errors.push(err),
+            }
         }
-        for d in builders {
-            decls.push(self.top_decl(d)?);
+        if !errors.is_empty() {
+            errors.sort_by_key(|e| e.loc);
+            return Err(RnErrors(errors));
         }
         // Rewrite rules, as bindings `$rule%i%act binders = [lhs, rhs]` (the list makes the two
         // sides one type; see `tc::check_module`). A rule that does not rename is left out:
@@ -327,11 +347,9 @@ impl<'a> Renamer<'a> {
             if r.binders.iter().any(|(_, t)| t.as_ref().is_some_and(|t| matches!(t, crate::syntax::ast::Type::Forall(..)))) {
                 continue;
             }
-            let mark = self.locals.len();
-            match self.top_decl(rule_binding(i, r)) {
+            match self.rename_top_decl(rule_binding(i, r)) {
                 Ok(d) => decls.push(d),
                 Err(e) => {
-                    self.locals.truncate(mark);
                     if std::env::var_os("HSC_DEBUG_RULES").is_some() {
                         eprintln!("rule in {} not renamed: {}", self.module, e.msg);
                     }
@@ -344,7 +362,7 @@ impl<'a> Renamer<'a> {
             let Ok(q) = self.value_ref_in_scope(&p.name, p.loc, false) else { continue };
             let Some(module) = q.qual.as_deref().filter(|m| *m == self.module) else { continue };
             let target = format!("{module}.{}", q.name);
-            if let Ok(d) = self.top_decl(inline_binding(i, &target, p)) {
+            if let Ok(d) = self.rename_top_decl(inline_binding(i, &target, p)) {
                 decls.push(d);
             }
         }
@@ -573,7 +591,15 @@ impl<'a> Renamer<'a> {
                                 .collect::<Vec<_>>(),
                             ConFields::Positional(_) => Vec::new(),
                         };
+                        let mut constructor_fields = HashSet::new();
                         for f in &fields {
+                            if !constructor_fields.insert(f) {
+                                let field = iface::field_label(f);
+                                return Err(RnError {
+                                    loc: c.loc,
+                                    msg: format!("Constructor ‘{}’ declares field ‘{field}’ more than once", c.name),
+                                });
+                            }
                             if !fields_seen.contains(f) {
                                 fields_seen.push(f.clone());
                                 add_val(f, c.loc, &mut seen_vals)?;
@@ -593,6 +619,7 @@ impl<'a> Renamer<'a> {
                     own.push(entity(EntKind::TyCon, &module, name, vec![], vec![]));
                 }
                 Decl::Class(cd) => {
+                    check_group_signatures(&cd.decls)?;
                     add_type(&mut seen_types, &cd.name, cd.loc)?;
                     // Associated families are top-level type constructors of the module.
                     for cdecl in &cd.decls {
@@ -718,11 +745,61 @@ impl<'a> Renamer<'a> {
         RnError {
             loc,
             msg: format!(
-                "Ambiguous occurrence ‘{}’\n    It could refer to {}",
+                "Ambiguous occurrence ‘{}’\nIt could refer to {}",
                 q.name,
                 names.join(" or ")
             ),
         }
+    }
+
+    fn unbound(&self, q: &QName, loc: Loc, ns: Ns, con: bool) -> RnError {
+        let name = display_qname(q);
+        let mut msg = match (ns, con) {
+            (Ns::Type, _) => format!("Not in scope: type constructor or class ‘{name}’"),
+            (Ns::Value, true) => format!("Data constructor not in scope: {name}"),
+            (Ns::Value, false) => format!("Variable not in scope: {name}"),
+        };
+        let (plain, qualified) = match ns {
+            Ns::Type => (&self.types, &self.qtypes),
+            Ns::Value => (&self.vals, &self.qvals),
+        };
+        let eligible = |entities: &[Entity]| {
+            entities.len() == 1 && (ns == Ns::Type
+                || matches!(entities[0].kind, EntKind::Con | EntKind::PatSyn) == con)
+        };
+        let mut suggestions = Vec::new();
+        if let Some(alias) = &q.qual {
+            for ((module, occ), entities) in qualified {
+                if module == alias && eligible(entities) && one_edit_apart(&q.name, occ) {
+                    suggestions.push((1, format!("{alias}.{occ}")));
+                }
+            }
+        } else {
+            for ((alias, occ), entities) in qualified {
+                if occ == &q.name && eligible(entities) {
+                    suggestions.push((0, format!("{alias}.{occ}")));
+                }
+            }
+            for (occ, entities) in plain {
+                if eligible(entities) && one_edit_apart(&q.name, occ) {
+                    suggestions.push((1, occ.clone()));
+                }
+            }
+            if ns == Ns::Value && !con {
+                for occ in self.locals.iter().flat_map(|scope| scope.keys()) {
+                    if one_edit_apart(&q.name, occ) {
+                        suggestions.push((1, occ.clone()));
+                    }
+                }
+            }
+        }
+        suggestions.sort_unstable();
+        suggestions.dedup();
+        if !suggestions.is_empty() {
+            let rendered: Vec<_> = suggestions.iter().take(3).map(|(_, n)| format!("‘{n}’")).collect();
+            msg.push_str(&format!("\nPerhaps you meant {}.", rendered.join(" or ")));
+        }
+        RnError { loc, msg }
     }
 
     /// Resolves a variable or constructor in the value namespace.
@@ -764,13 +841,10 @@ impl<'a> Renamer<'a> {
                 qual: Some(e.global.module.clone()),
                 name: e.global.name.clone(),
             }),
-            Err(cands) if cands.is_empty() => Err(RnError {
-                loc,
-                msg: match (con, &q.qual) {
-                    (true, _) => format!("Data constructor not in scope: {}", display_qname(q)),
-                    (false, _) => format!("Variable not in scope: {}", display_qname(q)),
-                },
-            }),
+            Err(cands) if cands.is_empty() && !con && self.in_quote == 0 && q.qual.is_none() && q.name.starts_with('_') => {
+                Ok(QName { qual: Some(EXPR_HOLE.into()), name: q.name.clone() })
+            }
+            Err(cands) if cands.is_empty() => Err(self.unbound(q, loc, Ns::Value, con)),
             Err(cands) => Err(self.ambiguous(q, &cands, loc)),
         }
     }
@@ -792,10 +866,7 @@ impl<'a> Renamer<'a> {
         }
         match self.lookup_global(q, Ns::Value) {
             Ok(e) => Ok(e),
-            Err(c) if c.is_empty() => Err(RnError {
-                loc,
-                msg: format!("Data constructor not in scope: {}", display_qname(q)),
-            }),
+            Err(c) if c.is_empty() => Err(self.unbound(q, loc, Ns::Value, true)),
             Err(c) => Err(self.ambiguous(q, &c, loc)),
         }
     }
@@ -851,10 +922,7 @@ impl<'a> Renamer<'a> {
                     name: format!("'{}", e.global.name),
                 })
             }
-            Err(c) if c.is_empty() => Err(RnError {
-                loc,
-                msg: format!("Not in scope: type constructor or class ‘{}’", display_qname(q)),
-            }),
+            Err(c) if c.is_empty() => Err(self.unbound(q, loc, Ns::Type, false)),
             Err(c) => Err(self.ambiguous(q, &c, loc)),
         }
     }
@@ -997,6 +1065,19 @@ impl<'a> Renamer<'a> {
 
     // ----- declarations -----------------------------------------------------
 
+    /// A failed declaration may leave a partially renamed pattern, scope, or quotation.
+    fn rename_top_decl(&mut self, decl: Decl) -> RR<Decl> {
+        let depth = self.locals.len();
+        let in_quote = self.in_quote;
+        let result = self.top_decl(decl);
+        if result.is_err() {
+            self.locals.truncate(depth);
+            self.pat_seen = None;
+            self.in_quote = in_quote;
+        }
+        result
+    }
+
     fn top_decl(&mut self, d: Decl) -> RR<Decl> {
         Ok(match d {
             Decl::IPBind { loc, .. } => {
@@ -1027,7 +1108,7 @@ impl<'a> Renamer<'a> {
                 }
                 Decl::Sig {
                     names,
-                    ty: self.ty(ty)?,
+                    ty: self.partial_signature(ty)?,
                     loc,
                 }
             }
@@ -1092,13 +1173,13 @@ impl<'a> Renamer<'a> {
                 for d in std::mem::take(&mut cd.decls) {
                     decls.push(match d {
                         Decl::Sig { names, ty, loc } => Decl::Sig {
+                            ty: self.complete_signature(ty, "a class method signature")?,
                             names,
-                            ty: self.ty(ty)?,
                             loc,
                         },
                         Decl::DefaultSig { names, ty, loc } => Decl::DefaultSig {
+                            ty: self.complete_signature(ty, "a default method signature")?,
                             names,
-                            ty: self.ty(ty)?,
                             loc,
                         },
                         other => self.top_decl(other)?,
@@ -1108,6 +1189,7 @@ impl<'a> Renamer<'a> {
                 Decl::Class(cd)
             }
             Decl::Instance(mut id) => {
+                check_group_signatures(&id.decls)?;
                 id.context = self.types(id.context)?;
                 id.head = self.ty(id.head)?;
                 let class = instance_class(&id.head);
@@ -1139,8 +1221,8 @@ impl<'a> Renamer<'a> {
                     }
                     decls.push(match d {
                         Decl::Sig { names, ty, loc } => Decl::Sig {
+                            ty: self.complete_signature(ty, "an instance method signature")?,
                             names,
-                            ty: self.ty(ty)?,
                             loc,
                         },
                         other => self.top_decl(other)?,
@@ -1179,7 +1261,7 @@ impl<'a> Renamer<'a> {
             },
             Decl::KindSig { name, kind, loc } => Decl::KindSig {
                 name,
-                kind: self.ty(kind)?,
+                kind: self.complete_signature(kind, "a standalone kind signature")?,
                 loc,
             },
             Decl::TypeFamily {
@@ -1333,6 +1415,7 @@ impl<'a> Renamer<'a> {
 
     /// Binds and renames a local declaration group in the current (already pushed) scope.
     fn local_decls(&mut self, mut decls: Vec<Decl>) -> RR<Vec<Decl>> {
+        check_group_signatures(&decls)?;
         let mut seen: HashSet<String> = HashSet::new();
         if self.locals.is_empty() {
             self.push();
@@ -1417,8 +1500,8 @@ impl<'a> Renamer<'a> {
                 Decl::Sig { names, ty, loc } => {
                     let mut us = Vec::new();
                     for n in names {
-                        match self.lookup_local(&n) {
-                            Some(u) => us.push(u),
+                        match self.locals.last().and_then(|scope| scope.get(&n)) {
+                            Some(u) => us.push(u.clone()),
                             None => {
                                 return Err(RnError {
                                     loc,
@@ -1429,7 +1512,7 @@ impl<'a> Renamer<'a> {
                     }
                     Decl::Sig {
                         names: us,
-                        ty: self.ty(ty)?,
+                        ty: self.partial_signature(ty)?,
                         loc,
                     }
                 }
@@ -1787,13 +1870,8 @@ impl<'a> Renamer<'a> {
                 }
                 Expr::RecUpd(Box::new(e), out, loc)
             }
-            Expr::Sig(e, t, loc) => Expr::Sig(Box::new(self.expr(*e)?), self.ty(t)?, loc),
-            Expr::Wild(loc) => {
-                return Err(RnError {
-                    loc,
-                    msg: "Found hole: _".into(),
-                })
-            }
+            Expr::Sig(e, t, loc) => Expr::Sig(Box::new(self.expr(*e)?), self.partial_signature(t)?, loc),
+            Expr::Wild(loc) => Expr::Wild(loc),
             Expr::AsPat(_, _, loc) | Expr::LazyPat(_, loc) | Expr::BangPat(_, loc) | Expr::ViewPat(_, _, loc) => {
                 return Err(RnError {
                     loc,
@@ -1993,7 +2071,7 @@ impl<'a> Renamer<'a> {
             }
             Pat::Lazy(p, loc) => Pat::Lazy(Box::new(self.pat(*p, mode)?), loc),
             Pat::Bang(p, loc) => Pat::Bang(Box::new(self.pat(*p, mode)?), loc),
-            Pat::Sig(p, t, loc) => Pat::Sig(Box::new(self.pat(*p, mode)?), self.ty(t)?, loc),
+            Pat::Sig(p, t, loc) => Pat::Sig(Box::new(self.pat(*p, mode)?), self.partial_signature(t)?, loc),
             Pat::View(e, p, loc) => Pat::View(Box::new(self.expr(*e)?), Box::new(self.pat(*p, mode)?), loc),
             Pat::OpChain(items, loc) => {
                 let mut toks: Vec<Tk<Pat, QName>> = Vec::with_capacity(items.len());
@@ -2044,6 +2122,25 @@ impl<'a> Renamer<'a> {
     }
 
     // ----- types ------------------------------------------------------------
+
+    fn partial_signature(&mut self, ty: Type) -> RR<Type> {
+        if !self.partial_type_signatures {
+            if let Some(loc) = ty.first_wildcard() {
+                return Err(RnError {
+                    loc,
+                    msg: "Found type wildcard ‘_’\nEnable PartialTypeSignatures to use an inferred type here.".into(),
+                });
+            }
+        }
+        self.ty(ty)
+    }
+
+    fn complete_signature(&mut self, ty: Type, context: &str) -> RR<Type> {
+        if let Some(loc) = ty.first_wildcard() {
+            return Err(RnError { loc, msg: format!("Wildcard ‘_’ is not allowed in {context}") });
+        }
+        self.ty(ty)
+    }
 
     fn ty(&mut self, t: Type) -> RR<Type> {
         Ok(match t {
@@ -2296,6 +2393,51 @@ impl<'a> Renamer<'a> {
     }
 }
 
+/// Match one insertion, deletion, substitution or adjacent transposition.
+fn one_edit_apart(a: &str, b: &str) -> bool {
+    let mut a = a.chars().peekable();
+    let mut b = b.chars().peekable();
+    while a.peek().is_some() && a.peek() == b.peek() {
+        a.next();
+        b.next();
+    }
+    match (a.next(), b.next()) {
+        (None, Some(_)) => b.next().is_none(),
+        (Some(_), None) => a.next().is_none(),
+        (Some(x), Some(y)) => {
+            if a.peek() == Some(&y) && b.peek() == Some(&x) && a.clone().skip(1).eq(b.clone().skip(1)) {
+                return true;
+            }
+            a.clone().eq(b.clone())
+                || a.clone().eq(std::iter::once(y).chain(b.clone()))
+                || std::iter::once(x).chain(a).eq(b)
+        }
+        (None, None) => false,
+    }
+}
+
+/// A binding group can give a name one signature of each kind.
+fn check_group_signatures(decls: &[Decl]) -> RR<()> {
+    let mut seen = HashMap::new();
+    for decl in decls {
+        let (kind, names, loc) = match decl {
+            Decl::Sig { names, loc, .. } => ("type signature", names, loc),
+            Decl::DefaultSig { names, loc, .. } => ("default signature", names, loc),
+            Decl::Fixity { ops, loc, .. } => ("fixity declaration", ops, loc),
+            _ => continue,
+        };
+        for name in names {
+            if let Some(first) = seen.insert((kind, name), loc) {
+                return Err(RnError {
+                    loc: *loc,
+                    msg: format!("Duplicate {kind}s for ‘{name}’\nThe first declaration is at line {}, column {}.", first.line, first.col),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// GHC's rules for the equations of one function: a variable binding takes exactly one
 /// equation, and all equations must have the same number of arguments.
 fn check_arities(name: &str, clauses: &[Clause], loc: Loc) -> RR<()> {
@@ -2376,6 +2518,9 @@ fn name_duplicate_fields(decls: &mut [Decl]) {
 
 /// The qualifier the renamer gives a variable a quotation uses but does not have in scope.
 pub(crate) const UNBOUND_IN_QUOTE: &str = "%unbound";
+
+/// A named expression hole survives renaming so the type checker can report its expected type.
+pub(crate) const EXPR_HOLE: &str = "%hole";
 
 /// Builds a top-level entity.
 fn entity(kind: EntKind, module: &str, name: &str, subs: Vec<Entity>, fields: Vec<String>) -> Entity {

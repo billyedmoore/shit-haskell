@@ -250,7 +250,7 @@ fn dev_mode(opts: &cli::Opts) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("{file}:{}:{}: error:\n    {}", e.line, e.col, e.msg);
+                eprintln!("{}", e.render(path, &src));
                 ExitCode::from(1)
             }
         };

@@ -7,7 +7,7 @@ use super::env::{ClassInfo, InstInfo, Synonym, TyConInfo};
 use super::types::{subst_gen, Pred, Scheme, Ty};
 use super::{count_args, Checker, Given, TcError, Wanted, TR};
 use crate::core::{Alt, Core, TopBind};
-use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Module, QName, Type};
+use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Loc, Module, QName, Type};
 
 impl Checker {
     /// Compare quantified heads independently of each registration path's variable order.
@@ -48,6 +48,24 @@ impl Checker {
                 && old.ctx.len() == ctx.len()
                 && old.ctx.iter().zip(ctx).all(|(a, b)| a.class == b.class && Self::alpha_heads(&a.args, &b.args, &mut lr, &mut rl))
         })
+    }
+
+    fn check_duplicate_instance(&self, class: &str, head: &[Ty], kinds: &[Option<String>], declared: &HashMap<String, Loc>) -> TR<()> {
+        let reps = self.instance_reps(head, kinds);
+        let duplicate = self.env.instances.for_class(class).find(|old| {
+            // The implementation may repeat an instance declared in its own boot interface.
+            declared.contains_key(&old.dict)
+                && self.instance_reps(&old.head, &old.kinds) == reps
+                && Self::alpha_heads(&old.head, head, &mut HashMap::new(), &mut HashMap::new())
+        });
+        if let Some(previous) = duplicate.and_then(|old| declared.get(&old.dict)) {
+            let head = Pred { class: class.into(), args: head.to_vec() };
+            return self.err(format!(
+                "Duplicate instance declaration for ‘{}’\nThe previous declaration is at line {}, column {}.",
+                self.show_pred(&head), previous.line, previous.col
+            ));
+        }
+        Ok(())
     }
 
     fn fresh_derived_dict(&mut self, strategy: &str, class: &str, tycon: &str) -> String {
@@ -152,6 +170,10 @@ impl Checker {
     /// Checks a renamed module and returns its Core bindings. The environment is
     /// extended with everything the module defines.
     pub fn check_module(&mut self, m: &Module) -> TR<Vec<TopBind>> {
+        self.check_module_with_main(m, None)
+    }
+
+    pub(crate) fn check_module_with_main(&mut self, m: &Module, main: Option<(&str, &str, Loc)>) -> TR<Vec<TopBind>> {
         self.module = m.name.clone();
         self.coercions.clear();
         // Equalities a previous module left stuck are of no use to this one.
@@ -274,15 +296,16 @@ impl Checker {
             }
         }
         // Newtype deriving and standalone deriving, once this module's classes are known.
+        let mut instance_locs = HashMap::new();
         for d in decls {
             if let Decl::Data(dd) = d {
-                self.register_newtype_deriving(dd)?;
+                self.register_newtype_deriving(dd, &mut instance_locs)?;
             }
         }
         for d in decls {
             if let Decl::Deriving(sd) = d {
                 self.loc = sd.loc;
-                derived.extend(self.standalone_derive(sd)?);
+                derived.extend(self.standalone_derive(sd, &mut instance_locs)?);
             }
         }
         // The associated type equations of derived instances (`Rep T` of a derived Generic).
@@ -309,14 +332,14 @@ impl Checker {
         let mut derived_insts: Vec<(usize, DataDecl)> = Vec::new();
         for d in decls {
             if let Decl::Instance(id) = d {
-                self.instance_header(id)?;
+                self.instance_header(id, &mut instance_locs)?;
                 all_insts.push(id.clone());
             }
         }
         for (i, d) in derived.iter().enumerate() {
             if let Decl::Instance(id) = d {
                 let before = self.env.instances.len();
-                self.instance_header(id)?;
+                self.instance_header(id, &mut instance_locs)?;
                 all_insts.push(id.clone());
                 if let Some(dd) = derived_from.get(i).filter(|_| self.env.instances.len() > before) {
                     derived_insts.push((self.env.instances.len() - 1, dd.clone()));
@@ -407,17 +430,21 @@ impl Checker {
             }
         }
 
-        // `main` is an IO action: a type the monomorphism restriction left open (`main = return
-        // ()`) is fixed to `IO t` before the remaining constraints are solved, as GHC checks it.
-        if self.module == "Main" {
-            if let Some(scheme) = self.vars.get("Main.main").cloned() {
-                let ty = self.metas.zonk(&scheme.ty);
-                let mut ms = Vec::new();
-                self.metas.free_metas(&ty, &mut ms);
-                if !ms.is_empty() {
-                    let t = self.meta();
-                    let _ = self.unify_at(&ty, &Ty::app(Ty::con("GHC.Types.IO"), t));
-                }
+        // Check the entry action before defaulting, so e.g. the monomorphic binding
+        // `main = pure ()` fixes its applicative to IO.
+        if let Some((key, name, loc)) = main {
+            self.loc = loc;
+            let Some(scheme) = self.lookup_var(key) else {
+                return self.err(format!("The IO action ‘{name}’ is not defined in module ‘{}’", m.name));
+            };
+            let (body, ty) = self.inst_var(key, &scheme, loc);
+            let expected = Ty::app(Ty::con("GHC.Types.IO"), self.meta());
+            self.unify_at(&ty, &expected).map_err(|mut err| {
+                err.msg.push_str(&format!("\nWhen checking the type of the IO action ‘{name}’"));
+                err
+            })?;
+            if key != "Main.main" || !scheme.preds.is_empty() {
+                self.out.push(TopBind { name: crate::core::MAIN_ENTRY.into(), body });
             }
         }
 
@@ -471,6 +498,7 @@ impl Checker {
 
         // Field types per constructor, with occurrence names of record fields.
         let mut per_con: Vec<(String, Vec<String>, Vec<Ty>, Scheme)> = Vec::new();
+        let mut record_fields = HashMap::new();
         for (tag, c) in dd.cons.iter().enumerate() {
             self.loc = c.loc;
             let mut vars = tvs.clone();
@@ -489,6 +517,23 @@ impl Checker {
                     for (names, f) in groups {
                         let t = self.convert_type(&f.ty, &mut vars)?;
                         for nm in names {
+                            // In an ordinary datatype the constructors share the header's
+                            // type variables. Repeated field labels must give the same type.
+                            if c.gadt_result.is_none() && c.exist.is_empty() {
+                                if let Some((first_con, first_ty)) = record_fields.get(nm) {
+                                    let a = self.normalize(first_ty);
+                                    let b = self.normalize(&t);
+                                    if simple_record_type(&a, n) && simple_record_type(&b, n) && a != b {
+                                        let field = crate::rename::iface::field_label(nm);
+                                        return self.err(format!(
+                                            "Constructors ‘{first_con}’ and ‘{}’ give different types for field ‘{field}’\n‘{first_con}’ uses ‘{}’, while ‘{}’ uses ‘{}’.",
+                                            c.name, self.show(&a), c.name, self.show(&b)
+                                        ));
+                                    }
+                                } else {
+                                    record_fields.insert(nm.clone(), (c.name.as_str(), t.clone()));
+                                }
+                            }
                             occs.push(nm.clone());
                             field_tys.push(t.clone());
                         }
@@ -949,7 +994,7 @@ impl Checker {
     }
 
     /// Registers an instance: its context, head and dictionary name.
-    fn instance_header(&mut self, id: &InstDecl) -> TR<()> {
+    fn instance_header(&mut self, id: &InstDecl, declared: &mut HashMap<String, Loc>) -> TR<()> {
         self.loc = id.loc;
         let (class_name, args) = instance_head_parts(&id.head).ok_or_else(|| TcError {
             loc: id.loc,
@@ -982,6 +1027,11 @@ impl Checker {
         // A module can be registered twice (first as a boot file, then for real): the same instance
         // keeps its dictionary name, so that what was compiled against the first still refers to it.
         let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
+        // Unboxed tuples share the internal representation of boxed tuples. Their
+        // erased types do not establish that two source instance heads are equal.
+        if !id.unboxed_head {
+            self.check_duplicate_instance(&class, &head, &kinds, declared)?;
+        }
         let earlier = self.prior_instance(&class, &head, &kinds, &ctx);
         let dict = match earlier {
             Some(i) => self.env.instances.remove(i).dict,
@@ -996,6 +1046,9 @@ impl Checker {
                 }
             }
         };
+        if !id.unboxed_head {
+            declared.insert(dict.clone(), id.loc);
+        }
         self.env.instances.push(InstInfo {
             class,
             nvars: tvs.len() as u32,
@@ -1423,7 +1476,7 @@ impl Checker {
 
     /// Newtype deriving: the dictionary of the derived class at the representation type
     /// serves as the dictionary of the newtype, because newtypes are erased at run time.
-    fn register_newtype_deriving(&mut self, dd: &DataDecl) -> TR<()> {
+    fn register_newtype_deriving(&mut self, dd: &DataDecl, declared: &mut HashMap<String, Loc>) -> TR<()> {
         use crate::syntax::ast::Strategy;
         self.loc = dd.loc;
         // The representation of a newtype (its one field), for newtype deriving.
@@ -1454,10 +1507,12 @@ impl Checker {
                     let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
                     let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
                     let ctx = vec![Pred { class: cls_name.clone(), args: vec![rep] }];
+                    self.check_duplicate_instance(&cls_name, std::slice::from_ref(&head), &[], declared)?;
                     let dict = match self.prior_instance(&cls_name, std::slice::from_ref(&head), &[], &ctx) {
                         Some(i) => { self.dict_counter += 1; self.env.instances.remove(i).dict },
                         None => self.fresh_derived_dict("Via", &cls_name, &dd.name),
                     };
+                    declared.insert(dict.clone(), dd.loc);
                     self.env.instances.push(InstInfo {
                         class: cls_name.clone(),
                         nvars: tvs.len() as u32,
@@ -1539,10 +1594,12 @@ impl Checker {
                 let mut heads = pre;
                 heads.push(head);
                 let ctx = vec![Pred { class: cls_name.clone(), args: ctx_args }];
+                self.check_duplicate_instance(&cls_name, &heads, &[], declared)?;
                 let dict = match self.prior_instance(&cls_name, &heads, &[], &ctx) {
                     Some(i) => { self.dict_counter += 1; self.env.instances.remove(i).dict },
                     None => self.fresh_derived_dict("GND", &cls_name, &dd.name),
                 };
+                declared.insert(dict.clone(), dd.loc);
                 self.env.instances.push(InstInfo {
                     class: cls_name.clone(),
                     nvars: tvs.len() as u32,
@@ -1582,7 +1639,7 @@ impl Checker {
         }
     }
 
-    fn standalone_derive(&mut self, sd: &crate::syntax::ast::StandaloneDeriving) -> TR<Vec<Decl>> {
+    fn standalone_derive(&mut self, sd: &crate::syntax::ast::StandaloneDeriving, declared: &mut HashMap<String, Loc>) -> TR<Vec<Decl>> {
         use crate::syntax::ast::{Deriving, Type};
         let (cls, arg) = match &sd.head {
             Type::App(c, a) => (c.as_ref().clone(), a.as_ref().clone()),
@@ -1697,12 +1754,13 @@ impl Checker {
         };
         let synthetic = DataDecl {
             deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: sd.via.clone() }],
+            loc: sd.loc,
             ..dd
         };
         // The constructors and the instance head are named in the declaring module.
         let here = std::mem::replace(&mut self.module, defining);
         // A newtype's class instance by newtype deriving (no generated code).
-        let via_newtype = self.register_newtype_deriving(&synthetic);
+        let via_newtype = self.register_newtype_deriving(&synthetic, declared);
         let derived = via_newtype.and_then(|_| self.derive_instances(&synthetic));
         self.module = here;
         // A standalone deriving declaration states its own context and head; the inferred ones
@@ -1713,11 +1771,22 @@ impl Checker {
                 Decl::Instance(mut id) => {
                     id.context = sd.context.clone();
                     id.head = sd.head.clone();
+                    id.unboxed_head = sd.unboxed_head;
+                    id.loc = sd.loc;
                     Decl::Instance(id)
                 }
                 other => other,
             })
             .collect())
+    }
+}
+
+fn simple_record_type(ty: &Ty, parameters: u32) -> bool {
+    match ty {
+        Ty::Con(_) => true,
+        Ty::Gen(i) => *i < parameters,
+        Ty::App(f, a) => simple_record_type(f, parameters) && simple_record_type(a, parameters),
+        _ => false,
     }
 }
 

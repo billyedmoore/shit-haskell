@@ -491,6 +491,7 @@ fn instance(checker: &Checker, dd: &DataDecl, class: &QName, decls: Vec<Decl>, d
         overlap: None,
         context,
         head,
+        unboxed_head: false,
         decls,
         loc,
     })

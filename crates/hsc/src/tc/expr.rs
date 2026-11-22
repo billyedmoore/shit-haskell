@@ -43,6 +43,9 @@ impl Checker {
     pub fn check(&mut self, e: &Expr, ty: &Ty) -> TR<Core> {
         // The expected type reaches the alternatives, so that a GADT match can refine it there.
         match e {
+            Expr::Wild(loc) => self.report_hole("_", *loc, Some(ty)),
+            Expr::Var(q, loc) if q.qual.as_deref() == Some(crate::rename::EXPR_HOLE) =>
+                self.report_hole(&q.name, *loc, Some(ty)),
             Expr::Case(scrut, alts, loc) => {
                 self.loc = *loc;
                 let (cs, ts) = self.infer(scrut)?;
@@ -437,7 +440,15 @@ impl Checker {
             for (i, (a, p)) in spine.iter().zip(&params).enumerate() {
                 let rank = if constrained(self, p) { 2 } else if matches!(a, Expr::Lam(..)) { 1 } else { 0 };
                 if rank == pass && checked[i].is_none() {
-                    checked[i] = Some(self.check_arg(a, p)?);
+                    checked[i] = Some(self.check_arg(a, p).map_err(|mut err| {
+                        if let Expr::Var(q, _) | Expr::Con(q, _) = head {
+                            let name = q.name.split('%').next().unwrap_or(&q.name);
+                            if !name.starts_with('$') {
+                                err.msg.push_str(&format!("\nIn argument {} of ‘{name}’", i + 1));
+                            }
+                        }
+                        err
+                    })?);
                 }
             }
         }
@@ -508,6 +519,8 @@ impl Checker {
     pub fn infer(&mut self, e: &Expr) -> TR<(Core, Ty)> {
         self.loc = e.loc();
         match e {
+            Expr::Var(q, loc) if q.qual.as_deref() == Some(crate::rename::EXPR_HOLE) =>
+                self.report_hole(&q.name, *loc, None),
             Expr::Var(q, loc) => {
                 self.loc = *loc;
                 let key = self.resolve_key(&qkey(q));
@@ -929,14 +942,20 @@ impl Checker {
                 let c = self.check(e, &scheme.ty)?;
                 Ok((c, scheme.ty))
             }
-            Expr::Wild(loc) => {
-                self.loc = *loc;
-                self.err("Found hole: _")
-            }
+            Expr::Wild(loc) => self.report_hole("_", *loc, None),
             Expr::AsPat(_, _, loc) | Expr::LazyPat(_, loc) | Expr::BangPat(_, loc) | Expr::ViewPat(_, _, loc) => {
                 self.loc = *loc;
                 self.err("Pattern syntax in expression context")
             }
+        }
+    }
+
+    fn report_hole<T>(&mut self, name: &str, loc: Loc, ty: Option<&Ty>) -> TR<T> {
+        self.loc = loc;
+        if let Some(ty) = ty {
+            self.err(format!("Found hole: {name} :: {}", self.show(ty)))
+        } else {
+            self.err(format!("Found hole: {name}"))
         }
     }
 
@@ -1642,14 +1661,18 @@ impl Checker {
 
     // ----- desugaring to AST ------------------------------------------------
 
-    fn desugar_do(&mut self, stmts: &[Stmt], _loc: Loc) -> TR<Expr> {
+    fn desugar_do(&mut self, stmts: &[Stmt], loc: Loc) -> TR<Expr> {
         let Some((first, rest)) = stmts.split_first() else {
+            self.loc = loc;
             return self.err("Empty 'do' block");
         };
         if rest.is_empty() {
             return match first {
                 Stmt::Expr { expr, .. } => Ok(expr.clone()),
-                _ => self.err("The last statement in a 'do' block must be an expression"),
+                Stmt::Bind { loc, .. } | Stmt::Let { loc, .. } => {
+                    self.loc = *loc;
+                    self.err("The last statement in a 'do' block must be an expression")
+                }
             };
         }
         match first {

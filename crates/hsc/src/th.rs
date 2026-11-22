@@ -998,14 +998,14 @@ impl Conv<'_> {
                         None => None,
                     };
                     let decls = self.decs(&a[3])?;
-                    out.push(Decl::Instance(InstDecl { overlap, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, decls, loc }));
+                    out.push(Decl::Instance(InstDecl { overlap, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, unboxed_head: false, decls, loc }));
                 }
                 "StandaloneDerivD" => {
                     let strategy = match self.maybe(&a[0])? {
                         Some(s) => self.strategy(&s)?,
                         None => None,
                     };
-                    out.push(Decl::Deriving(StandaloneDeriving { strategy, via: None, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, loc }));
+                    out.push(Decl::Deriving(StandaloneDeriving { strategy, via: None, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, unboxed_head: false, loc }));
                 }
                 // Pragmas and kind signatures change nothing here.
                 "PragmaD" | "KiSigD" => {}

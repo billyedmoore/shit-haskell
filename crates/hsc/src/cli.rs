@@ -22,6 +22,11 @@ pub struct Opts {
     pub output: Option<String>,
     /// `-c` or `-no-link`: build the modules, do not link a program.
     pub no_link: bool,
+    /// `-fno-code`: check the modules without emitting object files or linking.
+    pub no_code: bool,
+    pub write_interface: bool,
+    /// Entry module and binding selected by `-main-is`.
+    pub main_is: Option<(String, String)>,
     pub odir: Option<PathBuf>,
     pub hidir: Option<PathBuf>,
     pub hisuf: String,
@@ -174,6 +179,19 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
             "--native" | "-fhsc-native" => o.native = true,
             "--make" => {}
             "-c" | "-no-link" => o.no_link = true,
+            "-fno-code" => o.no_code = true,
+            "-fobject-code" => o.no_code = false,
+            "-fwrite-interface" => o.write_interface = true,
+            "-fno-write-interface" => o.write_interface = false,
+            "-main-is" => {
+                let entry = value(&mut i)?;
+                let (module, name) = match entry.rsplit_once('.') {
+                    Some((module, name)) if name.starts_with(|ch: char| ch.is_lowercase() || ch == '_') => (module, name),
+                    _ if entry.starts_with(|ch: char| ch.is_lowercase() || ch == '_') => ("Main", entry.as_str()),
+                    _ => (entry.as_str(), "main"),
+                };
+                o.main_is = Some((module.into(), name.into()));
+            }
             "-shared" => o.shared = true,
             "-dynamic-too" => o.dynamic_too = true,
             "-o" => o.output = Some(value(&mut i)?),
@@ -220,6 +238,7 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
                 dirs.extend(a[2..].split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
             }
             _ if a.starts_with("-X") || a == "-dcore-lint" => o.flags.push(a.to_string()),
+            _ if a.starts_with("-W") || a == "-w" => o.flags.push(a.to_string()),
             _ if a.starts_with("-D") || a.starts_with("-U") => o.flags.push(a.to_string()),
             _ if a.starts_with("-I") && a.len() > 2 => o.flags.push(format!("-I{}", absolute(&a[2..]).display())),
             _ if a.starts_with("-optP") => {
@@ -603,7 +622,7 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
     // The include directories of the packages in scope, as GHC passes them to the C compiler
     // (unix-compat's cbits include unix's HsUnixConfig.h).
     let pkg_includes: Vec<PathBuf> = if any_c { package_dirs(o).map(|(_, inc, _)| inc).unwrap_or_default() } else { Vec::new() };
-    for c in &c_inputs {
+    for c in c_inputs.iter().filter(|_| !o.no_code) {
         // A C file's object keeps its path under the output directory (`cbits/a.c` gives
         // `odir/cbits/a.o`), as GHC places it.
         let out = match (&o.output, o.no_link, &o.odir) {
@@ -640,6 +659,11 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
         }
         c_objects.push(out.display().to_string());
     }
+    if o.no_code {
+        if let Some(missing) = c_inputs.iter().find(|path| !Path::new(path.as_str()).is_file()) {
+            return Err(format!("<command line>: does not exist: {missing}"));
+        }
+    }
     let with_objects;
     let o = if c_objects.is_empty() || o.no_link {
         o
@@ -654,7 +678,7 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
         }
         return Ok(0);
     }
-    if o.shared {
+    if o.shared && !o.no_code {
         // A shared library of a package: hsc keeps a package's code in its sources, so the library is
         // an empty object.
         if let Some(out) = &o.output {
@@ -707,8 +731,18 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
             targets.push((inp.to_string(), f.path));
         }
     }
-    let main_target = targets.iter().position(|(m, _)| m == "Main");
-    let link = !o.no_link && main_target.is_some();
+    let mut files = std::collections::HashMap::new();
+    for (module, path) in &targets {
+        if let Some(first) = files.insert(module, path) {
+            return Err(format!("<no location info>: error:\n    Module ‘{module}’ is defined in multiple files: {} and {}", first.display(), path.display()));
+        }
+    }
+    let main_module = o.main_is.as_ref().map_or("Main", |(module, _)| module);
+    let main_target = targets.iter().position(|(m, _)| m == main_module);
+    if !o.no_link && !o.no_code && o.output.is_some() && main_target.is_none() {
+        return Err(format!("<no location info>: error:\n    Output was redirected with -o, but there is no module named ‘{main_module}’."));
+    }
+    let link = !o.no_link && !o.no_code && main_target.is_some();
     // A program: its sources are compiled together, from its main module. A file given with its own
     // directory is searched there too, as GHC does when no -i is given.
     if link {
@@ -727,19 +761,35 @@ pub fn compile(o: &Opts) -> Result<i32, String> {
     }
     // Modules of a package: each is checked (with everything it imports) and gets its interface.
     let mut d = driver::Driver::new(search.clone(), pkg_dirs, o.flags.clone());
+    d.home_targets.extend(targets.iter().cloned());
+    if let Some((module, name)) = &o.main_is {
+        d.entry_module = module.clone();
+        d.entry_name = name.clone();
+    }
     for (m, path) in &targets {
-        if m == "Main" {
-            driver::compile_with(&mut d, path, &o.flags)?;
+        if m == main_module {
+            if o.no_code {
+                driver::check_with(&mut d, path, &o.flags)?;
+            } else {
+                driver::compile_with(&mut d, path, &o.flags)?;
+            }
         } else {
             let key = d.home_wired_key(m).unwrap_or_else(|| m.clone());
             d.load(&key)?;
         }
     }
+    d.load_booted()?;
     for (m, path, home) in d.sources.clone() {
         if !home {
             continue;
         }
-        write_outputs(o, d.real_name(&m), &path)?;
+        if o.no_code {
+            if o.write_interface {
+                write_interface(o, d.real_name(&m), &path, &o.hisuf)?;
+            }
+        } else {
+            write_outputs(o, d.real_name(&m), &path)?;
+        }
     }
     Ok(0)
 }
@@ -770,13 +820,17 @@ fn abi_hash(o: &Opts, search: &[PathBuf], modules: &[&String]) -> Result<i32, St
 }
 
 /// The interface and object files of a module of the program.
-fn write_outputs(o: &Opts, module: &str, path: &Path) -> Result<(), String> {
+fn write_interface(o: &Opts, module: &str, path: &Path, suffix: &str) -> Result<(), String> {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let hi_dir = o.hidir.clone().or_else(|| o.odir.clone());
-    driver::write_interface(&out_path(&hi_dir, module, path, &o.hisuf), module, &abs, path, &o.flags)?;
+    driver::write_interface(&out_path(&hi_dir, module, path, suffix), module, &abs, path, &o.flags)
+}
+
+fn write_outputs(o: &Opts, module: &str, path: &Path) -> Result<(), String> {
+    write_interface(o, module, path, &o.hisuf)?;
     empty_object(&out_path(&o.odir, module, path, &o.osuf))?;
     if o.dynamic_too {
-        driver::write_interface(&out_path(&hi_dir, module, path, &o.dynhisuf), module, &abs, path, &o.flags)?;
+        write_interface(o, module, path, &o.dynhisuf)?;
         empty_object(&out_path(&o.odir, module, path, &o.dynosuf))?;
     }
     Ok(())
@@ -803,6 +857,10 @@ pub fn run_program(o: &Opts, main: &Path, args: Vec<String>) -> Result<i32, Stri
     o.flags.extend(pkg_includes.iter().map(|d| format!("-I{}", d.display())));
     o.flags.extend(visible);
     let mut d = driver::Driver::new(search, pkg_dirs, o.flags.clone());
+    if let Some((module, name)) = &o.main_is {
+        d.entry_module = module.clone();
+        d.entry_name = name.clone();
+    }
     let binds = driver::compile_with(&mut d, main, &o.flags)?;
     let prog_name = main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "main".into());
     crate::ccall::set_program_args(std::iter::once(prog_name.clone()).chain(args).collect());
@@ -836,6 +894,12 @@ fn build_program(
     for f in &o.flags {
         key.push_str(&format!("flag {f}\n"));
     }
+    if let Some((module, name)) = &o.main_is {
+        key.push_str(&format!("main {module}.{name}\n"));
+    }
+    for (module, path) in targets {
+        key.push_str(&format!("target {module} {}\n", path.display()));
+    }
     for d in search.iter().chain(pkg_dirs.iter()) {
         key.push_str(&format!("dir {}\n", d.display()));
     }
@@ -854,6 +918,11 @@ fn build_program(
         }
     }
     let mut d = driver::Driver::new(search, pkg_dirs, o.flags.clone());
+    d.home_targets.extend(targets.iter().cloned());
+    if let Some((module, name)) = &o.main_is {
+        d.entry_module = module.clone();
+        d.entry_name = name.clone();
+    }
     let binds = driver::compile_with(&mut d, main_path, &o.flags)?;
     // The program's own modules get their interface and object files, as GHC writes them.
     for (m, path, home) in d.sources.clone() {
@@ -861,7 +930,6 @@ fn build_program(
             write_outputs(o, &m, &path)?;
         }
     }
-    let _ = targets;
     if o.dump_core {
         for b in &binds {
             println!("{} = {}", b.name, crate::core::pretty::show(&b.body));

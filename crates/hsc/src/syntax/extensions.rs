@@ -106,6 +106,8 @@ pub const KNOWN: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct Extensions {
     on: BTreeSet<String>,
+    pub(crate) warnings: crate::diagnostic::WarningOptions,
+    pub(crate) tabs: Option<(crate::syntax::ast::Loc, usize)>,
 }
 
 impl Default for Extensions {
@@ -118,6 +120,8 @@ impl Extensions {
     pub fn ghc2021() -> Self {
         Extensions {
             on: GHC2021.iter().map(|s| s.to_string()).collect(),
+            warnings: Default::default(),
+            tabs: None,
         }
     }
 
@@ -138,7 +142,7 @@ impl Extensions {
         }
         match item {
             "GHC2021" => {
-                *self = Extensions::ghc2021();
+                self.on = Extensions::ghc2021().on;
                 return Ok(());
             }
             "Haskell2010" | "Haskell98" => {

@@ -662,6 +662,11 @@ impl Checker {
             }
             Err(types::UnifyError::Mismatch) => {
                 let (a, e) = (self.show(actual), self.show(expected));
+                let (a, e) = if a == e {
+                    (types::show_ty_qualified(&self.metas, actual), types::show_ty_qualified(&self.metas, expected))
+                } else {
+                    (a, e)
+                };
                 self.err(format!(
                     "Couldn't match expected type ‘{e}’ with actual type ‘{a}’"
                 ))

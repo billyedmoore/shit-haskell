@@ -23,6 +23,7 @@ pub struct Pragma {
 pub struct Lexed {
     pub tokens: Vec<Token>,
     pub pragmas: Vec<Pragma>,
+    pub(crate) tabs: Option<(super::ast::Loc, usize)>,
 }
 
 const SYMBOL_CHARS: &str = "!#$%&*+./<=>?@\\^|-~:";
@@ -123,11 +124,13 @@ pub fn lex_with(src: &str, magic_hash: bool, unicode: bool) -> Result<Lexed, Lex
         toks: Vec::new(),
         magic_hash,
         unicode,
+        tabs: None,
     };
     lx.run()?;
     Ok(Lexed {
         tokens: lx.toks,
         pragmas: lx.pragmas,
+        tabs: lx.tabs,
     })
 }
 
@@ -141,6 +144,7 @@ struct Lexer {
     magic_hash: bool,
     /// UnicodeSyntax: the Unicode forms of reserved symbols are those symbols.
     unicode: bool,
+    tabs: Option<(super::ast::Loc, usize)>,
 }
 
 impl Lexer {
@@ -222,6 +226,10 @@ impl Lexer {
                 Some(c) if c.is_whitespace() => {
                     nl |= c == '\n';
                     sp = true;
+                    if c == '\t' {
+                        let loc = super::ast::Loc { line: self.line, col: self.col };
+                        self.tabs.get_or_insert((loc, 0)).1 += 1;
+                    }
                     self.bump();
                 }
                 Some('-') if self.peek(1) == Some('-') && self.is_line_comment() => {

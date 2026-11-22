@@ -602,7 +602,13 @@ impl Checker {
     }
 
     pub fn fun_clauses(&mut self, clauses: &[Clause], ty: &Ty, name: &str) -> TR<Core> {
-        self.with_application_scope(|tc| tc.fun_clauses_body(clauses, ty, name))
+        self.with_application_scope(|tc| tc.fun_clauses_body(clauses, ty, name)).map_err(|mut err| {
+            let name = super::types::unqualify(name).split('%').next().unwrap_or(name);
+            if !name.starts_with('$') {
+                err.msg.push_str(&format!("\nIn an equation for ‘{name}’"));
+            }
+            err
+        })
     }
 
     fn fun_clauses_body(&mut self, clauses: &[Clause], ty: &Ty, name: &str) -> TR<Core> {

@@ -444,6 +444,37 @@ pub enum Type {
     Splice(Box<Expr>, Loc),
 }
 
+impl Type {
+    pub fn loc(&self) -> Loc {
+        match self {
+            Self::Var(_, loc) | Self::Con(_, loc) | Self::List(_, loc) |
+            Self::Tuple(_, loc) | Self::OpChain(_, loc) | Self::Lit(_, loc) |
+            Self::Wild(loc) | Self::Splice(_, loc) => *loc,
+            Self::App(t, _) | Self::Fun(t, _) | Self::Sig(t, _) | Self::Forall(_, t) => t.loc(),
+            Self::Qual(ctx, body) => ctx.first().map_or_else(|| body.loc(), Type::loc),
+        }
+    }
+
+    pub fn first_wildcard(&self) -> Option<Loc> {
+        match self {
+            Self::Wild(loc) => Some(*loc),
+            Self::App(a, b) | Self::Fun(a, b) | Self::Sig(a, b) =>
+                a.first_wildcard().or_else(|| b.first_wildcard()),
+            Self::List(t, _) => t.first_wildcard(),
+            Self::Forall(vars, body) => vars.iter().filter_map(|v| v.kind.as_ref())
+                .find_map(Type::first_wildcard).or_else(|| body.first_wildcard()),
+            Self::Qual(ctx, body) =>
+                ctx.iter().find_map(Type::first_wildcard).or_else(|| body.first_wildcard()),
+            Self::Tuple(ts, _) => ts.iter().find_map(Type::first_wildcard),
+            Self::OpChain(items, _) => items.iter().find_map(|item| match item {
+                TypeOpItem::Operand(t) => t.first_wildcard(),
+                TypeOpItem::Op(..) => None,
+            }),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeOpItem {
     Operand(Type),
@@ -516,6 +547,8 @@ pub struct InstDecl {
     pub context: Vec<Type>,
     /// The class and its argument types, as a type application chain.
     pub head: Type,
+    /// The parser erases the distinction between boxed and unboxed tuple types.
+    pub unboxed_head: bool,
     pub decls: Vec<Decl>,
     pub loc: Loc,
 }
@@ -526,5 +559,6 @@ pub struct StandaloneDeriving {
     pub via: Option<Type>,
     pub context: Vec<Type>,
     pub head: Type,
+    pub unboxed_head: bool,
     pub loc: Loc,
 }

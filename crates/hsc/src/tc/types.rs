@@ -469,21 +469,30 @@ impl Metas {
 
 /// Renders a type the way GHC does in messages: unqualified names, `[a]`, `(a, b)`.
 pub fn show_ty(m: &Metas, t: &Ty) -> String {
-    fn go(m: &Metas, t: &Ty, prec: u8) -> String {
+    show_ty_with_names(m, t, false)
+}
+
+pub(super) fn show_ty_qualified(m: &Metas, t: &Ty) -> String {
+    show_ty_with_names(m, t, true)
+}
+
+fn show_ty_with_names(m: &Metas, t: &Ty, qualified: bool) -> String {
+    fn go(m: &Metas, t: &Ty, prec: u8, qualified: bool) -> String {
         let t = m.prune(t);
         if let Some((a, b)) = t.as_fun() {
-            let s = format!("{} -> {}", go(m, a, 1), go(m, b, 0));
+            let s = format!("{} -> {}", go(m, a, 1, qualified), go(m, b, 0, qualified));
             return if prec > 0 { format!("({s})") } else { s };
         }
         let (head, args) = t.split_apps();
         match head {
-            Ty::Con(c) if c == LIST && args.len() == 1 => format!("[{}]", go(m, args[0], 0)),
+            Ty::Con(c) if c == LIST && args.len() == 1 => format!("[{}]", go(m, args[0], 0, qualified)),
             Ty::Con(c) if tuple_arity(c) == Some(args.len()) && args.len() >= 2 => {
-                let parts: Vec<String> = args.iter().map(|a| go(m, a, 0)).collect();
+                let parts: Vec<String> = args.iter().map(|a| go(m, a, 0, qualified)).collect();
                 format!("({})", parts.join(", "))
             }
             _ => {
                 let mut s = match head {
+                    Ty::Con(c) if qualified && !c.starts_with("Builtin.") => c.clone(),
                     Ty::Con(c) => unqualify(c).to_string(),
                     Ty::Meta(i) => format!("t{i}"),
                     Ty::Skol(_, n) => n.clone(),
@@ -495,7 +504,7 @@ pub fn show_ty(m: &Metas, t: &Ty) -> String {
                 };
                 for a in &args {
                     s.push(' ');
-                    s.push_str(&go(m, a, 2));
+                    s.push_str(&go(m, a, 2, qualified));
                 }
                 if prec > 1 && !args.is_empty() {
                     format!("({s})")
@@ -505,7 +514,7 @@ pub fn show_ty(m: &Metas, t: &Ty) -> String {
             }
         }
     }
-    go(m, t, 0)
+    go(m, t, 0, qualified)
 }
 
 pub fn show_pred(m: &Metas, p: &Pred) -> String {

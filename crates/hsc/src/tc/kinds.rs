@@ -318,11 +318,12 @@ impl Checker {
             let shown = show(&self.kinds.zonk(&k));
             let head = type_head_name(t);
             let msg = if shown.contains("->") {
-                format!("Expecting one more argument to ‘{head}’\n    Expected a type, but ‘{head}’ has kind ‘{shown}’")
+                format!("Expected a type, but ‘{head}’ has kind ‘{shown}’\n‘{head}’ needs more type arguments here.")
             } else {
                 format!("Expected a type, but ‘{head}’ has kind ‘{shown}’")
             };
-            return self.kind_err(loc, msg);
+            let type_loc = t.loc();
+            return self.kind_err(if type_loc.line == 0 { loc } else { type_loc }, msg);
         }
         Ok(())
     }

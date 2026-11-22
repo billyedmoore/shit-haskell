@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::TopBind;
 use crate::rename::iface::Iface;
-use crate::syntax::ast::{Decl, Module};
+use crate::syntax::ast::{Decl, Loc, Module};
 use crate::syntax::extensions::Extensions;
 use crate::tc::Checker;
 
@@ -27,6 +27,10 @@ pub struct Driver {
     flags: Vec<String>,
     /// Every module loaded: its name, source file, and whether it is one of the program's own.
     pub sources: Vec<(String, PathBuf, bool)>,
+    /// Explicit home targets need not use the module's name as their file name.
+    pub(crate) home_targets: HashMap<String, PathBuf>,
+    pub(crate) entry_module: String,
+    pub(crate) entry_name: String,
     /// The C sources of the packages the program uses, with the C compiler's flags for each.
     pub c_sources: Vec<(PathBuf, Vec<String>)>,
     /// The C include and macro flags of every package module loaded (for the capi wrappers).
@@ -358,6 +362,9 @@ impl Driver {
             loading: Vec::new(),
             flags,
             sources: Vec::new(),
+            home_targets: HashMap::new(),
+            entry_module: "Main".into(),
+            entry_name: "main".into(),
             c_sources: Vec::new(),
             c_flags: Vec::new(),
             renamed: BTreeMap::new(),
@@ -382,6 +389,9 @@ impl Driver {
         // `resolve_home_wired_imports`).
         if let Some(found) = self.wired_dir().and_then(|d| Self::find_in_package_dir(d, &stem)) {
             return Some(found);
+        }
+        if let Some(path) = self.home_targets.get(module) {
+            return Some(Found { path: path.clone(), flags: self.flags.clone(), home: true, pkg_dir: None });
         }
         for d in &self.search {
             if let Some(found) = self.find_home_in(d, &stem) {
@@ -619,10 +629,6 @@ impl Driver {
         }
     }
 
-    fn find_source(&self, module: &str) -> Option<PathBuf> {
-        self.find_module(module).map(|f| f.path)
-    }
-
     fn find_boot(&self, module: &str, source: Option<&Path>) -> Option<PathBuf> {
         let rel = format!("{}.hs-boot", module.replace('.', "/"));
         // A package module's boot file is beside its source.
@@ -653,7 +659,7 @@ impl Driver {
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
         let (mut parsed, mut exts) =
-            crate::syntax::parse_module_source(&src, &flags).map_err(|e| format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg))?;
+            crate::syntax::parse_module_source(&src, &flags).map_err(|e| e.render(&path, &src))?;
         strip_boot_bodies(&mut parsed);
         let path_text = path.to_string_lossy();
         if ["/libs/ghc-internal/", "/libs/ghc-prim/", "/libs/ghc-bignum/", "/libs/base/"].iter().any(|p| path_text.contains(p)) {
@@ -666,17 +672,13 @@ impl Driver {
             deps.insert(0, "Prelude".into());
         }
         for dep in deps {
-            if source.contains(&dep) {
-                self.load_boot(&dep)?;
-            } else {
-                self.load(&dep)?;
-            }
+            self.load_dependency(&parsed, &dep, source.contains(&dep), &path, &src)?;
             let name = if source.contains(&dep) { format!("{{boot}}{dep}") } else { dep };
             dep_names.push(name);
         }
         let dep_keys: Option<Vec<_>> = dep_names.iter().map(|name| self.dependency_key(name).map(|key| (name.clone(), key))).collect();
         self.checker.boot = true;
-        let result = self.compile_module(parsed, exts, &path);
+        let result = self.compile_module(parsed, exts, &path, Some(&src), None);
         self.checker.boot = false;
         result?;
         let own = format!("boot\0{module}\0{}\0{}\0{src}\0{}", path.display(), flags.join("\u{1}"), self.instance_key(module));
@@ -721,7 +723,7 @@ impl Driver {
 
     /// After the program is loaded: every module that was only known through its boot file is
     /// loaded for real, so that its definitions are compiled.
-    fn load_booted(&mut self) -> Result<(), String> {
+    pub(crate) fn load_booted(&mut self) -> Result<(), String> {
         loop {
             let pending: Vec<String> = self.booted.iter().filter(|m| !self.loaded.contains(*m)).cloned().collect();
             if pending.is_empty() {
@@ -808,10 +810,14 @@ impl Driver {
                 }
             }
         }
-        let (mut parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
-            format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
-        })?;
+        let (mut parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| e.render(&path, &src))?;
         timing::add("parse", t_parse);
+        if parsed.name != self.real_name(module) {
+            return Err(crate::diagnostic::error(&path, Some(&src), parsed.loc, &format!(
+                "File name does not match module name\nExpected ‘{}’, but the file declares ‘{}’.",
+                self.real_name(module), parsed.name
+            )));
+        }
         if let Some((real, _)) = self.renamed.get(module) {
             // Loaded under an internal name: `module M` of its own name in its export list (base's
             // `module GHC.Internal.TH.Syntax`) is still the module itself.
@@ -857,13 +863,9 @@ impl Driver {
             eprintln!("full: {module} needs {deps:?} (loading {:?})", self.loading);
         }
         for d in &deps {
-            let loaded = if source.contains(d) { self.load_boot(d) } else { self.load(d) };
-            if let Err(e) = loaded {
+            if let Err(e) = self.load_dependency(&parsed, d, source.contains(d), &path, &src) {
                 self.loading.pop();
-                return Err(match self.find_source(d) {
-                    Some(_) => e,
-                    None => format!("{}:{}:{}: error:\n    {}", path.display(), parsed.loc.line, parsed.loc.col, e),
-                });
+                return Err(e);
             }
         }
         self.loading.pop();
@@ -907,7 +909,7 @@ impl Driver {
             self.checker.env.instances.iter().filter(|i| i.dict.starts_with(&prefix) && !implemented.contains(i.dict.as_str())).cloned().collect()
         } else { Vec::new() };
         let binds_before = self.binds.len();
-        self.compile_module(parsed, exts, &shown)?;
+        self.compile_module(parsed, exts, &shown, Some(&src), None)?;
         let mut new_binds = self.binds.split_off(binds_before);
         if completing_boot {
             if !self.checker.complete_boot_instances(&boot_instances, &mut new_binds).map_err(|e| e.msg)? {
@@ -958,6 +960,18 @@ impl Driver {
             }
         }
         Ok(())
+    }
+
+    fn load_dependency(&mut self, module: &Module, dep: &str, boot: bool, path: &Path, source: &str) -> Result<(), String> {
+        let result = if boot { self.load_boot(dep) } else { self.load(dep) };
+        result.map_err(|err| {
+            if err.starts_with(&format!("Could not find module ‘{dep}’")) {
+                let loc = module.imports.iter().find(|i| i.module == dep).map_or(module.loc, |i| i.loc);
+                crate::diagnostic::error(path, Some(source), loc, &err)
+            } else {
+                err
+            }
+        })
     }
 
     /// Loads a module from its cache entry, if the modules it imports (loaded first) are the
@@ -1091,7 +1105,7 @@ impl Driver {
         let saved_kinds = self.checker.kinds.clone();
         let saved_families = self.checker.metas.families.clone();
         let run = (|| -> Result<Vec<Decl>, String> {
-            self.compile_module(smod, exts.clone(), path)?;
+            self.compile_module(smod, exts.clone(), path, None, None)?;
             let pre = self.reify_values(&m.name, exts, path, first)?;
             let pre_io = pre.as_ref().map(|p| format!("{p}IO"));
             match crate::th::run_decl_splices(&self.binds, &m.name, locs.clone(), pre) {
@@ -1185,7 +1199,7 @@ impl Driver {
         let vm = crate::th::reify_values_module(&refs, module, &name, loc);
         let mut exts = exts.clone();
         exts.apply("NoImplicitPrelude")?;
-        self.compile_module(vm, exts, path)?;
+        self.compile_module(vm, exts, path, None, None)?;
         self.ifaces.remove(&name);
         Ok(Some(format!("{name}.{}", crate::th::REIFY_VALUES)))
     }
@@ -1471,7 +1485,7 @@ impl Driver {
         let saved_kinds = self.checker.kinds.clone();
         let saved_families = self.checker.metas.families.clone();
         let results = (|| -> Result<Vec<crate::syntax::ast::Expr>, String> {
-            self.compile_module(smod, exts.clone(), path)?;
+            self.compile_module(smod, exts.clone(), path, None, None)?;
             let pre = if own { self.reify_values(&m.name, exts, path, first)? } else { None };
             if timing {
                 eprintln!("splices compiled: {:?}", t0.elapsed());
@@ -1501,7 +1515,9 @@ impl Driver {
         Ok(())
     }
 
-    fn compile_module(&mut self, m: Module, exts: Extensions, path: &Path) -> Result<(), String> {
+    fn compile_module(
+        &mut self, m: Module, exts: Extensions, path: &Path, source: Option<&str>, entry_name: Option<&str>,
+    ) -> Result<(), String> {
         let name = m.name.clone();
         // HSC_PROGRESS: each module compiled, with the compiler's resident memory then.
         if std::env::var_os("HSC_PROGRESS").is_some() {
@@ -1519,9 +1535,7 @@ impl Driver {
                 None => text,
             }
         };
-        let located = |loc: crate::syntax::ast::Loc, msg: &str| {
-            format!("{}:{}:{}: error:\n    {}", path.display(), loc.line, loc.col, msg)
-        };
+        let located = |loc, msg: &str| crate::diagnostic::error(path, source, loc, msg);
         let boot = self.checker.boot;
         self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
         self.checker.overloaded_lists = exts.is_on("OverloadedLists");
@@ -1530,14 +1544,105 @@ impl Driver {
         self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         let t = std::time::Instant::now();
-        let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot, exts.is_on("RebindableSyntax"))
-            .map_err(|e| located(e.loc, &e.msg))?;
+        let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, &exts, boot)
+            .map_err(|errors| errors.0.iter().map(|e| located(e.loc, &e.msg)).collect::<Vec<_>>().join("\n\n"))?;
         timing::add("rename", t);
         let t = std::time::Instant::now();
-        let binds = self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;
+        let entry = if let Some(entry_name) = entry_name {
+            let exported = iface.exports.iter().flat_map(|e| std::iter::once(e).chain(&e.subs))
+                .find(|e| e.kind.is_value() && e.occ() == entry_name);
+            let loc = renamed.decls.iter().find_map(|decl| match decl {
+                crate::syntax::ast::Decl::Fun { name, loc, .. }
+                | crate::syntax::ast::Decl::Foreign { import: true, name, loc, .. } if name == entry_name => Some(*loc),
+                crate::syntax::ast::Decl::PatBind { pat, .. } =>
+                    crate::rename::pat_vars(pat).into_iter().find_map(|(n, loc)| (n == entry_name).then_some(loc)),
+                _ => None,
+            });
+            match exported {
+                Some(e) => Some((format!("{}.{}", e.global.module, e.global.name), entry_name, loc.unwrap_or(renamed.loc))),
+                None => {
+                    // Report errors in the module itself before a missing entry point.
+                    self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;
+                    let problem = if loc.is_some() || self.checker.env.values.contains_key(&format!("{name}.{entry_name}")) {
+                        "exported by"
+                    } else {
+                        "defined in"
+                    };
+                    return Err(located(renamed.loc, &format!("The IO action ‘{entry_name}’ is not {problem} module ‘{name}’")));
+                }
+            }
+        } else {
+            None
+        };
+        let binds = self.checker.check_module_with_main(&renamed, entry.as_ref().map(|(key, name, loc)| (key.as_str(), *name, *loc)))
+            .map_err(|e| located(e.loc, &e.msg))?;
         timing::add("typecheck", t);
+        if source.is_some() {
+            self.report_warnings(&renamed, &exts, path, source)?;
+        }
         self.binds.extend(binds);
         self.ifaces.insert(name, iface);
+        Ok(())
+    }
+
+    fn report_warnings(&self, module: &Module, exts: &Extensions, path: &Path, source: Option<&str>) -> Result<(), String> {
+        use crate::diagnostic::Warning;
+        let mut warnings = Vec::new();
+        if let (Some((loc, count)), Some(fatal)) = (exts.tabs, exts.warnings.level(Warning::Tabs)) {
+            let mut message = "Tab character found here.".to_string();
+            if count > 1 {
+                let others = count - 1;
+                let label = if others == 1 { "location" } else { "locations" };
+                message.push_str(&format!(" Tabs were also found at {others} other {label}."));
+            }
+            message.push_str("\nUse spaces for indentation.");
+            warnings.push((loc, message, Warning::Tabs, fatal));
+        }
+        if let Some(fatal) = exts.warnings.level(Warning::MissingSignatures) {
+            let signed: HashSet<_> = module.decls.iter().filter_map(|decl| match decl {
+                Decl::Sig { names, .. } => Some(names.iter().map(String::as_str)),
+                _ => None,
+            }).flatten().collect();
+            let mut report = |name: &str, loc: Loc| {
+                if signed.contains(name) || name.starts_with('$') || loc.line == 0 {
+                    return;
+                }
+                let key = format!("{}.{name}", module.name);
+                if let Some(scheme) = self.checker.env.values.get(&key) {
+                    let ty = self.checker.show(&scheme.ty);
+                    let preds: Vec<_> = scheme.preds.iter().map(|p| self.checker.show_pred(p)).collect();
+                    let context = match preds.as_slice() {
+                        [] => String::new(),
+                        [one] => format!("{one} => "),
+                        _ => format!("({}) => ", preds.join(", ")),
+                    };
+                    let message = format!("Top-level binding with no type signature: {name} :: {context}{ty}");
+                    warnings.push((loc, message, Warning::MissingSignatures, fatal));
+                }
+            };
+            for decl in &module.decls {
+                match decl {
+                    Decl::Fun { name, loc, .. } => report(name, *loc),
+                    Decl::PatBind { pat, .. } => {
+                        for (name, loc) in crate::rename::pat_vars(pat) {
+                            report(&name, loc);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        warnings.sort_by_key(|(loc, ..)| *loc);
+        let has_fatal = warnings.iter().any(|(_, _, _, fatal)| *fatal);
+        let rendered = warnings.into_iter().map(|(loc, msg, flag, fatal)| {
+            crate::diagnostic::warning(path, source, loc, &msg, flag, fatal)
+        });
+        if has_fatal {
+            return Err(rendered.collect::<Vec<_>>().join("\n\n"));
+        }
+        for warning in rendered {
+            eprintln!("{warning}");
+        }
         Ok(())
     }
 }
@@ -1549,14 +1654,14 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
     compile_with(&mut d, main_file, &flags)
 }
 
-/// Compiles the program rooted at `main_file` with a driver set up for its search path and
-/// packages, returning all its Core bindings. The main module's flags are `flags`.
-pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Result<Vec<TopBind>, String> {
+pub(crate) fn check_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Result<(), String> {
+    compile_sources(d, main_file, flags, false)
+}
+
+fn compile_sources(d: &mut Driver, main_file: &Path, flags: &[String], with_runtime: bool) -> Result<(), String> {
     let src = read_source(main_file).map_err(|e| format!("{}: {e}", main_file.display()))?;
     let src = preprocess_if_needed(src, main_file, flags)?;
-    let (mut parsed, exts) = crate::syntax::parse_module_source(&src, flags).map_err(|e| {
-        format!("{}:{}:{}: error:\n    {}", main_file.display(), e.line, e.col, e.msg)
-    })?;
+    let (mut parsed, exts) = crate::syntax::parse_module_source(&src, flags).map_err(|e| e.render(main_file, &src))?;
     d.resolve_package_imports(&mut parsed);
     d.resolve_home_wired_imports(&mut parsed);
     let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
@@ -1574,29 +1679,34 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
     }
     let source = Driver::source_imports(&src);
     for dep in &deps {
-        if source.contains(dep) {
-            d.load_boot(dep)?;
-        } else {
-            d.load(dep)?;
-        }
+        d.load_dependency(&parsed, dep, source.contains(dep), main_file, &src)?;
     }
     // A program on the real base runs under its top handler, which GHC links into every program.
     let real_base = d.loaded.iter().any(|m| m.starts_with("GHC.Internal."));
-    if real_base && !d.loaded.contains("GHC.Internal.TopHandler") {
+    if with_runtime && real_base && !d.loaded.contains("GHC.Internal.TopHandler") {
         d.load("GHC.Internal.TopHandler")?;
     }
     let name = parsed.name.clone();
     let mut parsed = parsed;
     d.expand_splices(&mut parsed, &exts, main_file)?;
-    d.compile_module(parsed, exts, main_file)?;
+    let entry = (name == d.entry_module).then(|| d.entry_name.clone());
+    d.compile_module(parsed, exts, main_file, Some(&src), entry.as_deref())?;
     d.sources.push((name.clone(), main_file.to_path_buf(), true));
-    d.load_booted()?;
-    if name == "Main" && !d.checker.env.values.contains_key("Main.main") {
-        return Err(format!(
-            "{}:1:1: error:\n    The IO action ‘main’ is not defined in module ‘Main’",
-            main_file.display()
-        ));
+    d.loaded.insert(name.clone());
+    // Explicit targets participate in the build even when the entry module does not import them.
+    let mut remaining: Vec<_> = d.home_targets.keys().filter(|module| **module != name).cloned().collect();
+    remaining.sort();
+    for module in remaining {
+        let key = d.home_wired_key(&module).unwrap_or(module);
+        d.load(&key)?;
     }
+    d.load_booted()
+}
+
+/// Compiles the program rooted at `main_file` with a driver set up for its search path and
+/// packages, returning all its Core bindings. The main module's flags are `flags`.
+pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Result<Vec<TopBind>, String> {
+    compile_sources(d, main_file, flags, true)?;
     let mut binds = std::mem::take(&mut d.binds);
     // HSC_DEBUG_BINDS=file: each binding's name and the size of its Core (to compare builds).
     if let Some(f) = std::env::var_os("HSC_DEBUG_BINDS") {
@@ -1671,7 +1781,7 @@ pub fn module_name_of(path: &Path, flags: &[String]) -> Result<String, String> {
     let src = read_source(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let src = preprocess_if_needed(src, path, flags)?;
     let (parsed, _) = crate::syntax::parse_module_source(&src, flags)
-        .map_err(|e| format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg))?;
+        .map_err(|e| e.render(path, &src))?;
     Ok(parsed.name)
 }
 
@@ -2229,9 +2339,10 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     // exits, as GHC's `hs_exit` does: `hsc$main` is `runMainIO Main.main >> flushStdHandles`.
     let mut binds = binds.to_vec();
     let has = |n: &str| binds.iter().any(|b| b.name == n);
-    if !has("hsc$main") && has("GHC.Internal.TopHandler.runMainIO") && has("Main.main") && has("GHC.Internal.TopHandler.flushStdHandles") && has("GHC.Internal.Base.thenIO") {
+    let action = if has(crate::core::MAIN_ENTRY) { crate::core::MAIN_ENTRY } else { "Main.main" };
+    if !has("hsc$main") && has("GHC.Internal.TopHandler.runMainIO") && has(action) && has("GHC.Internal.TopHandler.flushStdHandles") && has("GHC.Internal.Base.thenIO") {
         use crate::core::Core::{App, Var};
-        let run_main = App(Box::new(Var("GHC.Internal.TopHandler.runMainIO".into())), Box::new(Var("Main.main".into())));
+        let run_main = App(Box::new(Var("GHC.Internal.TopHandler.runMainIO".into())), Box::new(Var(action.into())));
         let body = App(
             Box::new(App(Box::new(Var("GHC.Internal.Base.thenIO".into())), Box::new(run_main))),
             Box::new(Var("GHC.Internal.TopHandler.flushStdHandles".into())),
@@ -2239,7 +2350,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
         binds.push(crate::core::TopBind { name: "hsc$main".into(), body });
     }
     // Only what the program reaches is compiled: its entry, and the bindings the runtime uses.
-    let entry = if binds.iter().any(|b| b.name == "hsc$main") { "hsc$main" } else { "Main.main" };
+    let entry = if binds.iter().any(|b| b.name == "hsc$main") { "hsc$main" } else { action };
     let mut roots: Vec<&str> = vec![entry];
     roots.extend_from_slice(crate::native::RTS_GLOBALS);
     let t = std::time::Instant::now();
