@@ -975,11 +975,22 @@ impl Checker {
         let header = entity
             .and_then(|e| e.split_whitespace().find(|w| w.ends_with(".h")).map(str::to_string))
             .unwrap_or_default();
-        let value = entity.is_some_and(|e| e.split_whitespace().any(|w| w == "value"));
+        // Only capi recognizes the marker before a symbol. A bare `value` can be
+        // the symbol itself.
+        let value = capi && entity.is_some_and(|e| {
+            let mut words = e.split_whitespace().rev();
+            words.next().is_some_and(|symbol| !symbol.starts_with('&')) && words.next() == Some("value")
+        });
+        if value && (!scheme.preds.is_empty() || self.normalize(&body).as_fun().is_some()) {
+            self.loc = ty.loc();
+            return self.err(format!(
+                "The C value import ‘{name}’ cannot have a function type\nRemove ‘value’ to import a function, or declare the type of the C value."
+            ));
+        }
         let prim = entity
             .and_then(|e| {
                 e.split_whitespace()
-                    .filter(|w| *w != "static" && *w != "%capi" && *w != "%unsafe" && *w != "%interruptible" && *w != "value" && !w.ends_with(".h"))
+                    .filter(|w| *w != "static" && *w != "%capi" && *w != "%unsafe" && *w != "%interruptible" && !w.ends_with(".h"))
                     .last()
                     .map(str::to_string)
             })

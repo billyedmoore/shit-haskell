@@ -1275,15 +1275,19 @@ impl Parser {
         } else {
             return self.unexpected();
         };
-        // The calling convention is kept (`prim` is the runtime's own primitives); safety is not.
+        // `prim` is also used for hsc's own runtime primitives.
         let prim = self.at_varid("prim");
         let capi = self.at_varid("capi");
-        if ["ccall", "capi", "stdcall", "prim", "javascript"]
+        if !["ccall", "capi", "stdcall", "prim", "javascript"]
             .iter()
             .any(|cc| self.at_varid(cc))
         {
-            self.bump();
+            return self.err("Expected a calling convention such as ‘ccall’ in the foreign declaration");
         }
+        if capi && !self.exts.is_on("CApiFFI") {
+            return self.err("The ‘capi’ calling convention requires CApiFFI");
+        }
+        self.bump();
         // An unsafe call keeps the runtime to itself; a safe one (the default) lets other threads
         // run while it is in C: `%unsafe` marks the former in the entity.
         let mut unsafe_call = false;
@@ -1295,6 +1299,9 @@ impl Parser {
         }
         let entity = match self.tok().clone() {
             Tok::Str(s) if self.real() => {
+                if import && capi && s.trim() == "wrapper" {
+                    return self.err("A ‘wrapper’ import cannot use the ‘capi’ calling convention");
+                }
                 self.bump();
                 Some(s)
             }
