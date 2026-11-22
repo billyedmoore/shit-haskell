@@ -260,10 +260,9 @@ pub fn global_db_path() -> PathBuf {
     std::fs::canonicalize(&dir).unwrap_or(dir).join("package.conf.d")
 }
 
-/// The user package database (`~/.hsc/x86_64-linux-9.12.2/package.conf.d`), when it exists.
+/// The user package database for this hsc version, when it exists.
 pub fn user_db_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let p = PathBuf::from(home).join(".hsc").join("x86_64-linux-9.12.2").join("package.conf.d");
+    let p = crate::version::user_path(Path::new("package.conf.d"))?;
     p.is_dir().then_some(p)
 }
 

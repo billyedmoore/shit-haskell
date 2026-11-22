@@ -19,3 +19,4 @@ pub mod signals;
 pub mod syntax;
 pub mod tc;
 pub mod th;
+pub mod version;

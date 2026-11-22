@@ -13,10 +13,6 @@ enum Macro {
 
 /// Predefined macros, as GHC 9.12 on x86-64 Linux defines them.
 const PREDEFINED: &[(&str, &str)] = &[
-    ("__GLASGOW_HASKELL__", "912"),
-    ("__GLASGOW_HASKELL_FULL_VERSION__", "\"9.12.2\""),
-    ("__GLASGOW_HASKELL_PATCHLEVEL1__", "2"),
-    ("__GLASGOW_HASKELL_PATCHLEVEL2__", "0"),
     ("linux_HOST_OS", "1"),
     ("x86_64_HOST_ARCH", "1"),
     ("linux_BUILD_OS", "1"),
@@ -28,6 +24,20 @@ const PREDEFINED: &[(&str, &str)] = &[
     ("TABLES_NEXT_TO_CODE", "1"),
     ("__LINE__", "0"),
 ];
+
+fn predefined_macros() -> impl Iterator<Item = (&'static str, String)> {
+    use crate::version::{ghc_compat_int, ghc_compat_parts, GHC_COMPAT_VERSION};
+
+    let [_, _, patch] = ghc_compat_parts();
+    [
+        ("__GLASGOW_HASKELL__", ghc_compat_int().to_string()),
+        ("__GLASGOW_HASKELL_FULL_VERSION__", format!("\"{GHC_COMPAT_VERSION}\"")),
+        ("__GLASGOW_HASKELL_PATCHLEVEL1__", patch.to_string()),
+        ("__GLASGOW_HASKELL_PATCHLEVEL2__", "0".to_string()),
+    ]
+    .into_iter()
+    .chain(PREDEFINED.iter().map(|&(name, value)| (name, value.to_string())))
+}
 
 /// Versions of the boot packages that `MIN_VERSION_<pkg>(a,b,c)` compares against.
 const PACKAGE_VERSIONS: &[(&str, [u32; 3])] = &[
@@ -102,9 +112,8 @@ pub fn wants_cpp(src: &str, flags: &[String]) -> bool {
 
 impl Preprocessor {
     pub fn new(include_dirs: Vec<PathBuf>) -> Preprocessor {
-        let defs = PREDEFINED
-            .iter()
-            .map(|(k, v)| (k.to_string(), Macro::Object(v.to_string())))
+        let defs = predefined_macros()
+            .map(|(k, v)| (k.to_string(), Macro::Object(v)))
             .chain(std::iter::once(("MIN_VERSION_GLASGOW_HASKELL".to_string(), min_version_ghc())))
             .collect();
         Preprocessor { defs, include_dirs, file: String::new(), versions: None }
@@ -849,8 +858,8 @@ pub fn package_version(pkg: &str) -> Option<[u32; 3]> {
 /// Haskell tools generate (hsc2hs): as cabal's `cabal_macros.h` and GHC define them.
 pub fn c_macro_definitions() -> String {
     let mut out = String::new();
-    for (k, v) in PREDEFINED {
-        if *k != "__LINE__" {
+    for (k, v) in predefined_macros() {
+        if k != "__LINE__" {
             out.push_str(&format!("#ifndef {k}\n#define {k} {v}\n#endif\n"));
         }
     }

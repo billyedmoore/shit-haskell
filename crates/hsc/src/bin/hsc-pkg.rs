@@ -3,6 +3,7 @@
 //! `recache`, `check`).
 
 use hsc::pkg::{self, Db, Package};
+use hsc::version::GHC_COMPAT_VERSION;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -70,11 +71,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         match a.as_str() {
             "--version" | "-V" => {
-                println!("GHC package manager version 9.12.2");
+                // Cabal expects the compiler compatibility version in the fifth word.
+                println!("hsc package manager version {GHC_COMPAT_VERSION}");
                 return Ok(());
             }
             "--numeric-version" => {
-                println!("9.12.2");
+                println!("{GHC_COMPAT_VERSION}");
                 return Ok(());
             }
             "--help" | "-?" => {
