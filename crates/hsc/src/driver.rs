@@ -660,7 +660,8 @@ impl Driver {
         let src = preprocess_if_needed(src, &path, &flags)?;
         let (mut parsed, mut exts) =
             crate::syntax::parse_module_source(&src, &flags).map_err(|e| e.render(&path, &src))?;
-        strip_boot_bodies(&mut parsed);
+        check_boot_declarations(&mut parsed)
+            .map_err(|(loc, msg)| crate::diagnostic::error(&path, Some(&src), loc, msg))?;
         let path_text = path.to_string_lossy();
         if ["/libs/ghc-internal/", "/libs/ghc-prim/", "/libs/ghc-bignum/", "/libs/base/"].iter().any(|p| path_text.contains(p)) {
             exts.apply("NoImplicitPrelude")?;
@@ -890,6 +891,16 @@ impl Driver {
             })
             .collect();
         let completing_boot = self.booted.contains(module);
+        let boot_iface = completing_boot.then(|| self.ifaces.get(module).cloned()).flatten();
+        let boot_values: Vec<_> = boot_iface.iter().flat_map(|iface| &iface.exports)
+            .filter(|e| e.kind == crate::rename::iface::EntKind::Var)
+            .filter_map(|e| {
+                let key = format!("{}.{}", e.global.module, e.global.name);
+                let ty = self.checker.env.values.get(&key).and_then(boot_value_type)?.clone();
+                Some((key, e.occ(), ty))
+            })
+            .collect();
+        let module_loc = parsed.loc;
         let boot_key = self.boot_key(module);
         let cacheable = cache_file.is_some() && !has_splices && dep_keys.is_some() && (!completing_boot || boot_key.is_some());
         let mut snapshot = cacheable.then(|| {
@@ -912,6 +923,31 @@ impl Driver {
         let warnings = self.compile_module(parsed, exts, &shown, Some(&src), None)?;
         let mut new_binds = self.binds.split_off(binds_before);
         if completing_boot {
+            if let (Some(boot), Some(full)) = (&boot_iface, self.ifaces.get(module)) {
+                let exports: HashSet<_> = full.exports.iter()
+                    .flat_map(|e| std::iter::once(e).chain(&e.subs))
+                    .map(|e| (&e.global, e.kind.is_value()))
+                    .collect();
+                for e in boot.exports.iter().flat_map(|e| std::iter::once(e).chain(&e.subs)) {
+                    if !exports.contains(&(&e.global, e.kind.is_value())) {
+                        return Err(crate::diagnostic::error(&shown, Some(&src), module_loc, &format!(
+                            "The hs-boot interface for ‘{}’ exports ‘{}’\nExport it from the implementing module to match the interface.",
+                            self.real_name(module), e.occ()
+                        )));
+                    }
+                }
+            }
+            for (key, name, boot_type) in boot_values {
+                let Some(full_type) = self.checker.env.values.get(&key).and_then(boot_value_type) else { continue };
+                let boot_type = self.checker.normalize(&boot_type);
+                let full_type = self.checker.normalize(full_type);
+                if boot_type != full_type {
+                    return Err(crate::diagnostic::error(&shown, Some(&src), module_loc, &format!(
+                        "The type of ‘{name}’ differs from its hs-boot signature\nImplementation: {name} :: {}\nHs-boot file:   {name} :: {}",
+                        self.checker.show(&full_type), self.checker.show(&boot_type)
+                    )));
+                }
+            }
             if !self.checker.complete_boot_instances(&boot_instances, &mut new_binds).map_err(|e| e.msg)? {
                 snapshot = None;
             }
@@ -1868,16 +1904,37 @@ pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Resul
     pp.run(&src, &dir).map_err(|e| format!("{}: error: {e}", path.display()))
 }
 
-/// A boot file declares; it does not define. Method definitions and instance bodies are removed.
-fn strip_boot_bodies(m: &mut Module) {
+/// Boot interfaces may describe class defaults. Their method bodies are checked
+/// in the implementation.
+fn check_boot_declarations(m: &mut Module) -> Result<(), (Loc, &'static str)> {
     for d in &mut m.decls {
         match d {
+            Decl::Fun { loc, .. } | Decl::PatBind { loc, .. } | Decl::IPBind { loc, .. } => {
+                return Err((*loc, "Value bindings are not allowed in an hs-boot file. Use a type signature here."));
+            }
+            Decl::TypeInstance { loc, .. } => {
+                return Err((*loc, "A type-family instance is not allowed in an hs-boot file."));
+            }
             Decl::Class(cd) => cd.decls.retain(|x| !matches!(x, Decl::Fun { .. } | Decl::PatBind { .. })),
             Decl::Instance(id) => id.decls.clear(),
             _ => {}
         }
     }
-    m.decls.retain(|d| !matches!(d, Decl::Fun { .. } | Decl::PatBind { .. }));
+    Ok(())
+}
+
+/// Simple boot signatures can be compared directly. Polymorphic signatures
+/// need an equivalence check that accounts for local binders and constraints.
+fn boot_value_type(scheme: &crate::tc::types::Scheme) -> Option<&crate::tc::types::Ty> {
+    use crate::tc::types::Ty;
+    fn closed(ty: &Ty) -> bool {
+        match ty {
+            Ty::Con(_) => true,
+            Ty::App(f, a) => closed(f) && closed(a),
+            _ => false,
+        }
+    }
+    (scheme.nvars == 0 && scheme.preds.is_empty() && closed(&scheme.ty)).then_some(&scheme.ty)
 }
 
 #[cfg(test)]

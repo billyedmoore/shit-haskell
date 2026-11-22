@@ -1,0 +1,3 @@
+BootDefines.hs-boot:4:1: error
+Value bindings are not allowed in an hs-boot file
+Use a type signature here
