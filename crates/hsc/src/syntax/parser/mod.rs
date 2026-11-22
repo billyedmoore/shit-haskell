@@ -664,7 +664,7 @@ impl Parser {
             )
         };
 
-        let items = self.block(|p| p.top_item())?;
+        let items = self.block(|p| p.top_item(&name))?;
         if !self.at_eof() {
             return self.unexpected();
         }
@@ -698,11 +698,11 @@ impl Parser {
         })
     }
 
-    fn top_item(&mut self) -> PResult<TopItem> {
+    fn top_item(&mut self, module: &str) -> PResult<TopItem> {
         if self.at_kw(Kw::Import) {
             return Ok(TopItem::Import(self.import_decl()?));
         }
-        Ok(TopItem::Decl(self.topdecl()?))
+        Ok(TopItem::Decl(self.topdecl(module)?))
     }
 
     fn import_decl(&mut self) -> PResult<Import> {

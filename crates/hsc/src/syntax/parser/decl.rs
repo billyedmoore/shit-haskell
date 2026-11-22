@@ -6,7 +6,7 @@ use crate::syntax::token::{Kw, ROp, Tok};
 use crate::syntax::ast::TypeEquation;
 
 impl Parser {
-    pub(super) fn topdecl(&mut self) -> PResult<Decl> {
+    pub(super) fn topdecl(&mut self, module: &str) -> PResult<Decl> {
         let loc = self.loc();
         match self.tok().clone() {
             Tok::Kw(Kw::Data) if self.real() => {
@@ -14,7 +14,7 @@ impl Parser {
                 if self.at_varid("family") {
                     // A data family is an open type family; its instances are data types.
                     self.bump();
-                    return self.type_family(loc, true);
+                    return self.type_family(loc, module);
                 }
                 if self.at_kw(Kw::Instance) {
                     self.bump();
@@ -30,7 +30,7 @@ impl Parser {
                 }
                 self.data_decl(true, loc)
             }
-            Tok::Kw(Kw::Type) if self.real() => self.type_decl(loc),
+            Tok::Kw(Kw::Type) if self.real() => self.type_decl(loc, module),
             Tok::VarId(s) if s == "pattern" && self.real() && self.exts.is_on("PatternSynonyms") => {
                 self.bump();
                 self.pattern_decl(loc)
@@ -491,11 +491,11 @@ impl Parser {
         }))
     }
 
-    fn type_decl(&mut self, loc: Loc) -> PResult<Decl> {
+    fn type_decl(&mut self, loc: Loc, module: &str) -> PResult<Decl> {
         self.expect_kw(Kw::Type)?;
         if self.at_varid("family") {
             self.bump();
-            return self.type_family(loc, true);
+            return self.type_family(loc, module);
         }
         if self.at_kw(Kw::Instance) {
             self.bump();
@@ -535,8 +535,8 @@ impl Parser {
         })
     }
 
-    /// `F a b [:: kind] [where equations]`, after `type family` (or `type` in a class).
-    fn type_family(&mut self, loc: Loc, top: bool) -> PResult<Decl> {
+    /// `F a b [:: kind] [where equations]`, after `type family` or `data family`.
+    fn type_family(&mut self, loc: Loc, module: &str) -> PResult<Decl> {
         let head = self.btype()?;
         let (name, params) = self.decl_head(head)?;
         if self.at_res(ROp::DColon) {
@@ -552,9 +552,25 @@ impl Parser {
                 injective = self.injectivity();
             }
         }
-        let equations = if top && self.at_kw(Kw::Where) {
+        let equations = if self.at_kw(Kw::Where) {
             self.bump();
-            Some(self.block(|p| p.type_equation().map(|(_, e)| e))?)
+            Some(self.block(|p| {
+                let (head, equation) = p.type_equation()?;
+                if head.name != name || head.qual.as_deref().is_some_and(|qual| qual != module) {
+                    let actual = match head.qual {
+                        Some(qual) => format!("{qual}.{}", head.name),
+                        None => head.name,
+                    };
+                    return Err(super::ParseError {
+                        line: equation.loc.line,
+                        col: equation.loc.col,
+                        msg: format!(
+                            "The equation for closed type family ‘{name}’ names ‘{actual}’\nUse ‘{name}’ at the head of the equation."
+                        ),
+                    });
+                }
+                Ok(equation)
+            })?)
         } else {
             None
         };
@@ -596,22 +612,21 @@ impl Parser {
 
     /// `F t1 .. tn = rhs`: the family name and the equation.
     fn type_equation(&mut self) -> PResult<(QName, TypeEquation)> {
-        let loc = self.loc();
         let lhs = self.btype()?;
-        self.equation_from(lhs, loc)
+        self.equation_from(lhs)
     }
 
     /// The rest of an equation whose left-hand side has been parsed.
-    fn equation_from(&mut self, lhs: Type, loc: Loc) -> PResult<(QName, TypeEquation)> {
+    fn equation_from(&mut self, lhs: Type) -> PResult<(QName, TypeEquation)> {
         self.expect_res(ROp::Eq)?;
         let rhs = self.sigtype()?;
         // An infix head `a == b` (one operator) is the family applied to both operands.
-        let (name, args) = match lhs {
+        let (name, args, loc) = match lhs {
             Type::OpChain(items, _) if items.len() == 3 => {
                 let mut it = items.into_iter();
                 match (it.next(), it.next(), it.next()) {
-                    (Some(TypeOpItem::Operand(l)), Some(TypeOpItem::Op(q, _)), Some(TypeOpItem::Operand(r))) => {
-                        (q, vec![l, r])
+                    (Some(TypeOpItem::Operand(l)), Some(TypeOpItem::Op(q, loc)), Some(TypeOpItem::Operand(r))) => {
+                        (q, vec![l, r], loc)
                     }
                     _ => return self.err("malformed type family equation"),
                 }
@@ -625,7 +640,7 @@ impl Parser {
                 }
                 args.reverse();
                 match t {
-                    Type::Con(q, _) => (q, args),
+                    Type::Con(q, loc) => (q, args, loc),
                     _ => return self.err("malformed type family equation"),
                 }
             }
@@ -1161,7 +1176,7 @@ impl Parser {
                     return Ok(Decl::TypeFamily { name, params, equations: None, injective, loc });
                 }
                 (self.pos, self.ctx, self.semi_done) = save;
-                let (name, equation) = self.equation_from(head, loc)?;
+                let (name, equation) = self.equation_from(head)?;
                 return Ok(Decl::TypeInstance {
                     name,
                     equation,

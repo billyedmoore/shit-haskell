@@ -1112,7 +1112,22 @@ impl<'a> Renamer<'a> {
     fn rename_top_decl(&mut self, decl: Decl) -> RR<Decl> {
         let depth = self.locals.len();
         let in_quote = self.in_quote;
-        let result = self.top_decl(decl);
+        let result = self.top_decl(decl).and_then(|decl| {
+            if let Decl::TypeInstance { name, equation, .. } = &decl {
+                let entities = self.own.iter().chain(self.ifaces.values().flat_map(|iface| &iface.exports));
+                let mut classes = entities.filter(|entity| entity.kind == EntKind::Class);
+                if let Some(class) = classes.find(|class| class.subs.iter().any(|sub| {
+                    sub.kind == EntKind::TyCon && sub.global.name == name.name
+                        && Some(sub.global.module.as_str()) == name.qual.as_deref()
+                })) {
+                    return Err(RnError {
+                        loc: equation.loc,
+                        msg: format!("The associated type ‘{}’ must be defined inside an instance of ‘{}’", name.name, class.occ()),
+                    });
+                }
+            }
+            Ok(decl)
+        });
         if result.is_err() {
             self.locals.truncate(depth);
             self.pat_seen = None;
@@ -1226,6 +1241,7 @@ impl<'a> Renamer<'a> {
             Decl::Class(mut cd) => {
                 check_type_binders(&cd.tyvars, cd.loc)?;
                 cd.context = self.types(cd.context)?;
+                let class = QName { qual: Some(self.module.clone()), name: cd.name.clone() };
                 let mut decls = Vec::new();
                 for d in std::mem::take(&mut cd.decls) {
                     decls.push(match d {
@@ -1239,6 +1255,12 @@ impl<'a> Renamer<'a> {
                             names,
                             loc,
                         },
+                        Decl::TypeInstance { name, equation, .. } if self.class_assoc(&class, &name.name).is_none() => {
+                            return Err(RnError {
+                                loc: equation.loc,
+                                msg: format!("Class ‘{}’ has no associated type named ‘{}’", cd.name, name.name),
+                            });
+                        }
                         other => self.top_decl(other)?,
                     });
                 }
@@ -1289,6 +1311,14 @@ impl<'a> Renamer<'a> {
                             if let Some(g) = class.as_ref().and_then(|g| self.class_assoc(g, &name.name)) {
                                 decls.push(Decl::TypeInstance { name: g, equation: self.type_equation(equation.clone())?, loc: *loc });
                                 continue;
+                            }
+                            if let Some(class) = class.as_ref().filter(|class| {
+                                methods.is_some() && class.qual.as_deref() == Some(self.module.as_str())
+                            }) {
+                                return Err(RnError {
+                                    loc: equation.loc,
+                                    msg: format!("Class ‘{}’ has no associated type named ‘{}’", class.name, name.name),
+                                });
                             }
                         }
                     }
