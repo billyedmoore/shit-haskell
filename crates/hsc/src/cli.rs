@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use crate::driver;
 use crate::pkg;
 
-pub const VERSION: &str = "9.12.2";
+pub use crate::version::VERSION;
+use crate::version::{self, GHC_COMPAT_VERSION};
 
 /// What the command line asks for.
 #[derive(Default, Clone)]
@@ -162,8 +163,6 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
             "--supported-languages" | "--supported-extensions" => o.info = Some("languages".into()),
             "--print-libdir" => o.info = Some("libdir".into()),
             "--print-global-package-db" => o.info = Some("global-db".into()),
-            "--print-project-git-commit-id" => o.info = Some("git".into()),
-            "--print-booter-version" => o.info = Some("booter".into()),
             "--abi-hash" => o.abi_hash = true,
             "--run" => o.run = true,
             "--dump-ast" => o.dump_ast = true,
@@ -252,11 +251,10 @@ pub fn info(what: &str) -> String {
     let global = libdir.join("package.conf.d");
     match what {
         "version" => format!("The Shit Haskell Compilation System, version {VERSION}\n"),
-        "numeric-version" => format!("{VERSION}\n"),
+        // cabal reads the version here, refuses old GHCs and chooses its flags by it.
+        "numeric-version" => format!("{GHC_COMPAT_VERSION}\n"),
         "libdir" => format!("{}\n", libdir.display()),
         "global-db" => format!("{}\n", global.display()),
-        "git" => "383be28ffdddf65b57b7b111bfc89808b4229ebc\n".into(),
-        "booter" => "9.10.1\n".into(),
         "languages" => {
             let mut out = String::new();
             for l in crate::syntax::extensions::supported_languages() {
@@ -316,14 +314,9 @@ pub fn info(what: &str) -> String {
                 ("RTS expects libdw", "NO".into()),
                 ("Relative Global Package DB", "package.conf.d".into()),
                 ("Project version", VERSION.into()),
-                ("Project Git commit id", "383be28ffdddf65b57b7b111bfc89808b4229ebc".into()),
-                ("Project Version Int", "912".into()),
-                ("Project Patch Level", "2".into()),
-                ("Project Patch Level1", "2".into()),
-                ("Project Patch Level2", "0".into()),
-                ("Project Unit Id", "ghc-9.12.2".into()),
-                ("Booter version", "9.10.1".into()),
-                ("Stage", "2".into()),
+                ("GHC compatibility version", GHC_COMPAT_VERSION.into()),
+                // Cabal derives the compiler ABI tag from this identifier.
+                ("Project Unit Id", format!("ghc-{GHC_COMPAT_VERSION}")),
                 ("Build platform", "x86_64-unknown-linux".into()),
                 ("Host platform", "x86_64-unknown-linux".into()),
                 ("Target platform", "x86_64-unknown-linux".into()),
@@ -373,8 +366,8 @@ fn show_string(s: &str) -> String {
 }
 
 /// The package environment file in effect, as GHC finds one: `-package-env`, then `GHC_ENVIRONMENT`,
-/// then `.ghc.environment.x86_64-linux-9.12.2` in the current directory or a parent, then hsc's
-/// default environment (`~/.hsc/x86_64-linux-9.12.2/environments/default`). `-` means none.
+/// then Cabal's `.ghc.environment.*` in the current directory or a parent, then hsc's
+/// default user environment. `-` means none.
 fn environment_file(o: &Opts) -> Option<PathBuf> {
     let named = o.package_env.clone().or_else(|| std::env::var("GHC_ENVIRONMENT").ok());
     if let Some(n) = named {
@@ -386,19 +379,18 @@ fn environment_file(o: &Opts) -> Option<PathBuf> {
             return Some(p);
         }
         // A bare name is an environment in the user's directory.
-        let home = std::env::var_os("HOME")?;
-        return Some(PathBuf::from(home).join(".hsc/x86_64-linux-9.12.2/environments").join(n));
+        return version::user_path(&Path::new("environments").join(n));
     }
-    let local = ".ghc.environment.x86_64-linux-9.12.2";
+    let local = version::ghc_environment_file_name();
     let mut dir = std::env::current_dir().ok();
     while let Some(d) = dir {
-        if d.join(local).is_file() {
-            return Some(d.join(local));
+        let path = d.join(&local);
+        if path.is_file() {
+            return Some(path);
         }
         dir = d.parent().map(Path::to_path_buf);
     }
-    let home = std::env::var_os("HOME")?;
-    let default = PathBuf::from(home).join(".hsc/x86_64-linux-9.12.2/environments/default");
+    let default = version::user_path(Path::new("environments/default"))?;
     default.is_file().then_some(default)
 }
 
@@ -828,8 +820,7 @@ fn build_program(
     };
     // HSC_DEBUG builds keep symbols: a different executable.
     let mut key = format!(
-        "hsc {VERSION} {}\nnative {}\ndebug {}\n",
-        env!("CARGO_PKG_VERSION"),
+        "hsc {VERSION}\ncompat {GHC_COMPAT_VERSION}\nnative {}\ndebug {}\n",
         o.native,
         std::env::var_os("HSC_DEBUG").is_some()
     );
