@@ -354,16 +354,31 @@ impl Parser {
     // ----- data, newtype, type synonyms ------------------------------------
 
     fn data_decl(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
-        let context = self.try_context();
+        let context = self.datatype_context()?;
         let head = self.btype()?;
         let (name, tyvars) = self.decl_head(head)?;
         self.data_body(newtype, context, name, tyvars, loc)
+    }
+
+    fn datatype_context(&mut self) -> PResult<Vec<Type>> {
+        let start = self.pos;
+        let loc = self.loc();
+        let context = self.try_context();
+        if self.pos != start && !self.exts.is_on("DatatypeContexts") {
+            return Err(super::ParseError {
+                line: loc.line,
+                col: loc.col,
+                msg: "A context on a data or newtype declaration requires DatatypeContexts".into(),
+            });
+        }
+        Ok(context)
     }
 
     /// `data instance F t1 .. tn = cons`, after `data instance` (or `newtype instance`). Each
     /// instance becomes a data type of its own, named after the family and the instance's place,
     /// over the variables of the instance head; and the family equation `F t1 .. tn = R vs`.
     fn data_instance(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
+        let context = self.datatype_context()?;
         let head = self.btype()?;
         let mut args = Vec::new();
         let mut t = head;
@@ -382,7 +397,7 @@ impl Parser {
         }
         let name = format!("R:{}{}_{}", family.name, loc.line, loc.col);
         let tyvars: Vec<TyVarBind> = vars.iter().map(|v| TyVarBind { name: v.clone(), kind: None }).collect();
-        let data = self.data_body(newtype, Vec::new(), name.clone(), tyvars, loc)?;
+        let data = self.data_body(newtype, context, name.clone(), tyvars, loc)?;
         let rhs = vars.iter().fold(Type::Con(QName::unqual(name), loc), |acc, v| {
             Type::App(Box::new(acc), Box::new(Type::Var(v.clone(), loc)))
         });
@@ -472,7 +487,21 @@ impl Parser {
                 }));
             }
             loop {
-                cons.push(self.constr()?);
+                let con = self.constr()?;
+                if (!con.exist.is_empty() || !con.context.is_empty())
+                    && !self.exts.is_on("ExistentialQuantification")
+                    && !self.exts.is_on("GADTs")
+                {
+                    return Err(super::ParseError {
+                        line: con.loc.line,
+                        col: con.loc.col,
+                        msg: format!(
+                            "Constructor ‘{}’ requires ExistentialQuantification or GADTs to declare local type variables or constraints",
+                            con.name
+                        ),
+                    });
+                }
+                cons.push(con);
                 if self.at_res(ROp::Bar) {
                     self.bump();
                 } else {
@@ -480,6 +509,12 @@ impl Parser {
                 }
             }
         } else if self.at_kw(Kw::Where) {
+            if !self.exts.is_on("GADTSyntax") {
+                return self.err("Using ‘where’ for data constructors requires GADTSyntax (also enabled by GADTs)");
+            }
+            if !context.is_empty() {
+                return self.err("A GADT-style declaration cannot have a datatype context\nPut the constraints on the individual constructors that need them.");
+            }
             self.bump();
             let groups = self.block(|p| p.gadt_con_group())?;
             cons = groups.into_iter().flatten().collect();
