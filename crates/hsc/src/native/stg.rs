@@ -1012,6 +1012,9 @@ impl Lowering {
     /// Boxes raw slot `r` in body `depth` by scheduling `SBind::BoxRaw(r)` on its pending list.
     fn box_raw_at(&mut self, depth: usize, r: u32) -> Atom {
         let b = &mut self.bodies[depth];
+        if let Some((s, _)) = b.pending.iter().find(|(_, bind)| matches!(bind, SBind::BoxRaw(prev) if *prev == r)) {
+            return Atom::Slot(*s);
+        }
         let s = b.fresh_slot();
         b.pending.push((s, SBind::BoxRaw(r)));
         Atom::Slot(s)
@@ -3310,6 +3313,73 @@ mod raw_slot_tests {
         let prog = Lowering::program(&binds, &numeric);
         let (worker, _) = prog.globals[0].worker.as_ref().expect("fib worker");
         assert!(worker.nraw <= 2, "expected compacted nraw <= 2 for fib, got {}", worker.nraw);
+    }
+
+    #[test]
+    fn box_raw_at_deduplicates_pending_box_in_same_batch() {
+        // go q n = case q <# 0# of 1# -> 0#; _ -> case n ==# 0# of 1# -> Pair q q; _ -> go (q +# 1#) (n -# 1#)
+        // Hot path uses `q` raw, cold branch uses `q` twice in `Pair q q`: must emit only ONE `SBind::BoxRaw`.
+        let inner = case(
+            prim("==#", vec![var("n"), Core::Lit(Lit::Int(0))]),
+            "c",
+            Core::Case(
+                Box::new(var("c")),
+                "cb".into(),
+                vec![
+                    Alt::Lit(Lit::Int(1), Core::Con("Test.Pair".into(), vec![var("q"), var("q")])),
+                    Alt::Default(case(
+                        prim("+#", vec![var("q"), Core::Lit(Lit::Int(1))]),
+                        "q1",
+                        case(
+                            prim("-#", vec![var("n"), Core::Lit(Lit::Int(1))]),
+                            "n1",
+                            app(app(var("Test.go"), var("q1")), var("n1")),
+                        ),
+                    )),
+                ],
+            ),
+        );
+        let go_body = Core::Lam(
+            "q".into(),
+            Box::new(Core::Lam(
+                "n".into(),
+                Box::new(case(
+                    prim("<#", vec![var("q"), Core::Lit(Lit::Int(0))]),
+                    "c0",
+                    Core::Case(
+                        Box::new(var("c0")),
+                        "cb0".into(),
+                        vec![Alt::Lit(Lit::Int(1), Core::Lit(Lit::Int(0))), Alt::Default(inner)],
+                    ),
+                )),
+            )),
+        );
+        let binds = vec![TopBind { name: "Test.go".into(), body: go_body }];
+        let numeric = NumericParams {
+            params: [("Test.go".to_string(), vec![NUM_INT, NUM_INT])].into_iter().collect(),
+            results: HashMap::new(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, _) = prog.globals[0].worker.as_ref().expect("go should get raw worker");
+        fn count_box_raw(e: &SExpr) -> usize {
+            match e {
+                SExpr::Let(bs, b) => {
+                    bs.iter().filter(|(_, bind)| matches!(bind, SBind::BoxRaw(_))).count() + count_box_raw(b)
+                }
+                SExpr::Case(s, _, alts) => {
+                    count_box_raw(s)
+                        + alts
+                            .iter()
+                            .map(|a| match a {
+                                SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => count_box_raw(b),
+                            })
+                            .sum::<usize>()
+                }
+                SExpr::Join(_, _, c, b) => count_box_raw(c) + count_box_raw(b),
+                _ => 0,
+            }
+        }
+        assert_eq!(count_box_raw(&worker.body), 1, "expected deduplicated single SBind::BoxRaw: {:?}", worker.body);
     }
 }
 

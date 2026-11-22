@@ -2257,7 +2257,14 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
         let r = (|| {
         let (o, r) = (obj.display().to_string(), runtime.display().to_string());
         let mut args = vec![o.as_str()];
-        args.extend(c_objs.iter().map(String::as_str));
+        let mut deferred_libs: Vec<&str> = Vec::new();
+        for item in &c_objs {
+            if matches!(item.as_str(), "-lstdc++" | "-lc++") {
+                deferred_libs.push(item.as_str());
+            } else {
+                args.push(item.as_str());
+            }
+        }
         // The program's C symbols are found by name at run time (`crate::ccall`).
         // Exclude `libhsc.a` from `-rdynamic` so `--gc-sections` strips unused compiler/RTS code.
         args.extend_from_slice(&[
@@ -2273,6 +2280,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
             args.push("-s");
         }
         args.extend_from_slice(&["-lpthread", "-ldl", "-lm", "-lgcc_s"]);
+        args.extend(deferred_libs);
         run(&args)
         })();
         timing::add("link", t_link);

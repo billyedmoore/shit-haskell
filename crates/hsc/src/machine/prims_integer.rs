@@ -336,6 +336,32 @@ fn mul_mag64(a: &[u64], b: &[u64]) -> Vec<u64> {
     out
 }
 
+/// Hardware 128-by-64 unsigned division when `hi < d` (guaranteed no overflow).
+#[inline(always)]
+fn div_rem_u128_by_u64(hi: u64, lo: u64, d: u64) -> (u64, u64) {
+    debug_assert!(hi < d);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let q: u64;
+        let r: u64;
+        // SAFETY: `hi < d` guarantees quotient fits in `u64` and `d > 0`.
+        std::arch::asm!(
+            "div {d}",
+            d = in(reg) d,
+            inout("rax") lo => q,
+            inout("rdx") hi => r,
+            options(pure, nomem, nostack),
+        );
+        (q, r)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let num = ((hi as u128) << 64) | (lo as u128);
+        let d128 = d as u128;
+        ((num / d128) as u64, (num % d128) as u64)
+    }
+}
+
 /// Truncated division of non-empty base-2^64 magnitudes: Knuth's Algorithm D.
 fn divrem_mag64(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     debug_assert!(!b.is_empty() && *b.last().unwrap() != 0);
@@ -343,18 +369,18 @@ fn divrem_mag64(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
         return (Vec::new(), a.to_vec());
     }
     if b.len() == 1 {
-        let d = b[0] as u128;
+        let d = b[0];
         let mut q = vec![0u64; a.len()];
-        let mut rem = 0u128;
+        let mut rem = 0u64;
         for i in (0..a.len()).rev() {
-            let cur = (rem << 64) | (a[i] as u128);
-            q[i] = (cur / d) as u64;
-            rem = cur % d;
+            let (qi, ri) = div_rem_u128_by_u64(rem, a[i], d);
+            q[i] = qi;
+            rem = ri;
         }
         while q.last() == Some(&0) {
             q.pop();
         }
-        let r = if rem == 0 { Vec::new() } else { vec![rem as u64] };
+        let r = if rem == 0 { Vec::new() } else { vec![rem] };
         return (q, r);
     }
     let n = b.len();
@@ -379,16 +405,17 @@ fn divrem_mag64(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     let vn = shl(b, false);
     let mut un = shl(a, true);
     let mut q = vec![0u64; m + 1];
-    let top = vn[n - 1] as u128;
+    let top_u64 = vn[n - 1];
+    let top = top_u64 as u128;
     let next = vn[n - 2] as u128;
     for j in (0..=m).rev() {
-        let u_hi = un[j + n] as u128;
-        let u_lo = un[j + n - 1] as u128;
-        let (mut qhat, mut rhat) = if u_hi == top {
-            (u64::MAX as u128, u_lo + top)
+        let u_hi = un[j + n];
+        let u_lo = un[j + n - 1];
+        let (mut qhat, mut rhat) = if u_hi == top_u64 {
+            (u64::MAX as u128, (u_lo as u128) + top)
         } else {
-            let num = (u_hi << 64) | u_lo;
-            (num / top, num % top)
+            let (qh, rh) = div_rem_u128_by_u64(u_hi, u_lo, top_u64);
+            (qh as u128, rh as u128)
         };
         let u_next = un[j + n - 2] as u128;
         while rhat < (1u128 << 64) && qhat * next > ((rhat << 64) | u_next) {
@@ -588,29 +615,27 @@ fn divop_big_by_small(
         return 0;
     }
     let (b_neg, d) = small_sign_mag(b);
-    let d128 = d as u128;
     let q_neg = a_neg != b_neg;
     match kind {
         DivKind::Rem | DivKind::Mod => {
             let src_bp = follow_ind(m, m.heap_get(m.args[0], 1));
-            let mut rem = 0u128;
+            let mut rem = 0u64;
             // SAFETY: `src_bp` has `a_len` limbs; no GC occurs in this loop.
             unsafe {
                 let src = (src_bp as *const u64).add(1);
                 for i in (0..a_len).rev() {
-                    let cur = (rem << 64) | (*src.add(i) as u128);
-                    rem = cur % d128;
+                    let (_, ri) = div_rem_u128_by_u64(rem, *src.add(i), d);
+                    rem = ri;
                 }
             }
-            let r_u64 = rem as u64;
-            if r_u64 == 0 {
+            if rem == 0 {
                 return is_value(m, 0);
             }
             if matches!(kind, DivKind::Mod) && q_neg {
                 // `mod` adjusts remainder to `|b| - |r|` with sign `b_neg`.
-                encode_u128(m, b_neg, (d - r_u64) as u128)
+                encode_u128(m, b_neg, (d - rem) as u128)
             } else {
-                encode_u128(m, a_neg, r_u64 as u128)
+                encode_u128(m, a_neg, rem as u128)
             }
         }
         DivKind::Quot | DivKind::Div => {
@@ -618,15 +643,15 @@ fn divop_big_by_small(
             let src_bp = follow_ind(m, m.heap_get(m.args[0], 1));
             let saved_hp = m.hp;
             let dst_bp = m.alloc(1 + a_len);
-            let mut rem = 0u128;
+            let mut rem = 0u64;
             // SAFETY: `src_bp` has `a_len` limbs; `dst_bp` has `1 + a_len` words.
             let mut words = unsafe {
                 let src = (src_bp as *const u64).add(1);
                 let dst = (dst_bp as *mut u64).add(1);
                 for i in (0..a_len).rev() {
-                    let cur = (rem << 64) | (*src.add(i) as u128);
-                    *dst.add(i) = (cur / d128) as u64;
-                    rem = cur % d128;
+                    let (qi, ri) = div_rem_u128_by_u64(rem, *src.add(i), d);
+                    *dst.add(i) = qi;
+                    rem = ri;
                 }
                 let mut w = a_len;
                 while w > 0 && *dst.add(w - 1) == 0 {
@@ -923,21 +948,20 @@ fn quotrem_big_by_small(
         return 0;
     }
     let (b_neg, d) = small_sign_mag(b);
-    let d128 = d as u128;
     let q_neg = a_neg != b_neg;
     m.reserve(a_len + 16);
     let src_bp = follow_ind(m, m.heap_get(m.args[0], 1));
     let saved_hp = m.hp;
     let dst_bp = m.alloc(1 + a_len);
-    let mut rem = 0u128;
+    let mut rem = 0u64;
     // SAFETY: `src_bp` has `a_len` limbs; `dst_bp` has `1 + a_len` words.
     let mut words = unsafe {
         let src = (src_bp as *const u64).add(1);
         let dst = (dst_bp as *mut u64).add(1);
         for i in (0..a_len).rev() {
-            let cur = (rem << 64) | (*src.add(i) as u128);
-            *dst.add(i) = (cur / d128) as u64;
-            rem = cur % d128;
+            let (qi, ri) = div_rem_u128_by_u64(rem, *src.add(i), d);
+            *dst.add(i) = qi;
+            rem = ri;
         }
         let mut w = a_len;
         while w > 0 && *dst.add(w - 1) == 0 {
@@ -962,9 +986,9 @@ fn quotrem_big_by_small(
                 words += 1;
             }
         }
-        (b_neg, d - (rem as u64))
+        (b_neg, d - rem)
     } else {
-        (a_neg, rem as u64)
+        (a_neg, rem)
     };
     if words < a_len {
         m.hp -= 8 * (a_len - words) as Word;
@@ -1298,6 +1322,30 @@ mod tests {
             let (qb, rb) = bfact.quot_rem(&bp10);
             assert_eq!(q64, from_bigint(&qb));
             assert_eq!(r64, from_bigint(&rb));
+        }
+    }
+
+    #[test]
+    fn div_rem_u128_by_u64_edge_cases() {
+        let divisors = [1u64, 2, 3, 10, 1_000_000_000, (1u64 << 63), (1u64 << 63) + 1, u64::MAX - 1, u64::MAX];
+        let los = [0u64, 1, 0x1234_5678_9abc_def0, (1u64 << 63) - 1, 1u64 << 63, u64::MAX - 1, u64::MAX];
+        for d in divisors {
+            let his = [0u64, 1, d / 2, d - 1];
+            for hi in his {
+                if hi >= d {
+                    continue;
+                }
+                for lo in los {
+                    let num = ((hi as u128) << 64) | (lo as u128);
+                    let expected_q = (num / (d as u128)) as u64;
+                    let expected_r = (num % (d as u128)) as u64;
+                    assert_eq!(
+                        div_rem_u128_by_u64(hi, lo, d),
+                        (expected_q, expected_r),
+                        "mismatch for ({hi:#x}, {lo:#x}) / {d:#x}"
+                    );
+                }
+            }
         }
     }
 }
