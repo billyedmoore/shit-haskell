@@ -12,10 +12,12 @@ impl Parser {
             Tok::Kw(Kw::Data) if self.real() => {
                 self.bump();
                 if self.at_varid("family") {
+                    self.require_type_families()?;
                     self.bump();
                     return self.type_family(loc, module, true);
                 }
                 if self.at_kw(Kw::Instance) {
+                    self.require_type_families()?;
                     self.bump();
                     return self.data_instance(false, loc);
                 }
@@ -24,6 +26,7 @@ impl Parser {
             Tok::Kw(Kw::Newtype) if self.real() => {
                 self.bump();
                 if self.at_kw(Kw::Instance) {
+                    self.require_type_families()?;
                     self.bump();
                     return self.data_instance(true, loc);
                 }
@@ -493,10 +496,12 @@ impl Parser {
     fn type_decl(&mut self, loc: Loc, module: &str) -> PResult<Decl> {
         self.expect_kw(Kw::Type)?;
         if self.at_varid("family") {
+            self.require_type_families()?;
             self.bump();
             return self.type_family(loc, module, false);
         }
         if self.at_kw(Kw::Instance) {
+            self.require_type_families()?;
             self.bump();
             return self.type_instance(loc);
         }
@@ -534,6 +539,13 @@ impl Parser {
         })
     }
 
+    fn require_type_families(&self) -> PResult<()> {
+        if !self.exts.is_on("TypeFamilies") {
+            return self.err("Family declarations and instances require TypeFamilies");
+        }
+        Ok(())
+    }
+
     /// `F a b [:: kind] [where equations]`, after `type family` or `data family`.
     fn type_family(&mut self, loc: Loc, module: &str, data: bool) -> PResult<Decl> {
         let head = self.btype()?;
@@ -545,10 +557,13 @@ impl Parser {
         // TypeFamilyDependencies: `= r | r -> a` names the result and the parameters it determines.
         let mut injective = Vec::new();
         if self.at_res(ROp::Eq) {
+            if !self.exts.is_on("TypeFamilyDependencies") {
+                return self.err("A named type family result requires TypeFamilyDependencies");
+            }
             self.bump();
             self.atype()?;
             if self.at_res(ROp::Bar) {
-                injective = self.injectivity();
+                injective = self.injectivity()?;
             }
         }
         let equations = if self.at_kw(Kw::Where) {
@@ -587,7 +602,10 @@ impl Parser {
     }
 
     /// `| r -> a b`, at the bar: the parameters named after the arrow.
-    fn injectivity(&mut self) -> Vec<String> {
+    fn injectivity(&mut self) -> PResult<Vec<String>> {
+        if !self.exts.is_on("TypeFamilyDependencies") {
+            return self.err("An injectivity annotation requires TypeFamilyDependencies");
+        }
         let mut names = Vec::new();
         let mut after_arrow = false;
         while self.real() && !self.at_kw(Kw::Where) {
@@ -600,7 +618,7 @@ impl Parser {
             }
             self.bump();
         }
-        names
+        Ok(names)
     }
 
     /// `type instance F t1 .. tn = rhs`, after `type instance`.
@@ -1156,6 +1174,7 @@ impl Parser {
 
     fn class_body_decl(&mut self) -> PResult<Decl> {
         if self.at_kw(Kw::Type) {
+            self.require_type_families()?;
             // An associated type: `type F a [:: k]` declares it; `type F T = t` is an equation
             // (an instance's definition or a class default).
             let loc = self.loc();
@@ -1174,7 +1193,7 @@ impl Parser {
                 let save = (self.pos, self.ctx.clone(), self.semi_done);
                 self.bump();
                 if self.atype().is_ok() && self.at_res(ROp::Bar) {
-                    let injective = self.injectivity();
+                    let injective = self.injectivity()?;
                     let (name, params) = self.decl_head(head)?;
                     return Ok(Decl::TypeFamily { name, params, equations: None, data: false, injective, loc });
                 }
@@ -1208,6 +1227,7 @@ impl Parser {
             };
         }
         if self.at_kw(Kw::Data) {
+            self.require_type_families()?;
             return self.err("associated data families are not supported yet");
         }
         self.value_decl()

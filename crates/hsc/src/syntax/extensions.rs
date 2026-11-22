@@ -202,6 +202,7 @@ fn implied_by(name: &str) -> &'static [&'static str] {
         "GADTs" => &["GADTSyntax", "MonoLocalBinds"],
         "FlexibleInstances" => &["TypeSynonymInstances"],
         "TypeFamilies" => &["MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
+        "TypeFamilyDependencies" => &["TypeFamilies", "MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
         "RecordWildCards" => &["DisambiguateRecordFields"],
         "RankNTypes" => &["ExplicitForAll"],
         "ScopedTypeVariables" => &["ExplicitForAll"],
