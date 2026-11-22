@@ -520,16 +520,24 @@ fn show_ty_with_names(m: &Metas, t: &Ty, qualified: bool) -> String {
 }
 
 pub fn show_pred(m: &Metas, p: &Pred) -> String {
-    let mut s = unqualify(&p.class).to_string();
+    show_pred_with_names(m, p, false)
+}
+
+pub(crate) fn show_pred_with_names(m: &Metas, p: &Pred, qualified: bool) -> String {
+    let mut s = if qualified && !p.class.starts_with("Builtin.") {
+        p.class.clone()
+    } else {
+        unqualify(&p.class).to_string()
+    };
     for a in &p.args {
         s.push(' ');
-        s.push_str(&show_ty_atomic(m, a));
+        s.push_str(&show_ty_atomic(m, a, qualified));
     }
     s
 }
 
-fn show_ty_atomic(m: &Metas, t: &Ty) -> String {
-    let s = show_ty(m, t);
+fn show_ty_atomic(m: &Metas, t: &Ty, qualified: bool) -> String {
+    let s = show_ty_with_names(m, t, qualified);
     if s.contains(' ') && !s.starts_with('[') && !s.starts_with('(') {
         format!("({s})")
     } else {

@@ -950,10 +950,13 @@ impl Driver {
                 }
                 let boot_type = self.checker.normalize(&boot_scheme.ty);
                 let full_type = self.checker.normalize(&full_scheme.ty);
-                if boot_scheme.nvars != full_scheme.nvars || boot_type != full_type {
+                if boot_scheme.nvars != full_scheme.nvars || boot_type != full_type || boot_scheme.preds != full_scheme.preds {
                     let (implementation, boot) = self.checker.show_type_pair(&full_type, &boot_type);
-                    let implementation = show_boot_signature(&self.checker, full_scheme.nvars, implementation);
-                    let boot = show_boot_signature(&self.checker, boot_scheme.nvars, boot);
+                    let show_pred = |pred: &crate::tc::types::Pred| self.checker.show_pred(pred);
+                    let qualify_context = full_scheme.preds != boot_scheme.preds
+                        && full_scheme.preds.iter().map(show_pred).eq(boot_scheme.preds.iter().map(show_pred));
+                    let implementation = show_boot_signature(&self.checker, full_scheme, &implementation, qualify_context);
+                    let boot = show_boot_signature(&self.checker, &boot_scheme, &boot, qualify_context);
                     return Err(crate::diagnostic::error(&shown, Some(&src), signature_loc.unwrap_or(module_loc), &format!(
                         "The type of ‘{name}’ differs from its hs-boot signature\nImplementation: {name} :: {}\nHs-boot file:   {name} :: {}",
                         implementation, boot
@@ -1971,19 +1974,32 @@ fn comparable_boot_signature(scheme: &crate::tc::types::Scheme, allow_polymorphi
             _ => false,
         }
     }
-    if !scheme.preds.is_empty() || (!allow_polymorphism && scheme.nvars != 0) {
+    if !allow_polymorphism && (scheme.nvars != 0 || !scheme.preds.is_empty()) {
         return false;
     }
     let mut variables = HashSet::new();
-    collect_variables(&scheme.ty, &mut variables, allow_polymorphism) && variables.len() == scheme.nvars as usize
+    collect_variables(&scheme.ty, &mut variables, allow_polymorphism)
+        && variables.len() == scheme.nvars as usize
+        && scheme.preds.iter().all(|pred| {
+            !pred.args.is_empty() && pred.args.iter().all(|arg| matches!(arg, Ty::Gen(i) if variables.contains(i)))
+        })
 }
 
-fn show_boot_signature(checker: &Checker, nvars: u32, body: String) -> String {
-    if nvars == 0 {
-        return body;
+fn show_boot_signature(checker: &Checker, scheme: &crate::tc::types::Scheme, body: &str, qualified: bool) -> String {
+    use crate::tc::types::{show_pred_with_names, Ty};
+    let mut signature = String::new();
+    if scheme.nvars != 0 {
+        let variables: Vec<_> = (0..scheme.nvars).map(|i| checker.show(&Ty::Gen(i))).collect();
+        signature.push_str(&format!("forall {}. ", variables.join(" ")));
     }
-    let variables: Vec<_> = (0..nvars).map(|i| checker.show(&crate::tc::types::Ty::Gen(i))).collect();
-    format!("forall {}. {body}", variables.join(" "))
+    let context: Vec<_> = scheme.preds.iter().map(|pred| show_pred_with_names(&checker.metas, pred, qualified)).collect();
+    match context.as_slice() {
+        [] => {}
+        [pred] => signature.push_str(&format!("{pred} => ")),
+        _ => signature.push_str(&format!("({}) => ", context.join(", "))),
+    }
+    signature.push_str(body);
+    signature
 }
 
 #[cfg(test)]
