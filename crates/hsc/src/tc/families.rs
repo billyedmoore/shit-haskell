@@ -613,8 +613,28 @@ impl Checker {
     /// An equation, `default` for a class's default of an associated type (see `FamEqn`).
     pub fn add_family_equation_as(&mut self, name: &str, args: &[Type], rhs: &Type, loc: Loc, default: bool) -> TR<()> {
         self.loc = loc;
-        if !self.env.families.contains_key(name) {
+        let Some(arity) = self.env.families.get(name).map(|family| family.arity) else {
             return self.err(format!("‘{}’ is not a type family", super::types::unqualify(name)));
+        };
+        let short_name = super::types::unqualify(name);
+        if default {
+            let mut binders = std::collections::HashSet::new();
+            for arg in args {
+                let mut pattern = arg;
+                while let Type::Sig(inner, _) = pattern {
+                    pattern = inner;
+                }
+                match pattern {
+                    Type::Wild(_) => {}
+                    Type::Var(var, _) if binders.insert(var) => {}
+                    _ => {
+                        self.loc = arg.loc();
+                        return self.err(format!(
+                            "The default equation for ‘{short_name}’ requires distinct type variables on its left-hand side"
+                        ));
+                    }
+                }
+            }
         }
         let mut tvs = Vec::new();
         let mut pats = Vec::with_capacity(args.len());
@@ -630,8 +650,8 @@ impl Checker {
         // An instance with more arguments than the family's parameters (`data family F a :: Type
         // -> Type` with `data instance F X b = ..`): the extra variables are eta-reduced away, as
         // GHC does, so that `F X` reduces on its own (`F X b = R b` becomes `F X = R`).
-        let arity = self.env.families.get(name).map_or(pats.len(), |f| f.arity);
-        while pats.len() > arity {
+        let data_instance = matches!(rhs_ty.split_apps().0, Ty::Con(c) if super::types::unqualify(c).starts_with("R:"));
+        while data_instance && pats.len() > arity {
             let Some(Ty::Gen(i)) = pats.last().cloned() else { break };
             let Ty::App(f, a) = rhs_ty.clone() else { break };
             let mentions = |t: &Ty| mentions_gen(t, i);
@@ -641,6 +661,12 @@ impl Checker {
             pats.pop();
             kinds.pop();
             rhs_ty = (*f).clone();
+        }
+        if !data_instance && pats.len() != arity {
+            return self.err(format!(
+                "Wrong number of arguments in the equation for type family ‘{short_name}’\nThe declaration expects {arity}. This equation supplies {}.",
+                pats.len()
+            ));
         }
         let eqn = FamEqn {
             nvars: tvs.len() as u32,
