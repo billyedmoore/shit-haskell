@@ -4959,22 +4959,22 @@ impl Gen {
         }
         // The result's cell (and for a read its pair with the state token) first: the allocation
         // may move the array.
+        // The new object is held in %r14 (the result register; the cache registers may hold
+        // raw operands, and `load` writes only its target).
         let words = if access == "read" { 5 } else { 2 };
         self.alloc(words, p);
-        self.emit("movq %rax, %r8");
+        self.emit("movq %rax, %r14");
         element(self);
         self.emit(&format!("{load} 8(%rax,%rdx,{scale}), %rcx"));
-        self.emit(&format!("movq ${}, (%r8)", header(INT, 1, 0)));
-        self.emit("movq %rcx, 8(%r8)");
+        self.emit(&format!("movq ${}, (%r14)", header(INT, 1, 0)));
+        self.emit("movq %rcx, 8(%r14)");
         if access == "read" {
             let pair = self.con_id("Builtin.(,)");
             self.emit(&format!("movabsq ${}, %rcx", header(CON, 2, pair as u64)));
-            self.emit("movq %rcx, 16(%r8)");
-            self.emit("movq $0, 24(%r8)");
-            self.emit("movq %r8, 32(%r8)");
-            self.emit("leaq 16(%r8), %r14");
-        } else {
-            self.emit("movq %r8, %r14");
+            self.emit("movq %rcx, 16(%r14)");
+            self.emit("movq $0, 24(%r14)");
+            self.emit("movq %r14, 32(%r14)");
+            self.emit("addq $16, %r14");
         }
         self.fast_ret(p);
         true
