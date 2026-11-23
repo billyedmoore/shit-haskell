@@ -1,0 +1,3 @@
+DeprecatedFlagSupport.hs:1:14: warning: [-Wdeprecated-flags]
+Language extension ‘RecordPuns’ is deprecated
+Use ‘NamedFieldPuns’.

@@ -1,0 +1,3 @@
+warning: [-Wdeprecated-flags]
+Language extension ‘AutoDeriveTypeable’ is deprecated
+Typeable instances are generated automatically.

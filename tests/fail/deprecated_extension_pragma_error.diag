@@ -1,0 +1,3 @@
+.hs:1:14: error: [-Wdeprecated-flags]
+Language extension ‘PatternSignatures’ is deprecated
+Use ‘ScopedTypeVariables’.

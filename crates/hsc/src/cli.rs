@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::diagnostic::{self, Warning, WarningOptions};
 use crate::driver;
 use crate::pkg;
 
@@ -608,6 +609,30 @@ fn empty_object(path: &Path) -> Result<(), String> {
         .status();
     if !st.is_ok_and(|s| s.success()) {
         std::fs::write(path, b"").map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Reports legacy language flags from this invocation before source pragmas are applied.
+pub fn check_command_line_flags(flags: &[String]) -> Result<(), String> {
+    let mut warning_options = WarningOptions::default();
+    for flag in flags {
+        warning_options.apply(flag);
+    }
+    let Some(fatal) = warning_options.level(Warning::DeprecatedFlags) else { return Ok(()) };
+    let warnings: Vec<_> = flags.iter()
+        .filter_map(|flag| flag.strip_prefix("-X"))
+        .filter_map(crate::syntax::extensions::deprecated_extension)
+        .map(|message| diagnostic::warning(
+            Path::new("command line"), None, Default::default(), &message, Warning::DeprecatedFlags, fatal,
+        ))
+        .collect();
+    if !warnings.is_empty() {
+        let diagnostics = warnings.join("\n\n");
+        if fatal {
+            return Err(diagnostics);
+        }
+        eprintln!("{diagnostics}");
     }
     Ok(())
 }

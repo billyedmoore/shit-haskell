@@ -1626,6 +1626,16 @@ impl Driver {
             eprintln!("compiling {name} ({} decls, rss {} MB)", m.decls.len(), rss * 4096 / (1 << 20));
         }
         self.checker.user_module = !path.starts_with(default_lib_dir());
+        let mut warnings = Vec::new();
+        if self.checker.user_module && source.is_some() {
+            for (loc, message) in &exts.deprecated_flags {
+                let warning = crate::diagnostic::warning(
+                    path, source, *loc, message, crate::diagnostic::Warning::DeprecatedFlags, false,
+                );
+                eprintln!("{warning}");
+                warnings.push(warning);
+            }
+        }
         // Call stacks name a library file as GHC's build does (libraries/<package>/...).
         self.checker.source_name = if self.checker.user_module {
             path.display().to_string()
@@ -1696,13 +1706,12 @@ impl Driver {
         let binds = self.checker.check_module_with_main(&renamed, entry.as_ref().map(|(key, name, loc)| (key.as_str(), *name, *loc)))
             .map_err(|e| located(e.loc, &e.msg))?;
         timing::add("typecheck", t);
-        let warnings = if source.is_some() {
-            self.module_warnings(&renamed, &broad_imports, &rename_warnings, &exts, path, source)?
-        } else {
-            Vec::new()
-        };
-        for warning in &warnings {
-            eprintln!("{warning}");
+        if source.is_some() {
+            let module_warnings = self.module_warnings(&renamed, &broad_imports, &rename_warnings, &exts, path, source)?;
+            for warning in &module_warnings {
+                eprintln!("{warning}");
+            }
+            warnings.extend(module_warnings);
         }
         self.binds.extend(binds);
         self.ifaces.insert(name, iface);

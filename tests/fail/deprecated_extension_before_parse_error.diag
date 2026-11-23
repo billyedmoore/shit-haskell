@@ -1,0 +1,2 @@
+.hs:1:14: error: [-Wdeprecated-flags]
+Use ‘DataKinds’ and ‘PolyKinds’.

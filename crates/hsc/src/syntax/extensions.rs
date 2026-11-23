@@ -116,6 +116,7 @@ pub struct Extensions {
     pub(crate) warnings: crate::diagnostic::WarningOptions,
     pub(crate) tabs: Option<(crate::syntax::ast::Loc, usize)>,
     pub(crate) unknown_pragmas: Vec<(crate::syntax::ast::Loc, String)>,
+    pub(crate) deprecated_flags: Vec<(crate::syntax::ast::Loc, String)>,
 }
 
 impl Default for Extensions {
@@ -132,6 +133,7 @@ impl Extensions {
             warnings: Default::default(),
             tabs: None,
             unknown_pragmas: Vec::new(),
+            deprecated_flags: Vec::new(),
         }
     }
 
@@ -180,7 +182,8 @@ impl Extensions {
                 "GeneralisedNewtypeDeriving" => "GeneralizedNewtypeDeriving".into(),
                 "RecordPuns" => "NamedFieldPuns".into(),
                 "PatternSignatures" => "ScopedTypeVariables".into(),
-                "AutoDeriveTypeable" | "NullaryTypeClasses" => "MultiParamTypeClasses".into(),
+                "NullaryTypeClasses" => "MultiParamTypeClasses".into(),
+                "DoRec" => "RecursiveDo".into(),
                 other => other.to_string(),
             }
         };
@@ -198,11 +201,19 @@ impl Extensions {
         if enable && name == "RebindableSyntax" {
             self.set_extension("ImplicitPrelude", false);
         }
-        self.set_extension(name, enable);
+        self.set_extension(name, enable || name == "RelaxedPolyRec");
         if enable {
             for implied in implied_by(name) {
                 self.set_extension(implied, true);
             }
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_source_flag(&mut self, item: &str, loc: crate::syntax::ast::Loc) -> Result<(), String> {
+        self.apply(item)?;
+        if let Some(message) = deprecated_extension(item) {
+            self.deprecated_flags.push((loc, message));
         }
         Ok(())
     }
@@ -215,6 +226,32 @@ impl Extensions {
             self.on.remove(name);
         }
     }
+}
+
+pub(crate) fn deprecated_extension(item: &str) -> Option<String> {
+    let (prefix, name) = item.strip_prefix("No").map_or(("", item), |name| ("No", name));
+    let replacement = match name {
+        "PatternSignatures" => Some("ScopedTypeVariables"),
+        "RecordPuns" => Some("NamedFieldPuns"),
+        "NullaryTypeClasses" => Some("MultiParamTypeClasses"),
+        "DoRec" => Some("RecursiveDo"),
+        _ => None,
+    };
+    let advice = if let Some(replacement) = replacement {
+        format!("Use ‘{prefix}{replacement}’.")
+    } else {
+        match item {
+            "TypeInType" => "Use ‘DataKinds’ and ‘PolyKinds’.".into(),
+            "NoTypeInType" => "Remove this flag. Use ‘NoDataKinds’ or ‘NoPolyKinds’ to disable those extensions explicitly.".into(),
+            "OverlappingInstances" | "NoOverlappingInstances" =>
+                "Use an OVERLAPPING, OVERLAPPABLE, or OVERLAPS pragma on each relevant instance.".into(),
+            "AutoDeriveTypeable" => "Typeable instances are generated automatically.".into(),
+            "DatatypeContexts" => "Move the constraints to the functions that need them.".into(),
+            "NoRelaxedPolyRec" => "RelaxedPolyRec is always enabled. Remove this flag.".into(),
+            _ => return None,
+        }
+    };
+    Some(format!("Language extension ‘{item}’ is deprecated\n{advice}"))
 }
 
 /// Extensions switched on by enabling `name`.

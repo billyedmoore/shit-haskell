@@ -396,7 +396,11 @@ impl Lexer {
             self.unknown_pragmas.push((at, name));
             return Ok((nl, None));
         }
-        let name = if name == "NOTINLINE" { "NOINLINE".to_string() } else { name };
+        let name = match name.as_str() {
+            "NOTINLINE" => "NOINLINE".into(),
+            "OPTIONS" => "OPTIONS_GHC".into(),
+            _ => name,
+        };
         if ["LANGUAGE", "OPTIONS_GHC", "RULES", "INLINE", "NOINLINE", "MINIMAL"].contains(&name.as_str()) {
             let body_start = body.len() - body.trim_start().len() + name_len;
             let after_name = &body[body_start..];
