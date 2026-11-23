@@ -1322,6 +1322,19 @@ impl<'a> Renamer<'a> {
                 }
                 dd.tyvars = self.tyvar_binds(std::mem::take(&mut dd.tyvars))?;
                 dd.context = self.types(dd.context)?;
+                let mut parameter_scope: Vec<_> = dd.tyvars.iter().map(|binder| binder.name.clone())
+                    .chain(dd.erased_kind_variables.iter().cloned()).collect();
+                for kind in dd.tyvars.iter().filter_map(|binder| binder.kind.as_ref()) {
+                    kind.first_unbound_variable(|name, _| {
+                        if !parameter_scope.iter().any(|binder| binder == name) {
+                            parameter_scope.push(name.to_owned());
+                        }
+                        true
+                    });
+                }
+                for constraint in &dd.context {
+                    check_type_variables(constraint, &parameter_scope, "Bind it in the datatype header.")?;
+                }
                 for c in &mut dd.cons {
                     c.exist = self.tyvar_binds(std::mem::take(&mut c.exist))?;
                     c.context = self.types(std::mem::take(&mut c.context))?;
@@ -1338,7 +1351,7 @@ impl<'a> Renamer<'a> {
                                 .collect::<RR<Vec<_>>>()?,
                         ),
                     };
-                    check_gadt_binders(c)?;
+                    check_constructor_binders(c, &parameter_scope)?;
                 }
                 for dv in &mut dd.deriving {
                     dv.classes = self.types(std::mem::take(&mut dv.classes))?;
@@ -2851,28 +2864,30 @@ fn check_record_fields<T>(fields: &[(QName, Option<T>)], loc: Loc) -> RR<()> {
     Ok(())
 }
 
-fn check_gadt_binders(constructor: &ConDecl) -> RR<()> {
-    if !constructor.gadt_forall {
+fn check_type_variables(ty: &Type, bound: &[String], hint: &str) -> RR<()> {
+    if let Some((name, loc)) = ty.first_unbound_variable(|name, _| bound.iter().any(|v| v == name)) {
+        return Err(RnError { loc, msg: format!("Not in scope: type variable ‘{name}’\n{hint}") });
+    }
+    Ok(())
+}
+
+fn check_constructor_binders(constructor: &ConDecl, datatype_scope: &[String]) -> RR<()> {
+    let gadt = constructor.gadt_result.is_some();
+    if gadt && !constructor.gadt_forall {
         return Ok(());
     }
-    let check = |ty: &Type, bound: &[&str]| {
-        if let Some((name, loc)) = ty.first_unbound_variable(|name, _| bound.contains(&name)) {
-            return Err(RnError {
-                loc,
-                msg: format!(
-                    "Not in scope: type variable ‘{name}’\nBind it in the ‘forall’ for constructor ‘{}’.",
-                    constructor.name,
-                ),
-            });
-        }
-        Ok(())
+    let hint = if gadt {
+        format!("Bind it in the ‘forall’ for constructor ‘{}’.", constructor.name)
+    } else {
+        format!("Bind it in the datatype header or in the ‘forall’ for constructor ‘{}’.", constructor.name)
     };
-    let mut bound = Vec::new();
+    let check = |ty: &Type, bound: &[String]| check_type_variables(ty, bound, &hint);
+    let mut bound = if gadt { Vec::new() } else { datatype_scope.to_vec() };
     for binder in &constructor.exist {
         if let Some(kind) = &binder.kind {
             check(kind, &bound)?;
         }
-        bound.push(binder.name.as_str());
+        bound.push(binder.name.clone());
     }
     for constraint in &constructor.context {
         check(constraint, &bound)?;

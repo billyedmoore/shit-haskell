@@ -416,7 +416,7 @@ bin_enum!(ConFields { 0 => Positional(a), 1 => Record(a) });
 bin_struct!(ConDecl { name, exist, context, fields, gadt_result, gadt_forall, infix, loc });
 bin_enum!(Strategy { 0 => Stock, 1 => Newtype, 2 => Anyclass });
 bin_struct!(Deriving { loc, strategy, classes, via });
-bin_struct!(DataDecl { newtype, context, name, tyvars, cons, deriving, loc });
+bin_struct!(DataDecl { newtype, context, name, tyvars, erased_kind_variables, cons, deriving, loc });
 bin_enum!(Assoc { 0 => Left, 1 => Right, 2 => None });
 
 bin_struct!(GName { module, name });
@@ -581,7 +581,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 13";
+const MAGIC: &str = "hsc-module-cache 14";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.

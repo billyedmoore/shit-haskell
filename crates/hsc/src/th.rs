@@ -989,7 +989,7 @@ impl Conv<'_> {
                     let tyvars = self.tyvar_binds(&a[2], false)?;
                     let cons = if newtype { vec![self.con_decl(&a[4])?] } else { self.list(&a[4])?.iter().map(|x| self.con_decl(x)).collect::<CR<_>>()? };
                     let deriving = self.deriv_clauses(&a[5])?;
-                    out.push(Decl::Data(DataDecl { newtype, context, name, tyvars, cons, deriving, loc }));
+                    out.push(Decl::Data(DataDecl { newtype, context, name, tyvars, erased_kind_variables: Vec::new(), cons, deriving, loc }));
                 }
                 "TySynD" => out.push(Decl::TypeSyn { name: self.binder(&a[0])?, tyvars: self.tyvar_binds(&a[1], false)?, rhs: self.ty(&a[2])?, loc }),
                 "InstanceD" => {

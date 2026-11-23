@@ -1,0 +1,3 @@
+traditional_scope_standalone_kind.hs:5:27: error:
+Not in scope: type variable ‘k’
+Bind it in the datatype header or in the ‘forall’ for constructor ‘T’.

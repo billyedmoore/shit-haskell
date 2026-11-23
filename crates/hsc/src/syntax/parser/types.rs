@@ -139,7 +139,10 @@ impl Parser {
                 // A visible kind argument `T @k`: kinds are not checked, so it is dropped.
                 self.require_ext("TypeApplications")?;
                 self.bump();
-                self.atype()?;
+                let argument = self.atype()?;
+                if let Some(arguments) = &mut self.head_kind_arguments {
+                    arguments.push(argument);
+                }
             } else {
                 break;
             }

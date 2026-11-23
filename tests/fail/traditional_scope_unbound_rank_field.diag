@@ -1,0 +1,3 @@
+traditional_scope_unbound_rank_field.hs:2:30: error:
+Not in scope: type variable ‘missing’
+Bind it in the datatype header or in the ‘forall’ for constructor ‘T’.

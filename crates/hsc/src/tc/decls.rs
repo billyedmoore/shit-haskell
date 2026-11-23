@@ -770,6 +770,7 @@ impl Checker {
         };
 
         let mut class_scope = class_vars.clone();
+        class_scope.extend(cd.erased_kind_variables.iter().cloned());
         for kind in cd.tyvars.iter().filter_map(|binder| binder.kind.as_ref()) {
             kind.first_unbound_variable(|name, _| {
                 if !class_scope.iter().any(|binder| binder == name) {
@@ -2019,6 +2020,7 @@ impl Checker {
                     context: Vec::new(),
                     name: "[]".to_string(),
                     tyvars: vec![TyVarBind { name: "a".into(), kind: None, inferred: false }],
+                    erased_kind_variables: Vec::new(),
                     cons: vec![
                         con("[]", Vec::new(), false),
                         con(
@@ -2056,6 +2058,7 @@ impl Checker {
                 context: Vec::new(),
                 name: occ.to_string(),
                 tyvars,
+                erased_kind_variables: Vec::new(),
                 cons: vec![ConDecl {
                     name: occ.to_string(),
                     exist: Vec::new(),

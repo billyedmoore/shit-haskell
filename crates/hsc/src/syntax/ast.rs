@@ -613,6 +613,8 @@ pub struct DataDecl {
     pub context: Vec<Type>,
     pub name: String,
     pub tyvars: Vec<TyVarBind>,
+    /// Kind variables in the head that are erased from the datatype parameters.
+    pub erased_kind_variables: Vec<String>,
     pub cons: Vec<ConDecl>,
     pub deriving: Vec<Deriving>,
     pub loc: Loc,
@@ -623,6 +625,7 @@ pub struct ClassDecl {
     pub context: Vec<Type>,
     pub name: String,
     pub tyvars: Vec<TyVarBind>,
+    pub erased_kind_variables: Vec<String>,
     pub fundeps: Vec<(Vec<String>, Vec<String>)>,
     pub decls: Vec<Decl>,
     pub minimal: Option<(Minimal, Loc)>,

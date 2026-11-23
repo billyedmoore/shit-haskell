@@ -360,9 +360,21 @@ impl Parser {
 
     fn data_decl(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
         let context = self.datatype_context()?;
-        let head = self.btype()?;
+        let (head, erased_kind_variables) = self.head_with_kind_variables()?;
         let (name, tyvars) = self.decl_head(head)?;
-        self.data_body(newtype, context, name, tyvars, loc)
+        self.data_body(newtype, context, name, tyvars, erased_kind_variables, loc)
+    }
+
+    /// Declaration scopes keep the variables of visible kind arguments even when the type erases them.
+    fn head_with_kind_variables(&mut self) -> PResult<(Type, Vec<String>)> {
+        let saved = self.head_kind_arguments.replace(Vec::new());
+        let head = self.btype();
+        let arguments = std::mem::replace(&mut self.head_kind_arguments, saved).unwrap_or_default();
+        let mut variables = Vec::new();
+        for argument in arguments {
+            collect_type_vars(&argument, &mut variables, true);
+        }
+        Ok((head?, variables))
     }
 
     fn datatype_context(&mut self) -> PResult<Vec<Type>> {
@@ -384,7 +396,7 @@ impl Parser {
     /// over the variables of the instance head; and the family equation `F t1 .. tn = R vs`.
     fn data_instance(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
         let context = self.datatype_context()?;
-        let head = self.btype()?;
+        let (head, mut erased_kind_variables) = self.head_with_kind_variables()?;
         let mut args = Vec::new();
         let mut t = head;
         while let Type::App(f, a) = t {
@@ -397,12 +409,14 @@ impl Parser {
             _ => return self.err("malformed data instance head"),
         };
         let mut vars: Vec<String> = Vec::new();
-        for a in &args {
-            type_vars_of(a, &mut vars);
+        for arg in &args {
+            type_vars_of(arg, &mut vars);
+            collect_type_vars(arg, &mut erased_kind_variables, true);
         }
+        erased_kind_variables.retain(|name| !vars.contains(name));
         let name = format!("R:{}{}_{}", family.name, loc.line, loc.col);
         let tyvars: Vec<TyVarBind> = vars.iter().map(|v| TyVarBind { name: v.clone(), kind: None, inferred: false }).collect();
-        let data = self.data_body(newtype, context, name.clone(), tyvars, loc)?;
+        let data = self.data_body(newtype, context, name.clone(), tyvars, erased_kind_variables, loc)?;
         let rhs = vars.iter().fold(Type::Con(QName::unqual(name), loc), |acc, v| {
             Type::App(Box::new(acc), Box::new(Type::Var(v.clone(), loc)))
         });
@@ -414,7 +428,10 @@ impl Parser {
     }
 
     /// The constructors and deriving clauses of a data declaration whose head is parsed.
-    fn data_body(&mut self, newtype: bool, context: Vec<Type>, name: String, mut tyvars: Vec<TyVarBind>, loc: Loc) -> PResult<Decl> {
+    fn data_body(
+        &mut self, newtype: bool, context: Vec<Type>, name: String, mut tyvars: Vec<TyVarBind>,
+        erased_kind_variables: Vec<String>, loc: Loc,
+    ) -> PResult<Decl> {
         if self.at_res(ROp::DColon) {
             // Kind signature: each argument of its arrows is one more parameter (`data F :: Type
             // -> Type where ...` has one), named so that no source variable clashes. A data
@@ -463,6 +480,7 @@ impl Parser {
                     context,
                     name,
                     tyvars,
+                    erased_kind_variables,
                     cons: Vec::new(),
                     deriving: Vec::new(),
                     loc,
@@ -491,6 +509,7 @@ impl Parser {
                     context,
                     name,
                     tyvars,
+                    erased_kind_variables,
                     cons: Vec::new(),
                     deriving: Vec::new(),
                     loc,
@@ -535,6 +554,7 @@ impl Parser {
             context,
             name,
             tyvars,
+            erased_kind_variables,
             cons,
             deriving,
             loc,
@@ -1338,7 +1358,7 @@ impl Parser {
     fn class_decl(&mut self, loc: Loc) -> PResult<Decl> {
         self.expect_kw(Kw::Class)?;
         let context = self.try_context();
-        let head = self.btype()?;
+        let (head, erased_kind_variables) = self.head_with_kind_variables()?;
         let head_loc = head.loc();
         let (name, tyvars) = self.decl_head(head)?;
         if tyvars.len() != 1 && !self.exts.is_on("MultiParamTypeClasses") {
@@ -1394,6 +1414,7 @@ impl Parser {
             context,
             name,
             tyvars,
+            erased_kind_variables,
             fundeps,
             decls,
             minimal,
@@ -1419,7 +1440,7 @@ impl Parser {
         }
         let mut p = Parser {
             toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: self.exts.clone(),
-            kind_annotations: Vec::new(), static_count: 0,
+            kind_annotations: Vec::new(), head_kind_arguments: None, static_count: 0,
         };
         if p.at_eof() {
             return Ok(Minimal::All(Vec::new()));
