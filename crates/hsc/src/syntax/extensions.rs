@@ -224,6 +224,7 @@ fn implied_by(name: &str) -> &'static [&'static str] {
         "FlexibleInstances" => &["TypeSynonymInstances"],
         "TypeFamilies" => &["MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
         "TypeFamilyDependencies" => &["TypeFamilies", "MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
+        "TypeOperators" => &["ExplicitNamespaces"],
         "RecordWildCards" => &["DisambiguateRecordFields"],
         "RankNTypes" | "ScopedTypeVariables" | "ExistentialQuantification"
         | "LiberalTypeSynonyms" | "QuantifiedConstraints" => &["ExplicitForAll"],

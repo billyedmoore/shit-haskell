@@ -763,16 +763,31 @@ impl Parser {
 
     fn ie_list(&mut self, mut locations: Option<&mut Vec<Loc>>) -> PResult<Vec<IEItem>> {
         self.expect_special('(')?;
+        let exporting = locations.is_some();
         let mut items = Vec::new();
         loop {
             if self.at_special(')') {
                 self.bump();
                 break;
             }
-            if let Some(locations) = &mut locations {
-                locations.push(self.loc());
+            let loc = self.loc();
+            let item = self.ie_item()?;
+            if matches!(item, IEItem::Thing { subs: Subs::AllPlus(_), .. }) {
+                let problem = if !exporting {
+                    Some("An import list cannot mix ‘..’ with named members\nUse this form in a module export to bundle pattern synonyms.")
+                } else if !self.exts.is_on("PatternSynonyms") {
+                    Some("Mixing ‘..’ with named export members requires PatternSynonyms")
+                } else {
+                    None
+                };
+                if let Some(msg) = problem {
+                    return Err(ParseError { line: loc.line, col: loc.col, msg: msg.into() });
+                }
             }
-            items.push(self.ie_item()?);
+            if let Some(locations) = &mut locations {
+                locations.push(loc);
+            }
+            items.push(item);
             if self.at_special(',') {
                 self.bump();
                 continue;
@@ -791,6 +806,9 @@ impl Parser {
         if self.at_kw(Kw::Type) {
             // ExplicitNamespaces: `type (op)` or `type T`. A parenthesised operator after `type`
             // names a type-level operator, not a value.
+            if !self.exts.is_on("ExplicitNamespaces") {
+                return self.err("The ‘type’ namespace requires ExplicitNamespaces");
+            }
             self.bump();
             if self.at_special('(') {
                 let name = self.paren_op()?;
@@ -799,13 +817,18 @@ impl Parser {
                 return Ok(IEItem::Thing { name, subs });
             }
         }
-        if self.at_varid("pattern") && matches!(self.peek_raw(1), Tok::ConId(_) | Tok::QConId(..)) {
-            self.bump();
-            return Ok(IEItem::Pattern(self.qcon()?));
-        }
-        if self.at_varid("pattern") && *self.peek_raw(1) == Tok::Special('(') && matches!(self.peek_raw(2), Tok::ConSym(_) | Tok::QConSym(..)) {
-            self.bump();
-            return Ok(IEItem::Pattern(self.paren_op()?));
+        if self.at_varid("pattern") {
+            let constructor = matches!(self.peek_raw(1), Tok::ConId(_) | Tok::QConId(..));
+            let operator = *self.peek_raw(1) == Tok::Special('(')
+                && matches!(self.peek_raw(2), Tok::ConSym(_) | Tok::QConSym(..));
+            if constructor || operator {
+                if !self.exts.is_on("PatternSynonyms") {
+                    return self.err("The ‘pattern’ namespace requires PatternSynonyms");
+                }
+                self.bump();
+                let name = if operator { self.paren_op()? } else { self.qcon()? };
+                return Ok(IEItem::Pattern(name));
+            }
         }
         if self.at_special('(') {
             let name = self.paren_op()?;
