@@ -986,8 +986,8 @@ impl Driver {
                     let show_pred = |pred: &crate::tc::types::Pred| self.checker.show_pred(pred);
                     let qualify_context = full_scheme.preds != boot_scheme.preds
                         && full_scheme.preds.iter().map(show_pred).eq(boot_scheme.preds.iter().map(show_pred));
-                    let implementation = show_boot_signature(&self.checker, full_scheme, &implementation, qualify_context);
-                    let boot = show_boot_signature(&self.checker, &boot_scheme, &boot, qualify_context);
+                    let implementation = self.checker.show_signature(full_scheme, &implementation, qualify_context, None);
+                    let boot = self.checker.show_signature(&boot_scheme, &boot, qualify_context, None);
                     return Err(crate::diagnostic::error(&shown, Some(&src), signature_loc.unwrap_or(module_loc), &format!(
                         "The type of ‘{name}’ differs from its hs-boot signature\nImplementation: {name} :: {}\nHs-boot file:   {name} :: {}",
                         implementation, boot
@@ -2125,23 +2125,6 @@ fn comparable_boot_signature(scheme: &crate::tc::types::Scheme, allow_polymorphi
         && scheme.preds.iter().all(|pred| {
             !pred.args.is_empty() && pred.args.iter().all(|arg| matches!(arg, Ty::Gen(i) if variables.contains(i)))
         })
-}
-
-fn show_boot_signature(checker: &Checker, scheme: &crate::tc::types::Scheme, body: &str, qualified: bool) -> String {
-    use crate::tc::types::{show_pred_with_names, Ty};
-    let mut signature = String::new();
-    if scheme.nvars != 0 {
-        let variables: Vec<_> = (0..scheme.nvars).map(|i| checker.show(&Ty::Gen(i))).collect();
-        signature.push_str(&format!("forall {}. ", variables.join(" ")));
-    }
-    let context: Vec<_> = scheme.preds.iter().map(|pred| show_pred_with_names(&checker.metas, pred, qualified)).collect();
-    match context.as_slice() {
-        [] => {}
-        [pred] => signature.push_str(&format!("{pred} => ")),
-        _ => signature.push_str(&format!("({}) => ", context.join(", "))),
-    }
-    signature.push_str(body);
-    signature
 }
 
 #[cfg(test)]

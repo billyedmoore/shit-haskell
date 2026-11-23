@@ -500,6 +500,15 @@ impl Checker {
     /// Solves what can be solved. Returns evidence bindings and the residual wanteds
     /// that still mention unsolved unification variables.
     pub fn solve(&mut self, wanteds: Vec<Wanted>) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
+        self.solve_constraints(wanteds, false)
+    }
+
+    /// Leaves missing constraints for a caller that knows the context to report.
+    pub(super) fn solve_allowing_unsolved(&mut self, wanteds: Vec<Wanted>) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
+        self.solve_constraints(wanteds, true)
+    }
+
+    fn solve_constraints(&mut self, wanteds: Vec<Wanted>, keep_unsolved: bool) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
         self.retry_deferred()?;
         let mut binds = Vec::new();
         let mut pending = wanteds;
@@ -507,7 +516,7 @@ impl Checker {
         // improvement, an equality) has made their types known.
         for _round in 0..64 {
             let before: Vec<Pred> = pending.iter().map(|w| self.metas_zonk_pred(&w.pred)).collect();
-            let (b, residual) = self.solve_round(std::mem::take(&mut pending))?;
+            let (b, residual) = self.solve_round(std::mem::take(&mut pending), keep_unsolved)?;
             binds.extend(b);
             let progressed = residual.len() != before.len()
                 || residual.iter().zip(&before).any(|(w, p)| self.metas_zonk_pred(&w.pred) != *p);
@@ -520,7 +529,7 @@ impl Checker {
     }
 
     /// One pass of the solver over a list of wanteds.
-    fn solve_round(&mut self, wanteds: Vec<Wanted>) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
+    fn solve_round(&mut self, wanteds: Vec<Wanted>, keep_unsolved: bool) -> TR<(Vec<(String, Core)>, Vec<Wanted>)> {
         let mut work = wanteds;
         let mut binds = Vec::new();
         let mut residual = Vec::new();
@@ -585,6 +594,10 @@ impl Checker {
                 // whose dictionary must be forwarded rather than replaced by unit.
                 if let Some(ev) = self.find_given(&pred) {
                     binds.push((w.ev.clone(), ev));
+                    continue;
+                }
+                if keep_unsolved {
+                    residual.push(Wanted { pred, ..w });
                     continue;
                 }
                 // A stuck family constraint is taken to hold: its evidence is never inspected,
@@ -762,7 +775,7 @@ impl Checker {
                     binds.push((w.ev.clone(), core));
                 }
                 None => {
-                    if self.pred_has_metas(&pred) {
+                    if keep_unsolved || self.pred_has_metas(&pred) {
                         residual.push(Wanted { pred, ..w });
                     } else {
                         let msg = format!("No instance for ({}) arising from a use of a class method", self.show_pred(&pred));

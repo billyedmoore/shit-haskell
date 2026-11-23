@@ -243,6 +243,29 @@ impl Checker {
         types::show_pred(&self.metas, p)
     }
 
+    pub(crate) fn show_signature(
+        &self, scheme: &Scheme, body: &str, qualified: bool, binders: Option<&[String]>,
+    ) -> String {
+        let mut signature = String::new();
+        if scheme.nvars != 0 {
+            let variables = binders.map_or_else(
+                || (0..scheme.nvars).map(|i| self.show(&Ty::Gen(i))).collect::<Vec<_>>().join(" "),
+                |names| names.join(" "),
+            );
+            signature.push_str(&format!("forall {variables}. "));
+        }
+        let context: Vec<_> = scheme.preds.iter()
+            .map(|pred| types::show_pred_with_names(&self.metas, pred, qualified))
+            .collect();
+        match context.as_slice() {
+            [] => {}
+            [pred] => signature.push_str(&format!("{pred} => ")),
+            _ => signature.push_str(&format!("({}) => ", context.join(", "))),
+        }
+        signature.push_str(body);
+        signature
+    }
+
     /// Looks up the scheme of a variable: locals and this module's top-level bindings
     /// first, then the global environment.
     /// The real defining module of a wired-in name written `Base.x`: the module being checked

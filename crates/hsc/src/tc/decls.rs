@@ -1,11 +1,11 @@
 //! Module-level declarations: types, constructors, classes, instances, foreign imports.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::bind::explicit_binders;
 use super::convert::{global_tycon_name, tvar_index};
 use super::env::{ClassInfo, InstInfo, Synonym, TyConInfo};
-use super::types::{subst_gen, Pred, Scheme, Ty};
+use super::types::{subst_gen, subst_gen_pred, Pred, Scheme, Ty};
 use super::{count_args, Checker, Given, TcError, Wanted, TR};
 use crate::core::{Alt, Core, TopBind};
 use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Loc, Minimal, Module, QName, Type};
@@ -1381,6 +1381,91 @@ impl Checker {
         Some(())
     }
 
+    /// Check that a caller of the class method can use the instance signature.
+    /// The returned wrapper supplies its dictionaries in the order it expects.
+    fn instance_signature_adapter(
+        &mut self, method: &str, supplied: &Scheme, required: &Scheme, instance_vars: &[String], loc: Loc,
+    ) -> TR<impl FnOnce(Core) -> Core> {
+        let binder_names = |names: &[String]| {
+            let mut used: HashSet<_> = instance_vars.iter().chain(names).cloned().collect();
+            names.iter().map(|name| {
+                if instance_vars.contains(name) {
+                    (1..).map(|i| format!("{name}{i}")).find(|n| used.insert(n.clone())).unwrap()
+                } else {
+                    name.clone()
+                }
+            }).collect::<Vec<_>>()
+        };
+        let class_names = binder_names(&required.names);
+        let givens = self.givens.len();
+        let refinements = self.metas.skol_binds.clone();
+        let kinds = self.skol_kinds.clone();
+        let coercions = self.coercions.len();
+        let deferred = std::mem::take(&mut self.deferred_eqs);
+        let result = self.with_application_scope(|tc| {
+            tc.loc = loc;
+            let skolems: Vec<_> = class_names.iter().map(|name| tc.metas.fresh_skolem(name)).collect();
+            let expected = subst_gen(&required.ty, &skolems);
+            let params: Vec<_> = required.preds.iter().map(|_| tc.fresh_name("imd")).collect();
+            for (pred, name) in required.preds.iter().zip(&params) {
+                tc.add_given(Given { pred: subst_gen_pred(pred, &skolems), ev: Core::Var(name.clone()) });
+            }
+            let (actual, preds, _) = tc.metas.instantiate(supplied, tc.level);
+            tc.unify_at(&actual, &expected)?;
+            let wanted: Vec<_> = preds.into_iter().map(|pred| Wanted {
+                pred, ev: tc.fresh_name("imw"), loc,
+            }).collect();
+            let args: Vec<_> = wanted.iter().map(|w| Core::Var(w.ev.clone())).collect();
+            let (evidence, residual) = tc.solve_allowing_unsolved(wanted)?;
+            if let Some(w) = residual.first() {
+                let pred = tc.metas_zonk_pred(&w.pred);
+                return tc.err(format!("Could not deduce ‘{}’ from the class method and instance contexts", tc.show_pred(&pred)));
+            }
+            tc.retry_deferred()?;
+            if let Some((a, b, _)) = tc.deferred_eqs.first() {
+                let (a, b) = tc.show_type_pair(a, b);
+                return tc.err(format!("Could not establish the type equality ‘{a} ~ {b}’"));
+            }
+            Ok((params, evidence, args))
+        });
+        self.givens.truncate(givens);
+        self.metas.skol_binds = refinements;
+        self.skol_kinds = kinds;
+        self.coercions.truncate(coercions);
+        self.deferred_eqs = deferred;
+        let (params, evidence, args) = result.map_err(|error| {
+            let qualified = |t| super::types::show_ty_qualified(&self.metas, t);
+            let qualify_type = self.show(&supplied.ty) == self.show(&required.ty)
+                && qualified(&supplied.ty) != qualified(&required.ty);
+            let qualify_context = supplied.preds != required.preds
+                && supplied.preds.iter().map(|p| self.show_pred(p)).eq(required.preds.iter().map(|p| self.show_pred(p)));
+            let mut show = |scheme: &Scheme, names: &[String]| {
+                let vars: Vec<_> = names.iter().map(|name| self.metas.fresh_skolem(name)).collect();
+                let ty = subst_gen(&scheme.ty, &vars);
+                let body = if qualify_type { super::types::show_ty_qualified(&self.metas, &ty) } else { self.show(&ty) };
+                let display = Scheme {
+                    preds: scheme.preds.iter().map(|p| subst_gen_pred(p, &vars)).collect(),
+                    ..scheme.clone()
+                };
+                self.show_signature(&display, &body, qualify_context, Some(names))
+            };
+            let instance = show(supplied, &binder_names(&supplied.names));
+            let class = show(required, &class_names);
+            TcError {
+                loc,
+                msg: format!(
+                    "Instance signature for ‘{method}’ is not general enough\n{}\nInstance signature: {instance}\nRequired by class:  {class}",
+                    error.msg,
+                ),
+            }
+        })?;
+        Ok(move |body| {
+            let body = args.into_iter().fold(body, |body, arg| Core::App(Box::new(body), Box::new(arg)));
+            let body = super::expr::wrap_let(evidence, body);
+            params.into_iter().rev().fold(body, |body, name| Core::Lam(name, Box::new(body)))
+        })
+    }
+
     /// Builds the dictionary for an instance and checks its methods.
     fn instance_body(&mut self, id: &InstDecl) -> TR<()> {
         // GADT refinements made inside the declaration end with it.
@@ -1536,22 +1621,15 @@ impl Checker {
             });
             let field = match impl_decl {
                 Some((clauses, loc)) => {
-                    let mut sch = instantiate_method(mscheme, info.nparams, &head);
+                    let sch = instantiate_method(mscheme, info.nparams, &head);
                     let method_key = format!("{}.{occ}@inst", self.module);
-                    let mut scoped_binders = 0;
-                    if let Some(sig_ty) = inst_sig {
-                        let binders = explicit_binders(sig_ty);
-                        if let Ok(inst_sch) = self.sig_scheme(sig_ty, &[]) {
-                            if inst_sch.preds.len() == sch.preds.len() {
-                                sch = inst_sch;
-                                scoped_binders = binders;
-                            } else if binders > 0 && inst_sch.nvars == sch.nvars {
-                                sch.names = inst_sch.names;
-                                scoped_binders = binders;
-                            }
-                        }
-                    }
-                    let core = self.check_method(clauses, &sch, &method_key, loc, scoped_binders)?;
+                    let core = if let Some(sig_ty) = inst_sig {
+                        let inst_sch = self.sig_scheme(sig_ty, &[])?;
+                        let adapt = self.instance_signature_adapter(&occ, &inst_sch, &sch, &tvs, sig_ty.loc())?;
+                        adapt(self.check_method(clauses, &inst_sch, &method_key, loc, explicit_binders(sig_ty))?)
+                    } else {
+                        self.check_method(clauses, &sch, &method_key, loc, 0)?
+                    };
                     let name = self.fresh_name("mi");
                     method_binds.push((name.clone(), core));
                     Core::Var(name)

@@ -1,0 +1,3 @@
+instance_method_signature_rigid_family.hs:7:13: error:
+Could not establish the type equality ‘G [a] ~ F [a]’
+Required by class:  [a] -> F [a]

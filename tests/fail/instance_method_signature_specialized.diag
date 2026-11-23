@@ -1,0 +1,3 @@
+instance_method_signature_specialized.hs:4:13: error:
+Instance signature for ‘method’ is not general enough
+Required by class:  forall b. Int -> b -> b

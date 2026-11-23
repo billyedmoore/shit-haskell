@@ -1,0 +1,4 @@
+instance_method_signature_concrete_mismatch.hs:4:13: error:
+Instance signature for ‘method’ is not general enough
+Instance signature: Bool -> Bool
+Required by class:  Int -> Int
