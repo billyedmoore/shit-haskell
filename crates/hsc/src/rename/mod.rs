@@ -456,7 +456,15 @@ impl<'a> Renamer<'a> {
         let mut inline_sites = HashMap::new();
         for (i, p) in m.inlines.iter().enumerate() {
             let pragma = if p.inline { "INLINE" } else { "NOINLINE" };
-            let q = self.value_ref_in_scope(&p.name, p.loc, false).ok();
+            // A name the module defines wins even when an import makes it ambiguous
+            // (`lookup` defined here and also in the implicit Prelude).
+            let own_binding = p.name.qual.is_none()
+                && self.own.iter().any(|e| e.kind == EntKind::Var && e.occ() == p.name.name);
+            let q = if own_binding {
+                Some(QName { qual: Some(self.module.clone()), name: p.name.name.clone() })
+            } else {
+                self.value_ref_in_scope(&p.name, p.loc, false).ok()
+            };
             let module = q.as_ref().and_then(|q| q.qual.as_deref()).filter(|m| *m == self.module);
             let (Some(q), Some(module)) = (&q, module) else {
                 return Err(RnError {
