@@ -122,13 +122,23 @@ impl Parser {
     }
 
     pub(super) fn forall_binders(&mut self) -> PResult<Vec<TyVarBind>> {
+        self.located_forall_binders()
+            .map(|binders| binders.into_iter().map(|(binder, _)| binder).collect())
+    }
+
+    pub(super) fn located_forall_binders(&mut self) -> PResult<Vec<(TyVarBind, Loc)>> {
         if !self.exts.is_on("ExplicitForAll") {
             return self.err("Explicit ‘forall’ in a type requires ExplicitForAll");
         }
-        self.quantified_binders()
+        self.located_quantified_binders()
     }
 
     pub(super) fn quantified_binders(&mut self) -> PResult<Vec<TyVarBind>> {
+        self.located_quantified_binders()
+            .map(|binders| binders.into_iter().map(|(binder, _)| binder).collect())
+    }
+
+    fn located_quantified_binders(&mut self) -> PResult<Vec<(TyVarBind, Loc)>> {
         self.bump();
         let mut binders = Vec::new();
         let mut locations = HashMap::new();
@@ -144,7 +154,7 @@ impl Parser {
                     ),
                 });
             }
-            binders.push(binder);
+            binders.push((binder, loc));
         }
         self.bump();
         Ok(binders)

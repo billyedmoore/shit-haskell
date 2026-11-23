@@ -512,9 +512,9 @@ impl Parser {
     /// instance becomes a data type of its own, named after the family and the instance's place,
     /// over the variables of the instance head; and the family equation `F t1 .. tn = R vs`.
     fn data_instance(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
+        let binders = self.family_forall()?;
         let context = self.datatype_context()?;
-        let (head, arguments) = self.head_with_kind_arguments()?;
-        let mut erased_kind_variables = self.family_pattern_kind_variables(&arguments)?;
+        let (head, mut erased_kind_variables) = self.family_head(binders.as_deref())?;
         let mut args = Vec::new();
         let mut t = head;
         while let Type::App(f, a) = t {
@@ -681,7 +681,8 @@ impl Parser {
         if self.at_kw(Kw::Instance) {
             self.require_type_families()?;
             self.bump();
-            return self.type_instance(loc);
+            let binders = self.family_forall()?;
+            return self.type_instance(loc, binders.as_deref());
         }
         if self.at_varid("role") {
             if !self.exts.is_on("RoleAnnotations") {
@@ -796,7 +797,8 @@ impl Parser {
                     p.bump();
                     return Ok(());
                 }
-                let (head, equation) = p.type_equation()?;
+                let binders = p.family_forall()?;
+                let (head, equation) = p.type_equation(binders.as_deref())?;
                 if head.name != name || head.qual.as_deref().is_some_and(|qual| qual != module) {
                     let actual = match head.qual {
                         Some(qual) => format!("{qual}.{}", head.name),
@@ -898,9 +900,16 @@ impl Parser {
         Ok(names)
     }
 
+    fn family_forall(&mut self) -> PResult<Option<Vec<(TyVarBind, Loc)>>> {
+        if self.at_varid("forall") {
+            return self.located_forall_binders().map(Some);
+        }
+        Ok(None)
+    }
+
     /// `type instance F t1 .. tn = rhs`, after `type instance`.
-    fn type_instance(&mut self, loc: Loc) -> PResult<Decl> {
-        let (name, equation) = self.type_equation()?;
+    fn type_instance(&mut self, loc: Loc, binders: Option<&[(TyVarBind, Loc)]>) -> PResult<Decl> {
+        let (name, equation) = self.type_equation(binders)?;
         Ok(Decl::TypeInstance {
             name,
             equation,
@@ -909,10 +918,23 @@ impl Parser {
     }
 
     /// `F t1 .. tn = rhs`: the family name and the equation.
-    fn type_equation(&mut self) -> PResult<(QName, TypeEquation)> {
-        let (lhs, arguments) = self.head_with_kind_arguments()?;
-        let erased_kind_variables = self.family_pattern_kind_variables(&arguments)?;
+    fn type_equation(&mut self, binders: Option<&[(TyVarBind, Loc)]>) -> PResult<(QName, TypeEquation)> {
+        let (lhs, erased_kind_variables) = self.family_head(binders)?;
         self.equation_from(lhs, erased_kind_variables)
+    }
+
+    fn family_head(&mut self, binders: Option<&[(TyVarBind, Loc)]>) -> PResult<(Type, Vec<String>)> {
+        let (lhs, arguments) = self.head_with_kind_arguments()?;
+        let mut erased_kind_variables = self.family_pattern_kind_variables(&arguments)?;
+        if let Some(binders) = binders {
+            check_family_binders(binders, &lhs, &arguments)?;
+            for (binder, _) in binders {
+                if let Some(kind) = &binder.kind {
+                    kind.extend_variable_scope(&mut erased_kind_variables);
+                }
+            }
+        }
+        Ok((lhs, erased_kind_variables))
     }
 
     /// The rest of an equation whose left-hand side has been parsed.
@@ -1670,7 +1692,7 @@ impl Parser {
             self.bump();
             if self.at_kw(Kw::Instance) {
                 self.bump();
-                return self.type_instance(loc);
+                return self.type_instance(loc, None);
             }
             if self.at_varid("family") {
                 self.bump();
@@ -1745,10 +1767,11 @@ impl Parser {
 
     fn instance_signature(&mut self) -> PResult<(Vec<TyVarBind>, Vec<Type>, Type, bool)> {
         let binders = if self.at_varid("forall") { Some(self.forall_binders()?) } else { None };
-        let context = self.try_context();
-        let (head, unboxed_head) = self.instance_head()?;
+        let ((context, (head, unboxed_head)), arguments) = self.with_kind_arguments(|p| {
+            Ok((p.try_context(), p.instance_head()?))
+        })?;
         if let Some(binders) = &binders {
-            check_instance_binders(binders, &context, &head)?;
+            check_instance_binders(binders, &context, &head, &arguments)?;
         }
         Ok((binders.unwrap_or_default(), context, head, unboxed_head))
     }
@@ -2051,7 +2074,9 @@ impl Parser {
     }
 }
 
-fn check_instance_binders(binders: &[TyVarBind], context: &[Type], head: &Type) -> PResult<()> {
+fn check_instance_binders(
+    binders: &[TyVarBind], context: &[Type], head: &Type, arguments: &[KindArgument],
+) -> PResult<()> {
     let unbound = |name: &str, loc: Loc| super::ParseError {
         line: loc.line,
         col: loc.col,
@@ -2066,10 +2091,66 @@ fn check_instance_binders(binders: &[TyVarBind], context: &[Type], head: &Type) 
         }
         scope.push(binder.name.as_str());
     }
-    for ty in context.iter().chain(std::iter::once(head)) {
-        if let Some((name, loc)) = ty.first_unbound_variable(|name, _| scope.contains(&name)) {
-            return Err(unbound(name, loc));
+    let types = context.iter().chain(std::iter::once(head)).chain(arguments.iter().map(|arg| &arg.ty));
+    if let Some((name, loc)) = types
+        .filter_map(|ty| ty.first_unbound_variable(|name, _| scope.contains(&name)))
+        .min_by_key(|(_, loc)| *loc)
+    {
+        return Err(unbound(name, loc));
+    }
+    Ok(())
+}
+
+fn check_family_binders(
+    binders: &[(TyVarBind, Loc)], head: &Type, arguments: &[KindArgument],
+) -> PResult<()> {
+    let unbound = |name: &str, loc: Loc| super::ParseError {
+        line: loc.line,
+        col: loc.col,
+        msg: format!("Not in scope: type variable ‘{name}’\nBind it in the ‘forall’ for this family instance."),
+    };
+    let mut scope = Vec::new();
+    for (binder, _) in binders {
+        if let Some(kind) = &binder.kind {
+            if let Some((name, loc)) = kind.first_unbound_variable(|name, _| scope.contains(&name)) {
+                return Err(unbound(name, loc));
+            }
         }
+        scope.push(binder.name.as_str());
+    }
+    let mut used = Vec::new();
+    let types = std::iter::once(head).chain(arguments.iter().map(|argument| &argument.ty));
+    if let Some((name, loc)) = types
+        .filter_map(|ty| ty.first_unbound_variable(|name, _| scope.contains(&name)))
+        .min_by_key(|(_, loc)| *loc)
+    {
+        return Err(unbound(name, loc));
+    }
+    head.extend_variable_scope(&mut used);
+    for argument in arguments {
+        argument.ty.extend_variable_scope(&mut used);
+    }
+    // A kind variable can be used by a pattern through the kind of another binder.
+    for (binder, _) in binders.iter().rev() {
+        if used.contains(&binder.name) {
+            if let Some(kind) = &binder.kind {
+                kind.extend_variable_scope(&mut used);
+            }
+        }
+    }
+    let unused: Vec<_> = binders.iter().filter(|(binder, _)| !used.contains(&binder.name)).collect();
+    if let Some((_, loc)) = unused.first() {
+        let names = unused.iter().map(|(binder, _)| format!("‘{}’", binder.name)).collect::<Vec<_>>().join(", ");
+        let message = if unused.len() == 1 {
+            format!("Type variable {names} is bound by ‘forall’ but does not occur in a family pattern")
+        } else {
+            format!("Type variables {names} are bound by ‘forall’ but do not occur in any family pattern")
+        };
+        return Err(super::ParseError {
+            line: loc.line,
+            col: loc.col,
+            msg: format!("{message}\nUse each variable on the left-hand side or remove its binder."),
+        });
     }
     Ok(())
 }
