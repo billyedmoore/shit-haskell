@@ -433,7 +433,7 @@ impl<'a> Renamer<'a> {
         for (i, r) in m.rules.into_iter().enumerate() {
             // A binder of a polymorphic (rank-2) type, as "fold/build"'s `g`, cannot be checked
             // as a parameter here: those rules are built into the simplifier instead.
-            if r.binders.iter().any(|(_, t)| t.as_ref().is_some_and(|t| matches!(t, crate::syntax::ast::Type::Forall(..)))) {
+            if r.binders.iter().any(|(_, t)| t.as_ref().is_some_and(|t| matches!(t, crate::syntax::ast::Type::Forall { .. }))) {
                 continue;
             }
             match self.rename_top_decl(rule_binding(i, r)) {
@@ -2340,7 +2340,9 @@ impl<'a> Renamer<'a> {
             Type::Fun(a, b) => Type::Fun(Box::new(self.ty(*a)?), Box::new(self.ty(*b)?)),
             Type::List(t, loc) => Type::List(Box::new(self.ty(*t)?), loc),
             Type::Tuple(ts, loc) => Type::Tuple(self.types(ts)?, loc),
-            Type::Forall(vs, body) => Type::Forall(self.tyvar_binds(vs)?, Box::new(self.ty(*body)?)),
+            Type::Forall { binders, body, parenthesized } => Type::Forall {
+                binders: self.tyvar_binds(binders)?, body: Box::new(self.ty(*body)?), parenthesized,
+            },
             Type::Qual(ctx, body) => Type::Qual(self.types(ctx)?, Box::new(self.ty(*body)?)),
             Type::Sig(t, k) => Type::Sig(Box::new(self.ty(*t)?), Box::new(self.ty(*k)?)),
             Type::OpChain(items, loc) => {
@@ -3086,7 +3088,7 @@ fn merge_contexts(t: &Type) -> Type {
     let mut cur = t;
     loop {
         match cur {
-            Type::Forall(bs, body) => {
+            Type::Forall { binders: bs, body, .. } => {
                 binds.extend(bs.iter().cloned());
                 cur = body;
             }
@@ -3102,7 +3104,7 @@ fn merge_contexts(t: &Type) -> Type {
     if binds.is_empty() {
         body
     } else {
-        Type::Forall(binds, Box::new(body))
+        Type::Forall { binders: binds, body: Box::new(body), parenthesized: false }
     }
 }
 
@@ -3279,7 +3281,7 @@ fn closed_arg_types(sig: &Type) -> Vec<Option<Type>> {
     let mut t = sig;
     loop {
         match t {
-            Type::Forall(_, b) => t = b,
+            Type::Forall { body, .. } => t = body,
             Type::Qual(_, b) => t = b,
             _ => break,
         }

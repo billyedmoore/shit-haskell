@@ -1189,7 +1189,7 @@ impl Conv<'_> {
                 if binders.is_empty() {
                     body
                 } else {
-                    Type::Forall(binders, Box::new(body))
+                    Type::Forall { binders, body: Box::new(body), parenthesized: false }
                 }
             }
             "SigT" => Type::Sig(Box::new(self.ty(&a[0])?), Box::new(self.ty(&a[1])?)),
@@ -1396,7 +1396,7 @@ impl Reify {
             Type::Con(q, _) if q.name == "*" || q.name == "Type" => self.syn("StarT"),
             Type::Fun(a, b) => appt(appt(self.syn("ArrowT"), self.kind_ty(a)), self.kind_ty(b)),
             Type::App(f, a) => appt(self.kind_ty(f), self.kind_ty(a)),
-            Type::Sig(x, _) | Type::Forall(_, x) | Type::Qual(_, x) => self.kind_ty(x),
+            Type::Sig(x, _) | Type::Forall { body: x, .. } | Type::Qual(_, x) => self.kind_ty(x),
             _ => self.ty(t),
         }
     }
@@ -1557,7 +1557,7 @@ impl Reify {
             Type::App(f, a) | Type::Fun(f, a) => Self::ast_var_arity(f, v).max(Self::ast_var_arity(a, v)),
             Type::List(e, _) | Type::Sig(e, _) => Self::ast_var_arity(e, v),
             Type::Tuple(ts, _) => ts.iter().map(|x| Self::ast_var_arity(x, v)).max().unwrap_or(0),
-            Type::Forall(bs, b) => {
+            Type::Forall { binders: bs, body: b, .. } => {
                 if bs.iter().any(|tv| tv.name == v) {
                     0
                 } else {
@@ -1724,7 +1724,7 @@ impl Reify {
             Type::Fun(a, b) => appt(appt(self.syn("ArrowT"), self.ty(a)), self.ty(b)),
             Type::List(e, _) => appt(self.syn("ListT"), self.ty(e)),
             Type::Tuple(ts, _) => ts.iter().fold(tuple(ts.len()), |acc, x| appt(acc, self.ty(x))),
-            Type::Sig(x, _) | Type::Forall(_, x) | Type::Qual(_, x) => self.ty(x),
+            Type::Sig(x, _) | Type::Forall { body: x, .. } | Type::Qual(_, x) => self.ty(x),
             Type::Lit(Lit::Int(n), _) => app(self.syn("LitT"), app(self.syn("NumTyLit"), Expr::Lit(Lit::Int(n.clone()), loc))),
             Type::Lit(Lit::Str(s), _) => app(self.syn("LitT"), app(self.syn("StrTyLit"), self.str(s))),
             _ => self.syn("WildCardT"),

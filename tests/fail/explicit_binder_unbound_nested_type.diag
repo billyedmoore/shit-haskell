@@ -1,0 +1,2 @@
+explicit_binder_unbound_nested_type.hs:3:32: error:
+Not in scope: type variable ‘c’

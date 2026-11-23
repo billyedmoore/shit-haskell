@@ -31,7 +31,7 @@ impl Parser {
             }
             self.bump();
             let body = self.sigtype()?;
-            return Ok(Type::Forall(vars, Box::new(body)));
+            return Ok(Type::Forall { binders: vars, body: Box::new(body), parenthesized: false });
         }
         let t = self.type_expr()?;
         if self.at_res(ROp::DArrow) {
@@ -371,7 +371,11 @@ impl Parser {
                 }
                 self.expect_special(')')?;
                 if elems.len() == 1 {
-                    Ok(elems.pop().expect("one element"))
+                    let mut ty = elems.pop().expect("one element");
+                    if let Type::Forall { parenthesized, .. } = &mut ty {
+                        *parenthesized = true;
+                    }
+                    Ok(ty)
                 } else {
                     Ok(Type::Tuple(elems, loc))
                 }

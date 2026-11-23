@@ -1,0 +1,2 @@
+explicit_binder_unbound_local_type.hs:4:31: error:
+Not in scope: type variable ‘a’

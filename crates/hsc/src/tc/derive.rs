@@ -1625,7 +1625,7 @@ fn mentions(t: &Type, v: &str) -> bool {
         Type::List(e, _) => mentions(e, v),
         Type::Tuple(ts, _) => ts.iter().any(|x| mentions(x, v)),
         Type::Sig(x, _) => mentions(x, v),
-        Type::Forall(bs, body) => !bs.iter().any(|b| b.name == v) && mentions(body, v),
+        Type::Forall { binders: bs, body, .. } => !bs.iter().any(|b| b.name == v) && mentions(body, v),
         Type::Qual(ctx, body) => ctx.iter().any(|c| mentions(c, v)) || mentions(body, v),
         _ => false,
     }
@@ -1645,7 +1645,7 @@ fn map_fn(checker: &mut Checker, t: &Type, last: &str, f: &str, loc: Loc) -> Opt
         Type::Var(n, _) if n == last => Some(local(f, loc)),
         // A polymorphic field (`forall m. Monad m => StateT s m a`): mapped at each instance;
         // the constructor's argument is checked at the polymorphic type again.
-        Type::Forall(_, body) | Type::Qual(_, body) => map_fn(checker, body, last, f, loc),
+        Type::Forall { body, .. } | Type::Qual(_, body) => map_fn(checker, body, last, f, loc),
         Type::App(g, arg) if !mentions(g, last) => {
             let inner = map_fn(checker, arg, last, f, loc)?;
             Some(app(base_var("fmap", loc), vec![inner]))
@@ -1694,7 +1694,7 @@ fn co_map_fn(checker: &mut Checker, t: &Type, last: &str, f: &str, loc: Loc) -> 
         return None;
     }
     match t {
-        Type::Forall(_, body) | Type::Qual(_, body) => co_map_fn(checker, body, last, f, loc),
+        Type::Forall { body, .. } | Type::Qual(_, body) => co_map_fn(checker, body, last, f, loc),
         // `h :: A[b] -> B[b]` becomes `\x -> co_B (h (map_A x)) :: A[a] -> B[a]`.
         Type::Fun(a, b) => {
             let h = checker.fresh_name("h");

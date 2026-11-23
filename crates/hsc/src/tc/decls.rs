@@ -2037,7 +2037,7 @@ fn check_type_synonym_cycles(module: &str, decls: &[Decl]) -> TR<()> {
                 ctx.iter().for_each(&mut add);
                 add(body);
             }
-            Type::Forall(binders, body) => {
+            Type::Forall { binders, body, .. } => {
                 binders.iter().filter_map(|b| b.kind.as_ref()).for_each(&mut add);
                 add(body);
             }

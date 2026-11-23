@@ -1,0 +1,2 @@
+explicit_binder_no_named_wildcards.hs:3:21: error:
+Not in scope: type variable ‘_b’

@@ -1332,7 +1332,7 @@ impl Driver {
                 }
                 Type::List(e, _) => names(e, out),
                 Type::Tuple(ts, _) => ts.iter().for_each(|x| names(x, out)),
-                Type::Forall(_, b) | Type::Qual(_, b) => names(b, out),
+                Type::Forall { body: b, .. } | Type::Qual(_, b) => names(b, out),
                 Type::Sig(x, _) => names(x, out),
                 Type::OpChain(items, _) => {
                     for it in items {
@@ -1657,6 +1657,7 @@ impl Driver {
         self.checker.monomorphism_restriction = exts.is_on("MonomorphismRestriction");
         self.checker.mono_local_binds = exts.is_on("MonoLocalBinds");
         self.checker.scoped_type_variables = exts.is_on("ScopedTypeVariables");
+        self.checker.named_wildcards = exts.is_on("NamedWildCards");
         self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         self.checker.derive_anyclass = exts.is_on("DeriveAnyClass");

@@ -366,7 +366,7 @@ impl Q<'_, '_> {
                 }
                 acc
             }
-            Type::Forall(binders, body) => {
+            Type::Forall { binders, body, .. } => {
                 let tvs = binders
                     .iter()
                     .map(|b| {

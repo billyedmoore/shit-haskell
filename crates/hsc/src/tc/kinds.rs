@@ -284,7 +284,7 @@ impl Checker {
                 }
                 Ok(Kind::Star)
             }
-            Type::Forall(binders, body) => {
+            Type::Forall { binders, body, .. } => {
                 for b in binders {
                     let k = self.kinds.fresh();
                     vars.insert(b.name.clone(), k);
@@ -352,7 +352,7 @@ impl Checker {
                 kvars.insert(n.clone(), k.clone());
                 k
             }
-            Type::Forall(_, body) => self.kind_from_type_vars(body, kvars),
+            Type::Forall { body, .. } => self.kind_from_type_vars(body, kvars),
             _ => Kind::Star,
         }
     }

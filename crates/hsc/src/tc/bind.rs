@@ -28,7 +28,7 @@ struct Item<'d> {
 /// Only the outer syntactically visible `forall` binds variables in the body.
 pub(super) fn explicit_binders(ty: &Type) -> usize {
     match ty {
-        Type::Forall(binders, _) => binders.len(),
+        Type::Forall { binders, parenthesized: false, .. } => binders.len(),
         _ => 0,
     }
 }
@@ -1026,7 +1026,7 @@ fn kind_vars_of(t: &crate::syntax::ast::Type, in_kind: bool, out: &mut Vec<Strin
         }
         Type::List(e, _) => kind_vars_of(e, in_kind, out),
         Type::Tuple(ts, _) => ts.iter().for_each(|x| kind_vars_of(x, in_kind, out)),
-        Type::Forall(binds, body) => {
+        Type::Forall { binders: binds, body, .. } => {
             for b in binds {
                 if let Some(k) = &b.kind {
                     kind_vars_of(k, true, out);

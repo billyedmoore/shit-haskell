@@ -353,7 +353,7 @@ bin_enum!(Lit { 0 => Prim(a), 1 => Int(a), 2 => Frac(a), 3 => Char(a), 4 => Str(
 bin_struct!(TyVarBind { name, kind });
 bin_enum!(Type {
     0 => Var(a, b), 1 => Con(a, b), 2 => App(a, b), 3 => Fun(a, b), 4 => List(a, b), 5 => Tuple(a, b),
-    6 => Forall(a, b), 7 => Qual(a, b), 8 => Sig(a, b), 9 => OpChain(a, b), 10 => Lit(a, b), 11 => Wild(a),
+    6 => Forall { binders, body, parenthesized }, 7 => Qual(a, b), 8 => Sig(a, b), 9 => OpChain(a, b), 10 => Lit(a, b), 11 => Wild(a),
     12 => Splice(a, b),
 });
 bin_enum!(TypeOpItem { 0 => Operand(a), 1 => Op(a, b) });
@@ -581,7 +581,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 10";
+const MAGIC: &str = "hsc-module-cache 11";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.

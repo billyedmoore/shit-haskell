@@ -100,6 +100,7 @@ pub struct Checker {
     /// Type variables in scope from enclosing signatures, declarations and patterns.
     pub scoped: Vec<(String, Ty)>,
     pub(crate) scoped_type_variables: bool,
+    pub(crate) named_wildcards: bool,
     /// The variables a signature uses in kinds (`(a :: k)`, `TYPE r`), by binding key: they stay
     /// flexible when the binding is checked (kinds are not inferred).
     pub sig_kind_vars: HashMap<String, Vec<String>>,
@@ -188,6 +189,7 @@ impl Checker {
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),
             scoped_type_variables: true,
+            named_wildcards: true,
             sig_kind_vars: HashMap::new(),
             overloaded_strings: false,
             flexible_instances: true,

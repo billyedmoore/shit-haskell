@@ -1,0 +1,2 @@
+Not in scope: type variable ‘_k’
+Bind it before using it in this explicitly quantified type.

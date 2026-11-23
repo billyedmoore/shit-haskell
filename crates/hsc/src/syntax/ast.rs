@@ -459,7 +459,12 @@ pub enum Type {
     List(Box<Type>, Loc),
     /// Tuple type; `Con("()")` is the unit type.
     Tuple(Vec<Type>, Loc),
-    Forall(Vec<TyVarBind>, Box<Type>),
+    Forall {
+        binders: Vec<TyVarBind>,
+        body: Box<Type>,
+        /// Parentheses separate this quantifier from the enclosing signature's binders.
+        parenthesized: bool,
+    },
     /// `context => body`.
     Qual(Vec<Type>, Box<Type>),
     /// `(t :: k)`.
@@ -478,42 +483,75 @@ impl Type {
             Self::Var(_, loc) | Self::Con(_, loc) | Self::List(_, loc) |
             Self::Tuple(_, loc) | Self::OpChain(_, loc) | Self::Lit(_, loc) |
             Self::Wild(loc) | Self::Splice(_, loc) => *loc,
-            Self::App(t, _) | Self::Fun(t, _) | Self::Sig(t, _) | Self::Forall(_, t) => t.loc(),
+            Self::App(t, _) | Self::Fun(t, _) | Self::Sig(t, _) | Self::Forall { body: t, .. } => t.loc(),
             Self::Qual(ctx, body) => ctx.first().map_or_else(|| body.loc(), Type::loc),
         }
     }
 
     /// Named wildcards can be recognized when there are no enclosing type binders.
     pub(crate) fn first_wildcard(&self, named: bool) -> Option<(&str, Loc)> {
-        fn find<'a>(ty: &'a Type, named: bool, bound: &mut Vec<&'a str>) -> Option<(&'a str, Loc)> {
-            match ty {
-                Type::Wild(loc) => Some(("_", *loc)),
-                Type::Var(name, loc) if named && name.starts_with('_') && !bound.contains(&name.as_str()) =>
-                    Some((name, *loc)),
-                Type::App(a, b) | Type::Fun(a, b) | Type::Sig(a, b) =>
-                    find(a, named, bound).or_else(|| find(b, named, bound)),
-                Type::List(t, _) => find(t, named, bound),
-                Type::Forall(vars, body) => {
-                    let depth = bound.len();
-                    let wildcard = vars.iter().find_map(|v| {
-                        let wildcard = v.kind.as_ref().and_then(|k| find(k, named, bound));
-                        bound.push(v.name.as_str());
-                        wildcard
-                    }).or_else(|| find(body, named, bound));
-                    bound.truncate(depth);
-                    wildcard
+        self.find_signature_unbound(|ty, outer_binder_kind| match ty {
+            Type::Wild(loc) => Some(("_", *loc)),
+            Type::Var(name, loc) if named && !outer_binder_kind && name.starts_with('_') => Some((name.as_str(), *loc)),
+            _ => None,
+        })
+    }
+
+    /// The scope predicate also sees whether the variable occurs in an outer binder's kind.
+    pub(crate) fn first_unbound_variable(&self, mut in_scope: impl FnMut(&str, bool) -> bool) -> Option<(&str, Loc)> {
+        self.find_signature_unbound(|ty, outer_binder_kind| match ty {
+            Type::Var(name, loc) if !in_scope(name, outer_binder_kind) => Some((name.as_str(), *loc)),
+            _ => None,
+        })
+    }
+
+    fn find_signature_unbound<'a, T>(&'a self, mut inspect: impl FnMut(&'a Type, bool) -> Option<T>) -> Option<T> {
+        let mut bound = Vec::new();
+        let body = if let Type::Forall { binders, body, parenthesized: false } = self {
+            // The outer binder kinds are resolved before the signature's named wildcards.
+            for binder in binders {
+                if let Some(kind) = &binder.kind {
+                    if let Some(found) = kind.find_unbound(&mut bound, &mut |ty| inspect(ty, true)) {
+                        return Some(found);
+                    }
                 }
-                Type::Qual(ctx, body) =>
-                    ctx.iter().find_map(|t| find(t, named, bound)).or_else(|| find(body, named, bound)),
-                Type::Tuple(ts, _) => ts.iter().find_map(|t| find(t, named, bound)),
-                Type::OpChain(items, _) => items.iter().find_map(|item| match item {
-                    TypeOpItem::Operand(t) => find(t, named, bound),
-                    TypeOpItem::Op(..) => None,
-                }),
-                _ => None,
+                bound.push(binder.name.as_str());
             }
+            body.as_ref()
+        } else {
+            self
+        };
+        body.find_unbound(&mut bound, &mut |ty| inspect(ty, false))
+    }
+
+    fn find_unbound<'a, T>(
+        &'a self, bound: &mut Vec<&'a str>, inspect: &mut impl FnMut(&'a Type) -> Option<T>,
+    ) -> Option<T> {
+        match self {
+            Type::Var(name, _) if !bound.contains(&name.as_str()) => inspect(self),
+            Type::Wild(_) => inspect(self),
+            Type::App(a, b) | Type::Fun(a, b) | Type::Sig(a, b) =>
+                a.find_unbound(bound, inspect).or_else(|| b.find_unbound(bound, inspect)),
+            Type::List(t, _) => t.find_unbound(bound, inspect),
+            Type::Forall { binders, body, .. } => {
+                let depth = bound.len();
+                let found = binders.iter().find_map(|binder| {
+                    let found = binder.kind.as_ref().and_then(|kind| kind.find_unbound(bound, inspect));
+                    bound.push(binder.name.as_str());
+                    found
+                }).or_else(|| body.find_unbound(bound, inspect));
+                bound.truncate(depth);
+                found
+            }
+            Type::Qual(ctx, body) =>
+                ctx.iter().find_map(|ty| ty.find_unbound(bound, inspect)).or_else(|| body.find_unbound(bound, inspect)),
+            Type::Tuple(types, _) => types.iter().find_map(|ty| ty.find_unbound(bound, inspect)),
+            Type::OpChain(items, _) => items.iter().find_map(|item| match item {
+                TypeOpItem::Operand(ty) => ty.find_unbound(bound, inspect),
+                TypeOpItem::Op(..) => None,
+            }),
+            _ => None,
         }
-        find(self, named, &mut Vec::new())
     }
 }
 

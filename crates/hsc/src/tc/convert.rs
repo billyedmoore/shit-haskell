@@ -73,7 +73,7 @@ impl Checker {
             // A nested forall is approximated by quantifying its variables at the
             // enclosing signature. This accepts rank-N programs whose uses are
             // instantiation-compatible, such as `runST`, without checking them rank-N.
-            Type::Forall(binders, body) => {
+            Type::Forall { binders, body, .. } => {
                 // A nested polymorphic type: its variables are bound here, not by the signature.
                 let mut ids = Vec::with_capacity(binders.len());
                 let mark = self.bound_scope.len();
@@ -139,7 +139,7 @@ impl Checker {
     pub fn convert_context_item(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Vec<Pred>> {
         // QuantifiedConstraints: `forall x. ctx => C t` or `ctx => C t` in a context is a
         // predicate holding that polymorphic/implication type (see `solve::QUANTIFIED_CLASS`).
-        if let Type::Forall(..) | Type::Qual(..) = t {
+        if let Type::Forall { .. } | Type::Qual(..) = t {
             let ty = match self.convert_type(t, tvs)? {
                 f @ Ty::Forall(..) => f,
                 Ty::Qual(preds, body) => Ty::Forall(Vec::new(), preds, body),
@@ -223,7 +223,7 @@ impl Checker {
         let mut cur = t;
         loop {
             match cur {
-                Type::Forall(binders, body) => {
+                Type::Forall { binders, body, .. } => {
                     for b in binders {
                         tvar_index(tvs, &b.name);
                     }
@@ -246,6 +246,20 @@ impl Checker {
 
     /// The scheme of a signature. Free type variables are quantified in order of appearance.
     pub fn sig_scheme(&mut self, t: &Type, fixed: &[String]) -> TR<Scheme> {
+        if matches!(t, Type::Forall { parenthesized: false, .. }) {
+            let in_scope = |name: &str, outer_binder_kind: bool| {
+                fixed.iter().any(|binder| binder == name)
+                    || self.scoped.iter().any(|(binder, _)| binder == name)
+                    || self.bound_scope.iter().any(|(binder, _)| binder == name)
+                    || (self.named_wildcards && !outer_binder_kind && name.starts_with('_'))
+            };
+            if let Some((name, loc)) = t.first_unbound_variable(in_scope) {
+                return Err(TcError {
+                    loc,
+                    msg: format!("Not in scope: type variable ‘{name}’\nBind it before using it in this explicitly quantified type."),
+                });
+            }
+        }
         let mut tvs: Vec<String> = fixed.to_vec();
         let (preds, ty) = self.sig_parts(t, &mut tvs)?;
         Ok(Scheme {

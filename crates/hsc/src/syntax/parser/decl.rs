@@ -426,7 +426,7 @@ impl Parser {
             };
             if !data_instance {
                 let mut k = &kind;
-                while let Type::Forall(_, body) = k {
+                while let Type::Forall { body, .. } = k {
                     k = body;
                 }
                 while let Type::Fun(arg, res) = k {
@@ -1169,7 +1169,7 @@ impl Parser {
         }
         let mut ty = self.sigtype()?;
         let mut exist = Vec::new();
-        if let Type::Forall(vars, body) = ty {
+        if let Type::Forall { binders: vars, body, .. } = ty {
             exist = vars;
             ty = *body;
         }
@@ -1852,7 +1852,7 @@ fn collect_type_vars(t: &Type, out: &mut Vec<String>, include_kinds: bool) {
                 collect(f, out, bound, include_kinds);
                 collect(a, out, bound, include_kinds);
             }
-            Type::Forall(binders, body) if include_kinds => {
+            Type::Forall { binders, body, .. } if include_kinds => {
                 let mark = bound.len();
                 for binder in binders {
                     if let Some(kind) = &binder.kind {

@@ -2026,7 +2026,7 @@ impl Checker {
                         return None;
                     }
                     let vars: Vec<String> = crate::rename::pat_vars(pat).into_iter().map(|(v, _)| v).collect();
-                    if vars.iter().any(|v| matches!(sig_of.get(v), Some(Type::Forall(..)) | Some(Type::Qual(..)))) {
+                    if vars.iter().any(|v| matches!(sig_of.get(v), Some(Type::Forall { .. }) | Some(Type::Qual(..)))) {
                         return None;
                     }
                     Some(Deferred::Pat { pat: pat.clone(), rhs: rhs.clone(), vars: vars.into_iter().map(|v| (v, Ty::Con(String::new()))).collect(), loc: *loc })
@@ -2250,7 +2250,7 @@ fn mentions_type_var(e: &Expr, scoped: &[String]) -> bool {
             Type::App(a, b) | Type::Fun(a, b) => ty_has_var(a, scoped, bound) || ty_has_var(b, scoped, bound),
             Type::List(a, _) => ty_has_var(a, scoped, bound),
             Type::Tuple(ts, _) => ts.iter().any(|x| ty_has_var(x, scoped, bound)),
-            Type::Forall(bs, b) => {
+            Type::Forall { binders: bs, body: b, .. } => {
                 let mark = bound.len();
                 bound.extend(bs.iter().map(|x| x.name.clone()));
                 let r = ty_has_var(b, scoped, bound);
