@@ -365,22 +365,43 @@ impl Parser {
         self.data_body(newtype, context, name, tyvars, erased_kind_variables, loc)
     }
 
-    /// Declaration scopes keep the variables of visible kind arguments even when the type erases them.
-    fn head_with_kind_variables(&mut self) -> PResult<(Type, Vec<String>)> {
+    fn with_kind_arguments<T>(
+        &mut self, parse: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<(T, Vec<Type>)> {
         let saved = self.head_kind_arguments.replace(Vec::new());
-        let head = self.btype();
+        let result = parse(self);
         let arguments = std::mem::replace(&mut self.head_kind_arguments, saved).unwrap_or_default();
+        Ok((result?, arguments))
+    }
+
+    /// Declaration scopes keep the names of kind arguments even when the type erases them.
+    fn head_with_kind_variables(&mut self) -> PResult<(Type, Vec<String>)> {
+        let (head, arguments) = self.with_kind_arguments(Self::btype)?;
         let mut variables = Vec::new();
         for argument in arguments {
             collect_type_vars(&argument, &mut variables, true);
         }
-        Ok((head?, variables))
+        Ok((head, variables))
+    }
+
+    fn without_erased_kind_wildcards<T>(
+        &mut self, context: &str, parse: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<T> {
+        let (result, arguments) = self.with_kind_arguments(parse)?;
+        if let Some((_, loc)) = arguments.iter().find_map(|kind| kind.first_wildcard(false)) {
+            return Err(super::ParseError {
+                line: loc.line,
+                col: loc.col,
+                msg: format!("Wildcard ‘_’ is not allowed in {context}"),
+            });
+        }
+        Ok(result)
     }
 
     fn datatype_context(&mut self) -> PResult<Vec<Type>> {
         let start = self.pos;
         let loc = self.loc();
-        let context = self.try_context();
+        let context = self.without_erased_kind_wildcards("a datatype context", |p| Ok(p.try_context()))?;
         if self.pos != start && !self.exts.is_on("DatatypeContexts") {
             return Err(super::ParseError {
                 line: loc.line,
@@ -516,7 +537,7 @@ impl Parser {
                 }));
             }
             loop {
-                let con = self.constr()?;
+                let con = self.without_erased_kind_wildcards("a constructor declaration", Self::constr)?;
                 if (!con.exist.is_empty() || !con.context.is_empty())
                     && !self.exts.is_on("ExistentialQuantification")
                     && !self.exts.is_on("GADTs")
@@ -545,7 +566,7 @@ impl Parser {
                 return self.err("A GADT-style declaration cannot have a datatype context\nPut the constraints on the individual constructors that need them.");
             }
             self.bump();
-            let groups = self.block(|p| p.gadt_con_group())?;
+            let groups = self.block(|p| p.without_erased_kind_wildcards("a constructor declaration", Self::gadt_con_group))?;
             cons = groups.into_iter().flatten().collect();
         }
         let deriving = self.deriving_clauses()?;
@@ -614,12 +635,14 @@ impl Parser {
         }
         let (name, tyvars) = self.decl_head(head)?;
         self.expect_res(ROp::Eq)?;
-        let mut rhs = self.sigtype()?;
-        // `type T = t :: kind`: a right-hand side with a kind signature.
-        if self.at_res(ROp::DColon) {
-            let kind = self.kind_signature()?;
-            rhs = Type::Sig(Box::new(rhs), Box::new(kind));
-        }
+        let rhs = self.without_erased_kind_wildcards("the right-hand side of a type synonym", |p| {
+            let mut rhs = p.sigtype()?;
+            if p.at_res(ROp::DColon) {
+                let kind = p.kind_signature()?;
+                rhs = Type::Sig(Box::new(rhs), Box::new(kind));
+            }
+            Ok(rhs)
+        })?;
         Ok(Decl::TypeSyn {
             name,
             tyvars,
@@ -794,7 +817,7 @@ impl Parser {
     /// The rest of an equation whose left-hand side has been parsed.
     fn equation_from(&mut self, lhs: Type, erased_kind_variables: Vec<String>) -> PResult<(QName, TypeEquation)> {
         self.expect_res(ROp::Eq)?;
-        let rhs = self.sigtype()?;
+        let rhs = self.without_erased_kind_wildcards("the right-hand side of a type family equation", Self::sigtype)?;
         // An infix head `a == b` (one operator) is the family applied to both operands.
         let (name, args, loc) = match lhs {
             Type::OpChain(items, _) if items.len() == 3 => {

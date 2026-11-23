@@ -226,7 +226,11 @@ impl Parser {
                 self.bump();
                 let inner = if self.at_special('(') {
                     self.bump();
-                    let e = self.expr()?;
+                    // A type annotation inside the splice expression has its own scope.
+                    let saved = self.head_kind_arguments.take();
+                    let e = self.expr();
+                    self.head_kind_arguments = saved;
+                    let e = e?;
                     self.expect_special(')')?;
                     e
                 } else {

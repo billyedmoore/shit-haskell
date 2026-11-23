@@ -1,0 +1,2 @@
+declaration_wildcard_gadt_wildcard.hs:5:14: error
+Wildcard ‘_’ is not allowed in a constructor declaration

@@ -1,0 +1,2 @@
+declaration_wildcard_traditional_nested_wildcard.hs:4:19: error
+Wildcard ‘_’ is not allowed in a constructor declaration

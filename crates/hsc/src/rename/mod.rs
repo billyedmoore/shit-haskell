@@ -1324,6 +1324,7 @@ impl<'a> Renamer<'a> {
                 dd.context = self.types(dd.context)?;
                 let parameter_scope = TyVarBind::declaration_scope(&dd.tyvars, &dd.erased_kind_variables);
                 for constraint in &dd.context {
+                    check_declaration_wildcards(constraint, "a datatype context")?;
                     check_type_variables(constraint, &parameter_scope, "Bind it in the datatype header.")?;
                 }
                 for c in &mut dd.cons {
@@ -1362,6 +1363,7 @@ impl<'a> Renamer<'a> {
                 if let Type::Sig(_, kind) = &rhs {
                     kind.extend_variable_scope(&mut bound);
                 }
+                check_declaration_wildcards(&rhs, "the right-hand side of a type synonym")?;
                 check_type_variables(&rhs, &bound, "Bind it in the type synonym’s header or in an explicit ‘forall’.")?;
                 Decl::TypeSyn { name, tyvars, erased_kind_variables, rhs, loc }
             }
@@ -1560,6 +1562,7 @@ impl<'a> Renamer<'a> {
         for pattern in &args {
             pattern.extend_variable_scope(&mut bound);
         }
+        check_declaration_wildcards(&rhs, "the right-hand side of a type family equation")?;
         check_type_variables(&rhs, &bound, "Bind it on the left-hand side of this type family equation.")?;
         Ok(TypeEquation { args, erased_kind_variables, rhs, loc })
     }
@@ -2869,17 +2872,27 @@ fn check_type_variables(ty: &Type, bound: &[String], hint: &str) -> RR<()> {
     Ok(())
 }
 
+fn check_declaration_wildcards(ty: &Type, context: &str) -> RR<()> {
+    if let Some((_, loc)) = ty.first_wildcard(false) {
+        return Err(RnError { loc, msg: format!("Wildcard ‘_’ is not allowed in {context}") });
+    }
+    Ok(())
+}
+
 fn check_constructor_binders(constructor: &ConDecl, datatype_scope: &[String]) -> RR<()> {
     let gadt = constructor.gadt_result.is_some();
-    if gadt && !constructor.gadt_forall {
-        return Ok(());
-    }
     let hint = if gadt {
         format!("Bind it in the ‘forall’ for constructor ‘{}’.", constructor.name)
     } else {
         format!("Bind it in the datatype header or in the ‘forall’ for constructor ‘{}’.", constructor.name)
     };
-    let check = |ty: &Type, bound: &[String]| check_type_variables(ty, bound, &hint);
+    let check = |ty: &Type, bound: &[String]| {
+        check_declaration_wildcards(ty, "a constructor declaration")?;
+        if !gadt || constructor.gadt_forall {
+            check_type_variables(ty, bound, &hint)?;
+        }
+        Ok(())
+    };
     let mut bound = if gadt { Vec::new() } else { datatype_scope.to_vec() };
     for binder in &constructor.exist {
         if let Some(kind) = &binder.kind {

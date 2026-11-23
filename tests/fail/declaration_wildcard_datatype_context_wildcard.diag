@@ -1,0 +1,2 @@
+declaration_wildcard_datatype_context_wildcard.hs:4:11: error
+Wildcard ‘_’ is not allowed in a datatype context
