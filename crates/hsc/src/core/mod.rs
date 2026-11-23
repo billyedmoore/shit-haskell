@@ -63,9 +63,10 @@ pub struct TopBind {
 
 /// The optimisation level of the program being compiled, as GHC's `-O0`, `-O1` and `-O2` set it.
 ///
-/// - 0: no program-wide optimisation: the Core is lowered as the desugarer gave it.
-/// - 1: the simplifier (inlining, rules and fusion, specialisation, calls by value) and the
-///   native backend's lambda lifting and case-chain collapsing.
+/// - 0: the program's own modules are compiled as written; packages are optimised as at 1 (GHC's
+///   packages come compiled with -O).
+/// - 1: the simplifier (inlining, rules and fusion, specialisation, calls by value) over the
+///   whole program.
 /// - 2: as 1, with larger inlining and specialisation thresholds and more rounds.
 ///
 /// One program is compiled per process, so the level is a setting of the process.
