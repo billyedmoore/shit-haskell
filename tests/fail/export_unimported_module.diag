@@ -1,0 +1,3 @@
+1:20: error:
+The export ‘module Data.Maybe’ does not name an imported module
+The export ‘module NoSuchModule’ does not name an imported module

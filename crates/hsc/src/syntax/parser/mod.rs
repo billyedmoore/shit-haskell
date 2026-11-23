@@ -647,11 +647,12 @@ impl Parser {
 
     fn module(&mut self) -> PResult<Module> {
         let loc = self.loc();
+        let mut export_locs = Vec::new();
         let (name, exports) = if self.at_kw(Kw::Module) {
             self.bump();
             let name = self.modid()?;
             let exports = if self.at_special('(') {
-                Some(self.ie_list()?)
+                Some(self.ie_list(Some(&mut export_locs))?)
             } else {
                 None
             };
@@ -690,6 +691,7 @@ impl Parser {
         Ok(Module {
             name,
             exports,
+            export_locs,
             imports,
             decls: group_binds(decls),
             loc,
@@ -744,7 +746,7 @@ impl Parser {
             false
         };
         let items = if self.at_special('(') {
-            Some(self.ie_list()?)
+            Some(self.ie_list(None)?)
         } else {
             None
         };
@@ -759,13 +761,16 @@ impl Parser {
         })
     }
 
-    fn ie_list(&mut self) -> PResult<Vec<IEItem>> {
+    fn ie_list(&mut self, mut locations: Option<&mut Vec<Loc>>) -> PResult<Vec<IEItem>> {
         self.expect_special('(')?;
         let mut items = Vec::new();
         loop {
             if self.at_special(')') {
                 self.bump();
                 break;
+            }
+            if let Some(locations) = &mut locations {
+                locations.push(self.loc());
             }
             items.push(self.ie_item()?);
             if self.at_special(',') {

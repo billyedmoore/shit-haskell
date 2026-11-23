@@ -55,6 +55,8 @@ pub enum Lit {
 pub struct Module {
     pub name: String,
     pub exports: Option<Vec<IEItem>>,
+    /// Source locations of the explicit export items, in list order.
+    pub export_locs: Vec<Loc>,
     pub imports: Vec<Import>,
     pub decls: Vec<Decl>,
     pub loc: Loc,

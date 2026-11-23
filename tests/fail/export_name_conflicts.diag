@@ -1,0 +1,4 @@
+Conflicting exports for value ‘answer’
+Both ‘ExportLeft.answer’ and ‘ExportRight.answer’ would be exported as ‘answer’.
+Conflicting exports for value ‘Item’
+Conflicting exports for type ‘Item’

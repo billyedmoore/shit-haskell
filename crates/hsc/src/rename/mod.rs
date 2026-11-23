@@ -110,6 +110,7 @@ pub struct Renamer<'a> {
     /// The depth of quotations being renamed (see `value_ref`).
     in_quote: usize,
     patsyns: HashMap<GName, PatSynDef>,
+    duplicate_record_fields: bool,
     /// Renaming a `.hs-boot` file: signatures declare values without bindings.
     boot: bool,
 }
@@ -174,7 +175,8 @@ pub fn rename_module(
     extensions: &Extensions,
     boot: bool,
 ) -> Result<(Module, Iface), RnErrors> {
-    if extensions.is_on("DuplicateRecordFields") {
+    let duplicate_record_fields = extensions.is_on("DuplicateRecordFields");
+    if duplicate_record_fields {
         name_duplicate_fields(&mut m.decls);
     }
     // Global names are unique, so the fixities of every loaded module can be merged. This
@@ -202,6 +204,7 @@ pub fn rename_module(
         locals: Vec::new(),
         counter: 0,
         pat_seen: None,
+        duplicate_record_fields,
         boot,
         in_quote: 0,
         patsyns: ifaces
@@ -454,7 +457,7 @@ impl<'a> Renamer<'a> {
         }
 
         // Exports.
-        let exports = self.compute_exports(&m.exports, m.loc)?;
+        let exports = self.compute_exports(m.exports.as_deref(), &m.export_locs, m.loc, &imports)?;
         let mut fixities = BTreeMap::new();
         for (g, f) in self.fixities.iter() {
             if g.module == self.module {
@@ -476,6 +479,7 @@ impl<'a> Renamer<'a> {
         let module = Module {
             name: m.name,
             exports: m.exports,
+            export_locs: m.export_locs,
             imports,
             decls,
             loc: m.loc,
@@ -2438,15 +2442,58 @@ impl<'a> Renamer<'a> {
         out
     }
 
-    fn compute_exports(&self, exports: &Option<Vec<IEItem>>, loc: Loc) -> RR<Vec<Entity>> {
-        let Some(items) = exports else {
+    fn compute_exports(
+        &self, items: Option<&[IEItem]>, export_locs: &[Loc], module_loc: Loc, imports: &[Import],
+    ) -> Result<Vec<Entity>, RnErrors> {
+        let Some(items) = items else {
             return Ok(self.own.clone());
         };
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Namespace {
+            Type,
+            Value,
+            Field,
+        }
         let mut out: Vec<Entity> = Vec::new();
+        let mut errors = Vec::new();
+        let mut exported = HashMap::<(String, Namespace), (GName, Loc)>::new();
+        let mut conflicts = HashSet::new();
+        let mut exported_fields = HashSet::new();
         // A module can export a type or class more than once (`module System.Random, Uniform(..)`
         // where `System.Random` exported bare `Uniform` without its methods). Merge their
         // sub-entities into one entry so `select_item` sees all exported children.
-        let push_export = |out: &mut Vec<Entity>, e: Entity| {
+        let mut push_export = |out: &mut Vec<Entity>, errors: &mut Vec<RnError>, e: Entity, loc: Loc| {
+            for entity in std::iter::once(&e).chain(&e.subs) {
+                let namespace = match entity.kind {
+                    EntKind::Field if self.duplicate_record_fields => continue,
+                    EntKind::Field => Namespace::Field,
+                    kind if kind.is_value() => Namespace::Value,
+                    _ => Namespace::Type,
+                };
+                let name = entity.occ();
+                if namespace == Namespace::Field && !exported_fields.insert(entity.global.clone()) {
+                    continue;
+                }
+                let (first, first_loc) = exported.entry((name.to_string(), namespace))
+                    .or_insert_with(|| (entity.global.clone(), loc));
+                // A single module re-export can bring several fields with the same label.
+                if namespace == Namespace::Field && *first_loc == loc {
+                    continue;
+                }
+                if *first != entity.global && conflicts.insert((entity.global.clone(), namespace)) {
+                    let earlier = format!("The earlier export is at line {}, column {}.", first_loc.line, first_loc.col);
+                    let msg = if namespace == Namespace::Field {
+                        format!("Duplicate record field ‘{name}’ in the export list\n{earlier}\nEnable DuplicateRecordFields to export both fields.")
+                    } else {
+                        let namespace = if namespace == Namespace::Value { "value" } else { "type" };
+                        format!(
+                            "Conflicting exports for {namespace} ‘{name}’\nBoth ‘{}.{name}’ and ‘{}.{name}’ would be exported as ‘{name}’.\n{earlier}",
+                            first.module, entity.global.module,
+                        )
+                    };
+                    errors.push(RnError { loc, msg });
+                }
+            }
             if let Some(existing) = out.iter_mut().find(|x| x.global == e.global && x.kind.is_value() == e.kind.is_value()) {
                 for s in e.subs {
                     if !existing.subs.iter().any(|o| o.global == s.global) {
@@ -2460,32 +2507,41 @@ impl<'a> Renamer<'a> {
         // The exported types and classes with all their children, so that a child exported on its
         // own (`StateT(StateT), runStateT`) is still one of its parent's (imported by `StateT(..)`).
         let mut parents: Vec<(GName, Vec<Entity>)> = Vec::new();
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
+            let loc = export_locs.get(index).copied().unwrap_or(module_loc);
             match item {
                 IEItem::Var(q) if q.qual.is_none() && is_builtin_tycon(&q.name) => {}
                 IEItem::Var(q) | IEItem::Pattern(q) => {
-                    let e = self.lookup_global(q, Ns::Value).map_err(|c| RnError {
-                        loc,
-                        msg: if c.is_empty() {
-                            format!("Not in scope: ‘{}’", display_qname(q))
+                    let e = self.lookup_global(q, Ns::Value).map_err(|c| {
+                        if c.is_empty() {
+                            self.unbound(q, loc, Ns::Value, matches!(item, IEItem::Pattern(_)))
                         } else {
-                            format!("Ambiguous occurrence ‘{}’", display_qname(q))
-                        },
-                    })?;
-                    push_export(&mut out, e);
+                            self.ambiguous(q, &c, loc)
+                        }
+                    });
+                    match e {
+                        Ok(e) => push_export(&mut out, &mut errors, e, loc),
+                        Err(error) => errors.push(error),
+                    }
                 }
                 IEItem::Thing { name, .. } if name.qual.is_none() && is_builtin_tycon(&name.name) => {
                     // Built-in syntax and operators have no defining entity to export.
                 }
                 IEItem::Thing { name, subs } => {
-                    let e = self.lookup_global(name, Ns::Type).map_err(|c| RnError {
-                        loc,
-                        msg: if c.is_empty() {
-                            format!("Not in scope: type constructor or class ‘{}’", display_qname(name))
+                    let e = self.lookup_global(name, Ns::Type).map_err(|c| {
+                        if c.is_empty() {
+                            self.unbound(name, loc, Ns::Type, false)
                         } else {
-                            format!("Ambiguous occurrence ‘{}’", display_qname(name))
-                        },
-                    })?;
+                            self.ambiguous(name, &c, loc)
+                        }
+                    });
+                    let e = match e {
+                        Ok(e) => e,
+                        Err(error) => {
+                            errors.push(error);
+                            continue;
+                        }
+                    };
                     parents.push((e.global.clone(), self.all_children(&e)));
                     let mut with_subs = e.clone();
                     with_subs.subs = match subs {
@@ -2515,12 +2571,21 @@ impl<'a> Renamer<'a> {
                             some
                         }
                     };
-                    push_export(&mut out, with_subs);
+                    push_export(&mut out, &mut errors, with_subs, loc);
                 }
                 IEItem::Module(m) => {
+                    if *m != self.module && !imports.iter().any(|import| {
+                        import.alias.as_deref().unwrap_or(&import.module) == m
+                    }) {
+                        errors.push(RnError {
+                            loc,
+                            msg: format!("The export ‘module {m}’ does not name an imported module\nImport the module or use the alias in its import declaration."),
+                        });
+                        continue;
+                    }
                     if *m == self.module {
                         for e in &self.own {
-                            push_export(&mut out, e.clone());
+                            push_export(&mut out, &mut errors, e.clone(), loc);
                         }
                     }
                     {
@@ -2538,7 +2603,7 @@ impl<'a> Renamer<'a> {
                                         }
                                         // A type and a constructor can share a global name; they
                                         // are different entities.
-                                        push_export(&mut out, e.clone());
+                                        push_export(&mut out, &mut errors, e.clone(), loc);
                                     }
                                 }
                             }
@@ -2546,6 +2611,10 @@ impl<'a> Renamer<'a> {
                     }
                 }
             }
+        }
+        if !errors.is_empty() {
+            errors.sort_by(|a, b| (a.loc, &a.msg).cmp(&(b.loc, &b.msg)));
+            return Err(RnErrors(errors));
         }
         let alone: Vec<Entity> = out.iter().filter(|e| e.kind.is_value()).cloned().collect();
         for (parent, children) in &parents {

@@ -1,0 +1,6 @@
+1:20: error:
+Variable not in scope: doesNotExist
+2:20: error:
+Variable not in scope: alsoMissing
+3:20: error:
+Not in scope: type constructor or class ‘Main.Wrong’
