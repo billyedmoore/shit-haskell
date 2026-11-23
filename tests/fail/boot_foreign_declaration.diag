@@ -1,0 +1,2 @@
+4:1: error:
+A foreign declaration is not allowed in an hs-boot file.

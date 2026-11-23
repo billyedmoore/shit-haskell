@@ -120,6 +120,7 @@ pub struct ClassInfo {
     pub dict_con: String,
     /// Functional dependencies, as parameter positions: determining and determined.
     pub fundeps: Vec<(Vec<usize>, Vec<usize>)>,
+    pub minimal: crate::syntax::ast::Minimal,
 }
 
 impl ClassInfo {

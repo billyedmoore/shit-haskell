@@ -1,0 +1,3 @@
+warning: [-Wmissing-methods]
+Incomplete instance ‘Measure Int’
+Implement ‘lengthOf’.

@@ -906,6 +906,19 @@ impl Driver {
                 Some((key, name, scheme.clone(), signature_loc))
             })
             .collect();
+        let boot_class_defaults: Vec<_> = if completing_boot {
+            parsed.decls.iter().filter_map(|decl| {
+                let Decl::Class(class) = decl else { return None };
+                let key = format!("{module}.{}", class.name);
+                let boot = self.checker.class(&key)?;
+                let methods = boot.methods.iter()
+                    .map(|(method, _)| (method.clone(), boot.defaults.contains_key(method)))
+                    .collect::<Vec<_>>();
+                Some((key, class.name.clone(), class.loc, methods))
+            }).collect()
+        } else {
+            Vec::new()
+        };
         let module_loc = parsed.loc;
         let boot_key = self.boot_key(module);
         let cacheable = cache_file.is_some() && !has_splices && dep_keys.is_some() && (!completing_boot || boot_key.is_some());
@@ -960,6 +973,21 @@ impl Driver {
                     return Err(crate::diagnostic::error(&shown, Some(&src), signature_loc.unwrap_or(module_loc), &format!(
                         "The type of ‘{name}’ differs from its hs-boot signature\nImplementation: {name} :: {}\nHs-boot file:   {name} :: {}",
                         implementation, boot
+                    )));
+                }
+            }
+            for (key, class, loc, methods) in boot_class_defaults {
+                let Some(full) = self.checker.class(&key) else { continue };
+                for (method, boot_default) in methods {
+                    let full_default = full.defaults.contains_key(&method);
+                    if full_default == boot_default || !full.methods.iter().any(|(name, _)| name == &method) {
+                        continue;
+                    }
+                    let method = crate::tc::types::unqualify(&method);
+                    let status = |has_default| if has_default { "has a default" } else { "has no default" };
+                    return Err(crate::diagnostic::error(&shown, Some(&src), loc, &format!(
+                        "The default for method ‘{method}’ in class ‘{class}’ differs from its hs-boot declaration\nImplementation: {}\nHs-boot file:   {}",
+                        status(full_default), status(boot_default),
                     )));
                 }
             }
@@ -1602,6 +1630,7 @@ impl Driver {
         self.checker.mono_local_binds = exts.is_on("MonoLocalBinds");
         self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
+        self.checker.derive_anyclass = exts.is_on("DeriveAnyClass");
         let t = std::time::Instant::now();
         let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, &exts, boot)
             .map_err(|errors| errors.0.iter().map(|e| located(e.loc, &e.msg)).collect::<Vec<_>>().join("\n\n"))?;
@@ -1958,6 +1987,9 @@ pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Resul
 /// Boot interfaces may describe class defaults. Their method bodies are checked
 /// in the implementation.
 fn check_boot_declarations(m: &mut Module) -> Result<(), (Loc, &'static str)> {
+    if let Some(pragma) = m.inlines.first() {
+        return Err((pragma.loc, "INLINE and NOINLINE pragmas belong in the implementing module, on the binding."));
+    }
     for d in &mut m.decls {
         match d {
             Decl::Fun { loc, .. } | Decl::PatBind { loc, .. } | Decl::IPBind { loc, .. } => {
@@ -1966,8 +1998,34 @@ fn check_boot_declarations(m: &mut Module) -> Result<(), (Loc, &'static str)> {
             Decl::TypeInstance { loc, .. } => {
                 return Err((*loc, "A type-family instance is not allowed in an hs-boot file."));
             }
-            Decl::Class(cd) => cd.decls.retain(|x| !matches!(x, Decl::Fun { .. } | Decl::PatBind { .. })),
-            Decl::Instance(id) => id.decls.clear(),
+            Decl::Foreign { loc, .. } => {
+                return Err((*loc, "A foreign declaration is not allowed in an hs-boot file. Put it in the implementing module."));
+            }
+            Decl::Deriving(deriving) => {
+                return Err((deriving.loc, "An hs-boot file cannot derive instances. Write an instance declaration without a body."));
+            }
+            Decl::Data(data) => {
+                if let Some(clause) = data.deriving.iter().find(|clause| !clause.classes.is_empty()) {
+                    return Err((clause.loc, "An hs-boot file cannot derive instances. Write an instance declaration without a body."));
+                }
+            }
+            Decl::Instance(id) => {
+                for declaration in &id.decls {
+                    match declaration {
+                        Decl::Fun { loc, .. } | Decl::PatBind { loc, .. } | Decl::IPBind { loc, .. } => {
+                            return Err((*loc, "An instance in an hs-boot file cannot define methods. Put the binding in the implementing module."));
+                        }
+                        Decl::Sig { loc, .. } => {
+                            return Err((*loc, "An instance in an hs-boot file cannot contain method signatures. Put the signature with the binding in the implementing module."));
+                        }
+                        Decl::TypeInstance { loc, .. } => {
+                            return Err((*loc, "An associated type-family instance is not allowed in an hs-boot file. Put the equation in the implementing module."));
+                        }
+                        _ => {}
+                    }
+                }
+                id.decls.clear();
+            }
             _ => {}
         }
     }

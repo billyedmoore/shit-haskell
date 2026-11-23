@@ -576,7 +576,16 @@ pub struct ClassDecl {
     pub tyvars: Vec<TyVarBind>,
     pub fundeps: Vec<(Vec<String>, Vec<String>)>,
     pub decls: Vec<Decl>,
+    pub minimal: Option<(Minimal, Loc)>,
     pub loc: Loc,
+}
+
+/// A class's minimal complete definition. An empty conjunction requires no methods.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Minimal {
+    Method(String, Loc),
+    All(Vec<Minimal>),
+    Any(Vec<Minimal>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

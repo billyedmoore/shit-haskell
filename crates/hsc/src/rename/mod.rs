@@ -1304,6 +1304,8 @@ impl<'a> Renamer<'a> {
                                 msg: format!("Class ‘{}’ has no associated type named ‘{}’", cd.name, name.name),
                             });
                         }
+                        // Boot interfaces can describe a default without checking its body.
+                        binding @ Decl::Fun { .. } if self.boot => binding,
                         other => self.top_decl(other)?,
                     });
                 }

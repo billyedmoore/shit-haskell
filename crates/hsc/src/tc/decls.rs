@@ -7,7 +7,7 @@ use super::env::{ClassInfo, InstInfo, Synonym, TyConInfo};
 use super::types::{subst_gen, Pred, Scheme, Ty};
 use super::{count_args, Checker, Given, TcError, Wanted, TR};
 use crate::core::{Alt, Core, TopBind};
-use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Loc, Module, QName, Type};
+use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Loc, Minimal, Module, QName, Type};
 
 impl Checker {
     /// Compare quantified heads independently of each registration path's variable order.
@@ -781,6 +781,38 @@ impl Checker {
                 defaults.insert(format!("{}.{name}", self.module), format!("{}.$dm{name}", self.module));
             }
         }
+        let required = methods.iter()
+            .filter(|(key, _)| !defaults.contains_key(key))
+            .map(|(key, _)| super::types::unqualify(key));
+        let minimal = if let Some((formula, loc)) = &cd.minimal {
+            if let Some((name, loc)) = formula.unknown_method(&|occ| {
+                occ == "()" || methods.iter().any(|(key, _)| super::types::unqualify(key) == occ)
+            }) {
+                return Err(TcError {
+                    loc,
+                    msg: format!("‘{name}’ is not a method of class ‘{}’", cd.name),
+                });
+            }
+            if !self.boot {
+                let omitted: Vec<_> = required
+                    .filter(|method| formula.is_met(&|name| name != *method))
+                    .map(|method| format!("‘{method}’"))
+                    .collect();
+                if !omitted.is_empty() {
+                    self.warnings.push((
+                        *loc,
+                        format!(
+                            "The MINIMAL pragma for ‘{}’ allows omitting methods without defaults\nRequire these methods in each alternative: {}.",
+                            cd.name, omitted.join(", ")
+                        ),
+                        crate::diagnostic::Warning::IncompleteMinimal,
+                    ));
+                }
+            }
+            formula.clone()
+        } else {
+            Minimal::All(required.map(|method| Minimal::Method(method.into(), cd.loc)).collect())
+        };
         // The dictionary constructor, and a selector for each method.
         self.env.tycons.insert(
             class_key.clone(),
@@ -844,6 +876,7 @@ impl Checker {
             default_schemes,
             dict_con,
             fundeps,
+            minimal,
         };
         self.add_class_info(info);
         Ok(())
@@ -1126,7 +1159,7 @@ impl Checker {
             Type::Con(q, _) => global_tycon_name(q),
             _ => return self.err("Malformed instance head"),
         };
-        let derived = id.overlap.as_deref() == Some(super::derive::DERIVED_MARK);
+        let derived = super::derive::is_derived(id);
         let Some(info) = self.env.classes.get(&class) else {
             if derived {
                 // A derived instance of a class this library does not provide.
@@ -1341,7 +1374,7 @@ impl Checker {
 
     fn instance_body_body(&mut self, id: &InstDecl) -> TR<()> {
         self.loc = id.loc;
-        if id.overlap.as_deref() == Some(super::derive::DERIVED_MARK) {
+        if super::derive::is_derived(id) {
             let known = {
                 let (class_name, _) = instance_head_parts(&id.head).expect("validated");
                 matches!(class_name, Type::Con(q, _) if self.env.classes.contains_key(&global_tycon_name(q)))
@@ -1391,6 +1424,19 @@ impl Checker {
                 msg: format!("Could not resolve the instance for ‘{}’", self.show_pred(&Pred { class: class.clone(), args: head_check })),
             })?;
         let info = self.class(&class).cloned().expect("class registered");
+        if id.overlap.as_deref() != Some(super::derive::DERIVED_MARK) {
+            let implemented = |method: &str| {
+                id.decls.iter().any(|decl| matches!(decl, Decl::Fun { name, .. } if name == method))
+            };
+            if let Some(missing) = info.minimal.missing_methods(&implemented, false) {
+                let instance = self.show_pred(&Pred { class: class.clone(), args: inst.head.clone() });
+                self.warnings.push((
+                    id.head.loc(),
+                    format!("Incomplete instance ‘{instance}’\nImplement {missing}."),
+                    crate::diagnostic::Warning::MissingMethods,
+                ));
+            }
+        }
 
         // Skolemise the instance variables (named as in the source); the context is given.
         let names: Vec<String> =
@@ -2090,6 +2136,43 @@ fn is_constructor_class(cls: &str) -> bool {
 }
 
 /// The strictness of each field of the constructor with the given position.
+impl Minimal {
+    fn unknown_method(&self, known: &impl Fn(&str) -> bool) -> Option<(&str, Loc)> {
+        match self {
+            Self::Method(name, loc) => (!known(name)).then_some((name, *loc)),
+            Self::All(items) | Self::Any(items) => items.iter().find_map(|item| item.unknown_method(known)),
+        }
+    }
+
+    fn is_met(&self, present: &impl Fn(&str) -> bool) -> bool {
+        match self {
+            Self::Method(name, _) => present(name),
+            Self::All(items) => items.iter().all(|item| item.is_met(present)),
+            Self::Any(items) => items.iter().any(|item| item.is_met(present)),
+        }
+    }
+
+    fn missing_methods(&self, present: &impl Fn(&str) -> bool, nested: bool) -> Option<String> {
+        let (items, separator) = match self {
+            Self::Method(name, _) => return (!present(name)).then(|| format!("‘{name}’")),
+            Self::All(items) => (
+                items.iter().filter_map(|item| item.missing_methods(present, true)).collect::<Vec<_>>(),
+                " and ",
+            ),
+            Self::Any(items) => (
+                items.iter().map(|item| item.missing_methods(present, true)).collect::<Option<Vec<_>>>()?,
+                " or ",
+            ),
+        };
+        match items.len() {
+            0 => None,
+            1 => items.into_iter().next(),
+            _ if nested => Some(format!("({})", items.join(separator))),
+            _ => Some(items.join(separator)),
+        }
+    }
+}
+
 fn strict_flags(dd: &DataDecl, tag: usize) -> Vec<bool> {
     match dd.cons.get(tag).map(|c| &c.fields) {
         Some(ConFields::Positional(fs)) => fs.iter().map(|f| f.strict).collect(),

@@ -226,8 +226,14 @@ impl Lexer {
     fn run(&mut self) -> Result<(), LexError> {
         let mut bol = true;
         loop {
-            let (saw_nl, saw_space) = self.skip_space()?;
+            let (saw_nl, saw_space, pragma) = self.skip_space()?;
             bol |= saw_nl;
+            if let Some(mut pragma) = pragma {
+                pragma.first_on_line = bol;
+                self.toks.push(pragma);
+                bol = false;
+                continue;
+            }
             let (line, col) = (self.line, self.col);
             if self.pos >= self.chars.len() {
                 self.toks.push(Token {
@@ -267,8 +273,8 @@ impl Lexer {
         }
     }
 
-    /// Skips whitespace and comments. Returns (saw a newline, saw any space).
-    fn skip_space(&mut self) -> Result<(bool, bool), LexError> {
+    /// Skips whitespace and comments, stopping at a pragma that participates in layout.
+    fn skip_space(&mut self) -> Result<(bool, bool, Option<Token>), LexError> {
         let (mut nl, mut sp) = (false, false);
         loop {
             match self.peek(0) {
@@ -291,15 +297,27 @@ impl Lexer {
                     sp = true;
                 }
                 Some('{') if self.peek(1) == Some('-') => {
-                    let newline = if self.peek(2) == Some('#') {
-                        self.pragma()?
+                    if self.peek(2) == Some('#') {
+                        let (line, col) = (self.line, self.col);
+                        let (newline, tok) = self.pragma()?;
+                        if let Some(tok) = tok {
+                            let pragma = Token {
+                                tok, line, col,
+                                end_line: self.line,
+                                end_col: self.col.saturating_sub(1),
+                                first_on_line: false,
+                                space_before: true,
+                                space_after: true,
+                            };
+                            return Ok((nl, sp, Some(pragma)));
+                        }
+                        nl |= newline;
                     } else {
-                        self.block_comment()?
-                    };
-                    nl |= newline;
+                        nl |= self.block_comment()?;
+                    }
                     sp = true;
                 }
-                _ => return Ok((nl, sp)),
+                _ => return Ok((nl, sp, None)),
             }
         }
     }
@@ -343,7 +361,7 @@ impl Lexer {
         }
     }
 
-    fn pragma(&mut self) -> Result<bool, LexError> {
+    fn pragma(&mut self) -> Result<(bool, Option<Tok>), LexError> {
         let (line, col) = (self.line, self.col);
         self.bump();
         self.bump();
@@ -376,14 +394,17 @@ impl Lexer {
             let padding = body.len() - body.trim_start().len();
             let at = super::ast::Loc { line, col: col as u32 + 3 }.after(&body[..padding]);
             self.unknown_pragmas.push((at, name));
-            return Ok(nl);
+            return Ok((nl, None));
         }
         let name = if name == "NOTINLINE" { "NOINLINE".to_string() } else { name };
-        if ["LANGUAGE", "OPTIONS_GHC", "RULES", "INLINE", "NOINLINE"].contains(&name.as_str()) {
+        if ["LANGUAGE", "OPTIONS_GHC", "RULES", "INLINE", "NOINLINE", "MINIMAL"].contains(&name.as_str()) {
             let body_start = body.len() - body.trim_start().len() + name_len;
             let after_name = &body[body_start..];
             let padding = after_name.len() - after_name.trim_start().len();
             let body_loc = super::ast::Loc { line, col: col as u32 + 3 }.after(&body[..body_start + padding]);
+            if name == "MINIMAL" {
+                return Ok((nl, Some(Tok::Minimal(after_name.trim_start().to_string(), body_loc))));
+            }
             // A RULES body keeps its line breaks (its rules' positions count lines from here).
             let rest = if name == "RULES" {
                 after_name.to_string()
@@ -398,7 +419,7 @@ impl Lexer {
                 body_loc,
             });
         }
-        Ok(nl)
+        Ok((nl, None))
     }
 
     fn lex_token(&mut self) -> Result<Tok, LexError> {

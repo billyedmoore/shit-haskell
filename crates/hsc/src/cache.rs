@@ -434,7 +434,8 @@ bin_enum!(Kind { 0 => Star, 1 => Arr(a, b), 2 => Meta(a), 3 => Gen(a) });
 bin_struct!(TyConInfo { arity, cons });
 bin_struct!(DataCon { name, tycon, tag, arity, scheme, fields, newtype, strict });
 bin_struct!(Synonym { nparams, rhs });
-bin_struct!(ClassInfo { name, nparams, supers, methods, defaults, default_schemes, dict_con, fundeps });
+bin_enum!(Minimal { 0 => Method(a, b), 1 => All(a), 2 => Any(a) });
+bin_struct!(ClassInfo { name, nparams, supers, methods, defaults, default_schemes, dict_con, fundeps, minimal });
 bin_struct!(InstInfo { class, nvars, ctx, head, dict, kinds });
 bin_struct!(FamEqn { nvars, args, rhs, kinds, default });
 bin_struct!(FamilyInfo { arity, data, closed, equations, injective });
@@ -580,7 +581,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 9";
+const MAGIC: &str = "hsc-module-cache 10";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.

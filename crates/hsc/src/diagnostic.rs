@@ -10,22 +10,26 @@ pub(crate) enum Warning {
     MissingFields,
     UnrecognisedPragmas,
     MissingDerivingStrategies,
+    MissingMethods,
+    IncompleteMinimal,
 }
 
 impl Warning {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::Tabs, Self::MissingSignatures, Self::MissingFields, Self::UnrecognisedPragmas,
-        Self::MissingDerivingStrategies,
+        Self::MissingDerivingStrategies, Self::MissingMethods, Self::IncompleteMinimal,
     ];
 
-    fn name(self) -> &'static str {
-        match self {
+    fn name(self) -> Option<&'static str> {
+        Some(match self {
             Self::Tabs => "tabs",
             Self::MissingSignatures => "missing-signatures",
             Self::MissingFields => "missing-fields",
             Self::UnrecognisedPragmas => "unrecognised-pragmas",
             Self::MissingDerivingStrategies => "missing-deriving-strategies",
-        }
+            Self::MissingMethods => "missing-methods",
+            Self::IncompleteMinimal => return None,
+        })
     }
 }
 
@@ -41,6 +45,8 @@ impl Default for WarningOptions {
         enabled[Warning::Tabs as usize] = true;
         enabled[Warning::MissingFields as usize] = true;
         enabled[Warning::UnrecognisedPragmas as usize] = true;
+        enabled[Warning::MissingMethods as usize] = true;
+        enabled[Warning::IncompleteMinimal as usize] = true;
         Self { enabled, fatal: [false; Warning::ALL.len()] }
     }
 }
@@ -48,19 +54,19 @@ impl Default for WarningOptions {
 impl WarningOptions {
     pub(crate) fn apply(&mut self, flag: &str) {
         match flag {
-            "-Wall" | "-Wno-all" => {
-                for warning in Warning::ALL.into_iter().filter(|w| *w != Warning::MissingDerivingStrategies) {
-                    self.enabled[warning as usize] = flag == "-Wall";
+            "-Wall" | "-Wno-all" | "-Weverything" | "-w" | "-Wno-everything" => {
+                for warning in Warning::ALL.into_iter().filter(|w| w.name().is_some()) {
+                    if !matches!(flag, "-Wall" | "-Wno-all") || warning != Warning::MissingDerivingStrategies {
+                        self.enabled[warning as usize] = matches!(flag, "-Wall" | "-Weverything");
+                    }
                 }
             }
-            "-Weverything" => self.enabled.fill(true),
-            "-w" | "-Wno-everything" => self.enabled.fill(false),
             "-Werror" => self.fatal.fill(true),
             "-Wwarn" | "-Wno-error" => self.fatal.fill(false),
             _ => {
                 let Some(flag) = flag.strip_prefix("-W") else { return };
                 for warning in Warning::ALL {
-                    let name = warning.name();
+                    let Some(name) = warning.name() else { continue };
                     let index = warning as usize;
                     if flag == name {
                         self.enabled[index] = true;
@@ -87,8 +93,12 @@ pub(crate) fn warning(
     path: &Path, source: Option<&str>, loc: Loc, message: &str, flag: Warning, fatal: bool,
 ) -> String {
     let severity = if fatal { "error" } else { "warning" };
-    let name = flag.name();
-    format_at(path, source, loc, &format!("{severity}: [-W{name}]"), message)
+    let label = match flag.name() {
+        Some(name) => format!("{severity}: [-W{name}]"),
+        None if fatal => "error: [-Werror]".into(),
+        None => "warning:".into(),
+    };
+    format_at(path, source, loc, &label, message)
 }
 
 /// Formats a compiler error with its source line when the location is available.

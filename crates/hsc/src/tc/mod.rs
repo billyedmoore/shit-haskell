@@ -114,6 +114,7 @@ pub struct Checker {
     pub overloaded_lists: bool,
     /// GeneralizedNewtypeDeriving: a newtype derives most classes through its representation.
     pub newtype_deriving: bool,
+    pub derive_anyclass: bool,
     /// MonomorphismRestriction (on unless the module turns it off).
     pub monomorphism_restriction: bool,
     /// The monads of the typed quotations being checked, innermost last (their splices share them).
@@ -196,6 +197,7 @@ impl Checker {
             numeric_defaults: None,
             overloaded_lists: false,
             newtype_deriving: false,
+            derive_anyclass: false,
             monomorphism_restriction: true,
             quote_monads: Vec::new(),
             flex_kinds: Vec::new(),

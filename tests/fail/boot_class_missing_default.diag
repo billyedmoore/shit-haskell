@@ -1,0 +1,4 @@
+3:1: error:
+The default for method ‘select’ in class ‘Select’ differs from its hs-boot declaration
+Implementation: has no default
+Hs-boot file:   has a default

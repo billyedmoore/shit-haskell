@@ -101,6 +101,9 @@ impl Parser {
     // ----- value declarations ------------------------------------------------
 
     pub(super) fn value_decl(&mut self) -> PResult<Decl> {
+        if self.real() && matches!(self.tok(), Tok::Minimal(..)) {
+            return self.err("A MINIMAL pragma belongs in a class declaration");
+        }
         let loc = self.loc();
         if let Some(fixity) = self.fixity_decl(loc)? {
             return Ok(fixity);
@@ -1238,9 +1241,22 @@ impl Parser {
                 }
             }
         }
+        let mut minimal = None;
         let decls = if self.at_kw(Kw::Where) {
             self.bump();
-            group_binds(self.block(|p| p.class_body_decl(false))?)
+            let items = self.block(|p| {
+                if let Tok::Minimal(body, body_loc) = p.tok() {
+                    if minimal.is_some() {
+                        return p.err("This class has more than one MINIMAL pragma\nCombine alternatives in one pragma with ‘|’.");
+                    }
+                    minimal = Some((p.parse_minimal(body, *body_loc)?, p.loc()));
+                    p.bump();
+                    Ok(None)
+                } else {
+                    p.class_body_decl(false).map(Some)
+                }
+            })?;
+            group_binds(items.into_iter().flatten().collect())
         } else {
             Vec::new()
         };
@@ -1250,8 +1266,71 @@ impl Parser {
             tyvars,
             fundeps,
             decls,
+            minimal,
             loc,
         }))
+    }
+
+    fn parse_minimal(&self, body: &str, start: Loc) -> PResult<Minimal> {
+        let offset = |line, col| Loc {
+            line: start.line + line - 1,
+            col: if line == 1 { start.col + col - 1 } else { col },
+        };
+        let mut toks = crate::syntax::lexer::lex_for_module(body, &self.exts)
+            .map_err(|e| {
+                let loc = offset(e.line, e.col);
+                super::ParseError { line: loc.line, col: loc.col, msg: e.msg }
+            })?.tokens;
+        for tok in &mut toks {
+            let start = offset(tok.line, tok.col);
+            let end = offset(tok.end_line, tok.end_col);
+            (tok.line, tok.col) = (start.line, start.col);
+            (tok.end_line, tok.end_col) = (end.line, end.col);
+        }
+        let mut p = Parser {
+            toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: self.exts.clone(), static_count: 0,
+        };
+        if p.at_eof() {
+            return Ok(Minimal::All(Vec::new()));
+        }
+        let formula = p.minimal_alternatives()?;
+        if !p.at_eof() {
+            return p.unexpected();
+        }
+        Ok(formula)
+    }
+
+    fn minimal_alternatives(&mut self) -> PResult<Minimal> {
+        let mut choices = vec![self.minimal_conjunction()?];
+        while self.at_res(ROp::Bar) {
+            self.bump();
+            choices.push(self.minimal_conjunction()?);
+        }
+        Ok(if choices.len() == 1 { choices.remove(0) } else { Minimal::Any(choices) })
+    }
+
+    fn minimal_conjunction(&mut self) -> PResult<Minimal> {
+        let mut methods = vec![self.minimal_atom()?];
+        while self.at_special(',') {
+            self.bump();
+            methods.push(self.minimal_atom()?);
+        }
+        Ok(if methods.len() == 1 { methods.remove(0) } else { Minimal::All(methods) })
+    }
+
+    fn minimal_atom(&mut self) -> PResult<Minimal> {
+        let loc = self.loc();
+        if self.at_special('(') && !matches!(self.peek_raw(1), Tok::VarSym(_) | Tok::QVarSym(..) | Tok::Res(ROp::Tilde | ROp::At)) {
+            self.bump();
+            if self.at_special(')') {
+                self.bump();
+                return Ok(Minimal::Method("()".into(), loc));
+            }
+            let group = self.minimal_alternatives()?;
+            self.expect_special(')')?;
+            return Ok(group);
+        }
+        Ok(Minimal::Method(self.binder_name()?, loc))
     }
 
     fn tyvar_names(&mut self) -> Vec<String> {

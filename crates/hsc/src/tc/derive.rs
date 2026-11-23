@@ -164,28 +164,38 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
                 continue;
             }
             let derived = match name.as_str() {
-                "Eq" => derive_eq(checker, dd),
-                "Ord" => derive_ord(checker, dd),
-                "Show" => derive_show(checker, dd),
-                "Enum" => derive_enum(checker, dd),
-                "Bounded" => derive_bounded(checker, dd),
-                "Read" => derive_read(checker, dd),
-                "Functor" => derive_functor(checker, dd),
-                "Foldable" => derive_foldable(checker, dd),
-                "Traversable" => derive_traversable(checker, dd),
-                "Lift" => derive_lift(checker, dd),
-                "Data" => derive_data(checker, dd),
-                "Generic" => derive_generic(checker, dd, false),
-                "Generic1" => derive_generic(checker, dd, true),
-                // DeriveAnyClass: an instance with the class's default methods. Derived
-                // instances of unknown classes are skipped when the instance is registered.
-                _ => Vec::new(),
+                _ if d.strategy == Some(Strategy::Anyclass) => None,
+                "Eq" => Some(derive_eq(checker, dd)),
+                "Ord" => Some(derive_ord(checker, dd)),
+                "Show" => Some(derive_show(checker, dd)),
+                "Enum" => Some(derive_enum(checker, dd)),
+                "Bounded" => Some(derive_bounded(checker, dd)),
+                "Read" => Some(derive_read(checker, dd)),
+                "Functor" => Some(derive_functor(checker, dd)),
+                "Foldable" => Some(derive_foldable(checker, dd)),
+                "Traversable" => Some(derive_traversable(checker, dd)),
+                "Lift" => Some(derive_lift(checker, dd)),
+                "Data" => Some(derive_data(checker, dd)),
+                "Generic" => Some(derive_generic(checker, dd, false)),
+                "Generic1" => Some(derive_generic(checker, dd, true)),
+                _ => None,
             };
             // Constructor classes are derived for the type constructor without its last parameter.
             let drop_last = matches!(name.as_str(), "Functor" | "Foldable" | "Traversable" | "Generic1");
-            let mut inst = instance(checker, dd, &class_qname, derived, drop_last);
+            let inferred_anyclass = d.strategy.is_none() && checker.derive_anyclass
+                && derived.is_none()
+                && !matches!(
+                    (name.as_str(), class_qname.qual.as_deref()),
+                    ("Ix", Some("GHC.Internal.Ix")) | ("Typeable", Some("GHC.Internal.Data.Typeable.Internal"))
+                );
+            let origin = if d.strategy == Some(Strategy::Anyclass) || inferred_anyclass {
+                DERIVED_ANYCLASS_MARK
+            } else {
+                DERIVED_MARK
+            };
+            let mut inst = instance(checker, dd, &class_qname, derived.unwrap_or_default(), drop_last);
             if let Decl::Instance(id) = &mut inst {
-                id.overlap = Some(DERIVED_MARK.into());
+                id.overlap = Some(origin.into());
             }
             out.push(inst);
         }
@@ -195,6 +205,11 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
 
 /// Marks generated instances, so that a missing class is not an error for them.
 pub const DERIVED_MARK: &str = "derived";
+const DERIVED_ANYCLASS_MARK: &str = "derived anyclass";
+
+pub fn is_derived(instance: &InstDecl) -> bool {
+    matches!(instance.overlap.as_deref(), Some(DERIVED_MARK | DERIVED_ANYCLASS_MARK))
+}
 
 /// Whether a newtype derives a class the stock way when no strategy is given. With
 /// GeneralizedNewtypeDeriving, GHC derives every class through the representation except those
