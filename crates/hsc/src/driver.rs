@@ -1622,8 +1622,6 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
     if flags.iter().any(|f| f == "-dcore-lint") {
         crate::core::lint::lint_program(&binds).map_err(|e| format!("Core lint error: {e}"))?;
     }
-    // -O0 keeps only the cheap clean-ups (as GHC's -O0 keeps a gentle simplifier pass): an alias
-    // left as a thunk would change pointer identity (`casArray#`, `reallyUnsafePtrEquality#`).
     {
         let _t = timing::scope("optimise");
         crate::core::opt::inline_prim_wrappers(&mut binds);
@@ -1631,13 +1629,41 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
         crate::core::opt::resolve_known_methods(&mut binds);
         if crate::core::opt_level() > 0 {
             crate::core::simplify::simplify(&mut binds);
+        } else {
+            // -O0 is GHC's: the program's own modules are compiled as written, and the packages
+            // are as optimised as ever (GHC's come compiled with -O). Package modules do not
+            // import the program's, so their bindings are a program of their own; the
+            // simplifier keeps the meaning of each global it keeps, so the program's calls of
+            // them stand.
+            let home = home_binding_filter(&d.sources);
+            let (mut own, mut packages): (Vec<_>, Vec<_>) = binds.into_iter().partition(|b| home(&b.name));
+            crate::core::simplify::simplify(&mut packages);
+            packages.append(&mut own);
+            binds = packages;
         }
+        // An alias left as a thunk would change pointer identity (`casArray#`).
         crate::core::opt::eliminate_alias_thunks(&mut binds);
     }
     if flags.iter().any(|f| f == "-dcore-lint") {
         crate::core::lint::lint_program(&binds).map_err(|e| format!("Core lint after optimization: {e}"))?;
     }
     Ok(binds)
+}
+
+/// Whether a top-level binding belongs to one of the program's own modules: its name is
+/// prefixed by its module's (the longest module name that prefixes it, as `A.B.f` is `A.B`'s).
+fn home_binding_filter(sources: &[(String, PathBuf, bool)]) -> impl Fn(&str) -> bool {
+    let modules: HashMap<String, bool> = sources.iter().map(|(m, _, home)| (m.clone(), *home)).collect();
+    move |name: &str| {
+        let mut end = name.len();
+        while let Some(dot) = name[..end].rfind('.') {
+            if let Some(&home) = modules.get(&name[..dot]) {
+                return home;
+            }
+            end = dot;
+        }
+        false
+    }
 }
 
 /// The name a source file gives its module (from its `module` line; `Main` when it has none).
@@ -2219,10 +2245,8 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let t = std::time::Instant::now();
     let mut binds = crate::native::reachable(binds, &roots);
     let mut numeric = numeric.clone();
-    if crate::core::opt_level() > 0 {
-        crate::native::lift::lambda_lift(&mut binds, &mut numeric);
-        crate::native::stg::collapse_case_chains(&mut binds);
-    }
+    crate::native::lift::lambda_lift(&mut binds, &mut numeric);
+    crate::native::stg::collapse_case_chains(&mut binds);
     let prog = crate::native::stg::Lowering::program(&binds, &numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
