@@ -1512,27 +1512,19 @@ impl Parser {
         Ok(decl)
     }
 
-    /// `instance forall a b. C a => ..`: the explicit binders of an instance head (its variables
-    /// are implicitly bound anyway).
-    fn skip_instance_forall(&mut self) -> PResult<()> {
-        if self.at_varid("forall") {
-            self.require_explicit_forall()?;
-            self.bump();
-            while self.real() && !self.at_varsym(".") && !self.at_eof() {
-                self.bump();
-            }
-            if self.at_varsym(".") {
-                self.bump();
-            }
+    fn instance_signature(&mut self) -> PResult<(Vec<TyVarBind>, Vec<Type>, Type, bool)> {
+        let binders = if self.at_varid("forall") { Some(self.forall_binders()?) } else { None };
+        let context = self.try_context();
+        let (head, unboxed_head) = self.instance_head()?;
+        if let Some(binders) = &binders {
+            check_instance_binders(binders, &context, &head)?;
         }
-        Ok(())
+        Ok((binders.unwrap_or_default(), context, head, unboxed_head))
     }
 
     fn instance_decl(&mut self, loc: Loc) -> PResult<Decl> {
         self.expect_kw(Kw::Instance)?;
-        self.skip_instance_forall()?;
-        let context = self.try_context();
-        let (head, unboxed_head) = self.instance_head()?;
+        let (binders, context, head, unboxed_head) = self.instance_signature()?;
         let decls = if self.at_kw(Kw::Where) {
             self.bump();
             group_binds(self.block(|p| p.class_body_decl(true))?)
@@ -1541,6 +1533,7 @@ impl Parser {
         };
         Ok(Decl::Instance(InstDecl {
             overlap: None,
+            binders,
             context,
             head,
             unboxed_head,
@@ -1563,9 +1556,7 @@ impl Parser {
         let strategy_loc = self.loc();
         let strategy = if via.is_some() { None } else { self.deriving_strategy()? };
         self.expect_kw(Kw::Instance)?;
-        self.skip_instance_forall()?;
-        let context = self.try_context();
-        let (head, unboxed_head) = self.instance_head()?;
+        let (_, context, head, unboxed_head) = self.instance_signature()?;
         self.check_deriving_strategy(strategy, strategy_loc)?;
         Ok(Decl::Deriving(StandaloneDeriving {
             strategy,
@@ -1827,6 +1818,29 @@ impl Parser {
             }
         }
     }
+}
+
+fn check_instance_binders(binders: &[TyVarBind], context: &[Type], head: &Type) -> PResult<()> {
+    let unbound = |name: &str, loc: Loc| super::ParseError {
+        line: loc.line,
+        col: loc.col,
+        msg: format!("Not in scope: type variable ‘{name}’\nBind it before using it in this instance header."),
+    };
+    let mut scope = Vec::new();
+    for binder in binders {
+        if let Some(kind) = &binder.kind {
+            if let Some((name, loc)) = kind.first_unbound_variable(|name, _| scope.contains(&name)) {
+                return Err(unbound(name, loc));
+            }
+        }
+        scope.push(binder.name.as_str());
+    }
+    for ty in context.iter().chain(std::iter::once(head)) {
+        if let Some((name, loc)) = ty.first_unbound_variable(|name, _| scope.contains(&name)) {
+            return Err(unbound(name, loc));
+        }
+    }
+    Ok(())
 }
 
 /// The type variables of a type, in order of first occurrence.

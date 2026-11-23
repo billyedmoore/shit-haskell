@@ -1334,6 +1334,7 @@ impl<'a> Renamer<'a> {
             }
             Decl::Instance(mut id) => {
                 check_group_signatures(&id.decls)?;
+                check_type_binders(&id.binders, id.loc)?;
                 let methods_with_bindings: HashSet<_> = id.decls.iter().filter_map(|decl| match decl {
                     Decl::Fun { name, .. } => Some(name.as_str()),
                     _ => None,
@@ -1350,6 +1351,7 @@ impl<'a> Renamer<'a> {
                         }
                     }
                 }
+                id.binders = self.tyvar_binds(id.binders)?;
                 id.context = self.types(id.context)?;
                 id.head = self.ty(id.head)?;
                 let class = instance_class(&id.head);

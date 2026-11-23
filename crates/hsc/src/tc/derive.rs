@@ -504,6 +504,7 @@ fn instance(checker: &Checker, dd: &DataDecl, class: &QName, decls: Vec<Decl>, d
     }
     Decl::Instance(InstDecl {
         overlap: None,
+        binders: Vec::new(),
         context,
         head,
         unboxed_head: false,

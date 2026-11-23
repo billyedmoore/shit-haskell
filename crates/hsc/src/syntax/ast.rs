@@ -634,6 +634,8 @@ pub enum Minimal {
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstDecl {
     pub overlap: Option<String>,
+    /// The explicitly bound type variables from the instance header.
+    pub binders: Vec<TyVarBind>,
     pub context: Vec<Type>,
     /// The class and its argument types, as a type application chain.
     pub head: Type,

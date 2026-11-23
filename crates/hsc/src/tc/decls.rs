@@ -1192,7 +1192,7 @@ impl Checker {
                 super::types::unqualify(&class), info.nparams, args.len()
             ));
         }
-        let mut tvs = Vec::new();
+        let mut tvs: Vec<_> = id.binders.iter().map(|binder| binder.name.clone()).collect();
         let mut head = Vec::new();
         for a in &args {
             if !derived && !self.type_synonym_instances {
@@ -1409,7 +1409,7 @@ impl Checker {
         };
         // Find this instance's registered info by its head (and context, when kind-dispatched
         // instances share an erased head).
-        let mut tvs = Vec::new();
+        let mut tvs: Vec<_> = id.binders.iter().map(|binder| binder.name.clone()).collect();
         let mut head_check = Vec::new();
         let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
         for a in &args {

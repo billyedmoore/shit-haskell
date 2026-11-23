@@ -998,7 +998,10 @@ impl Conv<'_> {
                         None => None,
                     };
                     let decls = self.decs(&a[3])?;
-                    out.push(Decl::Instance(InstDecl { overlap, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, unboxed_head: false, decls, loc }));
+                    out.push(Decl::Instance(InstDecl {
+                        overlap, binders: Vec::new(), context: self.cxt(&a[1])?, head: self.ty(&a[2])?,
+                        unboxed_head: false, decls, loc,
+                    }));
                 }
                 "StandaloneDerivD" => {
                     let strategy = match self.maybe(&a[0])? {

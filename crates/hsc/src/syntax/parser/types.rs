@@ -20,18 +20,23 @@ impl Parser {
         Ok(())
     }
 
+    pub(super) fn forall_binders(&mut self) -> PResult<Vec<TyVarBind>> {
+        self.require_explicit_forall()?;
+        self.bump();
+        let mut binders = Vec::new();
+        while !self.at_varsym(".") {
+            binders.push(self.tyvar_binder()?);
+        }
+        self.bump();
+        Ok(binders)
+    }
+
     /// `[forall binders .] [context =>] type`
     pub(super) fn sigtype(&mut self) -> PResult<Type> {
         if self.at_varid("forall") {
-            self.require_explicit_forall()?;
-            self.bump();
-            let mut vars = Vec::new();
-            while !self.at_varsym(".") {
-                vars.push(self.tyvar_binder()?);
-            }
-            self.bump();
+            let binders = self.forall_binders()?;
             let body = self.sigtype()?;
-            return Ok(Type::Forall { binders: vars, body: Box::new(body), parenthesized: false });
+            return Ok(Type::Forall { binders, body: Box::new(body), parenthesized: false });
         }
         let t = self.type_expr()?;
         if self.at_res(ROp::DArrow) {
