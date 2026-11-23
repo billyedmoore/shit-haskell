@@ -88,9 +88,11 @@ impl Parser {
         let loc = self.loc();
         let mut items = Vec::new();
         let mut app = self.app_type()?;
-        while let Some(op) = self.type_operator() {
+        loop {
+            let op_loc = self.loc();
+            let Some(op) = self.type_operator() else { break };
             items.push(TypeOpItem::Operand(app));
-            items.push(TypeOpItem::Op(op, loc));
+            items.push(TypeOpItem::Op(op, op_loc));
             app = self.app_type()?;
         }
         if items.is_empty() {
@@ -266,11 +268,11 @@ impl Parser {
                     }
                     // `'(:)` and `'(,)`: a parenthesised constructor, promoted.
                     Tok::Special('(') => match self.atype()? {
-                        Type::Con(q, l) => {
+                        Type::Con(q, _) => {
                             if q.qual.is_none() && (q.name == "()" || q.name.starts_with("(,")) {
                                 self.require_data_kinds(loc, "A promoted tuple")?;
                             }
-                            Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, l))
+                            Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, loc))
                         }
                         tuple @ Type::Tuple(..) => {
                             self.require_data_kinds(loc, "A promoted tuple")?;

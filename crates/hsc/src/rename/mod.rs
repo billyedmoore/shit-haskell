@@ -92,6 +92,7 @@ pub struct Renamer<'a> {
     rebindable: bool,
     partial_type_signatures: bool,
     named_wildcards: bool,
+    data_kinds: bool,
     empty_data_decls: bool,
     /// Fixities declared for local operators (`where infixl 3 <!>`), by their unique local name.
     local_fixities: HashMap<String, (Assoc, u8)>,
@@ -205,6 +206,7 @@ pub(crate) fn rename_module_with_warnings(
         rebindable: extensions.is_on("RebindableSyntax"),
         partial_type_signatures: extensions.is_on("PartialTypeSignatures"),
         named_wildcards: extensions.is_on("NamedWildCards"),
+        data_kinds: extensions.is_on("DataKinds"),
         empty_data_decls: extensions.is_on("EmptyDataDecls"),
         local_fixities: HashMap::new(),
         vals: HashMap::new(),
@@ -977,7 +979,7 @@ impl<'a> Renamer<'a> {
         }
     }
 
-    fn tycon_ref(&mut self, q: &QName, loc: Loc) -> RR<QName> {
+    fn tycon_ref(&self, q: &QName, loc: Loc, infix: bool) -> RR<QName> {
         if let Some(m) = q.qual.as_deref().and_then(|x| x.strip_prefix("%G:")) {
             return Ok(QName { qual: Some(m.to_string()), name: q.name.clone() });
         }
@@ -996,18 +998,28 @@ impl<'a> Renamer<'a> {
         // A promoted data constructor (DataKinds) is looked up among the values; its global
         // name keeps the tick so that it is distinct from a type of the same name.
         if let Some(bare) = q.name.strip_prefix('\'') {
+            let value_name = QName { qual: q.qual.clone(), name: bare.to_string() };
+            let constructor = self.lookup_global(&value_name, Ns::Value);
+            // GHC also permits ticked infix syntax and its wired-in representation constructors.
+            if !self.data_kinds && !infix && !constructor.as_ref().is_ok_and(|e| self.wired_promotable_constructor(e)) {
+                let name = q.qual.as_ref().map_or_else(|| bare.to_string(), |module| format!("{module}.{bare}"));
+                return Err(RnError { loc, msg: format!("Promoting ‘{name}’ requires DataKinds") });
+            }
             // The built-in promoted constructors (list cons and nil, tuples) are always in scope.
             if q.qual.is_none() && (bare == ":" || bare == "[]" || bare == "()" || bare.starts_with("(,")) {
                 return Ok(QName { qual: Some(BUILTIN.to_string()), name: format!("'{bare}") });
             }
             if bare.starts_with(|c: char| c.is_uppercase() || c == ':') {
-                let vq = QName { qual: q.qual.clone(), name: bare.to_string() };
-                return match self.lookup_global(&vq, Ns::Value) {
-                    Ok(e) => Ok(QName {
+                return match constructor {
+                    Ok(e) if e.kind == EntKind::Con => Ok(QName {
                         qual: Some(e.global.module.clone()),
                         name: format!("'{}", e.global.name),
                     }),
-                    Err(_) => Err(RnError {
+                    Ok(e) if e.kind == EntKind::PatSyn => Err(RnError {
+                        loc,
+                        msg: format!("Pattern synonym ‘{bare}’ cannot be promoted to a type"),
+                    }),
+                    _ => Err(RnError {
                         loc,
                         msg: format!("Data constructor not in scope: {}", bare),
                     }),
@@ -1020,17 +1032,37 @@ impl<'a> Renamer<'a> {
                 qual: Some(e.global.module.clone()),
                 name: e.global.name.clone(),
             }),
-            // DataKinds: an unticked data constructor used as a type is promoted.
-            Err(c) if c.is_empty() && self.lookup_global(q, Ns::Value).is_ok() => {
-                let e = self.lookup_global(q, Ns::Value).unwrap_or_else(|_| unreachable!());
-                Ok(QName {
+            // With DataKinds, a constructor can also be promoted without a tick.
+            Err(c) if c.is_empty() => match self.lookup_global(q, Ns::Value) {
+                Ok(e) if e.kind == EntKind::Con && self.data_kinds => Ok(QName {
                     qual: Some(e.global.module.clone()),
                     name: format!("'{}", e.global.name),
-                })
-            }
-            Err(c) if c.is_empty() => Err(self.unbound(q, loc, Ns::Type, false)),
+                }),
+                Ok(e) if e.kind == EntKind::Con => {
+                    let mut error = self.unbound(q, loc, Ns::Type, false);
+                    let name = q.qual.as_ref().map_or_else(|| q.name.clone(), |module| format!("{module}.{}", q.name));
+                    error.msg.push_str(&format!("\nEnable DataKinds to promote the data constructor ‘{name}’."));
+                    Err(error)
+                }
+                Ok(e) if e.kind == EntKind::PatSyn && self.data_kinds => Err(RnError {
+                    loc,
+                    msg: format!("Pattern synonym ‘{}’ cannot be promoted to a type", q.name),
+                }),
+                _ => Err(self.unbound(q, loc, Ns::Type, false)),
+            },
             Err(c) => Err(self.ambiguous(q, &c, loc)),
         }
+    }
+
+    fn wired_promotable_constructor(&self, constructor: &Entity) -> bool {
+        if constructor.kind != EntKind::Con || constructor.global.module != "GHC.Types" {
+            return false;
+        }
+        let types = self.ifaces.get("GHC.Types").map_or(self.own.as_slice(), |iface| iface.exports.as_slice());
+        types.iter().any(|parent| {
+            matches!(parent.occ(), "RuntimeRep" | "Levity" | "VecCount" | "VecElem" | "Multiplicity")
+                && parent.subs.iter().any(|sub| sub.global == constructor.global)
+        })
     }
 
     /// RebindableSyntax: a numeric literal as `fromInteger (n :: Integer)` or `fromRational
@@ -1477,7 +1509,7 @@ impl<'a> Renamer<'a> {
                 }
             }
             Decl::TypeInstance { name, equation, loc } => {
-                let qname = self.tycon_ref(&name, loc)?;
+                let qname = self.tycon_ref(&name, loc, false)?;
                 Decl::TypeInstance {
                     name: qname,
                     equation: self.type_equation(equation)?,
@@ -2337,7 +2369,7 @@ impl<'a> Renamer<'a> {
     fn ty(&mut self, t: Type) -> RR<Type> {
         Ok(match t {
             Type::Var(v, loc) => Type::Var(v, loc),
-            Type::Con(q, loc) => Type::Con(self.tycon_ref(&q, loc)?, loc),
+            Type::Con(q, loc) => Type::Con(self.tycon_ref(&q, loc, false)?, loc),
             Type::App(f, a) => Type::App(Box::new(self.ty(*f)?), Box::new(self.ty(*a)?)),
             Type::Fun(a, b) => Type::Fun(Box::new(self.ty(*a)?), Box::new(self.ty(*b)?)),
             Type::List(t, loc) => Type::List(Box::new(self.ty(*t)?), loc),
@@ -2353,7 +2385,7 @@ impl<'a> Renamer<'a> {
                     match it {
                         TypeOpItem::Operand(t) => toks.push(Tk::Operand(self.ty(t)?)),
                         TypeOpItem::Op(q, l) => {
-                            let qn = self.tycon_ref(&q, l)?;
+                            let qn = self.tycon_ref(&q, l, true)?;
                             let (assoc, prec) = self.fixity_of(&qn);
                             toks.push(Tk::Op {
                                 op: qn,

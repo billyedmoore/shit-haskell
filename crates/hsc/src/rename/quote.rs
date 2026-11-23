@@ -346,11 +346,14 @@ impl Q<'_, '_> {
     fn ty(&self, t: &Type) -> RR<Expr> {
         Ok(match t {
             Type::Var(v, _) => app(self.lib("varT"), self.binder(v)),
-            Type::Con(q, _) => match (q.qual.as_deref(), q.name.as_str()) {
+            Type::Con(q, loc) => match (q.qual.as_deref(), q.name.as_str()) {
                 (_, "->") => self.lib("arrowT"),
                 (_, "[]") => self.lib("listT"),
                 (_, "()") => app(self.lib("tupleT"), Expr::Lit(Lit::Int("0".into()), self.loc)),
                 (_, n) if n.starts_with('\'') => {
+                    if !self.rn.data_kinds {
+                        self.rn.tycon_ref(q, *loc, false)?;
+                    }
                     let bare = QName { qual: q.qual.clone(), name: n[1..].to_string() };
                     app(self.lib("promotedT"), self.name(&bare, "mkNameG_d"))
                 }
