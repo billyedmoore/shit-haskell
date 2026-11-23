@@ -289,8 +289,7 @@ impl Checker {
         }
     }
 
-    /// The scheme of a signature. Free type variables are quantified in order of appearance.
-    pub fn sig_scheme(&mut self, t: &Type, fixed: &[String]) -> TR<Scheme> {
+    pub(super) fn check_signature_scope(&self, t: &Type, fixed: &[String]) -> TR<()> {
         if matches!(t, Type::Forall { parenthesized: false, .. }) {
             let in_scope = |name: &str, outer_binder_kind: bool| {
                 fixed.iter().any(|binder| binder == name)
@@ -305,6 +304,12 @@ impl Checker {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// The scheme of a signature. Free type variables are quantified in order of appearance.
+    pub fn sig_scheme(&mut self, t: &Type, fixed: &[String]) -> TR<Scheme> {
+        self.check_signature_scope(t, fixed)?;
         let mut tvs: Vec<String> = fixed.to_vec();
         let (preds, ty) = self.sig_parts(t, &mut tvs)?;
         Ok(Scheme {

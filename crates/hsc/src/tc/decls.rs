@@ -769,10 +769,20 @@ impl Checker {
             args: (0..nparams).map(Ty::Gen).collect(),
         };
 
+        let mut class_scope = class_vars.clone();
+        for kind in cd.tyvars.iter().filter_map(|binder| binder.kind.as_ref()) {
+            kind.first_unbound_variable(|name, _| {
+                if !class_scope.iter().any(|binder| binder == name) {
+                    class_scope.push(name.to_owned());
+                }
+                true
+            });
+        }
         let mut methods: Vec<(String, Scheme)> = Vec::new();
         for d in &cd.decls {
             if let Decl::Sig { names, ty, loc } = d {
                 self.loc = *loc;
+                self.check_signature_scope(ty, &class_scope)?;
                 for name in names {
                     let mut mtvs = class_vars.clone();
                     let (own_preds, mty) = self.sig_parts(ty, &mut mtvs)?;
@@ -875,6 +885,7 @@ impl Checker {
         for d in &cd.decls {
             if let Decl::DefaultSig { names, ty, loc } = d {
                 self.loc = *loc;
+                self.check_signature_scope(ty, &class_scope)?;
                 for name in names {
                     let mut mtvs = class_vars.clone();
                     let (own_preds, mty) = self.sig_parts(ty, &mut mtvs)?;
@@ -1048,15 +1059,8 @@ impl Checker {
     }
 
     fn foreign_import(&mut self, name: &str, entity: Option<&str>, ty: &Type, is_prim: bool) -> TR<()> {
-        let mut tvs = Vec::new();
-        let (preds, body) = self.sig_parts(ty, &mut tvs)?;
-        let scheme = Scheme {
-            nvars: tvs.len() as u32,
-            visible: visible_signature_vars(ty, &tvs, 0),
-            names: tvs,
-            preds,
-            ty: body.clone(),
-        };
+        let scheme = self.sig_scheme(ty, &[])?;
+        let body = scheme.ty.clone();
         let key = format!("{}.{name}", self.module);
         // The C entity: an optional `static`, an optional header (`HsBase.h`), then the symbol.
         let capi = entity.is_some_and(|e| e.split_whitespace().any(|w| w == "%capi"));

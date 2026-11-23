@@ -1,0 +1,3 @@
+declaration_scope_foreign_unbound.hs:2:43: error:
+Not in scope: type variable ‘missing’
+Bind it before using it in this explicitly quantified type.
