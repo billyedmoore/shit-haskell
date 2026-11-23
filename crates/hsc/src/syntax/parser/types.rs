@@ -5,6 +5,17 @@ use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
 
 impl Parser {
+    fn require_data_kinds(&self, loc: Loc, construct: &str) -> PResult<()> {
+        if self.exts.is_on("DataKinds") {
+            return Ok(());
+        }
+        Err(super::ParseError {
+            line: loc.line,
+            col: loc.col,
+            msg: format!("{construct} requires DataKinds"),
+        })
+    }
+
     pub(super) fn kind_signature(&mut self) -> PResult<Type> {
         self.expect_res(ROp::DColon)?;
         if !self.exts.is_on("KindSignatures") {
@@ -240,6 +251,7 @@ impl Parser {
                         Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, loc))
                     }
                     Tok::Special('[') => {
+                        self.require_data_kinds(loc, "A promoted list")?;
                         self.bump();
                         let mut elems = Vec::new();
                         if !self.at_special(']') {
@@ -254,7 +266,16 @@ impl Parser {
                     }
                     // `'(:)` and `'(,)`: a parenthesised constructor, promoted.
                     Tok::Special('(') => match self.atype()? {
-                        Type::Con(q, l) => Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, l)),
+                        Type::Con(q, l) => {
+                            if q.qual.is_none() && (q.name == "()" || q.name.starts_with("(,")) {
+                                self.require_data_kinds(loc, "A promoted tuple")?;
+                            }
+                            Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, l))
+                        }
+                        tuple @ Type::Tuple(..) => {
+                            self.require_data_kinds(loc, "A promoted tuple")?;
+                            Ok(tuple)
+                        }
                         other => Ok(other),
                     },
                     _ => self.unexpected(),
@@ -266,15 +287,18 @@ impl Parser {
                 Ok(Type::Con(QName { qual: Some("%G:GHC.Types".into()), name: "Type".into() }, loc))
             }
             Tok::Int(s) => {
+                self.require_data_kinds(loc, "A type-level literal")?;
                 self.bump();
                 Ok(Type::Lit(Lit::Int(s), loc))
             }
             Tok::Str(s) => {
+                self.require_data_kinds(loc, "A type-level literal")?;
                 self.bump();
                 Ok(Type::Lit(Lit::Str(s), loc))
             }
             // A type-level character (DataKinds): `'x'`.
             Tok::Char(c) => {
+                self.require_data_kinds(loc, "A type-level literal")?;
                 self.bump();
                 Ok(Type::Lit(Lit::Char(c), loc))
             }
@@ -339,6 +363,9 @@ impl Parser {
                 };
                 if let Some(q) = op_name {
                     if *self.peek_raw(1) == Tok::Special(')') {
+                        if q.qual.is_none() && q.name == ":" {
+                            self.require_data_kinds(loc, "The promoted list constructor ‘(:)’")?;
+                        }
                         self.bump();
                         self.bump();
                         return Ok(Type::Con(q, loc));
@@ -394,6 +421,7 @@ impl Parser {
                 let t = self.sigtype()?;
                 if self.at_special(',') {
                     // DataKinds: a promoted list literal `[t1, t2, ...]` is `t1 ': t2 ': ... '[]`.
+                    self.require_data_kinds(loc, "A promoted list")?;
                     let mut elems = vec![t];
                     while self.at_special(',') {
                         self.bump();
