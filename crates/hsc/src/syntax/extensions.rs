@@ -221,6 +221,9 @@ impl Extensions {
     }
 
     fn set_extension(&mut self, name: &str, enabled: bool) {
+        if enabled && name == "StandaloneKindSignatures" {
+            self.set_extension("CUSKs", false);
+        }
         self.overrides.insert(name.to_string(), enabled);
         if enabled {
             self.on.insert(name.to_string());

@@ -60,6 +60,12 @@ enum KindArgumentSite {
     InfixOperand(Loc),
 }
 
+struct KindSignatureRequirement {
+    declaration: String,
+    signature_name: String,
+    at: Loc,
+}
+
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -69,6 +75,7 @@ pub struct Parser {
     pub exts: Extensions,
     kind_annotations: Vec<Type>,
     captured_kind_arguments: Option<Vec<KindArgument>>,
+    kind_signature_requirements: Vec<KindSignatureRequirement>,
     /// The `static` forms parsed so far (each one's number keys its pointer).
     static_count: usize,
 }
@@ -88,6 +95,7 @@ pub(super) fn parse_module_with_warnings(
         exts,
         kind_annotations: Vec::new(),
         captured_kind_arguments: None,
+        kind_signature_requirements: Vec::new(),
         static_count: 0,
     };
     let mut m = p.module()?;
@@ -252,7 +260,7 @@ fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax:
                         ty_toks.push(eof_after(&bs[close]));
                         let mut tp = Parser {
                             toks: ty_toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(),
-                            kind_annotations: Vec::new(), captured_kind_arguments: None, static_count: 0,
+                            kind_annotations: Vec::new(), captured_kind_arguments: None, kind_signature_requirements: Vec::new(), static_count: 0,
                         };
                         let t = tp.sigtype()?;
                         if !tp.at_eof() {
@@ -277,7 +285,7 @@ fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax:
         ts.push(eof_after(&last));
         let mut ep = Parser {
             toks: ts, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(),
-            kind_annotations: Vec::new(), captured_kind_arguments: None, static_count: 0,
+            kind_annotations: Vec::new(), captured_kind_arguments: None, kind_signature_requirements: Vec::new(), static_count: 0,
         };
         let e = ep.expr()?;
         if !ep.at_eof() {
@@ -718,6 +726,7 @@ impl Parser {
                 TopItem::Decl(d) => decls.push(d),
             }
         }
+        self.check_kind_signature_requirements(&decls)?;
         Ok(Module {
             name,
             exports,
@@ -729,6 +738,29 @@ impl Parser {
             rules: Vec::new(),
             inlines: Vec::new(),
         })
+    }
+
+    fn check_kind_signature_requirements(&self, declarations: &[Decl]) -> PResult<()> {
+        if self.kind_signature_requirements.is_empty() {
+            return Ok(());
+        }
+        let signatures: std::collections::HashSet<_> = declarations.iter().filter_map(|declaration| {
+            if let Decl::KindSig { name, .. } = declaration { Some(name.as_str()) } else { None }
+        }).collect();
+        for requirement in &self.kind_signature_requirements {
+            if !signatures.contains(requirement.signature_name.as_str()) {
+                let name = &requirement.signature_name;
+                return Err(ParseError {
+                    line: requirement.at.line,
+                    col: requirement.at.col,
+                    msg: format!(
+                        "An invisible binder in ‘{}’ needs an explicit kind signature\nAdd a standalone kind signature for ‘{name}’, or supply a complete kind with CUSKs enabled.",
+                        requirement.declaration,
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn top_item(&mut self, module: &str) -> PResult<TopItem> {
