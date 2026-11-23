@@ -5,9 +5,17 @@ use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
 
 impl Parser {
+    pub(super) fn require_explicit_forall(&self) -> PResult<()> {
+        if !self.exts.is_on("ExplicitForAll") {
+            return self.err("Explicit ‘forall’ in a type requires ExplicitForAll");
+        }
+        Ok(())
+    }
+
     /// `[forall binders .] [context =>] type`
     pub(super) fn sigtype(&mut self) -> PResult<Type> {
         if self.at_varid("forall") {
+            self.require_explicit_forall()?;
             self.bump();
             let mut vars = Vec::new();
             while !self.at_varsym(".") {

@@ -1041,6 +1041,7 @@ impl Parser {
             let mut vars = Vec::new();
             let mut ok = true;
             if self.at_varid("forall") {
+                self.require_explicit_forall()?;
                 self.bump();
                 while !self.at_varsym(".") && self.real() {
                     match self.tyvar_binder() {
@@ -1440,8 +1441,9 @@ impl Parser {
 
     /// `instance forall a b. C a => ..`: the explicit binders of an instance head (its variables
     /// are implicitly bound anyway).
-    fn skip_instance_forall(&mut self) {
+    fn skip_instance_forall(&mut self) -> PResult<()> {
         if self.at_varid("forall") {
+            self.require_explicit_forall()?;
             self.bump();
             while self.real() && !self.at_varsym(".") && !self.at_eof() {
                 self.bump();
@@ -1450,11 +1452,12 @@ impl Parser {
                 self.bump();
             }
         }
+        Ok(())
     }
 
     fn instance_decl(&mut self, loc: Loc) -> PResult<Decl> {
         self.expect_kw(Kw::Instance)?;
-        self.skip_instance_forall();
+        self.skip_instance_forall()?;
         let context = self.try_context();
         let (head, unboxed_head) = self.instance_head()?;
         let decls = if self.at_kw(Kw::Where) {
@@ -1487,7 +1490,7 @@ impl Parser {
         let strategy_loc = self.loc();
         let strategy = if via.is_some() { None } else { self.deriving_strategy()? };
         self.expect_kw(Kw::Instance)?;
-        self.skip_instance_forall();
+        self.skip_instance_forall()?;
         let context = self.try_context();
         let (head, unboxed_head) = self.instance_head()?;
         self.check_deriving_strategy(strategy, strategy_loc)?;

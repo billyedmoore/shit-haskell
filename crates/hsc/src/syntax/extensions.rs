@@ -225,8 +225,8 @@ fn implied_by(name: &str) -> &'static [&'static str] {
         "TypeFamilies" => &["MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
         "TypeFamilyDependencies" => &["TypeFamilies", "MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
         "RecordWildCards" => &["DisambiguateRecordFields"],
-        "RankNTypes" => &["ExplicitForAll"],
-        "ScopedTypeVariables" => &["ExplicitForAll"],
+        "RankNTypes" | "ScopedTypeVariables" | "ExistentialQuantification"
+        | "LiberalTypeSynonyms" | "QuantifiedConstraints" => &["ExplicitForAll"],
         "TemplateHaskell" => &["TemplateHaskellQuotes"],
         "DerivingVia" => &["DerivingStrategies"],
         "UnliftedDatatypes" => &["DataKinds", "StandaloneKindSignatures"],
