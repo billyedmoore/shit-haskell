@@ -143,7 +143,9 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     if th_quotes {
         tokens = quote_brackets(tokens);
     }
-    let mut module = parser::parse_module(tokens, exts.clone()).map_err(|e| at(e.line, e.col, e.msg))?;
+    let (mut module, syntax_warnings) = parser::parse_module_with_warnings(tokens, exts.clone())
+        .map_err(|e| at(e.line, e.col, e.msg))?;
+    exts.syntax_warnings = syntax_warnings;
     // Rewrite rules: each pragma's body is lexed on its own, at the pragma's lines.
     for p in rule_pragmas {
         let Ok(lexed) = lexer::lex_for_module(&p.body, &exts) else { continue };

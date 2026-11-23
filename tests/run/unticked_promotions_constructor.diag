@@ -1,0 +1,3 @@
+[-Wunticked-promoted-constructors]
+Unticked promoted constructor ‘MkD’
+Write ‘'MkD’ to make the promotion explicit.

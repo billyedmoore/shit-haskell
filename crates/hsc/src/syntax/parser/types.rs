@@ -440,6 +440,10 @@ impl Parser {
                         elems.push(self.sigtype()?);
                     }
                     self.expect_special(']')?;
+                    let flag = crate::diagnostic::Warning::UntickedPromotedConstructors;
+                    if self.exts.warnings.level(flag).is_some() {
+                        self.exts.syntax_warnings.push((loc, "Unticked promoted list\nAdd a leading tick to the list.".into(), flag));
+                    }
                     return Ok(promoted_list(elems, loc));
                 }
                 self.expect_special(']')?;

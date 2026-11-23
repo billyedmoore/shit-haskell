@@ -15,14 +15,16 @@ pub(crate) enum Warning {
     MissingImportLists,
     DuplicateExports,
     DeprecatedFlags,
+    UntickedPromotedConstructors,
     IncompleteMinimal,
 }
 
 impl Warning {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Tabs, Self::MissingSignatures, Self::MissingFields, Self::UnrecognisedPragmas,
         Self::MissingDerivingStrategies, Self::MissingMethods, Self::MissingExportLists,
-        Self::MissingImportLists, Self::DuplicateExports, Self::DeprecatedFlags, Self::IncompleteMinimal,
+        Self::MissingImportLists, Self::DuplicateExports, Self::DeprecatedFlags,
+        Self::UntickedPromotedConstructors, Self::IncompleteMinimal,
     ];
 
     fn name(self) -> Option<&'static str> {
@@ -37,12 +39,16 @@ impl Warning {
             Self::MissingImportLists => "missing-import-lists",
             Self::DuplicateExports => "duplicate-exports",
             Self::DeprecatedFlags => "deprecated-flags",
+            Self::UntickedPromotedConstructors => "unticked-promoted-constructors",
             Self::IncompleteMinimal => return None,
         })
     }
 
     fn in_wall(self) -> bool {
-        !matches!(self, Self::MissingDerivingStrategies | Self::MissingExportLists | Self::MissingImportLists)
+        !matches!(
+            self,
+            Self::MissingDerivingStrategies | Self::MissingExportLists | Self::MissingImportLists | Self::UntickedPromotedConstructors
+        )
     }
 }
 

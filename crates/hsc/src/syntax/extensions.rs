@@ -117,6 +117,7 @@ pub struct Extensions {
     pub(crate) tabs: Option<(crate::syntax::ast::Loc, usize)>,
     pub(crate) unknown_pragmas: Vec<(crate::syntax::ast::Loc, String)>,
     pub(crate) deprecated_flags: Vec<(crate::syntax::ast::Loc, String)>,
+    pub(crate) syntax_warnings: Vec<(crate::syntax::ast::Loc, String, crate::diagnostic::Warning)>,
 }
 
 impl Default for Extensions {
@@ -134,6 +135,7 @@ impl Extensions {
             tabs: None,
             unknown_pragmas: Vec::new(),
             deprecated_flags: Vec::new(),
+            syntax_warnings: Vec::new(),
         }
     }
 

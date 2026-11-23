@@ -1724,7 +1724,7 @@ impl Driver {
         exts: &Extensions, path: &Path, source: Option<&str>,
     ) -> Result<Vec<String>, String> {
         use crate::diagnostic::Warning;
-        let mut warnings: Vec<_> = self.checker.warnings.iter().chain(rename_warnings).filter_map(|(loc, msg, flag)| {
+        let mut warnings: Vec<_> = self.checker.warnings.iter().chain(rename_warnings).chain(&exts.syntax_warnings).filter_map(|(loc, msg, flag)| {
             exts.warnings.level(*flag).map(|fatal| (*loc, msg.clone(), *flag, fatal))
         }).collect();
         if let Some(fatal) = exts.warnings.level(Warning::MissingExportLists).filter(|_| module.exports.is_none()) {

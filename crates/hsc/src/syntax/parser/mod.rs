@@ -61,6 +61,12 @@ pub struct Parser {
 }
 
 pub fn parse_module(toks: Vec<Token>, exts: Extensions) -> PResult<Module> {
+    parse_module_with_warnings(toks, exts).map(|(module, _)| module)
+}
+
+pub(super) fn parse_module_with_warnings(
+    toks: Vec<Token>, exts: Extensions,
+) -> PResult<(Module, Vec<(Loc, String, crate::diagnostic::Warning)>)> {
     let mut p = Parser {
         toks,
         pos: 0,
@@ -71,7 +77,7 @@ pub fn parse_module(toks: Vec<Token>, exts: Extensions) -> PResult<Module> {
     };
     let mut m = p.module()?;
     mark_gadt_infix(&mut m);
-    Ok(m)
+    Ok((m, p.exts.syntax_warnings))
 }
 
 /// Parses the body of a `{-# RULES #-}` pragma (lexed, with the pragma's line) into its rules.
