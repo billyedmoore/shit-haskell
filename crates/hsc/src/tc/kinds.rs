@@ -507,7 +507,7 @@ impl Checker {
                     pending.push((d, kind));
                     self.check_data_fields(dd, &mut vars)?;
                 }
-                Decl::TypeSyn { name, tyvars, rhs, loc } => {
+                Decl::TypeSyn { name, tyvars, rhs, loc, .. } => {
                     let full = format!("{}.{name}", self.module);
                     let mut vars: TyVars = HashMap::new();
                     let mut params = Vec::new();

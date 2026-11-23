@@ -1,0 +1,3 @@
+type_rhs_scope_synonym_rhs_forall_kind.hs:4:23: error:
+Not in scope: type variable ‘k’
+Bind it in the type synonym’s header or in an explicit ‘forall’.

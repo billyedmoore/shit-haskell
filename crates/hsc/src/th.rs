@@ -969,7 +969,7 @@ impl Conv<'_> {
             Type::Con(q, _) => q,
             _ => return Err("malformed Template Haskell type family instance head".into()),
         };
-        Ok((name, TypeEquation { args, rhs, loc }))
+        Ok((name, TypeEquation { args, erased_kind_variables: Vec::new(), rhs, loc }))
     }
 
     // ----- top-level declarations -----
@@ -991,7 +991,7 @@ impl Conv<'_> {
                     let deriving = self.deriv_clauses(&a[5])?;
                     out.push(Decl::Data(DataDecl { newtype, context, name, tyvars, erased_kind_variables: Vec::new(), cons, deriving, loc }));
                 }
-                "TySynD" => out.push(Decl::TypeSyn { name: self.binder(&a[0])?, tyvars: self.tyvar_binds(&a[1], false)?, rhs: self.ty(&a[2])?, loc }),
+                "TySynD" => out.push(Decl::TypeSyn { name: self.binder(&a[0])?, tyvars: self.tyvar_binds(&a[1], false)?, erased_kind_variables: Vec::new(), rhs: self.ty(&a[2])?, loc }),
                 "InstanceD" => {
                     let overlap = match self.maybe(&a[0])? {
                         Some(o) => Some(self.con(&o)?.0.to_uppercase()),

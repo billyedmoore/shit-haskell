@@ -420,7 +420,7 @@ impl Parser {
         let rhs = vars.iter().fold(Type::Con(QName::unqual(name), loc), |acc, v| {
             Type::App(Box::new(acc), Box::new(Type::Var(v.clone(), loc)))
         });
-        let equation = TypeEquation { args, rhs, loc };
+        let equation = TypeEquation { args, erased_kind_variables: Vec::new(), rhs, loc };
         Ok(Decl::Many(vec![
             data,
             Decl::TypeInstance { name: family, equation, loc },
@@ -601,7 +601,7 @@ impl Parser {
             }
             return Ok(Decl::RoleAnnotation { name, roles, loc });
         }
-        let head = self.btype()?;
+        let (head, erased_kind_variables) = self.head_with_kind_variables()?;
         if self.at_res(ROp::DColon) {
             if !self.exts.is_on("StandaloneKindSignatures") {
                 return self.err("A standalone kind signature requires StandaloneKindSignatures");
@@ -623,6 +623,7 @@ impl Parser {
         Ok(Decl::TypeSyn {
             name,
             tyvars,
+            erased_kind_variables,
             rhs,
             loc,
         })
@@ -786,12 +787,12 @@ impl Parser {
 
     /// `F t1 .. tn = rhs`: the family name and the equation.
     fn type_equation(&mut self) -> PResult<(QName, TypeEquation)> {
-        let lhs = self.btype()?;
-        self.equation_from(lhs)
+        let (lhs, erased_kind_variables) = self.head_with_kind_variables()?;
+        self.equation_from(lhs, erased_kind_variables)
     }
 
     /// The rest of an equation whose left-hand side has been parsed.
-    fn equation_from(&mut self, lhs: Type) -> PResult<(QName, TypeEquation)> {
+    fn equation_from(&mut self, lhs: Type, erased_kind_variables: Vec<String>) -> PResult<(QName, TypeEquation)> {
         self.expect_res(ROp::Eq)?;
         let rhs = self.sigtype()?;
         // An infix head `a == b` (one operator) is the family applied to both operands.
@@ -819,7 +820,7 @@ impl Parser {
                 }
             }
         };
-        Ok((name, TypeEquation { args, rhs, loc }))
+        Ok((name, TypeEquation { args, erased_kind_variables, rhs, loc }))
     }
 
     /// Splits a declaration head `T a (b :: k)` or `a :+: b` into its name and binders.
@@ -1518,7 +1519,7 @@ impl Parser {
             if self.at_varid("family") {
                 self.bump();
             }
-            let head = self.btype()?;
+            let (head, erased_kind_variables) = self.head_with_kind_variables()?;
             if self.at_res(ROp::Eq) {
                 // `type F a = (r :: k) | r -> a` (TypeFamilyDependencies) declares an injective
                 // family with a named result; injectivity is not checked, so the clause is skipped.
@@ -1530,7 +1531,7 @@ impl Parser {
                     return Ok(Decl::TypeFamily { name, params, equations: None, abstract_closed: None, data: false, injective, loc });
                 }
                 (self.pos, self.ctx, self.semi_done) = save;
-                let (name, equation) = self.equation_from(head)?;
+                let (name, equation) = self.equation_from(head, erased_kind_variables)?;
                 return Ok(Decl::TypeInstance {
                     name,
                     equation,

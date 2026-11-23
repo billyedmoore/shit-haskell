@@ -217,7 +217,7 @@ impl Checker {
         for _ in 0..=synonym_decls.len() {
             let mut changed = false;
             for d in &synonym_decls {
-                if let Decl::TypeSyn { name, tyvars, rhs, loc } = d {
+                if let Decl::TypeSyn { name, tyvars, rhs, loc, .. } = d {
                     self.loc = *loc;
                     let mut tvs: Vec<String> = tyvars.iter().map(|t| t.name.clone()).collect();
                     let rhs_ty = self.convert_type(rhs, &mut tvs)?;
@@ -769,16 +769,7 @@ impl Checker {
             args: (0..nparams).map(Ty::Gen).collect(),
         };
 
-        let mut class_scope = class_vars.clone();
-        class_scope.extend(cd.erased_kind_variables.iter().cloned());
-        for kind in cd.tyvars.iter().filter_map(|binder| binder.kind.as_ref()) {
-            kind.first_unbound_variable(|name, _| {
-                if !class_scope.iter().any(|binder| binder == name) {
-                    class_scope.push(name.to_owned());
-                }
-                true
-            });
-        }
+        let class_scope = crate::syntax::ast::TyVarBind::declaration_scope(&cd.tyvars, &cd.erased_kind_variables);
         let mut methods: Vec<(String, Scheme)> = Vec::new();
         for d in &cd.decls {
             if let Decl::Sig { names, ty, loc } = d {

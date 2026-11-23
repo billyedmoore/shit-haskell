@@ -1176,7 +1176,7 @@ fn derive_generic(checker: &mut Checker, dd: &DataDecl, one: bool) -> Vec<Decl> 
     );
     let rep_inst = Decl::TypeInstance {
         name: QName { qual: Some(G.into()), name: if one { "Rep1" } else { "Rep" }.into() },
-        equation: crate::syntax::ast::TypeEquation { args: vec![head], rhs: rep, loc },
+        equation: crate::syntax::ast::TypeEquation { args: vec![head], erased_kind_variables: Vec::new(), rhs: rep, loc },
         loc,
     };
     // The conversions.

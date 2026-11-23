@@ -1322,16 +1322,7 @@ impl<'a> Renamer<'a> {
                 }
                 dd.tyvars = self.tyvar_binds(std::mem::take(&mut dd.tyvars))?;
                 dd.context = self.types(dd.context)?;
-                let mut parameter_scope: Vec<_> = dd.tyvars.iter().map(|binder| binder.name.clone())
-                    .chain(dd.erased_kind_variables.iter().cloned()).collect();
-                for kind in dd.tyvars.iter().filter_map(|binder| binder.kind.as_ref()) {
-                    kind.first_unbound_variable(|name, _| {
-                        if !parameter_scope.iter().any(|binder| binder == name) {
-                            parameter_scope.push(name.to_owned());
-                        }
-                        true
-                    });
-                }
+                let parameter_scope = TyVarBind::declaration_scope(&dd.tyvars, &dd.erased_kind_variables);
                 for constraint in &dd.context {
                     check_type_variables(constraint, &parameter_scope, "Bind it in the datatype header.")?;
                 }
@@ -1362,14 +1353,17 @@ impl<'a> Renamer<'a> {
                 }
                 Decl::Data(dd)
             }
-            Decl::TypeSyn { name, tyvars, rhs, loc } => {
+            Decl::TypeSyn { name, tyvars, erased_kind_variables, rhs, loc } => {
                 check_type_binders(&tyvars, loc)?;
-                Decl::TypeSyn {
-                    name,
-                    tyvars: self.tyvar_binds(tyvars)?,
-                    rhs: self.ty(rhs)?,
-                    loc,
+                let tyvars = self.tyvar_binds(tyvars)?;
+                let rhs = self.ty(rhs)?;
+                let mut bound = TyVarBind::declaration_scope(&tyvars, &erased_kind_variables);
+                // The outer result kind of a synonym can introduce implicit kind variables.
+                if let Type::Sig(_, kind) = &rhs {
+                    kind.extend_variable_scope(&mut bound);
                 }
+                check_type_variables(&rhs, &bound, "Bind it in the type synonym’s header or in an explicit ‘forall’.")?;
+                Decl::TypeSyn { name, tyvars, erased_kind_variables, rhs, loc }
             }
             Decl::Class(mut cd) => {
                 check_type_binders(&cd.tyvars, cd.loc)?;
@@ -1559,11 +1553,15 @@ impl<'a> Renamer<'a> {
     }
 
     fn type_equation(&mut self, e: TypeEquation) -> RR<TypeEquation> {
-        Ok(TypeEquation {
-            args: self.types(e.args)?,
-            rhs: self.ty(e.rhs)?,
-            loc: e.loc,
-        })
+        let TypeEquation { args, erased_kind_variables, rhs, loc } = e;
+        let args = self.types(args)?;
+        let rhs = self.ty(rhs)?;
+        let mut bound = erased_kind_variables.clone();
+        for pattern in &args {
+            pattern.extend_variable_scope(&mut bound);
+        }
+        check_type_variables(&rhs, &bound, "Bind it on the left-hand side of this type family equation.")?;
+        Ok(TypeEquation { args, erased_kind_variables, rhs, loc })
     }
 
     /// An associated family of a class, by its occurrence name: its global name.

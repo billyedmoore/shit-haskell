@@ -207,6 +207,7 @@ pub enum Decl {
     TypeSyn {
         name: String,
         tyvars: Vec<TyVarBind>,
+        erased_kind_variables: Vec<String>,
         rhs: Type,
         loc: Loc,
     },
@@ -264,6 +265,7 @@ pub enum Decl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeEquation {
     pub args: Vec<Type>,
+    pub erased_kind_variables: Vec<String>,
     pub rhs: Type,
     pub loc: Loc,
 }
@@ -454,6 +456,17 @@ pub struct TyVarBind {
     pub inferred: bool,
 }
 
+impl TyVarBind {
+    pub(crate) fn declaration_scope(binders: &[Self], erased_kind_variables: &[String]) -> Vec<String> {
+        let mut scope: Vec<_> = binders.iter().map(|binder| binder.name.clone())
+            .chain(erased_kind_variables.iter().cloned()).collect();
+        for kind in binders.iter().filter_map(|binder| binder.kind.as_ref()) {
+            kind.extend_variable_scope(&mut scope);
+        }
+        scope
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
     Var(String, Loc),
@@ -507,6 +520,15 @@ impl Type {
             Type::Var(name, loc) if !in_scope(name, outer_binder_kind) => Some((name.as_str(), *loc)),
             _ => None,
         })
+    }
+
+    pub(crate) fn extend_variable_scope(&self, scope: &mut Vec<String>) {
+        self.first_unbound_variable(|name, _| {
+            if !scope.iter().any(|variable| variable == name) {
+                scope.push(name.to_owned());
+            }
+            true
+        });
     }
 
     fn find_signature_unbound<'a, T>(&'a self, mut inspect: impl FnMut(&'a Type, bool) -> Option<T>) -> Option<T> {
