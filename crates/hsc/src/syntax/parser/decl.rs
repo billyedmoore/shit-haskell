@@ -420,7 +420,7 @@ impl Parser {
             let data_instance = name.starts_with("R:");
             let kind = if data_instance {
                 self.bump();
-                self.sigtype()?
+                self.kind_type()?
             } else {
                 self.kind_signature()?
             };
@@ -586,7 +586,7 @@ impl Parser {
             }
             // StandaloneKindSignatures: `type T :: kind`.
             self.bump();
-            let kind = self.sigtype()?;
+            let kind = self.kind_type()?;
             let (name, _) = self.decl_head(head)?;
             return Ok(Decl::KindSig { name, kind, loc });
         }
@@ -619,7 +619,7 @@ impl Parser {
         let (name, params) = self.decl_head(head)?;
         if self.at_res(ROp::DColon) {
             self.bump();
-            self.sigtype()?;
+            self.kind_type()?;
         }
         // TypeFamilyDependencies: `= r | r -> a` names the result and the parameters it determines.
         let mut injective = Vec::new();

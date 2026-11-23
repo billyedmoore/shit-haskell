@@ -21,7 +21,17 @@ impl Parser {
         if !self.exts.is_on("KindSignatures") {
             return self.err("A kind annotation requires KindSignatures");
         }
-        self.sigtype()
+        self.kind_type()
+    }
+
+    pub(super) fn kind_type(&mut self) -> PResult<Type> {
+        let kind = self.sigtype()?;
+        if !self.exts.is_on("DataKinds") {
+            if let Some((construct, loc)) = kind_collection(&kind) {
+                self.require_data_kinds(loc, construct)?;
+            }
+        }
+        Ok(kind)
     }
 
     pub(super) fn require_explicit_forall(&self) -> PResult<()> {
@@ -502,6 +512,22 @@ fn context_items(t: Type) -> Vec<Type> {
         Type::Tuple(ts, _) => ts,
         Type::Con(q, _) if q.name == "()" => Vec::new(),
         other => vec![other],
+    }
+}
+
+fn kind_collection(ty: &Type) -> Option<(&'static str, Loc)> {
+    match ty {
+        Type::List(_, loc) => Some(("A list in a kind", *loc)),
+        Type::Tuple(_, loc) => Some(("A tuple in a kind", *loc)),
+        Type::Con(name, loc) if name.qual.is_none() && name.name == "()" => Some(("A tuple in a kind", *loc)),
+        Type::App(f, a) | Type::Fun(f, a) | Type::Sig(f, a) =>
+            kind_collection(f).or_else(|| kind_collection(a)),
+        Type::Forall { body, .. } | Type::Qual(_, body) => kind_collection(body),
+        Type::OpChain(items, _) => items.iter().find_map(|item| match item {
+            TypeOpItem::Operand(ty) => kind_collection(ty),
+            TypeOpItem::Op(..) => None,
+        }),
+        _ => None,
     }
 }
 
