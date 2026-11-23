@@ -13,6 +13,51 @@ pub fn global_tycon_name(q: &QName) -> String {
 }
 
 impl Checker {
+    /// A visible type argument uses enclosing binders and its own wildcards.
+    pub(super) fn visible_type_argument(&mut self, arg: &Type) -> TR<Ty> {
+        let mut wildcards = Vec::new();
+        if let Some((name, loc)) = arg.first_unbound_variable(|name, _| {
+            if self.scoped.iter().any(|(binder, _)| binder == name)
+                || self.bound_scope.iter().any(|(binder, _)| binder == name)
+            {
+                return true;
+            }
+            if self.named_wildcards && name.starts_with('_') {
+                if !wildcards.iter().any(|wildcard| wildcard == name) {
+                    wildcards.push(name.to_owned());
+                }
+                return true;
+            }
+            false
+        }) {
+            return Err(TcError { loc, msg: format!("Not in scope: type variable ‘{name}’") });
+        }
+
+        let mark = self.scoped.len();
+        for name in wildcards {
+            let wildcard = self.meta();
+            self.scoped.push((name, wildcard));
+        }
+        let loc = std::mem::replace(&mut self.loc, arg.loc());
+        let ty = self.convert_type(arg, &mut Vec::new());
+        self.scoped.truncate(mark);
+        self.loc = loc;
+        let ty = ty?;
+        if !self.impredicative_types {
+            if let Some(poly) = ty.first_polymorphic_component() {
+                let what = match poly {
+                    Ty::Forall(ids, _, _) if !ids.is_empty() => "polymorphic",
+                    _ => "qualified",
+                };
+                return Err(TcError {
+                    loc: arg.loc(),
+                    msg: format!("A {what} visible type argument requires ImpredicativeTypes"),
+                });
+            }
+        }
+        Ok(ty)
+    }
+
     /// Converts a type. Type variables are looked up in (or appended to) `tvs`, so that
     /// the caller decides how they are quantified.
     pub fn convert_type(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Ty> {

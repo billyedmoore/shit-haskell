@@ -1,0 +1,2 @@
+visible_type_application_unbound_underscore.hs:5:14: error:
+Not in scope: type variable ‘_missing’

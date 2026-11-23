@@ -266,6 +266,7 @@ fn implied_by(name: &str) -> &'static [&'static str] {
         "TypeFamilyDependencies" => &["TypeFamilies", "MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
         "TypeOperators" => &["ExplicitNamespaces"],
         "PolyKinds" => &["KindSignatures"],
+        "ImpredicativeTypes" => &["RankNTypes", "ExplicitForAll"],
         "TypeInType" => &["DataKinds", "PolyKinds", "KindSignatures"],
         "RecordWildCards" => &["DisambiguateRecordFields"],
         "RankNTypes" | "ScopedTypeVariables" | "ExistentialQuantification"

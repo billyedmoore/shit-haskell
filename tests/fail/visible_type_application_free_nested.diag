@@ -1,0 +1,2 @@
+visible_type_application_free_nested.hs:5:19: error:
+Not in scope: type variable ‘missing’

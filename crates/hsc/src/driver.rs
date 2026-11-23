@@ -1658,6 +1658,7 @@ impl Driver {
         self.checker.mono_local_binds = exts.is_on("MonoLocalBinds");
         self.checker.scoped_type_variables = exts.is_on("ScopedTypeVariables");
         self.checker.named_wildcards = exts.is_on("NamedWildCards");
+        self.checker.impredicative_types = exts.is_on("ImpredicativeTypes");
         self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         self.checker.derive_anyclass = exts.is_on("DeriveAnyClass");

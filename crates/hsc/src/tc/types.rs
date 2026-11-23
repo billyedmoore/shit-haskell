@@ -31,6 +31,16 @@ pub enum Ty {
 }
 
 impl Ty {
+    pub(super) fn first_polymorphic_component(&self) -> Option<&Ty> {
+        match self {
+            Ty::Forall(ids, preds, _) if !ids.is_empty() || !preds.is_empty() => Some(self),
+            Ty::Qual(preds, _) if !preds.is_empty() => Some(self),
+            Ty::Forall(_, _, body) | Ty::Qual(_, body) => body.first_polymorphic_component(),
+            Ty::App(f, a) => f.first_polymorphic_component().or_else(|| a.first_polymorphic_component()),
+            _ => None,
+        }
+    }
+
     pub fn con(name: &str) -> Ty {
         Ty::Con(name.to_string())
     }

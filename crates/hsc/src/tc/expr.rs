@@ -590,17 +590,7 @@ impl Checker {
                 })?;
                 let mut explicit = Vec::with_capacity(tys.len());
                 for t in tys {
-                    if matches!(t, Type::Wild(_)) {
-                        explicit.push(self.metas.fresh(self.level));
-                        continue;
-                    }
-                    let mut tvs = Vec::new();
-                    let ty = self.convert_type(t, &mut tvs)?;
-                    if !tvs.is_empty() {
-                        self.loc = t.loc();
-                        return self.err(format!("Not in scope: type variable ‘{}’", tvs[0]));
-                    }
-                    explicit.push(ty);
+                    explicit.push(self.visible_type_argument(t)?);
                 }
                 if explicit.len() > scheme.nvars as usize {
                     return self.err(format!(
