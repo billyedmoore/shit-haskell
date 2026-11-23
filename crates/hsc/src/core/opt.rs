@@ -247,15 +247,22 @@ fn rewrite_selection(
 
 /// Remove local bindings that only forward to another variable. The target computation remains
 /// shared, and recursive alias cycles retain their original thunks.
+///
+/// An alias whose name or target is bound more than once in the binding (matcher alternatives
+/// clone binders; unsimplified Core reuses names) or shadows a global is kept: substituting it
+/// could capture. The rest of the binding is still cleaned: a kept alias would be a thunk of its
+/// own, a different object to `casArray#` and `reallyUnsafePtrEquality#`.
 pub fn eliminate_alias_thunks(binds: &mut [TopBind]) {
     use std::collections::HashSet;
     let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
     for bind in binds {
-        let mut names = HashSet::new();
+        let mut bound = HashSet::new();
+        let mut unsafe_names = HashSet::new();
         let mut aliases = HashMap::new();
-        // Some matcher alternatives clone binders. Skip those bodies rather than risk capture
-        // when a name is reused in another scope (including a shadowed global).
-        if !local_aliases(&bind.body, &globals, &mut names, &mut aliases) || aliases.is_empty() {
+        local_aliases(&bind.body, &mut bound, &mut unsafe_names, &mut aliases);
+        unsafe_names.extend(bound.iter().filter(|n| globals.contains(*n)).cloned());
+        aliases.retain(|name, target| !unsafe_names.contains(name) && !unsafe_names.contains(target));
+        if aliases.is_empty() {
             continue;
         }
         let mut resolved = HashMap::new();
@@ -275,40 +282,54 @@ pub fn eliminate_alias_thunks(binds: &mut [TopBind]) {
     }
 }
 
+/// Collects the binders of `c` (those bound twice into `twice`) and its `let x = y` aliases.
 fn local_aliases(
     c: &Core,
-    globals: &std::collections::HashSet<String>,
-    names: &mut std::collections::HashSet<String>,
+    bound: &mut std::collections::HashSet<String>,
+    twice: &mut std::collections::HashSet<String>,
     aliases: &mut HashMap<String, String>,
-) -> bool {
-    let bind = |name: &String, names: &mut std::collections::HashSet<String>| {
-        !globals.contains(name) && names.insert(name.clone())
-    };
+) {
+    fn bind(name: &String, bound: &mut std::collections::HashSet<String>, twice: &mut std::collections::HashSet<String>) {
+        if !bound.insert(name.clone()) {
+            twice.insert(name.clone());
+        }
+    }
     match c {
-        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => true,
-        Core::App(f, a) => local_aliases(f, globals, names, aliases) && local_aliases(a, globals, names, aliases),
-        Core::Lam(name, body) => bind(name, names) && local_aliases(body, globals, names, aliases),
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            local_aliases(f, bound, twice, aliases);
+            local_aliases(a, bound, twice, aliases);
+        }
+        Core::Lam(name, body) => {
+            bind(name, bound, twice);
+            local_aliases(body, bound, twice, aliases);
+        }
         Core::Let(bindings, body) => {
             for (name, rhs) in bindings {
-                if !bind(name, names) {
-                    return false;
-                }
+                bind(name, bound, twice);
                 if let Core::Var(target) = rhs {
                     aliases.insert(name.clone(), target.clone());
                 }
             }
-            bindings.iter().all(|(_, rhs)| local_aliases(rhs, globals, names, aliases))
-                && local_aliases(body, globals, names, aliases)
+            for (_, rhs) in bindings {
+                local_aliases(rhs, bound, twice, aliases);
+            }
+            local_aliases(body, bound, twice, aliases);
         }
         Core::Case(scrut, binder, alts) => {
-            local_aliases(scrut, globals, names, aliases) && bind(binder, names)
-                && alts.iter().all(|alt| match alt {
-                    Alt::Con(_, vars, body) => vars.iter().all(|name| bind(name, names))
-                        && local_aliases(body, globals, names, aliases),
-                    Alt::Lit(_, body) | Alt::Default(body) => local_aliases(body, globals, names, aliases),
-                })
+            local_aliases(scrut, bound, twice, aliases);
+            bind(binder, bound, twice);
+            for alt in alts {
+                match alt {
+                    Alt::Con(_, vars, body) => {
+                        vars.iter().for_each(|v| bind(v, bound, twice));
+                        local_aliases(body, bound, twice, aliases);
+                    }
+                    Alt::Lit(_, body) | Alt::Default(body) => local_aliases(body, bound, twice, aliases),
+                }
+            }
         }
-        Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| local_aliases(a, globals, names, aliases)),
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| local_aliases(a, bound, twice, aliases)),
     }
 }
 
@@ -616,6 +637,22 @@ mod alias_thunk_tests {
             assert_eq!(binds[1].body, body);
             crate::core::lint::lint_program(&binds).unwrap();
         }
+    }
+
+    #[test]
+    fn a_reused_name_keeps_only_its_own_aliases() {
+        // `dup%9` is bound twice: its alias stays, `alias%2` still goes.
+        let mut binds = program(Core::Lam("outer%1".into(), Box::new(Core::Let(
+            vec![("alias%2".into(), var("outer%1")), ("dup%9".into(), var("outer%1"))],
+            Box::new(Core::App(Box::new(Core::Lam("dup%9".into(), Box::new(var("dup%9")))), Box::new(var("alias%2")))),
+        ))));
+        eliminate_alias_thunks(&mut binds);
+        crate::core::lint::lint_program(&binds).unwrap();
+        let Core::Lam(_, body) = &binds[1].body else { panic!("lambda") };
+        let Core::Let(kept, body) = body.as_ref() else { panic!("the reused alias must remain") };
+        assert_eq!(kept, &vec![("dup%9".to_string(), var("outer%1"))]);
+        let Core::App(_, arg) = body.as_ref() else { panic!("application") };
+        assert_eq!(arg.as_ref(), &var("outer%1"));
     }
 
     #[test]

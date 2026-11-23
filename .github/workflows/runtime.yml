@@ -22,7 +22,7 @@ jobs:
   runtime:
     name: Native runtime benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Before
         uses: actions/checkout@v4
@@ -51,38 +51,16 @@ jobs:
         run: |
           cargo build --release -p hsc --manifest-path before/Cargo.toml
           cargo build --release -p hsc --manifest-path after/Cargo.toml
-      - name: Measure native runtime
+      - name: Measure native runtime (hsc against GHC at -O0, -O1 and -O2)
         env:
+          # Both compilers build against the same libraries: the change's own.
           HSC_LIBDIR: ${{ github.workspace }}/after/libs
-        run: |
-          python3 - <<'PY'
-          import json, os, platform, subprocess
-          from pathlib import Path
-          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
-          metadata = {
-              'before_commit': event['pull_request']['base']['sha'],
-              'after_commit': event['pull_request']['head']['sha'],
-              'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
-              'platform': platform.platform(),
-              'cpu_affinity': sorted(os.sched_getaffinity(0)),
-              'cpu_model': next((line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), 'unknown'),
-              'ghc': subprocess.check_output(['ghc', '--numeric-version'], text=True).strip(),
-              'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
-              'hsc_libdir': os.environ['HSC_LIBDIR'],
-          }
-          work = Path(os.environ['RUNNER_TEMP']) / 'runtimebench'
-          work.mkdir(parents=True, exist_ok=True)
-          (work / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
-          PY
-          cat "$RUNNER_TEMP/runtimebench/metadata.json"
-          cpu=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
-          python3 after/tools/runtimebench.py \
-            --before "$GITHUB_WORKSPACE/before/target/release/hsc" \
-            --after "$GITHUB_WORKSPACE/after/target/release/hsc" \
-            --ghc ghc --cpu "$cpu" --runs 7 \
-            --bench "$GITHUB_WORKSPACE/after/bench/progs" \
-            --work "$RUNNER_TEMP/runtimebench"
-          cat "$RUNNER_TEMP/runtimebench/chart.md" >> "$GITHUB_STEP_SUMMARY"
+        run: >-
+          python3 after/tools/runtimebench.py
+          --before before/target/release/hsc --after after/target/release/hsc
+          --levels 0,1,2 --runs 5 --cpu auto
+          --bench after/bench/progs --work "$RUNNER_TEMP/runtimebench"
+          --summary "$GITHUB_STEP_SUMMARY"
       - name: Save measurements
         if: always()
         uses: actions/upload-artifact@v4
@@ -92,7 +70,6 @@ jobs:
           path: |
             ${{ runner.temp }}/runtimebench/times.json
             ${{ runner.temp }}/runtimebench/chart.md
-            ${{ runner.temp }}/runtimebench/metadata.json
             ${{ runner.temp }}/runtimebench/*/*/*.stdout
             ${{ runner.temp }}/runtimebench/*/*/*.stderr
           if-no-files-found: ignore

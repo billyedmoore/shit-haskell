@@ -86,6 +86,7 @@ fn real_main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    hsc::core::set_opt_level(opts.opt_level);
     if let Some(what) = &opts.info {
         print!("{}", cli::info(what));
         return ExitCode::SUCCESS;
