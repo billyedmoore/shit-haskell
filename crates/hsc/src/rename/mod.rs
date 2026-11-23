@@ -111,6 +111,7 @@ pub struct Renamer<'a> {
     in_quote: usize,
     patsyns: HashMap<GName, PatSynDef>,
     duplicate_record_fields: bool,
+    warn_duplicate_exports: bool,
     /// Renaming a `.hs-boot` file: signatures declare values without bindings.
     boot: bool,
 }
@@ -170,11 +171,21 @@ fn rule_binding(i: usize, r: crate::syntax::ast::Rule) -> Decl {
 }
 
 pub fn rename_module(
-    mut m: Module,
+    m: Module,
     ifaces: &BTreeMap<String, Iface>,
     extensions: &Extensions,
     boot: bool,
 ) -> Result<(Module, Iface), RnErrors> {
+    let (module, iface, _) = rename_module_with_warnings(m, ifaces, extensions, boot)?;
+    Ok((module, iface))
+}
+
+pub(crate) fn rename_module_with_warnings(
+    mut m: Module,
+    ifaces: &BTreeMap<String, Iface>,
+    extensions: &Extensions,
+    boot: bool,
+) -> Result<(Module, Iface, Vec<(Loc, String, crate::diagnostic::Warning)>), RnErrors> {
     let duplicate_record_fields = extensions.is_on("DuplicateRecordFields");
     if duplicate_record_fields {
         name_duplicate_fields(&mut m.decls);
@@ -205,6 +216,7 @@ pub fn rename_module(
         counter: 0,
         pat_seen: None,
         duplicate_record_fields,
+        warn_duplicate_exports: extensions.warnings.level(crate::diagnostic::Warning::DuplicateExports).is_some(),
         boot,
         in_quote: 0,
         patsyns: ifaces
@@ -219,7 +231,9 @@ pub fn rename_module(
 }
 
 impl<'a> Renamer<'a> {
-    fn run(&mut self, m: Module, implicit_prelude: bool) -> Result<(Module, Iface), RnErrors> {
+    fn run(
+        &mut self, m: Module, implicit_prelude: bool,
+    ) -> Result<(Module, Iface, Vec<(Loc, String, crate::diagnostic::Warning)>), RnErrors> {
         // Imports, including the implicit Prelude import.
         let explicit_prelude = m.imports.iter().any(|i| i.module == PRELUDE);
         let mut imports = m.imports.clone();
@@ -457,7 +471,8 @@ impl<'a> Renamer<'a> {
         }
 
         // Exports.
-        let exports = self.compute_exports(m.exports.as_deref(), &m.export_locs, m.loc, &imports)?;
+        let mut warnings = Vec::new();
+        let exports = self.compute_exports(m.exports.as_deref(), &m.export_locs, m.loc, &imports, &mut warnings)?;
         let mut fixities = BTreeMap::new();
         for (g, f) in self.fixities.iter() {
             if g.module == self.module {
@@ -487,7 +502,7 @@ impl<'a> Renamer<'a> {
             rules: Vec::new(),
             inlines: Vec::new(),
         };
-        Ok((module, iface))
+        Ok((module, iface, warnings))
     }
 
     /// Whether a fixity declaration can refer to this name: a value, a constructor,
@@ -2503,7 +2518,9 @@ impl<'a> Renamer<'a> {
 
     fn compute_exports(
         &self, items: Option<&[IEItem]>, export_locs: &[Loc], module_loc: Loc, imports: &[Import],
+        warnings: &mut Vec<(Loc, String, crate::diagnostic::Warning)>,
     ) -> Result<Vec<Entity>, RnErrors> {
+        use crate::diagnostic::Warning;
         let Some(items) = items else {
             return Ok(self.own.clone());
         };
@@ -2513,16 +2530,69 @@ impl<'a> Renamer<'a> {
             Value,
             Field,
         }
+        #[derive(Clone, Copy)]
+        enum ExportStyle {
+            Single,
+            Grouped,
+            Implicit,
+        }
         let mut out: Vec<Entity> = Vec::new();
         let mut errors = Vec::new();
         let mut exported = HashMap::<(String, Namespace), (GName, Loc)>::new();
         let mut conflicts = HashSet::new();
         let mut exported_fields = HashSet::new();
+        let mut export_sites = HashMap::<(GName, bool), [Option<Loc>; 3]>::new();
+        let mut exported_modules = HashSet::new();
+        let warn_repeated_children = |wildcard: &[Entity], names: &[String], loc, warnings: &mut Vec<_>| {
+            if !self.warn_duplicate_exports {
+                return;
+            }
+            let mut seen: HashSet<&str> = wildcard.iter().map(Entity::occ).collect();
+            for name in names {
+                if !seen.insert(name) {
+                    warnings.push((
+                        loc,
+                        format!("‘{name}’ appears more than once in this export item"),
+                        Warning::DuplicateExports,
+                    ));
+                }
+            }
+        };
         // A module can export a type or class more than once (`module System.Random, Uniform(..)`
         // where `System.Random` exported bare `Uniform` without its methods). Merge their
         // sub-entities into one entry so `select_item` sees all exported children.
-        let mut push_export = |out: &mut Vec<Entity>, errors: &mut Vec<RnError>, e: Entity, loc: Loc| {
-            for entity in std::iter::once(&e).chain(&e.subs) {
+        let mut push_export = |out: &mut Vec<Entity>, errors: &mut Vec<RnError>, warnings: &mut Vec<_>,
+                               e: Entity, item: &IEItem, loc: Loc| {
+            let covered = std::iter::once((&e, true)).chain(e.subs.iter().map(|child| (child, false)));
+            for (entity, root) in covered {
+                if self.warn_duplicate_exports {
+                    let style = match item {
+                        IEItem::Var(_) | IEItem::Pattern(_) | IEItem::Thing { subs: Subs::None, .. } => ExportStyle::Single,
+                        IEItem::Thing { subs, .. } if root
+                            || matches!(subs, Subs::Some(_))
+                            || matches!(subs, Subs::AllPlus(names) if names.iter().any(|name| name == entity.occ())) => ExportStyle::Grouped,
+                        _ => ExportStyle::Implicit,
+                    };
+                    let sites = export_sites.entry((entity.global.clone(), entity.kind.is_value())).or_default();
+                    // A direct export can duplicate any earlier occurrence. Members of
+                    // grouped exports warn when both items name the entity explicitly.
+                    let first = match style {
+                        ExportStyle::Single => sites.iter().flatten().min().copied(),
+                        ExportStyle::Grouped => sites[..2].iter().flatten().min().copied(),
+                        ExportStyle::Implicit => sites[ExportStyle::Single as usize],
+                    };
+                    if let Some(first) = first {
+                        warnings.push((
+                            loc,
+                            format!(
+                                "‘{}’ is exported more than once\nThe earlier export is at line {}, column {}.",
+                                entity.occ(), first.line, first.col,
+                            ),
+                            Warning::DuplicateExports,
+                        ));
+                    }
+                    sites[style as usize].get_or_insert(loc);
+                }
                 let namespace = match entity.kind {
                     EntKind::Field if self.duplicate_record_fields => continue,
                     EntKind::Field => Namespace::Field,
@@ -2579,7 +2649,7 @@ impl<'a> Renamer<'a> {
                         }
                     });
                     match e {
-                        Ok(e) => push_export(&mut out, &mut errors, e, loc),
+                        Ok(e) => push_export(&mut out, &mut errors, warnings, e, item, loc),
                         Err(error) => errors.push(error),
                     }
                 }
@@ -2608,16 +2678,18 @@ impl<'a> Renamer<'a> {
                         Subs::All => self.children_in_scope(&e),
                         Subs::AllPlus(extra) => {
                             let mut all = self.children_in_scope(&e);
+                            warn_repeated_children(&all, extra, loc, warnings);
                             self.export_named_children(&e, extra, loc, &mut all, &mut errors);
                             all
                         }
                         Subs::Some(names) => {
+                            warn_repeated_children(&[], names, loc, warnings);
                             let mut some = Vec::new();
                             self.export_named_children(&e, names, loc, &mut some, &mut errors);
                             some
                         }
                     };
-                    push_export(&mut out, &mut errors, with_subs, loc);
+                    push_export(&mut out, &mut errors, warnings, with_subs, item, loc);
                 }
                 IEItem::Module(m) => {
                     if *m != self.module && !imports.iter().any(|import| {
@@ -2629,9 +2701,12 @@ impl<'a> Renamer<'a> {
                         });
                         continue;
                     }
+                    if self.warn_duplicate_exports && !exported_modules.insert(m) {
+                        warnings.push((loc, format!("Module ‘{m}’ is exported more than once"), Warning::DuplicateExports));
+                    }
                     if *m == self.module {
                         for e in &self.own {
-                            push_export(&mut out, &mut errors, e.clone(), loc);
+                            push_export(&mut out, &mut errors, warnings, e.clone(), item, loc);
                         }
                     }
                     {
@@ -2649,7 +2724,7 @@ impl<'a> Renamer<'a> {
                                         }
                                         // A type and a constructor can share a global name; they
                                         // are different entities.
-                                        push_export(&mut out, &mut errors, e.clone(), loc);
+                                        push_export(&mut out, &mut errors, warnings, e.clone(), item, loc);
                                     }
                                 }
                             }

@@ -1,0 +1,2 @@
+error: [-Wduplicate-exports]
+Module ‘Data.Maybe’ is exported more than once

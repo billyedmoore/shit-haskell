@@ -1662,7 +1662,7 @@ impl Driver {
             Vec::new()
         };
         let t = std::time::Instant::now();
-        let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, &exts, boot)
+        let (renamed, iface, rename_warnings) = crate::rename::rename_module_with_warnings(m, &self.ifaces, &exts, boot)
             .map_err(|errors| errors.0.iter().map(|e| located(e.loc, &e.msg)).collect::<Vec<_>>().join("\n\n"))?;
         timing::add("rename", t);
         let t = std::time::Instant::now();
@@ -1696,7 +1696,7 @@ impl Driver {
             .map_err(|e| located(e.loc, &e.msg))?;
         timing::add("typecheck", t);
         let warnings = if source.is_some() {
-            self.module_warnings(&renamed, &broad_imports, &exts, path, source)?
+            self.module_warnings(&renamed, &broad_imports, &rename_warnings, &exts, path, source)?
         } else {
             Vec::new()
         };
@@ -1709,10 +1709,11 @@ impl Driver {
     }
 
     fn module_warnings(
-        &self, module: &Module, broad_imports: &[(Loc, String)], exts: &Extensions, path: &Path, source: Option<&str>,
+        &self, module: &Module, broad_imports: &[(Loc, String)], rename_warnings: &[(Loc, String, crate::diagnostic::Warning)],
+        exts: &Extensions, path: &Path, source: Option<&str>,
     ) -> Result<Vec<String>, String> {
         use crate::diagnostic::Warning;
-        let mut warnings: Vec<_> = self.checker.warnings.iter().filter_map(|(loc, msg, flag)| {
+        let mut warnings: Vec<_> = self.checker.warnings.iter().chain(rename_warnings).filter_map(|(loc, msg, flag)| {
             exts.warnings.level(*flag).map(|fatal| (*loc, msg.clone(), *flag, fatal))
         }).collect();
         if let Some(fatal) = exts.warnings.level(Warning::MissingExportLists).filter(|_| module.exports.is_none()) {

@@ -13,14 +13,15 @@ pub(crate) enum Warning {
     MissingMethods,
     MissingExportLists,
     MissingImportLists,
+    DuplicateExports,
     IncompleteMinimal,
 }
 
 impl Warning {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Tabs, Self::MissingSignatures, Self::MissingFields, Self::UnrecognisedPragmas,
         Self::MissingDerivingStrategies, Self::MissingMethods, Self::MissingExportLists,
-        Self::MissingImportLists, Self::IncompleteMinimal,
+        Self::MissingImportLists, Self::DuplicateExports, Self::IncompleteMinimal,
     ];
 
     fn name(self) -> Option<&'static str> {
@@ -33,6 +34,7 @@ impl Warning {
             Self::MissingMethods => "missing-methods",
             Self::MissingExportLists => "missing-export-lists",
             Self::MissingImportLists => "missing-import-lists",
+            Self::DuplicateExports => "duplicate-exports",
             Self::IncompleteMinimal => return None,
         })
     }
@@ -55,6 +57,7 @@ impl Default for WarningOptions {
         enabled[Warning::MissingFields as usize] = true;
         enabled[Warning::UnrecognisedPragmas as usize] = true;
         enabled[Warning::MissingMethods as usize] = true;
+        enabled[Warning::DuplicateExports as usize] = true;
         enabled[Warning::IncompleteMinimal as usize] = true;
         Self { enabled, fatal: [false; Warning::ALL.len()] }
     }

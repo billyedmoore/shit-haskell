@@ -1,0 +1,2 @@
+error: [-Wduplicate-exports]
+‘isJust’ is exported more than once

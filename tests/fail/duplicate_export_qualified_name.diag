@@ -1,0 +1,2 @@
+error: [-Wduplicate-exports]
+‘value’ is exported more than once
