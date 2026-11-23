@@ -597,6 +597,7 @@ impl Checker {
                     let mut tvs = Vec::new();
                     let ty = self.convert_type(t, &mut tvs)?;
                     if !tvs.is_empty() {
+                        self.loc = t.loc();
                         return self.err(format!("Not in scope: type variable ‘{}’", tvs[0]));
                     }
                     explicit.push(ty);
@@ -932,7 +933,7 @@ impl Checker {
                 let scheme = self.sig_scheme(t, &[])?;
                 if scheme.nvars != 0 || !scheme.preds.is_empty() {
                     // `(e :: forall a. C a => t)` is `let v :: forall a. C a => t; v = e in v`.
-                    let v = self.fresh_name("sig");
+                    let v = self.fresh_name("$sig");
                     let binding = crate::syntax::ast::Decl::Fun {
                         name: v.clone(),
                         clauses: vec![crate::syntax::ast::Clause {

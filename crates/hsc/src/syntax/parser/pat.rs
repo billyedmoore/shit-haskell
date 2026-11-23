@@ -72,7 +72,17 @@ impl Parser {
                 }
                 Pat::Bang(Box::new(self.expr_to_pat(*inner)?), loc)
             }
-            Expr::Sig(inner, ty, loc) => Pat::Sig(Box::new(self.expr_to_pat(*inner)?), ty, loc),
+            Expr::Sig(inner, ty, loc) => {
+                if !self.exts.is_on("ScopedTypeVariables") {
+                    let start = inner.loc();
+                    return Err(ParseError {
+                        line: start.line,
+                        col: start.col,
+                        msg: "A type signature in a pattern requires ScopedTypeVariables".into(),
+                    });
+                }
+                Pat::Sig(Box::new(self.expr_to_pat(*inner)?), ty, loc)
+            }
             Expr::RecCon {
                 con,
                 fields,

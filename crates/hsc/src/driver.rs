@@ -1646,6 +1646,7 @@ impl Driver {
         self.checker.overloaded_lists = exts.is_on("OverloadedLists");
         self.checker.monomorphism_restriction = exts.is_on("MonomorphismRestriction");
         self.checker.mono_local_binds = exts.is_on("MonoLocalBinds");
+        self.checker.scoped_type_variables = exts.is_on("ScopedTypeVariables");
         self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         self.checker.derive_anyclass = exts.is_on("DeriveAnyClass");

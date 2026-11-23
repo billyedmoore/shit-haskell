@@ -97,8 +97,9 @@ pub struct Checker {
     pub bound_counter: u32,
     /// Kinds of type constructors.
     pub kinds: kinds::KindEnv,
-    /// Type variables in scope from enclosing signatures with an explicit `forall`.
+    /// Type variables in scope from enclosing signatures, declarations and patterns.
     pub scoped: Vec<(String, Ty)>,
+    pub(crate) scoped_type_variables: bool,
     /// The variables a signature uses in kinds (`(a :: k)`, `TYPE r`), by binding key: they stay
     /// flexible when the binding is checked (kinds are not inferred).
     pub sig_kind_vars: HashMap<String, Vec<String>>,
@@ -122,8 +123,6 @@ pub struct Checker {
     /// The flexible kind variables of the signature being checked. Each clause of its body
     /// sees them afresh, as it would the rigid kind variables of a signature.
     pub flex_kinds: Vec<u32>,
-    /// Bindings whose signature has an explicit `forall` (their variables scope over the body).
-    pub explicit_sigs: std::collections::HashSet<String>,
     /// Equalities involving type families that cannot be decided yet.
     pub deferred_eqs: Vec<(Ty, Ty, Loc)>,
     /// Annotated kinds of skolem variables in scope (e.g. from kind-annotated instance heads).
@@ -188,6 +187,7 @@ impl Checker {
             callsites: HashMap::new(),
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),
+            scoped_type_variables: true,
             sig_kind_vars: HashMap::new(),
             overloaded_strings: false,
             flexible_instances: true,
@@ -201,7 +201,6 @@ impl Checker {
             monomorphism_restriction: true,
             quote_monads: Vec::new(),
             flex_kinds: Vec::new(),
-            explicit_sigs: std::collections::HashSet::new(),
             deferred_eqs: Vec::new(),
             skol_kinds: HashMap::new(),
         };
@@ -232,7 +231,7 @@ impl Checker {
     pub(crate) fn show_type_pair(&self, first: &Ty, second: &Ty) -> (String, String) {
         let (a, b) = (self.show(first), self.show(second));
         if a == b {
-            (types::show_ty_qualified(&self.metas, first), types::show_ty_qualified(&self.metas, second))
+            types::show_ty_pair_qualified(&self.metas, first, second)
         } else {
             (a, b)
         }

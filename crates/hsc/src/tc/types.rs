@@ -1,6 +1,6 @@
 //! Types, predicates, schemes, and unification with levels for generalisation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
@@ -471,25 +471,65 @@ impl Metas {
 
 /// Renders a type the way GHC does in messages: unqualified names, `[a]`, `(a, b)`.
 pub fn show_ty(m: &Metas, t: &Ty) -> String {
-    show_ty_with_names(m, t, false)
+    show_ty_with_names(m, t, false, None)
 }
 
 pub(super) fn show_ty_qualified(m: &Metas, t: &Ty) -> String {
-    show_ty_with_names(m, t, true)
+    show_ty_with_names(m, t, true, None)
 }
 
-fn show_ty_with_names(m: &Metas, t: &Ty, qualified: bool) -> String {
-    fn go(m: &Metas, t: &Ty, prec: u8, qualified: bool) -> String {
+pub(super) fn show_ty_pair_qualified(m: &Metas, first: &Ty, second: &Ty) -> (String, String) {
+    fn collect_skolems(m: &Metas, t: &Ty, variables: &mut Vec<(u32, String)>) {
+        match m.prune(t) {
+            Ty::Skol(id, name) => variables.push((id, name)),
+            Ty::App(f, a) => {
+                collect_skolems(m, &f, variables);
+                collect_skolems(m, &a, variables);
+            }
+            _ => {}
+        }
+    }
+
+    let first_qualified = show_ty_qualified(m, first);
+    let second_qualified = show_ty_qualified(m, second);
+    if first_qualified != second_qualified {
+        return (first_qualified, second_qualified);
+    }
+
+    // Two differently bound type variables can have the same source name.
+    let mut variables = Vec::new();
+    collect_skolems(m, first, &mut variables);
+    collect_skolems(m, second, &mut variables);
+    let mut used: HashSet<_> = variables.iter().map(|(_, name)| name.clone()).collect();
+    let mut first_ids = HashMap::new();
+    let mut renamed = HashMap::new();
+    for (id, name) in variables {
+        if *first_ids.entry(name.clone()).or_insert(id) != id && !renamed.contains_key(&id) {
+            let distinct = (1..).map(|i| format!("{name}{i}")).find(|n| used.insert(n.clone())).unwrap();
+            renamed.insert(id, distinct);
+        }
+    }
+    if renamed.is_empty() {
+        return (first_qualified, second_qualified);
+    }
+    (
+        show_ty_with_names(m, first, true, Some(&renamed)),
+        show_ty_with_names(m, second, true, Some(&renamed)),
+    )
+}
+
+fn show_ty_with_names(m: &Metas, t: &Ty, qualified: bool, renamed: Option<&HashMap<u32, String>>) -> String {
+    fn go(m: &Metas, t: &Ty, prec: u8, qualified: bool, renamed: Option<&HashMap<u32, String>>) -> String {
         let t = m.prune(t);
         if let Some((a, b)) = t.as_fun() {
-            let s = format!("{} -> {}", go(m, a, 1, qualified), go(m, b, 0, qualified));
+            let s = format!("{} -> {}", go(m, a, 1, qualified, renamed), go(m, b, 0, qualified, renamed));
             return if prec > 0 { format!("({s})") } else { s };
         }
         let (head, args) = t.split_apps();
         match head {
-            Ty::Con(c) if c == LIST && args.len() == 1 => format!("[{}]", go(m, args[0], 0, qualified)),
+            Ty::Con(c) if c == LIST && args.len() == 1 => format!("[{}]", go(m, args[0], 0, qualified, renamed)),
             Ty::Con(c) if tuple_arity(c) == Some(args.len()) && args.len() >= 2 => {
-                let parts: Vec<String> = args.iter().map(|a| go(m, a, 0, qualified)).collect();
+                let parts: Vec<String> = args.iter().map(|a| go(m, a, 0, qualified, renamed)).collect();
                 format!("({})", parts.join(", "))
             }
             _ => {
@@ -497,7 +537,7 @@ fn show_ty_with_names(m: &Metas, t: &Ty, qualified: bool) -> String {
                     Ty::Con(c) if qualified && !c.starts_with("Builtin.") => c.clone(),
                     Ty::Con(c) => unqualify(c).to_string(),
                     Ty::Meta(i) => format!("t{i}"),
-                    Ty::Skol(_, n) => n.clone(),
+                    Ty::Skol(id, name) => renamed.and_then(|names| names.get(id)).unwrap_or(name).clone(),
                     Ty::Gen(i) => gen_name(*i),
                     Ty::Bound(i) => format!("b{i}"),
                     Ty::Forall(..) => "(forall)".to_string(),
@@ -506,7 +546,7 @@ fn show_ty_with_names(m: &Metas, t: &Ty, qualified: bool) -> String {
                 };
                 for a in &args {
                     s.push(' ');
-                    s.push_str(&go(m, a, 2, qualified));
+                    s.push_str(&go(m, a, 2, qualified, renamed));
                 }
                 if prec > 1 && !args.is_empty() {
                     format!("({s})")
@@ -516,7 +556,7 @@ fn show_ty_with_names(m: &Metas, t: &Ty, qualified: bool) -> String {
             }
         }
     }
-    go(m, t, 0, qualified)
+    go(m, t, 0, qualified, renamed)
 }
 
 pub fn show_pred(m: &Metas, p: &Pred) -> String {
@@ -537,7 +577,7 @@ pub(crate) fn show_pred_with_names(m: &Metas, p: &Pred, qualified: bool) -> Stri
 }
 
 fn show_ty_atomic(m: &Metas, t: &Ty, qualified: bool) -> String {
-    let s = show_ty_with_names(m, t, qualified);
+    let s = show_ty_with_names(m, t, qualified, None);
     if s.contains(' ') && !s.starts_with('[') && !s.starts_with('(') {
         format!("({s})")
     } else {

@@ -1,0 +1,3 @@
+Couldn't match expected type ‘[a1]’ with actual type ‘[a]’
+In an expression type signature
+In an instance method for ‘f’

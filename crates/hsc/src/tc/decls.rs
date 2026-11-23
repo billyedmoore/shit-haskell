@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use super::bind::explicit_binders;
 use super::convert::{global_tycon_name, tvar_index};
 use super::env::{ClassInfo, InstInfo, Synonym, TyConInfo};
 use super::types::{subst_gen, Pred, Scheme, Ty};
@@ -921,9 +922,15 @@ impl Checker {
                         })?,
                 };
                 let dm = format!("{}.$dm{name}", self.module);
-                // The class's variables scope over its default methods.
-                self.explicit_sigs.insert(dm.clone());
-                let core = self.check_method(clauses, &scheme, &dm, *loc)?;
+                let has_default_signature = info.default_schemes.contains_key(&mkey);
+                let signature = cd.decls.iter().find_map(|decl| match decl {
+                    Decl::DefaultSig { names, ty, .. } if has_default_signature && names.contains(name) => Some(ty),
+                    Decl::Sig { names, ty, .. } if !has_default_signature && names.contains(name) => Some(ty),
+                    _ => None,
+                });
+                // The class parameters and the chosen signature's explicit binders are in scope.
+                let scoped_binders = info.nparams as usize + signature.map_or(0, explicit_binders);
+                let core = self.check_method(clauses, &scheme, &dm, *loc, scoped_binders)?;
                 self.out.push(TopBind { name: dm, body: core });
             }
         }
@@ -932,8 +939,10 @@ impl Checker {
 
     /// Checks a method implementation against its full scheme. The class predicate is
     /// the first predicate, so the result takes the class dictionary first.
-    fn check_method(&mut self, clauses: &[crate::syntax::ast::Clause], scheme: &Scheme, name: &str, loc: crate::syntax::ast::Loc) -> TR<Core> {
-        let binds = self.check_signed(name, clauses, scheme, loc)?;
+    fn check_method(
+        &mut self, clauses: &[crate::syntax::ast::Clause], scheme: &Scheme, name: &str, loc: Loc, scoped_binders: usize,
+    ) -> TR<Core> {
+        let binds = self.check_signed(name, clauses, scheme, loc, scoped_binders)?;
         Ok(binds.into_iter().next().expect("one binding").1)
     }
 
@@ -1470,8 +1479,10 @@ impl Checker {
         let givens_len = self.givens.len();
         // The instance head's variables scope over its methods.
         let scope_len = self.scoped.len();
-        for (n, sk) in tvs.iter().zip(&skolems) {
-            self.scoped.push((n.clone(), sk.clone()));
+        if self.scoped_type_variables {
+            for (n, sk) in tvs.iter().zip(&skolems) {
+                self.scoped.push((n.clone(), sk.clone()));
+            }
         }
         for (p, d) in ctx.iter().zip(&dparams) {
             self.add_given(Given {
@@ -1526,27 +1537,20 @@ impl Checker {
                 Some((clauses, loc)) => {
                     let mut sch = instantiate_method(mscheme, info.nparams, &head);
                     let method_key = format!("{}.{occ}@inst", self.module);
-                    let mut scoped_sig = false;
+                    let mut scoped_binders = 0;
                     if let Some(sig_ty) = inst_sig {
-                        let has_forall = matches!(sig_ty, Type::Forall(..));
+                        let binders = explicit_binders(sig_ty);
                         if let Ok(inst_sch) = self.sig_scheme(sig_ty, &[]) {
                             if inst_sch.preds.len() == sch.preds.len() {
                                 sch = inst_sch;
-                                scoped_sig = has_forall;
-                            } else if has_forall && inst_sch.nvars == sch.nvars {
+                                scoped_binders = binders;
+                            } else if binders > 0 && inst_sch.nvars == sch.nvars {
                                 sch.names = inst_sch.names;
-                                scoped_sig = true;
+                                scoped_binders = binders;
                             }
                         }
                     }
-                    if scoped_sig {
-                        self.explicit_sigs.insert(method_key.clone());
-                    }
-                    let core = self.check_method(clauses, &sch, &method_key, loc);
-                    if scoped_sig {
-                        self.explicit_sigs.remove(&method_key);
-                    }
-                    let core = core?;
+                    let core = self.check_method(clauses, &sch, &method_key, loc, scoped_binders)?;
                     let name = self.fresh_name("mi");
                     method_binds.push((name.clone(), core));
                     Core::Var(name)
