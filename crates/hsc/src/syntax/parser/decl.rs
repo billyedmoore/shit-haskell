@@ -417,9 +417,14 @@ impl Parser {
             // Kind signature: each argument of its arrows is one more parameter (`data F :: Type
             // -> Type where ...` has one), named so that no source variable clashes. A data
             // instance's parameters are its head's variables, so it keeps those.
-            self.bump();
-            let kind = self.sigtype()?;
-            if !name.starts_with("R:") {
+            let data_instance = name.starts_with("R:");
+            let kind = if data_instance {
+                self.bump();
+                self.sigtype()?
+            } else {
+                self.kind_signature()?
+            };
+            if !data_instance {
                 let mut k = &kind;
                 while let Type::Forall(_, body) = k {
                     k = body;
@@ -590,8 +595,7 @@ impl Parser {
         let mut rhs = self.sigtype()?;
         // `type T = t :: kind`: a right-hand side with a kind signature.
         if self.at_res(ROp::DColon) {
-            self.bump();
-            let kind = self.sigtype()?;
+            let kind = self.kind_signature()?;
             rhs = Type::Sig(Box::new(rhs), Box::new(kind));
         }
         Ok(Decl::TypeSyn {

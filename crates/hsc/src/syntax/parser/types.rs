@@ -5,6 +5,14 @@ use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
 
 impl Parser {
+    pub(super) fn kind_signature(&mut self) -> PResult<Type> {
+        self.expect_res(ROp::DColon)?;
+        if !self.exts.is_on("KindSignatures") {
+            return self.err("A kind annotation requires KindSignatures");
+        }
+        self.sigtype()
+    }
+
     pub(super) fn require_explicit_forall(&self) -> PResult<()> {
         if !self.exts.is_on("ExplicitForAll") {
             return self.err("Explicit ‘forall’ in a type requires ExplicitForAll");
@@ -352,8 +360,7 @@ impl Parser {
                 }
                 let first = self.sigtype()?;
                 if self.at_res(ROp::DColon) {
-                    self.bump();
-                    let kind = self.sigtype()?;
+                    let kind = self.kind_signature()?;
                     self.expect_special(')')?;
                     return Ok(Type::Sig(Box::new(first), Box::new(kind)));
                 }
@@ -404,8 +411,7 @@ impl Parser {
             };
             self.bump();
             let kind = if self.at_res(ROp::DColon) {
-                self.bump();
-                Some(self.sigtype()?)
+                Some(self.kind_signature()?)
             } else {
                 None
             };
@@ -419,8 +425,7 @@ impl Parser {
                 _ => return self.unexpected(),
             };
             self.bump();
-            self.expect_res(ROp::DColon)?;
-            let kind = self.sigtype()?;
+            let kind = self.kind_signature()?;
             self.expect_special(')')?;
             return Ok(TyVarBind {
                 name,
