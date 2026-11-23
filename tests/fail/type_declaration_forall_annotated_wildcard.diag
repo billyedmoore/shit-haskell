@@ -1,0 +1,2 @@
+type_declaration_forall_annotated_wildcard.hs:4:18: error
+A ‘forall’ binder must name a type variable

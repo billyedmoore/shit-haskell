@@ -597,42 +597,33 @@ impl Parser {
     /// A type variable binder: `a` or `(a :: k)`.
     fn tyvar_binder(&mut self) -> PResult<(TyVarBind, Loc)> {
         // Inferred binders `{a}` and `{a :: k}` are skipped by visible type applications.
-        if self.at_special('{') {
+        let closing = if self.at_special('{') {
             self.bump();
-            let loc = self.loc();
-            let name = match self.tok().clone() {
-                Tok::VarId(s) if self.real() => s,
-                _ => return self.unexpected(),
-            };
+            Some('}')
+        } else if self.at_special('(') {
             self.bump();
-            let kind = if self.at_res(ROp::DColon) {
-                Some(self.kind_signature()?)
-            } else {
-                None
-            };
-            self.expect_special('}')?;
-            return Ok((TyVarBind { name, kind, inferred: true }, loc));
-        }
-        if self.at_special('(') {
-            self.bump();
-            let loc = self.loc();
-            let name = match self.tok().clone() {
-                Tok::VarId(s) if self.real() => s,
-                _ => return self.unexpected(),
-            };
-            self.bump();
-            let kind = self.kind_signature()?;
-            self.expect_special(')')?;
-            return Ok((TyVarBind { name, kind: Some(kind), inferred: false }, loc));
-        }
-        match self.tok().clone() {
-            Tok::VarId(s) if self.real() => {
-                let loc = self.loc();
-                self.bump();
-                Ok((TyVarBind { name: s, kind: None, inferred: false }, loc))
+            Some(')')
+        } else {
+            None
+        };
+        let loc = self.loc();
+        let name = match self.tok().clone() {
+            Tok::VarId(name) if self.real() => name,
+            Tok::Kw(Kw::Underscore) if self.real() => {
+                return self.err("A ‘forall’ binder must name a type variable\nReplace ‘_’ with a fresh type variable.");
             }
-            _ => self.unexpected(),
+            _ => return self.unexpected(),
+        };
+        self.bump();
+        let kind = if closing == Some(')') || (closing == Some('}') && self.at_res(ROp::DColon)) {
+            Some(self.kind_signature()?)
+        } else {
+            None
+        };
+        if let Some(closing) = closing {
+            self.expect_special(closing)?;
         }
+        Ok((TyVarBind { name, kind, inferred: closing == Some('}') }, loc))
     }
 
     /// Parses `[context =>]` if present; otherwise rewinds and returns nothing.

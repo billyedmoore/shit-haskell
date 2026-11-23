@@ -1001,19 +1001,34 @@ impl Parser {
         Ok((name, tyvars.into_iter().map(|(_, binder)| binder).collect(), invisible))
     }
 
-    fn type_to_binder(&self, t: Type) -> PResult<TyVarBind> {
-        match t {
-            Type::Var(name, _) => Ok(TyVarBind { name, kind: None, inferred: false }),
-            Type::Sig(inner, kind) => match *inner {
-                Type::Var(name, _) => Ok(TyVarBind {
-                    name,
-                    kind: Some(*kind),
-                    inferred: false,
-                }),
-                _ => self.err("malformed type variable binder"),
-            },
-            _ => self.err("malformed type variable binder"),
-        }
+    fn type_to_binder(&self, ty: Type) -> PResult<TyVarBind> {
+        let (parameter, kind) = match ty {
+            Type::Sig(parameter, kind) => (*parameter, Some(*kind)),
+            parameter => (parameter, None),
+        };
+        let name = match parameter {
+            Type::Var(name, _) => name,
+            Type::Wild(loc) => {
+                if !self.exts.is_on("TypeAbstractions") {
+                    return Err(super::ParseError {
+                        line: loc.line,
+                        col: loc.col,
+                        msg: "A wildcard ‘_’ binder requires TypeAbstractions".into(),
+                    });
+                }
+                // Each wildcard still occupies a distinct parameter position.
+                format!("_%{}_{}", loc.line, loc.col)
+            }
+            other => {
+                let loc = other.loc();
+                return Err(super::ParseError {
+                    line: loc.line,
+                    col: loc.col,
+                    msg: "A declaration parameter must be a type variable or ‘_’".into(),
+                });
+            }
+        };
+        Ok(TyVarBind { name, kind, inferred: false })
     }
 
     /// Parses one constructor of a `data` or `newtype` declaration.
