@@ -1,0 +1,3 @@
+declaration_binder_class.hs:2:16: error:
+Type variable ‘a’ is bound more than once in the declaration of ‘Broken’
+The first binder is at line 2, column 14.

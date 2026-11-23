@@ -1,0 +1,3 @@
+declaration_binder_associated_family.hs:3:17: error:
+Type variable ‘a’ is bound more than once in the declaration of ‘Family’
+The first binder is at line 3, column 15.

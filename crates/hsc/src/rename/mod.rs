@@ -1508,6 +1508,7 @@ impl<'a> Renamer<'a> {
                 injective,
                 loc,
             } => {
+                check_type_binders(&params, loc)?;
                 if let Some(loc) = abstract_closed.filter(|_| !self.boot) {
                     return Err(RnError {
                         loc,

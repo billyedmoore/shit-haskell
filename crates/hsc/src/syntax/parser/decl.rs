@@ -1,5 +1,7 @@
 //! Top-level and local declarations.
 
+use std::collections::HashMap;
+
 use super::{group_binds, Ctx, PResult, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
@@ -809,20 +811,34 @@ impl Parser {
             t = *f;
         }
         args.reverse();
-        let (name, mut tyvars) = match t {
+        let (name, infix_args) = match t {
             Type::Con(q, _) if q.qual.is_none() => (q.name, Vec::new()),
             // Infix head `a :+: b`, possibly parenthesised and applied to more binders.
             Type::OpChain(items, _) => match items.as_slice() {
                 [TypeOpItem::Operand(l), TypeOpItem::Op(op, _), TypeOpItem::Operand(r)] => (
                     op.name.clone(),
-                    vec![self.type_to_binder(l.clone())?, self.type_to_binder(r.clone())?],
+                    vec![l.clone(), r.clone()],
                 ),
                 _ => return self.err("malformed declaration head"),
             },
             _ => return self.err("malformed declaration head"),
         };
-        for a in args {
-            tyvars.push(self.type_to_binder(a)?);
+        let mut locations = HashMap::<String, Loc>::new();
+        let mut tyvars = Vec::new();
+        for arg in infix_args.into_iter().chain(args) {
+            let loc = arg.loc();
+            let binder = self.type_to_binder(arg)?;
+            if let Some(first) = locations.insert(binder.name.clone(), loc) {
+                return Err(super::ParseError {
+                    line: loc.line,
+                    col: loc.col,
+                    msg: format!(
+                        "Type variable ‘{}’ is bound more than once in the declaration of ‘{name}’\nThe first binder is at line {}, column {}.",
+                        binder.name, first.line, first.col,
+                    ),
+                });
+            }
+            tyvars.push(binder);
         }
         Ok((name, tyvars))
     }

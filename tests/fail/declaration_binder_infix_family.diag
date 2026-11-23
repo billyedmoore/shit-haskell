@@ -1,0 +1,3 @@
+declaration_binder_infix_family.hs:2:19: error:
+Type variable ‘a’ is bound more than once in the declaration of ‘:+:’
+The first binder is at line 2, column 13.
