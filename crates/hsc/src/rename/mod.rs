@@ -1338,6 +1338,7 @@ impl<'a> Renamer<'a> {
                                 .collect::<RR<Vec<_>>>()?,
                         ),
                     };
+                    check_gadt_binders(c)?;
                 }
                 for dv in &mut dd.deriving {
                     dv.classes = self.types(std::mem::take(&mut dv.classes))?;
@@ -2846,6 +2847,50 @@ fn check_record_fields<T>(fields: &[(QName, Option<T>)], loc: Loc) -> RR<()> {
         if !seen.insert(field.name.as_str()) {
             return Err(RnError { loc, msg: format!("Field ‘{}’ is specified more than once in this record", field.name) });
         }
+    }
+    Ok(())
+}
+
+fn check_gadt_binders(constructor: &ConDecl) -> RR<()> {
+    if !constructor.gadt_forall {
+        return Ok(());
+    }
+    let check = |ty: &Type, bound: &[&str]| {
+        if let Some((name, loc)) = ty.first_unbound_variable(|name, _| bound.contains(&name)) {
+            return Err(RnError {
+                loc,
+                msg: format!(
+                    "Not in scope: type variable ‘{name}’\nBind it in the ‘forall’ for constructor ‘{}’.",
+                    constructor.name,
+                ),
+            });
+        }
+        Ok(())
+    };
+    let mut bound = Vec::new();
+    for binder in &constructor.exist {
+        if let Some(kind) = &binder.kind {
+            check(kind, &bound)?;
+        }
+        bound.push(binder.name.as_str());
+    }
+    for constraint in &constructor.context {
+        check(constraint, &bound)?;
+    }
+    match &constructor.fields {
+        ConFields::Positional(fields) => {
+            for field in fields {
+                check(&field.ty, &bound)?;
+            }
+        }
+        ConFields::Record(groups) => {
+            for (_, field) in groups {
+                check(&field.ty, &bound)?;
+            }
+        }
+    }
+    if let Some(result) = &constructor.gadt_result {
+        check(result, &bound)?;
     }
     Ok(())
 }

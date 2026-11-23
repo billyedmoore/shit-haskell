@@ -877,6 +877,7 @@ impl Parser {
                 context,
                 fields: ConFields::Positional(fields),
                 gadt_result: None,
+                gadt_forall: false,
                 infix: false,
                 loc,
             });
@@ -900,6 +901,7 @@ impl Parser {
                 context,
                 fields: ConFields::Positional(vec![left, right]),
                 gadt_result: None,
+                gadt_forall: false,
                 infix: true,
                 loc,
             });
@@ -919,6 +921,7 @@ impl Parser {
             context,
             fields: ConFields::Positional(fields),
             gadt_result: None,
+            gadt_forall: false,
             infix: false,
             loc,
         })
@@ -970,6 +973,7 @@ impl Parser {
             context,
             fields: ConFields::Record(fields),
             gadt_result: None,
+            gadt_forall: false,
             infix: false,
             loc,
         })
@@ -1117,13 +1121,16 @@ impl Parser {
         self.expect_res(ROp::DColon)?;
         // GADT record syntax: `C :: [forall vs.] [ctx =>] { f :: t, .. } -> result`.
         let mut record_exist = Vec::new();
+        let mut record_forall = false;
         let mut record_context = Vec::new();
         if self.at_varid("forall") || !self.at_special('{') {
             let saved = self.pos_state();
-            let vars = if self.at_varid("forall") { self.forall_binders()? } else { Vec::new() };
+            let quantified = self.at_varid("forall");
+            let vars = if quantified { self.forall_binders()? } else { Vec::new() };
             let ctx = if !self.at_special('{') { self.try_context() } else { Vec::new() };
             if self.at_special('{') {
                 record_exist = vars;
+                record_forall = quantified;
                 record_context = ctx;
             } else {
                 self.restore_pos_state(saved);
@@ -1166,7 +1173,11 @@ impl Parser {
             self.bump();
             self.ctx.pop();
             self.expect_res(ROp::RArrow)?;
+            let result_loc = self.loc();
             let result = self.sigtype()?;
+            if matches!(result, Type::Forall { .. } | Type::Qual(..)) {
+                return Err(Self::nested_gadt_signature(&names[0], result_loc));
+            }
             return Ok(names
                 .into_iter()
                 .map(|name| ConDecl {
@@ -1175,16 +1186,23 @@ impl Parser {
                     context: record_context.clone(),
                     fields: ConFields::Record(groups.clone()),
                     gadt_result: Some(result.clone()),
+                    gadt_forall: record_forall,
                     infix: false,
                     loc,
                 })
                 .collect());
         }
+        let signature_loc = self.loc();
         let mut ty = self.sigtype()?;
         let mut exist = Vec::new();
-        if let Type::Forall { binders: vars, body, .. } = ty {
+        let mut gadt_forall = false;
+        if let Type::Forall { binders: vars, body, parenthesized } = ty {
+            if parenthesized {
+                return Err(Self::nested_gadt_signature(&names[0], signature_loc));
+            }
             exist = vars;
             ty = *body;
+            gadt_forall = true;
         }
         let mut context = Vec::new();
         if let Type::Qual(ctx, body) = ty {
@@ -1199,6 +1217,9 @@ impl Parser {
             });
             ty = *res;
         }
+        if matches!(ty, Type::Forall { .. } | Type::Qual(..)) {
+            return Err(Self::nested_gadt_signature(&names[0], ty.loc()));
+        }
         Ok(names
             .into_iter()
             .map(|name| ConDecl {
@@ -1207,10 +1228,21 @@ impl Parser {
                 context: context.clone(),
                 fields: ConFields::Positional(fields.clone()),
                 gadt_result: Some(ty.clone()),
+                gadt_forall,
                 infix: false,
                 loc,
             })
             .collect())
+    }
+
+    fn nested_gadt_signature(constructor: &str, loc: Loc) -> super::ParseError {
+        super::ParseError {
+            line: loc.line,
+            col: loc.col,
+            msg: format!(
+                "The signature of GADT constructor ‘{constructor}’ contains a nested ‘forall’ or context\nUse a single outer ‘forall’ and context."
+            ),
+        }
     }
 
     fn deriving_clauses(&mut self) -> PResult<Vec<Deriving>> {

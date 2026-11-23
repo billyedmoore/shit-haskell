@@ -2010,6 +2010,7 @@ impl Checker {
                     context: Vec::new(),
                     fields: ConFields::Positional(fields),
                     gadt_result: None,
+                    gadt_forall: false,
                     infix,
                     loc: at,
                 };
@@ -2061,6 +2062,7 @@ impl Checker {
                     context: Vec::new(),
                     fields: ConFields::Positional(field_types),
                     gadt_result: None,
+                    gadt_forall: false,
                     infix: false,
                     loc: Loc { line: 0, col: 0 },
                 }],

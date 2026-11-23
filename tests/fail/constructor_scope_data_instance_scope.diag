@@ -1,0 +1,3 @@
+constructor_scope_data_instance_scope.hs:4:18: error:
+Not in scope: type variable ‘a’
+Bind it in the ‘forall’ for constructor ‘T’.

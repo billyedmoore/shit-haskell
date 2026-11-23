@@ -1045,7 +1045,7 @@ impl Conv<'_> {
     fn con_decl(&self, c: &crate::interp::Cell) -> CR<ConDecl> {
         let loc = self.loc;
         let (k, a) = self.con(c)?;
-        let plain = |name: String, fields: ConFields, infix: bool| ConDecl { name, exist: Vec::new(), context: Vec::new(), fields, gadt_result: None, infix, loc };
+        let plain = |name: String, fields: ConFields, infix: bool| ConDecl { name, exist: Vec::new(), context: Vec::new(), fields, gadt_result: None, gadt_forall: false, infix, loc };
         Ok(match k.as_str() {
             "NormalC" => plain(self.binder(&a[0])?, ConFields::Positional(self.list(&a[1])?.iter().map(|f| self.field(f)).collect::<CR<_>>()?), false),
             "RecC" => {
@@ -1063,6 +1063,7 @@ impl Conv<'_> {
             "ForallC" => {
                 let mut inner = self.con_decl(&a[2])?;
                 inner.exist = self.tyvar_binds(&a[0], true)?;
+                inner.gadt_forall = inner.gadt_result.is_some();
                 inner.context = self.cxt(&a[1])?;
                 inner
             }

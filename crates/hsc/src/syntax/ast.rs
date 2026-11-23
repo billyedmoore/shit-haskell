@@ -585,6 +585,8 @@ pub struct ConDecl {
     pub fields: ConFields,
     /// Result type of a GADT-style constructor.
     pub gadt_result: Option<Type>,
+    /// An explicit outer `forall` in a GADT signature, including `forall .`.
+    pub gadt_forall: bool,
     /// Declared infix (`a :+: b`); used by derived `Show`.
     pub infix: bool,
     pub loc: Loc,
