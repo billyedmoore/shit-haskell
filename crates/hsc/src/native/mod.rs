@@ -8,6 +8,7 @@
 pub mod codegen;
 pub mod lift;
 pub mod stg;
+pub mod strict_ops;
 
 use std::collections::{HashMap, HashSet};
 

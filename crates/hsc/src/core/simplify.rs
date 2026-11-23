@@ -1973,7 +1973,10 @@ impl Simp<'_> {
             return;
         }
         let Some((arity, body)) = self.templates.get(target) else { return };
-        if *arity > n {
+        // A call short of one argument inlines too: eta-expansion gave the function a parameter
+        // its callers supply later (`m *> k` in a monad of functions, `ST`'s `\s ->`), and the
+        // lambda left after beta reduction meets that argument when this binding is applied.
+        if n == 0 || *arity > n + 1 {
             return;
         }
         let mut copy = body.clone();

@@ -2247,6 +2247,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let mut numeric = numeric.clone();
     crate::native::lift::lambda_lift(&mut binds, &mut numeric);
     crate::native::stg::collapse_case_chains(&mut binds);
+    crate::native::strict_ops::evaluate_double_operands(&mut binds);
     let prog = crate::native::stg::Lowering::program(&binds, &numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
