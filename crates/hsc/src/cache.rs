@@ -350,7 +350,7 @@ bin_struct!(Loc { line, col });
 bin_struct!(QName { qual, name });
 bin_enum!(PrimLit { 0 => Int(a), 1 => Word(a), 2 => Float(a), 3 => Double(a), 4 => Char(a), 5 => Str(a) });
 bin_enum!(Lit { 0 => Prim(a), 1 => Int(a), 2 => Frac(a), 3 => Char(a), 4 => Str(a) });
-bin_struct!(TyVarBind { name, kind });
+bin_struct!(TyVarBind { name, kind, inferred });
 bin_enum!(Type {
     0 => Var(a, b), 1 => Con(a, b), 2 => App(a, b), 3 => Fun(a, b), 4 => List(a, b), 5 => Tuple(a, b),
     6 => Forall { binders, body, parenthesized }, 7 => Qual(a, b), 8 => Sig(a, b), 9 => OpChain(a, b), 10 => Lit(a, b), 11 => Wild(a),
@@ -429,7 +429,7 @@ bin_struct!(Pred { class, args });
 bin_enum!(Ty {
     0 => Con(a), 1 => App(a, b), 2 => Meta(a), 3 => Skol(a, b), 4 => Gen(a), 5 => Qual(a, b), 6 => Bound(a), 7 => Forall(a, b, c),
 });
-bin_struct!(Scheme { nvars, names, preds, ty });
+bin_struct!(Scheme { nvars, names, visible, preds, ty });
 bin_enum!(Kind { 0 => Star, 1 => Arr(a, b), 2 => Meta(a), 3 => Gen(a) });
 bin_struct!(TyConInfo { arity, cons });
 bin_struct!(DataCon { name, tycon, tag, arity, scheme, fields, newtype, strict });
@@ -581,7 +581,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 11";
+const MAGIC: &str = "hsc-module-cache 12";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.

@@ -588,16 +588,22 @@ impl Checker {
                     loc,
                     msg: format!("Variable not in scope: {key}"),
                 })?;
-                let mut explicit = Vec::with_capacity(tys.len());
-                for t in tys {
-                    explicit.push(self.visible_type_argument(t)?);
-                }
-                if explicit.len() > scheme.nvars as usize {
-                    return self.err(format!(
-                        "Cannot apply expression of type ‘{}’ to {} visible type argument(s)",
-                        key,
-                        explicit.len()
-                    ));
+                let explicit = tys.iter().map(|t| self.visible_type_argument(t)).collect::<TR<Vec<_>>>()?;
+                let available = scheme.visible.len();
+                if let Some(extra) = tys.get(available) {
+                    let occ = super::types::unqualify(&key);
+                    let binders: Vec<_> = (0..scheme.nvars).map(|i| {
+                        let name = self.show(&Ty::Gen(i));
+                        if scheme.visible.contains(&i) { name } else { format!("{{{name}}}") }
+                    }).collect();
+                    let ty = self.show_signature(&scheme, &self.show(&scheme.ty), false, Some(&binders));
+                    let msg = if available == 0 {
+                        format!("‘{occ}’ has no type variables available for visible type application")
+                    } else {
+                        let argument = if available == 1 { "argument" } else { "arguments" };
+                        format!("‘{occ}’ accepts only {available} visible type {argument}")
+                    };
+                    return Err(super::TcError { loc: extra.loc(), msg: format!("{msg}\nType: {ty}") });
                 }
                 Ok(self.inst_var_explicit(&key, &scheme, loc, &explicit))
             }
@@ -1060,12 +1066,10 @@ impl Checker {
     }
 
     pub fn inst_var_explicit(&mut self, name: &str, scheme: &Scheme, loc: Loc, explicit: &[Ty]) -> (Core, Ty) {
-        let args: Vec<Ty> = (0..scheme.nvars as usize)
-            .map(|i| match explicit.get(i) {
-                Some(t) => t.clone(),
-                None => self.metas.fresh(self.level),
-            })
-            .collect();
+        let mut args: Vec<Ty> = (0..scheme.nvars).map(|_| self.metas.fresh(self.level)).collect();
+        for (&index, ty) in scheme.visible.iter().zip(explicit) {
+            args[index as usize] = ty.clone();
+        }
         let ty = subst_gen(&scheme.ty, &args);
         // `coerce :: a -> b` (a primitive, its `Coercible a b` not checked): the two types are
         // kept to resolve a variable otherwise ambiguous (see `coercible_partner`).

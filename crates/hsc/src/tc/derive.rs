@@ -442,6 +442,35 @@ fn strip_last(t: &Type) -> Type {
     }
 }
 
+/// The variables quantified by a GADT constructor, in signature order.
+pub(crate) fn con_free_vars(c: &crate::syntax::ast::ConDecl) -> Vec<String> {
+    let mut vs = Vec::new();
+    for tv in &c.exist {
+        if !vs.contains(&tv.name) {
+            vs.push(tv.name.clone());
+        }
+    }
+    for p in &c.context {
+        type_vars(p, &mut vs);
+    }
+    match &c.fields {
+        ConFields::Positional(fs) => {
+            for f in fs {
+                type_vars(&f.ty, &mut vs);
+            }
+        }
+        ConFields::Record(groups) => {
+            for (_, f) in groups {
+                type_vars(&f.ty, &mut vs);
+            }
+        }
+    }
+    if let Some(res) = &c.gadt_result {
+        type_vars(res, &mut vs);
+    }
+    vs
+}
+
 /// The type variables mentioned by a type, in order of first occurrence.
 pub fn type_vars(t: &Type, out: &mut Vec<String>) {
     match t {

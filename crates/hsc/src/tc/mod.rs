@@ -766,6 +766,7 @@ impl Checker {
             Scheme {
                 nvars: 1,
                 names: vec!["a".into()],
+                visible: vec![0],
                 preds: vec![],
                 ty: list_a.clone(),
             },
@@ -780,6 +781,7 @@ impl Checker {
             Scheme {
                 nvars: 1,
                 names: vec!["a".into()],
+                visible: vec![0],
                 preds: vec![],
                 ty: Ty::funs(vec![a.clone(), list_a.clone()], list_a.clone()),
             },
@@ -808,6 +810,7 @@ impl Checker {
                 Scheme {
                     nvars: n as u32,
                     names: (0..n).map(|i| format!("t{i}")).collect(),
+                    visible: (0..n as u32).collect(),
                     preds: vec![],
                     ty,
                 },
@@ -831,6 +834,7 @@ impl Checker {
                     Scheme {
                         nvars: n as u32,
                         names: (0..n).map(|k| format!("t{k}")).collect(),
+                        visible: (0..n as u32).collect(),
                         preds: vec![],
                         ty: Ty::fun(vars[i].clone(), res.clone()),
                     },

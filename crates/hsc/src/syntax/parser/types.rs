@@ -472,7 +472,7 @@ impl Parser {
 
     /// A type variable binder: `a` or `(a :: k)`.
     fn tyvar_binder(&mut self) -> PResult<(TyVarBind, Loc)> {
-        // Inferred binders `{a}` and `{a :: k}` are accepted like ordinary ones.
+        // Inferred binders `{a}` and `{a :: k}` are skipped by visible type applications.
         if self.at_special('{') {
             self.bump();
             let loc = self.loc();
@@ -487,7 +487,7 @@ impl Parser {
                 None
             };
             self.expect_special('}')?;
-            return Ok((TyVarBind { name, kind }, loc));
+            return Ok((TyVarBind { name, kind, inferred: true }, loc));
         }
         if self.at_special('(') {
             self.bump();
@@ -499,13 +499,13 @@ impl Parser {
             self.bump();
             let kind = self.kind_signature()?;
             self.expect_special(')')?;
-            return Ok((TyVarBind { name, kind: Some(kind) }, loc));
+            return Ok((TyVarBind { name, kind: Some(kind), inferred: false }, loc));
         }
         match self.tok().clone() {
             Tok::VarId(s) if self.real() => {
                 let loc = self.loc();
                 self.bump();
-                Ok((TyVarBind { name: s, kind: None }, loc))
+                Ok((TyVarBind { name: s, kind: None, inferred: false }, loc))
             }
             _ => self.unexpected(),
         }

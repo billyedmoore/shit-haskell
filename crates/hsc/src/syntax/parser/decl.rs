@@ -401,7 +401,7 @@ impl Parser {
             type_vars_of(a, &mut vars);
         }
         let name = format!("R:{}{}_{}", family.name, loc.line, loc.col);
-        let tyvars: Vec<TyVarBind> = vars.iter().map(|v| TyVarBind { name: v.clone(), kind: None }).collect();
+        let tyvars: Vec<TyVarBind> = vars.iter().map(|v| TyVarBind { name: v.clone(), kind: None, inferred: false }).collect();
         let data = self.data_body(newtype, context, name.clone(), tyvars, loc)?;
         let rhs = vars.iter().fold(Type::Con(QName::unqual(name), loc), |acc, v| {
             Type::App(Box::new(acc), Box::new(Type::Var(v.clone(), loc)))
@@ -437,7 +437,7 @@ impl Parser {
                         Type::Var(..) => None,
                         a => Some(a.clone()),
                     };
-                    tyvars.push(TyVarBind { name: format!("k%{}", tyvars.len()), kind });
+                    tyvars.push(TyVarBind { name: format!("k%{}", tyvars.len()), kind, inferred: false });
                     k = res;
                 }
             }
@@ -845,11 +845,12 @@ impl Parser {
 
     fn type_to_binder(&self, t: Type) -> PResult<TyVarBind> {
         match t {
-            Type::Var(name, _) => Ok(TyVarBind { name, kind: None }),
+            Type::Var(name, _) => Ok(TyVarBind { name, kind: None, inferred: false }),
             Type::Sig(inner, kind) => match *inner {
                 Type::Var(name, _) => Ok(TyVarBind {
                     name,
                     kind: Some(*kind),
+                    inferred: false,
                 }),
                 _ => self.err("malformed type variable binder"),
             },

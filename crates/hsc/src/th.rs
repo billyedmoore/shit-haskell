@@ -986,12 +986,12 @@ impl Conv<'_> {
                     let newtype = k == "NewtypeD";
                     let context = self.cxt(&a[0])?;
                     let name = self.binder(&a[1])?;
-                    let tyvars = self.tyvar_binds(&a[2])?;
+                    let tyvars = self.tyvar_binds(&a[2], false)?;
                     let cons = if newtype { vec![self.con_decl(&a[4])?] } else { self.list(&a[4])?.iter().map(|x| self.con_decl(x)).collect::<CR<_>>()? };
                     let deriving = self.deriv_clauses(&a[5])?;
                     out.push(Decl::Data(DataDecl { newtype, context, name, tyvars, cons, deriving, loc }));
                 }
-                "TySynD" => out.push(Decl::TypeSyn { name: self.binder(&a[0])?, tyvars: self.tyvar_binds(&a[1])?, rhs: self.ty(&a[2])?, loc }),
+                "TySynD" => out.push(Decl::TypeSyn { name: self.binder(&a[0])?, tyvars: self.tyvar_binds(&a[1], false)?, rhs: self.ty(&a[2])?, loc }),
                 "InstanceD" => {
                     let overlap = match self.maybe(&a[0])? {
                         Some(o) => Some(self.con(&o)?.0.to_uppercase()),
@@ -1022,13 +1022,14 @@ impl Conv<'_> {
         self.list(c)?.iter().map(|t| self.ty(t)).collect()
     }
 
-    fn tyvar_binds(&self, c: &crate::interp::Cell) -> CR<Vec<TyVarBind>> {
+    fn tyvar_binds(&self, c: &crate::interp::Cell, with_specificity: bool) -> CR<Vec<TyVarBind>> {
         let mut out = Vec::new();
         for b in self.list(c)? {
             let (bk, ba) = self.con(&b)?;
             let name = self.binder(&ba[0])?;
             let kind = if bk == "KindedTV" { Some(self.ty(&ba[2])?) } else { None };
-            out.push(TyVarBind { name, kind });
+            let inferred = with_specificity && self.con(&ba[1])?.0 == "InferredSpec";
+            out.push(TyVarBind { name, kind, inferred });
         }
         Ok(out)
     }
@@ -1061,7 +1062,7 @@ impl Conv<'_> {
             "InfixC" => plain(self.binder(&a[1])?, ConFields::Positional(vec![self.field(&a[0])?, self.field(&a[2])?]), true),
             "ForallC" => {
                 let mut inner = self.con_decl(&a[2])?;
-                inner.exist = self.tyvar_binds(&a[0])?;
+                inner.exist = self.tyvar_binds(&a[0], true)?;
                 inner.context = self.cxt(&a[1])?;
                 inner
             }
@@ -1179,13 +1180,7 @@ impl Conv<'_> {
         }
         Ok(match k.as_str() {
             "ForallT" => {
-                let mut binders = Vec::new();
-                for b in self.list(&a[0])? {
-                    let (bk, ba) = self.con(&b)?;
-                    let name = self.binder(&ba[0])?;
-                    let kind = if bk == "KindedTV" { Some(self.ty(&ba[2])?) } else { None };
-                    binders.push(TyVarBind { name, kind });
-                }
+                let binders = self.tyvar_binds(&a[0], true)?;
                 let cxt = self.list(&a[1])?.iter().map(|t| self.ty(t)).collect::<CR<Vec<_>>>()?;
                 let body = self.ty(&a[2])?;
                 let body = if cxt.is_empty() { body } else { Type::Qual(cxt, Box::new(body)) };
@@ -1438,7 +1433,7 @@ impl Reify {
             ty = app(app(self.syn("AppT"), app(app(self.syn("AppT"), arrow.clone()), self.ty(f))), ty);
         }
         let qvars: Vec<String> = if c.gadt_result.is_some() {
-            Self::con_free_vars(c)
+            crate::tc::derive::con_free_vars(c)
         } else {
             let mut vs: Vec<String> = default_tyvars.iter().map(|tv| tv.name.clone()).collect();
             for tv in &c.exist {
@@ -1449,7 +1444,10 @@ impl Reify {
             vs
         };
         if !qvars.is_empty() || !c.context.is_empty() {
-            let binders: Vec<Expr> = qvars.iter().map(|v| kinded(v, "SpecifiedSpec")).collect();
+            let binders: Vec<Expr> = qvars.iter().map(|v| {
+                let inferred = c.exist.iter().any(|b| b.name == *v && b.inferred);
+                kinded(v, if inferred { "InferredSpec" } else { "SpecifiedSpec" })
+            }).collect();
             let cxt: Vec<Expr> = c.context.iter().map(|p| self.ty(p)).collect();
             ty = app(app(app(self.syn("ForallT"), Expr::List(binders, loc)), Expr::List(cxt, loc)), ty);
         }
@@ -1618,34 +1616,6 @@ impl Reify {
         vs.iter().any(|x| x == v)
     }
 
-    fn con_free_vars(c: &ConDecl) -> Vec<String> {
-        let mut vs = Vec::new();
-        for tv in &c.exist {
-            if !vs.contains(&tv.name) {
-                vs.push(tv.name.clone());
-            }
-        }
-        for p in &c.context {
-            crate::tc::derive::type_vars(p, &mut vs);
-        }
-        match &c.fields {
-            ConFields::Positional(fs) => {
-                for f in fs {
-                    crate::tc::derive::type_vars(&f.ty, &mut vs);
-                }
-            }
-            ConFields::Record(groups) => {
-                for (_, f) in groups {
-                    crate::tc::derive::type_vars(&f.ty, &mut vs);
-                }
-            }
-        }
-        if let Some(res) = &c.gadt_result {
-            crate::tc::derive::type_vars(res, &mut vs);
-        }
-        vs
-    }
-
     fn bang_type(&self, f: &Field) -> Expr {
         let strictness = if f.strict { "SourceStrict" } else { "NoSourceStrictness" };
         let bang = app(app(self.syn("Bang"), self.syn("NoSourceUnpackedness")), self.syn(strictness));
@@ -1683,7 +1653,7 @@ impl Reify {
                     app(app(app(self.syn("RecGadtC"), names), record_fields(groups)), res_ty)
                 }
             };
-            (gadt, Self::con_free_vars(c))
+            (gadt, crate::tc::derive::con_free_vars(c))
         } else {
             let vanilla = match &c.fields {
                 ConFields::Positional(fs) if c.infix && fs.len() == 2 => {

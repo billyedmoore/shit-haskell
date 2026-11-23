@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::bind::explicit_binders;
-use super::convert::{global_tycon_name, tvar_index};
+use super::convert::{global_tycon_name, tvar_index, visible_signature_vars};
 use super::env::{ClassInfo, InstInfo, Synonym, TyConInfo};
 use super::types::{subst_gen, subst_gen_pred, Pred, Scheme, Ty};
 use super::{count_args, Checker, Given, TcError, Wanted, TR};
@@ -600,9 +600,15 @@ impl Checker {
                 preds.extend(self.convert_context_item(ctx, &mut vars)?);
             }
             let name = format!("{}.{}", self.module, c.name);
+            let visible_names = if c.gadt_result.is_some() { super::derive::con_free_vars(c) } else { vars.clone() };
+            let visible = visible_names.iter()
+                .filter(|name| !c.exist.iter().any(|binder| binder.inferred && binder.name.as_str() == name.as_str()))
+                .filter_map(|name| vars.iter().position(|var| var == name).map(|i| i as u32))
+                .collect();
             let scheme = Scheme {
                 nvars: vars.len() as u32,
                 names: vars,
+                visible,
                 preds,
                 ty: Ty::funs(field_tys.clone(), res),
             };
@@ -661,6 +667,7 @@ impl Checker {
                     Scheme {
                         nvars: n,
                         names: tvs.clone(),
+                        visible: (0..n).collect(),
                         preds: Vec::new(),
                         ty: Ty::fun(result_head.clone(), field_ty),
                     },
@@ -776,6 +783,7 @@ impl Checker {
                         key,
                         Scheme {
                             nvars: mtvs.len() as u32,
+                            visible: visible_signature_vars(ty, &mtvs, nparams as usize),
                             names: mtvs,
                             preds,
                             ty: mty,
@@ -874,7 +882,13 @@ impl Checker {
                     preds.extend(own_preds);
                     default_schemes.insert(
                         format!("{}.{name}", self.module),
-                        Scheme { nvars: mtvs.len() as u32, names: mtvs, preds, ty: mty },
+                        Scheme {
+                            nvars: mtvs.len() as u32,
+                            visible: visible_signature_vars(ty, &mtvs, nparams as usize),
+                            names: mtvs,
+                            preds,
+                            ty: mty,
+                        },
                     );
                 }
             }
@@ -1038,6 +1052,7 @@ impl Checker {
         let (preds, body) = self.sig_parts(ty, &mut tvs)?;
         let scheme = Scheme {
             nvars: tvs.len() as u32,
+            visible: visible_signature_vars(ty, &tvs, 0),
             names: tvs,
             preds,
             ty: body.clone(),
@@ -1998,7 +2013,7 @@ impl Checker {
                     newtype: false,
                     context: Vec::new(),
                     name: "[]".to_string(),
-                    tyvars: vec![TyVarBind { name: "a".into(), kind: None }],
+                    tyvars: vec![TyVarBind { name: "a".into(), kind: None, inferred: false }],
                     cons: vec![
                         con("[]", Vec::new(), false),
                         con(
@@ -2023,7 +2038,7 @@ impl Checker {
             }
             let arity = if occ == "()" { 0 } else { occ.matches(',').count() + 1 };
             let tyvars: Vec<TyVarBind> = (0..arity)
-                .map(|i| TyVarBind { name: format!("t{i}"), kind: None })
+                .map(|i| TyVarBind { name: format!("t{i}"), kind: None, inferred: false })
                 .collect();
             let field_types: Vec<Field> = (0..arity)
                 .map(|i| Field {
@@ -2319,6 +2334,7 @@ pub fn instantiate_method(mscheme: &Scheme, nparams: u32, head: &[Ty]) -> Scheme
     Scheme {
         nvars: own,
         names: mscheme.names.iter().skip(nparams as usize).cloned().collect(),
+        visible: mscheme.visible.iter().filter_map(|index| index.checked_sub(nparams)).collect(),
         preds,
         ty,
     }

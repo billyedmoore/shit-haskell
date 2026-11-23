@@ -401,6 +401,7 @@ impl Checker {
                 Scheme {
                     nvars: qmetas.len() as u32,
                     names: names.clone(),
+                    visible: Vec::new(),
                     preds,
                     ty,
                 },

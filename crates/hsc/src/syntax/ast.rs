@@ -450,6 +450,8 @@ pub enum Pat {
 pub struct TyVarBind {
     pub name: String,
     pub kind: Option<Type>,
+    /// Braces in an explicit `forall` leave this binder to inference.
+    pub inferred: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

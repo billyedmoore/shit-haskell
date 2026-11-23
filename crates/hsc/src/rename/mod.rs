@@ -1599,6 +1599,7 @@ impl<'a> Renamer<'a> {
             .map(|b| {
                 Ok(TyVarBind {
                     name: b.name,
+                    inferred: b.inferred,
                     kind: match b.kind {
                         Some(k) => Some(self.ty(k)?),
                         None => None,

@@ -309,11 +309,31 @@ impl Checker {
         let (preds, ty) = self.sig_parts(t, &mut tvs)?;
         Ok(Scheme {
             nvars: tvs.len() as u32,
+            visible: visible_signature_vars(t, &tvs, fixed.len()),
             names: tvs,
             preds,
             ty,
         })
     }
+}
+
+/// Quantified variables introduced by a signature can be supplied unless braced.
+pub(super) fn visible_signature_vars(t: &Type, vars: &[String], fixed: usize) -> Vec<u32> {
+    let mut inferred = Vec::new();
+    let mut current = t;
+    loop {
+        match current {
+            Type::Forall { binders, body, .. } => {
+                inferred.extend(binders.iter().filter(|binder| binder.inferred).map(|binder| &binder.name));
+                current = body;
+            }
+            Type::Qual(_, body) => current = body,
+            _ => break,
+        }
+    }
+    vars.iter().enumerate().filter_map(|(index, name)| {
+        (index < fixed || !inferred.contains(&name)).then_some(index as u32)
+    }).collect()
 }
 
 /// The index of a type variable name, appending it if new.

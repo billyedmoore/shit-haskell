@@ -117,6 +117,8 @@ pub struct Scheme {
     pub nvars: u32,
     /// Names of the quantified variables, for messages.
     pub names: Vec<String>,
+    /// Indices of specified variables in visible type application order.
+    pub visible: Vec<u32>,
     pub preds: Vec<Pred>,
     pub ty: Ty,
 }
@@ -126,6 +128,7 @@ impl Scheme {
         Scheme {
             nvars: 0,
             names: Vec::new(),
+            visible: Vec::new(),
             preds: Vec::new(),
             ty,
         }
@@ -654,7 +657,7 @@ mod substitution_sharing_tests {
     fn shared_closed_parts_do_not_share_instantiation_variables() {
         let fixed = Rc::new(Ty::app(Ty::con("Closed"), Ty::con("Payload")));
         let scheme = Scheme {
-            nvars: 1, names: vec!["a".into()], preds: Vec::new(),
+            nvars: 1, names: vec!["a".into()], visible: vec![0], preds: Vec::new(),
             ty: Ty::App(fixed.clone(), Rc::new(Ty::Gen(0))),
         };
         let mut metas = Metas::default();
