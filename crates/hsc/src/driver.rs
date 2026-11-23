@@ -1649,6 +1649,18 @@ impl Driver {
         self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
         self.checker.derive_anyclass = exts.is_on("DeriveAnyClass");
+        // The renamer also adds the implicit Prelude import. Keep only the
+        // broad imports that appear in the source for the import-list warning.
+        let broad_imports: Vec<_> = if source.is_some()
+            && exts.warnings.level(crate::diagnostic::Warning::MissingImportLists).is_some()
+        {
+            m.imports.iter()
+                .filter(|import| !import.qualified && (import.items.is_none() || import.hiding))
+                .map(|import| (import.loc, self.real_name(&import.module).to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let t = std::time::Instant::now();
         let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, &exts, boot)
             .map_err(|errors| errors.0.iter().map(|e| located(e.loc, &e.msg)).collect::<Vec<_>>().join("\n\n"))?;
@@ -1684,7 +1696,7 @@ impl Driver {
             .map_err(|e| located(e.loc, &e.msg))?;
         timing::add("typecheck", t);
         let warnings = if source.is_some() {
-            self.module_warnings(&renamed, &exts, path, source)?
+            self.module_warnings(&renamed, &broad_imports, &exts, path, source)?
         } else {
             Vec::new()
         };
@@ -1696,11 +1708,32 @@ impl Driver {
         Ok(warnings)
     }
 
-    fn module_warnings(&self, module: &Module, exts: &Extensions, path: &Path, source: Option<&str>) -> Result<Vec<String>, String> {
+    fn module_warnings(
+        &self, module: &Module, broad_imports: &[(Loc, String)], exts: &Extensions, path: &Path, source: Option<&str>,
+    ) -> Result<Vec<String>, String> {
         use crate::diagnostic::Warning;
         let mut warnings: Vec<_> = self.checker.warnings.iter().filter_map(|(loc, msg, flag)| {
             exts.warnings.level(*flag).map(|fatal| (*loc, msg.clone(), *flag, fatal))
         }).collect();
+        if let Some(fatal) = exts.warnings.level(Warning::MissingExportLists).filter(|_| module.exports.is_none()) {
+            let name = self.real_name(&module.name);
+            warnings.push((
+                module.loc,
+                format!("Module ‘{name}’ has no explicit export list\nList the names to export after the module name."),
+                Warning::MissingExportLists,
+                fatal,
+            ));
+        }
+        if let Some(fatal) = exts.warnings.level(Warning::MissingImportLists) {
+            for (loc, name) in broad_imports {
+                warnings.push((
+                    *loc,
+                    format!("Unqualified import of ‘{name}’ has no explicit import list\nList the names to import or qualify the import."),
+                    Warning::MissingImportLists,
+                    fatal,
+                ));
+            }
+        }
         if let Some(fatal) = exts.warnings.level(Warning::UnrecognisedPragmas) {
             for (loc, name) in &exts.unknown_pragmas {
                 let mut message = format!("Unrecognised pragma ‘{name}’");

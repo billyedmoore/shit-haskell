@@ -1,0 +1,2 @@
+error: [-Wmissing-export-lists]
+Module ‘Main’ has no explicit export list

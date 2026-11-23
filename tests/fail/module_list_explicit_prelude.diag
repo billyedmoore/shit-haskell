@@ -1,0 +1,2 @@
+error: [-Wmissing-import-lists]
+Unqualified import of ‘Prelude’ has no explicit import list

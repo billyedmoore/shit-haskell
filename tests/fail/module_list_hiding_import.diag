@@ -1,0 +1,2 @@
+error: [-Wmissing-import-lists]
+Unqualified import of ‘Data.Maybe’ has no explicit import list

@@ -11,13 +11,16 @@ pub(crate) enum Warning {
     UnrecognisedPragmas,
     MissingDerivingStrategies,
     MissingMethods,
+    MissingExportLists,
+    MissingImportLists,
     IncompleteMinimal,
 }
 
 impl Warning {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 9] = [
         Self::Tabs, Self::MissingSignatures, Self::MissingFields, Self::UnrecognisedPragmas,
-        Self::MissingDerivingStrategies, Self::MissingMethods, Self::IncompleteMinimal,
+        Self::MissingDerivingStrategies, Self::MissingMethods, Self::MissingExportLists,
+        Self::MissingImportLists, Self::IncompleteMinimal,
     ];
 
     fn name(self) -> Option<&'static str> {
@@ -28,8 +31,14 @@ impl Warning {
             Self::UnrecognisedPragmas => "unrecognised-pragmas",
             Self::MissingDerivingStrategies => "missing-deriving-strategies",
             Self::MissingMethods => "missing-methods",
+            Self::MissingExportLists => "missing-export-lists",
+            Self::MissingImportLists => "missing-import-lists",
             Self::IncompleteMinimal => return None,
         })
+    }
+
+    fn in_wall(self) -> bool {
+        !matches!(self, Self::MissingDerivingStrategies | Self::MissingExportLists | Self::MissingImportLists)
     }
 }
 
@@ -56,7 +65,7 @@ impl WarningOptions {
         match flag {
             "-Wall" | "-Wno-all" | "-Weverything" | "-w" | "-Wno-everything" => {
                 for warning in Warning::ALL.into_iter().filter(|w| w.name().is_some()) {
-                    if !matches!(flag, "-Wall" | "-Wno-all") || warning != Warning::MissingDerivingStrategies {
+                    if !matches!(flag, "-Wall" | "-Wno-all") || warning.in_wall() {
                         self.enabled[warning as usize] = matches!(flag, "-Wall" | "-Weverything");
                     }
                 }
