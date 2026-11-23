@@ -1,0 +1,3 @@
+forall_duplicate_instance.hs:2:19: error:
+Duplicate binder ‘a’ in this ‘forall’
+The first binder is at line 2, column 17.

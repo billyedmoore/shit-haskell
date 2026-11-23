@@ -844,14 +844,7 @@ impl Parser {
     /// Parses one constructor of a `data` or `newtype` declaration.
     fn constr(&mut self) -> PResult<ConDecl> {
         let loc = self.loc();
-        let mut exist = Vec::new();
-        if self.at_varid("forall") {
-            self.bump();
-            while !self.at_varsym(".") {
-                exist.push(self.tyvar_binder()?);
-            }
-            self.bump();
-        }
+        let exist = if self.at_varid("forall") { self.quantified_binders()? } else { Vec::new() };
         let context = self.try_context();
 
         // Prefix operator constructor: `(:+:) a b` or `(:+:) { ... }`.
@@ -1090,28 +1083,9 @@ impl Parser {
         let mut record_context = Vec::new();
         if self.at_varid("forall") || !self.at_special('{') {
             let saved = self.pos_state();
-            let mut vars = Vec::new();
-            let mut ok = true;
-            if self.at_varid("forall") {
-                self.require_explicit_forall()?;
-                self.bump();
-                while !self.at_varsym(".") && self.real() {
-                    match self.tyvar_binder() {
-                        Ok(v) => vars.push(v),
-                        Err(_) => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok && self.at_varsym(".") {
-                    self.bump();
-                } else {
-                    ok = false;
-                }
-            }
-            let ctx = if ok && !self.at_special('{') { self.try_context() } else { Vec::new() };
-            if ok && self.at_special('{') {
+            let vars = if self.at_varid("forall") { self.forall_binders()? } else { Vec::new() };
+            let ctx = if !self.at_special('{') { self.try_context() } else { Vec::new() };
+            if self.at_special('{') {
                 record_exist = vars;
                 record_context = ctx;
             } else {

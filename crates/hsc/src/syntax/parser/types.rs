@@ -1,5 +1,7 @@
 //! Types, contexts and kinds.
 
+use std::collections::HashMap;
+
 use super::{PResult, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
@@ -38,19 +40,30 @@ impl Parser {
         Ok(kind)
     }
 
-    pub(super) fn require_explicit_forall(&self) -> PResult<()> {
+    pub(super) fn forall_binders(&mut self) -> PResult<Vec<TyVarBind>> {
         if !self.exts.is_on("ExplicitForAll") {
             return self.err("Explicit ‘forall’ in a type requires ExplicitForAll");
         }
-        Ok(())
+        self.quantified_binders()
     }
 
-    pub(super) fn forall_binders(&mut self) -> PResult<Vec<TyVarBind>> {
-        self.require_explicit_forall()?;
+    pub(super) fn quantified_binders(&mut self) -> PResult<Vec<TyVarBind>> {
         self.bump();
         let mut binders = Vec::new();
+        let mut locations = HashMap::new();
         while !self.at_varsym(".") {
-            binders.push(self.tyvar_binder()?);
+            let (binder, loc) = self.tyvar_binder()?;
+            if let Some(first) = locations.insert(binder.name.clone(), loc) {
+                return Err(super::ParseError {
+                    line: loc.line,
+                    col: loc.col,
+                    msg: format!(
+                        "Duplicate binder ‘{}’ in this ‘forall’\nThe first binder is at line {}, column {}.",
+                        binder.name, first.line, first.col,
+                    ),
+                });
+            }
+            binders.push(binder);
         }
         self.bump();
         Ok(binders)
@@ -458,10 +471,11 @@ impl Parser {
     }
 
     /// A type variable binder: `a` or `(a :: k)`.
-    pub(super) fn tyvar_binder(&mut self) -> PResult<TyVarBind> {
+    fn tyvar_binder(&mut self) -> PResult<(TyVarBind, Loc)> {
         // Inferred binders `{a}` and `{a :: k}` are accepted like ordinary ones.
         if self.at_special('{') {
             self.bump();
+            let loc = self.loc();
             let name = match self.tok().clone() {
                 Tok::VarId(s) if self.real() => s,
                 _ => return self.unexpected(),
@@ -473,10 +487,11 @@ impl Parser {
                 None
             };
             self.expect_special('}')?;
-            return Ok(TyVarBind { name, kind });
+            return Ok((TyVarBind { name, kind }, loc));
         }
         if self.at_special('(') {
             self.bump();
+            let loc = self.loc();
             let name = match self.tok().clone() {
                 Tok::VarId(s) if self.real() => s,
                 _ => return self.unexpected(),
@@ -484,15 +499,13 @@ impl Parser {
             self.bump();
             let kind = self.kind_signature()?;
             self.expect_special(')')?;
-            return Ok(TyVarBind {
-                name,
-                kind: Some(kind),
-            });
+            return Ok((TyVarBind { name, kind: Some(kind) }, loc));
         }
         match self.tok().clone() {
             Tok::VarId(s) if self.real() => {
+                let loc = self.loc();
                 self.bump();
-                Ok(TyVarBind { name: s, kind: None })
+                Ok((TyVarBind { name: s, kind: None }, loc))
             }
             _ => self.unexpected(),
         }
