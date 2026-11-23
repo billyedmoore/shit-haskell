@@ -59,6 +59,8 @@ pub struct Module {
     pub export_locs: Vec<Loc>,
     pub imports: Vec<Import>,
     pub decls: Vec<Decl>,
+    /// Source kind expressions retained for diagnostics, including family result kinds.
+    pub kind_annotations: Vec<Type>,
     pub loc: Loc,
     /// The module's rewrite rules (`{-# RULES #-}`): optimisations only, never needed for meaning.
     pub rules: Vec<Rule>,

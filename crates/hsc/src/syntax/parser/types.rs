@@ -30,6 +30,10 @@ impl Parser {
             if let Some((construct, loc)) = kind_collection(&kind) {
                 self.require_data_kinds(loc, construct)?;
             }
+            let flag = crate::diagnostic::Warning::DataKindsTypeConstructors;
+            if self.exts.warnings.level(flag).is_some() {
+                self.kind_annotations.push(kind.clone());
+            }
         }
         Ok(kind)
     }

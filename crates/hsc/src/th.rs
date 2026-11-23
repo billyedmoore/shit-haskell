@@ -236,7 +236,7 @@ fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice],
             loc,
         });
     }
-    Module { name: name.to_string(), exports: None, export_locs: Vec::new(), imports, decls, loc: module_loc, rules: Vec::new(), inlines: Vec::new() }
+    Module { name: name.to_string(), exports: None, export_locs: Vec::new(), imports, decls, kind_annotations: Vec::new(), loc: module_loc, rules: Vec::new(), inlines: Vec::new() }
 }
 
 // ----- walking the expressions of a module -----------------------------------------------
@@ -1928,7 +1928,7 @@ pub fn reify_values_module(values: &[(String, &crate::tc::types::Scheme)], modul
         loc,
     };
     let decls = vec![fun(REIFY_VALUES, body), fun(REIFY_VALUES_IO, Expr::Sig(Box::new(set), io_unit, loc))];
-    Module { name: name.to_string(), exports: None, export_locs: Vec::new(), imports: Vec::new(), decls, loc, rules: Vec::new(), inlines: Vec::new() }
+    Module { name: name.to_string(), exports: None, export_locs: Vec::new(), imports: Vec::new(), decls, kind_annotations: Vec::new(), loc, rules: Vec::new(), inlines: Vec::new() }
 }
 
 /// The binding of `reify_values_module`.

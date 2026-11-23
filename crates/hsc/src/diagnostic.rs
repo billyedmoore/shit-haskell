@@ -16,15 +16,16 @@ pub(crate) enum Warning {
     DuplicateExports,
     DeprecatedFlags,
     UntickedPromotedConstructors,
+    DataKindsTypeConstructors,
     IncompleteMinimal,
 }
 
 impl Warning {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Tabs, Self::MissingSignatures, Self::MissingFields, Self::UnrecognisedPragmas,
         Self::MissingDerivingStrategies, Self::MissingMethods, Self::MissingExportLists,
         Self::MissingImportLists, Self::DuplicateExports, Self::DeprecatedFlags,
-        Self::UntickedPromotedConstructors, Self::IncompleteMinimal,
+        Self::UntickedPromotedConstructors, Self::DataKindsTypeConstructors, Self::IncompleteMinimal,
     ];
 
     fn name(self) -> Option<&'static str> {
@@ -40,6 +41,7 @@ impl Warning {
             Self::DuplicateExports => "duplicate-exports",
             Self::DeprecatedFlags => "deprecated-flags",
             Self::UntickedPromotedConstructors => "unticked-promoted-constructors",
+            Self::DataKindsTypeConstructors => "data-kinds-tc",
             Self::IncompleteMinimal => return None,
         })
     }
@@ -67,6 +69,7 @@ impl Default for WarningOptions {
         enabled[Warning::MissingMethods as usize] = true;
         enabled[Warning::DuplicateExports as usize] = true;
         enabled[Warning::DeprecatedFlags as usize] = true;
+        enabled[Warning::DataKindsTypeConstructors as usize] = true;
         enabled[Warning::IncompleteMinimal as usize] = true;
         Self { enabled, fatal: [false; Warning::ALL.len()] }
     }

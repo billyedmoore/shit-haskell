@@ -1,0 +1,3 @@
+[-Wdata-kinds-tc]
+Using ‘Natural’ as a kind requires DataKinds
+Using ‘Symbol’ as a kind requires DataKinds

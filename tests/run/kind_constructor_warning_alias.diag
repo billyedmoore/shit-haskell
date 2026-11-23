@@ -1,0 +1,2 @@
+[-Wdata-kinds-tc]
+Using ‘Int’ as a kind requires DataKinds

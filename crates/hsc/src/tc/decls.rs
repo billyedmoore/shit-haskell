@@ -234,6 +234,7 @@ impl Checker {
                 break;
             }
         }
+        self.warn_kind_constructors(&m.kind_annotations);
         for d in decls {
             if let Decl::Data(dd) = d {
                 let cons: Vec<String> = dd.cons.iter().map(|c| format!("{}.{}", self.module, c.name)).collect();

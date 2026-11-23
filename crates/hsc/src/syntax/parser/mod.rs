@@ -56,6 +56,7 @@ pub struct Parser {
     /// The (token index, context depth) for which a virtual semicolon was consumed.
     semi_done: Option<(usize, usize)>,
     pub exts: Extensions,
+    kind_annotations: Vec<Type>,
     /// The `static` forms parsed so far (each one's number keys its pointer).
     static_count: usize,
 }
@@ -73,6 +74,7 @@ pub(super) fn parse_module_with_warnings(
         ctx: Vec::new(),
         semi_done: None,
         exts,
+        kind_annotations: Vec::new(),
         static_count: 0,
     };
     let mut m = p.module()?;
@@ -235,7 +237,10 @@ fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax:
                     let ty = if matches!(bs.get(j + 2).map(|t| &t.tok), Some(Tok::Res(ROp::DColon))) {
                         let mut ty_toks = bs[j + 3..close].to_vec();
                         ty_toks.push(eof_after(&bs[close]));
-                        let mut tp = Parser { toks: ty_toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(), static_count: 0 };
+                        let mut tp = Parser {
+                            toks: ty_toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(),
+                            kind_annotations: Vec::new(), static_count: 0,
+                        };
                         let t = tp.sigtype()?;
                         if !tp.at_eof() {
                             return Err(fail("unreadable binder type"));
@@ -257,7 +262,10 @@ fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax:
         }
         let last = ts[ts.len() - 1].clone();
         ts.push(eof_after(&last));
-        let mut ep = Parser { toks: ts, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(), static_count: 0 };
+        let mut ep = Parser {
+            toks: ts, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(),
+            kind_annotations: Vec::new(), static_count: 0,
+        };
         let e = ep.expr()?;
         if !ep.at_eof() {
             return Err(fail("unread tokens after a side"));
@@ -700,6 +708,7 @@ impl Parser {
             export_locs,
             imports,
             decls: group_binds(decls),
+            kind_annotations: std::mem::take(&mut self.kind_annotations),
             loc,
             rules: Vec::new(),
             inlines: Vec::new(),

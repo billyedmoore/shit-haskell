@@ -1373,7 +1373,8 @@ impl Parser {
             (tok.end_line, tok.end_col) = (end.line, end.col);
         }
         let mut p = Parser {
-            toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: self.exts.clone(), static_count: 0,
+            toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: self.exts.clone(),
+            kind_annotations: Vec::new(), static_count: 0,
         };
         if p.at_eof() {
             return Ok(Minimal::All(Vec::new()));

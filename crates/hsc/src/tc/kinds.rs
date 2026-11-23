@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::convert::global_tycon_name;
+use super::types::{unqualify, Ty, ARROW};
 use super::{Checker, TcError, TR};
 use crate::syntax::ast::{ClassDecl, DataDecl, Decl, Loc, Type};
 
@@ -223,7 +224,95 @@ mod sharing_tests {
 /// Environment of type variables in a declaration: name to kind.
 type TyVars = HashMap<String, Kind>;
 
+fn kind_constructor_locations(ty: &Type, locations: &mut Vec<(String, Loc)>) {
+    match ty {
+        Type::Con(name, loc) => locations.push((global_tycon_name(name), *loc)),
+        Type::App(f, a) | Type::Fun(f, a) => {
+            kind_constructor_locations(f, locations);
+            kind_constructor_locations(a, locations);
+        }
+        Type::Sig(body, _) | Type::Forall { body, .. } | Type::Qual(_, body) => {
+            kind_constructor_locations(body, locations);
+        }
+        Type::List(elem, _) => kind_constructor_locations(elem, locations),
+        Type::Tuple(elems, _) => {
+            for elem in elems {
+                kind_constructor_locations(elem, locations);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_kind_primitive(name: &str) -> bool {
+    if name == ARROW || name.starts_with('#') || unqualify(name).starts_with('\'') {
+        return true;
+    }
+    name.strip_prefix("GHC.Types.").or_else(|| name.strip_prefix("GHC.Prim.")).is_some_and(|name| {
+        matches!(name, "Type" | "Constraint" | "TYPE" | "CONSTRAINT" | "RuntimeRep" | "Levity" | "Multiplicity" | "VecCount" | "VecElem")
+    })
+}
+
+fn kind_for_diagnostic(ty: &Ty) -> Ty {
+    let Ty::App(constructor, argument) = ty else { return ty.clone() };
+    if matches!(constructor.as_ref(), Ty::Con(name) if matches!(name.as_str(), "GHC.Types.TYPE" | "GHC.Prim.TYPE")) {
+        let lifted = match argument.as_ref() {
+            Ty::Con(name) => matches!(name.as_str(), "GHC.Types.LiftedRep" | "GHC.Types.'LiftedRep"),
+            Ty::App(rep, levity) => {
+                matches!(rep.as_ref(), Ty::Con(name) if name == "GHC.Types.'BoxedRep")
+                    && matches!(levity.as_ref(), Ty::Con(name) if name == "GHC.Types.'Lifted")
+            }
+            _ => false,
+        };
+        if lifted {
+            return Ty::con("GHC.Types.Type");
+        }
+    }
+    Ty::app(kind_for_diagnostic(constructor), kind_for_diagnostic(argument))
+}
+
 impl Checker {
+    pub(super) fn warn_kind_constructors(&mut self, kinds: &[Type]) {
+        for kind in kinds {
+            let Ok(ty) = self.convert_type(kind, &mut Vec::new()) else { continue };
+            let ty = kind_for_diagnostic(&ty);
+            let mut locations = Vec::new();
+            kind_constructor_locations(kind, &mut locations);
+            let mut head = kind;
+            while let Type::App(f, _) = head {
+                head = f;
+            }
+            let expansion = if let Type::Con(alias, _) = head {
+                self.env.synonyms.contains_key(&global_tycon_name(alias))
+                    .then(|| format!("\n‘{}’ expands to ‘{}’ here.", alias.name, self.show(&ty)))
+            } else {
+                None
+            };
+            self.warn_kind_type(&ty, kind.loc(), &mut locations, expansion.as_deref().unwrap_or(""));
+        }
+    }
+
+    fn warn_kind_type(&mut self, ty: &Ty, loc: Loc, locations: &mut Vec<(String, Loc)>, expansion: &str) {
+        let (head, args) = ty.split_apps();
+        match head {
+            Ty::Con(name) if !is_kind_primitive(name) => {
+                let site = locations.iter().position(|(candidate, _)| candidate == name)
+                    .map_or(loc, |index| locations.remove(index).1);
+                let shown = self.show(ty);
+                self.warnings.push((
+                    site,
+                    format!("Using ‘{shown}’ as a kind requires DataKinds{expansion}"),
+                    crate::diagnostic::Warning::DataKindsTypeConstructors,
+                ));
+            }
+            Ty::Forall(_, _, body) | Ty::Qual(_, body) => self.warn_kind_type(body, loc, locations, expansion),
+            _ => {}
+        }
+        for arg in args {
+            self.warn_kind_type(arg, loc, locations, expansion);
+        }
+    }
+
     fn kind_err<T>(&self, loc: Loc, msg: String) -> TR<T> {
         Err(TcError { loc, msg })
     }

@@ -476,6 +476,10 @@ impl<'a> Renamer<'a> {
             }
         }
 
+        // Some headers discard their result kind after parsing. Resolve those saved expressions
+        // for diagnostics without changing the declarations checked below.
+        let kind_annotations = m.kind_annotations.into_iter().filter_map(|kind| self.ty(kind).ok()).collect();
+
         // Exports.
         let mut warnings = std::mem::take(&mut self.warnings);
         let exports = self.compute_exports(m.exports.as_deref(), &m.export_locs, m.loc, &imports, &mut warnings)?;
@@ -503,6 +507,7 @@ impl<'a> Renamer<'a> {
             export_locs: m.export_locs,
             imports,
             decls,
+            kind_annotations,
             loc: m.loc,
             // Rules are among the declarations now (`rule_binding`).
             rules: Vec::new(),
