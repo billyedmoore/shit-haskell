@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{group_binds, Ctx, KindArgument, KindArgumentSite, KindSignatureRequirement, PResult, Parser};
+use super::{group_binds, Ctx, InvisibleBinder, KindArgument, KindArgumentSite, KindSignatureRequirement, PResult, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
 use crate::syntax::ast::TypeEquation;
@@ -367,17 +367,17 @@ impl Parser {
     fn data_decl(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
         let context = self.datatype_context()?;
         let (head, arguments) = self.head_with_kind_arguments()?;
-        let (name, tyvars) = self.decl_head(head, &arguments)?;
+        let (name, tyvars, invisible_binders) = self.decl_head(head, &arguments)?;
         let erased_kind_variables = Self::erased_kind_variables(&arguments);
         let kind = if self.at_res(ROp::DColon) { Some(self.kind_signature()?) } else { None };
-        if Self::first_invisible_binder(&arguments).is_some() {
+        if !invisible_binders.is_empty() {
             let complete_parameters = Self::parameters_have_kinds(&tyvars, &arguments);
             let scope = TyVarBind::declaration_scope(&tyvars, &erased_kind_variables);
             let known_result_kind = match &kind {
                 Some(kind) => kind.first_unbound_variable(|name, _| scope.iter().any(|n| n == name)).is_none(),
                 None => !newtype || !self.exts.is_on("UnliftedNewtypes"),
             };
-            self.note_invisible_binder_kind(&name, &name, &arguments, complete_parameters && known_result_kind);
+            self.note_invisible_binder_kind(&name, &name, invisible_binders, complete_parameters && known_result_kind);
         }
         self.data_body(newtype, context, name, tyvars, kind, erased_kind_variables, loc)
     }
@@ -395,13 +395,6 @@ impl Parser {
         self.with_kind_arguments(|p| p.btype_with_head(true))
     }
 
-    fn first_invisible_binder(arguments: &[KindArgument]) -> Option<Loc> {
-        arguments.iter().filter_map(|argument| match argument.site {
-            KindArgumentSite::Head(at) => Some(at),
-            _ => None,
-        }).min()
-    }
-
     fn parameters_have_kinds(parameters: &[TyVarBind], arguments: &[KindArgument]) -> bool {
         parameters.iter().all(|param| param.kind.is_some()) &&
             arguments.iter().all(|argument| {
@@ -410,16 +403,14 @@ impl Parser {
     }
 
     fn note_invisible_binder_kind(
-        &mut self, name: &str, signature_name: &str, arguments: &[KindArgument], complete_kind: bool,
+        &mut self, name: &str, signature_name: &str, binders: Vec<InvisibleBinder>, complete_kind: bool,
     ) {
-        if complete_kind && self.exts.is_on("CUSKs") {
-            return;
-        }
-        if let Some(at) = Self::first_invisible_binder(arguments) {
+        if !binders.is_empty() {
             self.kind_signature_requirements.push(KindSignatureRequirement {
                 declaration: name.to_owned(),
                 signature_name: signature_name.to_owned(),
-                at,
+                binders,
+                has_cusk: complete_kind && self.exts.is_on("CUSKs"),
             });
         }
     }
@@ -731,11 +722,11 @@ impl Parser {
             // StandaloneKindSignatures: `type T :: kind`.
             self.bump();
             let kind = self.kind_type()?;
-            let (name, _) = self.decl_head(head, &arguments)?;
+            let (name, _, _) = self.decl_head(head, &arguments)?;
             return Ok(Decl::KindSig { name, kind, loc });
         }
         let erased_kind_variables = Self::erased_kind_variables(&arguments);
-        let (name, tyvars) = self.decl_head(head, &arguments)?;
+        let (name, tyvars, invisible_binders) = self.decl_head(head, &arguments)?;
         self.expect_res(ROp::Eq)?;
         let rhs = self.without_erased_kind_wildcards("the right-hand side of a type synonym", |p| {
             let mut rhs = p.sigtype()?;
@@ -746,7 +737,7 @@ impl Parser {
             Ok(rhs)
         })?;
         let complete_kind = Self::parameters_have_kinds(&tyvars, &arguments) && matches!(rhs, Type::Sig(..));
-        self.note_invisible_binder_kind(&name, &name, &arguments, complete_kind);
+        self.note_invisible_binder_kind(&name, &name, invisible_binders, complete_kind);
         Ok(Decl::TypeSyn {
             name,
             tyvars,
@@ -766,7 +757,7 @@ impl Parser {
     /// `F a b [:: kind] [where equations]`, after `type family` or `data family`.
     fn type_family(&mut self, loc: Loc, module: &str, data: bool) -> PResult<Decl> {
         let (head, arguments) = self.head_with_kind_arguments()?;
-        let (name, params) = self.decl_head(head, &arguments)?;
+        let (name, params, invisible_binders) = self.decl_head(head, &arguments)?;
         let mut has_result_kind = self.at_res(ROp::DColon);
         if has_result_kind {
             self.bump();
@@ -828,7 +819,7 @@ impl Parser {
         };
         let complete_kind = equations.is_none() ||
             (has_result_kind && Self::parameters_have_kinds(&params, &arguments));
-        self.note_invisible_binder_kind(&name, &name, &arguments, complete_kind);
+        self.note_invisible_binder_kind(&name, &name, invisible_binders, complete_kind);
         Ok(Decl::TypeFamily {
             name,
             params,
@@ -957,7 +948,9 @@ impl Parser {
     }
 
     /// Splits a declaration head `T a (b :: k)` or `a :+: b` into its name and binders.
-    fn decl_head(&self, head: Type, kind_arguments: &[KindArgument]) -> PResult<(String, Vec<TyVarBind>)> {
+    fn decl_head(
+        &self, head: Type, kind_arguments: &[KindArgument],
+    ) -> PResult<(String, Vec<TyVarBind>, Vec<InvisibleBinder>)> {
         let invisible_binders = self.invisible_binders(kind_arguments)?;
         let mut args = Vec::new();
         let mut t = head;
@@ -997,7 +990,15 @@ impl Parser {
                 });
             }
         }
-        Ok((name, tyvars.into_iter().map(|(_, binder)| binder).collect()))
+        let mut invisible = Vec::new();
+        for argument in kind_arguments {
+            if let KindArgumentSite::Head(at) = argument.site {
+                let preceding_parameters = tyvars.iter().filter(|(loc, _)| *loc < at).count();
+                invisible.push(InvisibleBinder { at, preceding_parameters });
+            }
+        }
+        invisible.sort_unstable_by_key(|binder| binder.at);
+        Ok((name, tyvars.into_iter().map(|(_, binder)| binder).collect(), invisible))
     }
 
     fn type_to_binder(&self, t: Type) -> PResult<TyVarBind> {
@@ -1497,7 +1498,7 @@ impl Parser {
         let context = self.try_context();
         let (head, arguments) = self.head_with_kind_arguments()?;
         let head_loc = head.loc();
-        let (name, tyvars) = self.decl_head(head, &arguments)?;
+        let (name, tyvars, invisible_binders) = self.decl_head(head, &arguments)?;
         let erased_kind_variables = Self::erased_kind_variables(&arguments);
         if tyvars.len() != 1 && !self.exts.is_on("MultiParamTypeClasses") {
             let count = if tyvars.is_empty() { "no parameters".into() } else { format!("{} parameters", tyvars.len()) };
@@ -1531,7 +1532,7 @@ impl Parser {
         }
         let mut minimal = None;
         let complete_kind = Self::parameters_have_kinds(&tyvars, &arguments);
-        self.note_invisible_binder_kind(&name, &name, &arguments, complete_kind);
+        self.note_invisible_binder_kind(&name, &name, invisible_binders, complete_kind);
         let class = ClassHeader { name: &name, complete_kind };
         let decls = if self.at_kw(Kw::Where) {
             self.bump();
@@ -1666,10 +1667,10 @@ impl Parser {
                 let save = (self.pos, self.ctx.clone(), self.semi_done);
                 self.bump();
                 if let Some(result) = self.atype().ok().filter(|_| self.at_res(ROp::Bar)) {
-                    let (name, params) = self.decl_head(head, &arguments)?;
+                    let (name, params, invisible_binders) = self.decl_head(head, &arguments)?;
                     let injective = self.family_result(&name, &params, &result)?;
                     if let Some(class) = class {
-                        self.note_invisible_binder_kind(&name, class.name, &arguments, class.complete_kind);
+                        self.note_invisible_binder_kind(&name, class.name, invisible_binders, class.complete_kind);
                     }
                     return Ok(Decl::TypeFamily { name, params, equations: None, abstract_closed: None, data: false, injective, loc });
                 }
@@ -1682,13 +1683,13 @@ impl Parser {
                     loc,
                 });
             }
-            let (name, params) = self.decl_head(head, &arguments)?;
+            let (name, params, invisible_binders) = self.decl_head(head, &arguments)?;
             if self.at_res(ROp::DColon) {
                 self.bump();
                 self.sigtype()?;
             }
             if let Some(class) = class {
-                self.note_invisible_binder_kind(&name, class.name, &arguments, class.complete_kind);
+                self.note_invisible_binder_kind(&name, class.name, invisible_binders, class.complete_kind);
             }
             return Ok(Decl::TypeFamily {
                 name,

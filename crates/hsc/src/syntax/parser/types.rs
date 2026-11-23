@@ -1,10 +1,91 @@
 //! Types, contexts and kinds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::{KindArgument, KindArgumentSite, PResult, Parser};
+use super::{InvisibleBinder, KindArgument, KindArgumentSite, PResult, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
+
+/// Match each invisible binder after consuming the required kind arguments that precede it.
+pub(super) fn unmatched_kind_binder(
+    kind: &Type, aliases: &HashMap<&str, &Type>, imports: &[Import], binders: &[InvisibleBinder],
+) -> Option<Loc> {
+    #[derive(PartialEq, Eq)]
+    enum Parameter {
+        Specified,
+        Required,
+    }
+
+    let mut parameters = Vec::new();
+    if !matches!(kind, Type::Forall { .. }) {
+        let mut implicit = Vec::new();
+        kind.extend_variable_scope(&mut implicit);
+        parameters.extend(implicit.into_iter().map(|_| Parameter::Specified));
+    }
+    let mut result = kind;
+    let mut aliases_seen = HashSet::new();
+    let known_result = loop {
+        match result {
+            Type::Forall { binders, body, .. } => {
+                parameters.extend(binders.iter().filter(|b| !b.inferred).map(|_| Parameter::Specified));
+                result = body;
+            }
+            Type::Fun(_, body) => {
+                parameters.push(Parameter::Required);
+                result = body;
+            }
+            Type::Con(name, _) if name.qual.is_none() && aliases.contains_key(name.name.as_str()) => {
+                if !aliases_seen.insert(name.name.as_str()) {
+                    break false;
+                }
+                result = aliases[name.name.as_str()];
+            }
+            Type::Con(name, _) => break known_terminal_kind(name, imports),
+            Type::Var(..) => break true,
+            _ => break false,
+        }
+    };
+
+    let mut parameters = parameters.into_iter();
+    let mut consumed = 0;
+    for binder in binders {
+        while consumed < binder.preceding_parameters {
+            if !parameters.any(|parameter| parameter == Parameter::Required) {
+                return known_result.then_some(binder.at);
+            }
+            consumed += 1;
+        }
+        match parameters.next() {
+            Some(Parameter::Specified) => {}
+            Some(Parameter::Required) => return Some(binder.at),
+            None => return known_result.then_some(binder.at),
+        }
+    }
+    None
+}
+
+fn known_terminal_kind(name: &QName, imports: &[Import]) -> bool {
+    if !matches!(name.name.as_str(), "Type" | "Constraint") {
+        return false;
+    }
+    if name.qual.as_deref() == Some("%G:GHC.Types") {
+        return true;
+    }
+    imports.iter().any(|import| {
+        if !matches!(import.module.as_str(), "Data.Kind" | "GHC.Types" | "GHC.Exts") {
+            return false;
+        }
+        let visible = match &name.qual {
+            Some(qualifier) => import.alias.as_ref().unwrap_or(&import.module) == qualifier,
+            None => !import.qualified,
+        };
+        visible && import.items.as_ref().is_none_or(|items| {
+            items.iter().any(|item| {
+                matches!(item, IEItem::Thing { name: q, .. } if q.name == name.name)
+            }) != import.hiding
+        })
+    })
+}
 
 impl Parser {
     fn require_data_kinds(&self, loc: Loc, construct: &str) -> PResult<()> {

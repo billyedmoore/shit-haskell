@@ -60,10 +60,16 @@ enum KindArgumentSite {
     InfixOperand(Loc),
 }
 
+struct InvisibleBinder {
+    at: Loc,
+    preceding_parameters: usize,
+}
+
 struct KindSignatureRequirement {
     declaration: String,
     signature_name: String,
-    at: Loc,
+    binders: Vec<InvisibleBinder>,
+    has_cusk: bool,
 }
 
 pub struct Parser {
@@ -726,7 +732,7 @@ impl Parser {
                 TopItem::Decl(d) => decls.push(d),
             }
         }
-        self.check_kind_signature_requirements(&decls)?;
+        self.check_kind_signature_requirements(&decls, &imports)?;
         Ok(Module {
             name,
             exports,
@@ -740,24 +746,51 @@ impl Parser {
         })
     }
 
-    fn check_kind_signature_requirements(&self, declarations: &[Decl]) -> PResult<()> {
+    fn check_kind_signature_requirements(&self, declarations: &[Decl], imports: &[Import]) -> PResult<()> {
         if self.kind_signature_requirements.is_empty() {
             return Ok(());
         }
-        let signatures: std::collections::HashSet<_> = declarations.iter().filter_map(|declaration| {
-            if let Decl::KindSig { name, .. } = declaration { Some(name.as_str()) } else { None }
-        }).collect();
+        let mut signatures = std::collections::HashMap::new();
+        let mut aliases = std::collections::HashMap::new();
+        for declaration in declarations {
+            match declaration {
+                Decl::KindSig { name, kind, loc } => {
+                    signatures.insert(name.as_str(), (kind, *loc));
+                }
+                Decl::TypeSyn { name, tyvars, rhs, .. } if tyvars.is_empty() => {
+                    aliases.insert(name.as_str(), rhs);
+                }
+                _ => {}
+            }
+        }
         for requirement in &self.kind_signature_requirements {
-            if !signatures.contains(requirement.signature_name.as_str()) {
-                let name = &requirement.signature_name;
-                return Err(ParseError {
-                    line: requirement.at.line,
-                    col: requirement.at.col,
-                    msg: format!(
-                        "An invisible binder in ‘{}’ needs an explicit kind signature\nAdd a standalone kind signature for ‘{name}’, or supply a complete kind with CUSKs enabled.",
-                        requirement.declaration,
-                    ),
-                });
+            let name = &requirement.signature_name;
+            match signatures.get(name.as_str()) {
+                Some((kind, signature_at)) if requirement.declaration == *name => {
+                    if let Some(at) = types::unmatched_kind_binder(kind, &aliases, imports, &requirement.binders) {
+                        return Err(ParseError {
+                            line: at.line,
+                            col: at.col,
+                            msg: format!(
+                                "No matching ‘forall’ binder for this invisible parameter of ‘{name}’\nThe standalone kind signature at line {}, column {} needs a specified ‘forall’ binder at this position.",
+                                signature_at.line, signature_at.col,
+                            ),
+                        });
+                    }
+                }
+                Some(_) => {}
+                None if requirement.has_cusk => {}
+                None => {
+                    let at = requirement.binders[0].at;
+                    return Err(ParseError {
+                        line: at.line,
+                        col: at.col,
+                        msg: format!(
+                            "An invisible binder in ‘{}’ needs an explicit kind signature\nAdd a standalone kind signature for ‘{name}’, or supply a complete kind with CUSKs enabled.",
+                            requirement.declaration,
+                        ),
+                    });
+                }
             }
         }
         Ok(())
