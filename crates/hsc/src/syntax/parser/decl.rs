@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{group_binds, Ctx, PResult, Parser};
+use super::{group_binds, Ctx, KindArgument, KindArgumentSite, PResult, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
 use crate::syntax::ast::TypeEquation;
@@ -360,35 +360,95 @@ impl Parser {
 
     fn data_decl(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
         let context = self.datatype_context()?;
-        let (head, erased_kind_variables) = self.head_with_kind_variables()?;
-        let (name, tyvars) = self.decl_head(head)?;
+        let (head, arguments) = self.head_with_kind_arguments()?;
+        let (name, tyvars) = self.decl_head(head, &arguments)?;
+        let erased_kind_variables = Self::erased_kind_variables(&arguments);
         self.data_body(newtype, context, name, tyvars, erased_kind_variables, loc)
     }
 
     fn with_kind_arguments<T>(
         &mut self, parse: impl FnOnce(&mut Self) -> PResult<T>,
-    ) -> PResult<(T, Vec<Type>)> {
-        let saved = self.head_kind_arguments.replace(Vec::new());
+    ) -> PResult<(T, Vec<KindArgument>)> {
+        let saved = self.captured_kind_arguments.replace(Vec::new());
         let result = parse(self);
-        let arguments = std::mem::replace(&mut self.head_kind_arguments, saved).unwrap_or_default();
+        let arguments = std::mem::replace(&mut self.captured_kind_arguments, saved).unwrap_or_default();
         Ok((result?, arguments))
     }
 
+    fn head_with_kind_arguments(&mut self) -> PResult<(Type, Vec<KindArgument>)> {
+        self.with_kind_arguments(|p| p.btype_with_head(true))
+    }
+
+    fn invisible_binders<'a>(&self, arguments: &'a [KindArgument]) -> PResult<Vec<(&'a str, Loc)>> {
+        let mut binders = Vec::new();
+        for KindArgument { ty, site } in arguments {
+            let at = match site {
+                KindArgumentSite::Head(at) => at,
+                KindArgumentSite::TypeApplication => continue,
+                KindArgumentSite::InfixOperand(at) => {
+                    return Err(super::ParseError {
+                        line: at.line,
+                        col: at.col,
+                        msg: "An infix declaration parameter cannot apply a visible kind argument".into(),
+                    });
+                }
+            };
+            if !self.exts.is_on("TypeAbstractions") {
+                return Err(super::ParseError {
+                    line: at.line,
+                    col: at.col,
+                    msg: "An invisible ‘@’ binder requires TypeAbstractions".into(),
+                });
+            }
+            let parameter = match ty {
+                Type::Sig(parameter, _) => parameter.as_ref(),
+                _ => ty,
+            };
+            match parameter {
+                Type::Var(name, loc) => binders.push((name.as_str(), *loc)),
+                Type::Wild(_) => {}
+                _ => {
+                    let loc = ty.loc();
+                    return Err(super::ParseError {
+                        line: loc.line,
+                        col: loc.col,
+                        msg: "An invisible type binder must be a type variable or ‘_’".into(),
+                    });
+                }
+            }
+        }
+        Ok(binders)
+    }
+
     /// Declaration scopes keep the names of kind arguments even when the type erases them.
-    fn head_with_kind_variables(&mut self) -> PResult<(Type, Vec<String>)> {
-        let (head, arguments) = self.with_kind_arguments(Self::btype)?;
+    fn erased_kind_variables(arguments: &[KindArgument]) -> Vec<String> {
         let mut variables = Vec::new();
         for argument in arguments {
-            collect_type_vars(&argument, &mut variables, true);
+            collect_type_vars(&argument.ty, &mut variables, true);
         }
-        Ok((head, variables))
+        variables
+    }
+
+    fn family_pattern_kind_variables(&self, arguments: &[KindArgument]) -> PResult<Vec<String>> {
+        if !self.exts.is_on("TypeApplications") {
+            for argument in arguments {
+                if let KindArgumentSite::InfixOperand(at) = argument.site {
+                    return Err(super::ParseError {
+                        line: at.line,
+                        col: at.col,
+                        msg: "A visible kind application requires TypeApplications".into(),
+                    });
+                }
+            }
+        }
+        Ok(Self::erased_kind_variables(arguments))
     }
 
     fn without_erased_kind_wildcards<T>(
         &mut self, context: &str, parse: impl FnOnce(&mut Self) -> PResult<T>,
     ) -> PResult<T> {
         let (result, arguments) = self.with_kind_arguments(parse)?;
-        if let Some((_, loc)) = arguments.iter().find_map(|kind| kind.first_wildcard(false)) {
+        if let Some((_, loc)) = arguments.iter().find_map(|kind| kind.ty.first_wildcard(false)) {
             return Err(super::ParseError {
                 line: loc.line,
                 col: loc.col,
@@ -417,7 +477,8 @@ impl Parser {
     /// over the variables of the instance head; and the family equation `F t1 .. tn = R vs`.
     fn data_instance(&mut self, newtype: bool, loc: Loc) -> PResult<Decl> {
         let context = self.datatype_context()?;
-        let (head, mut erased_kind_variables) = self.head_with_kind_variables()?;
+        let (head, arguments) = self.head_with_kind_arguments()?;
+        let mut erased_kind_variables = self.family_pattern_kind_variables(&arguments)?;
         let mut args = Vec::new();
         let mut t = head;
         while let Type::App(f, a) = t {
@@ -622,18 +683,22 @@ impl Parser {
             }
             return Ok(Decl::RoleAnnotation { name, roles, loc });
         }
-        let (head, erased_kind_variables) = self.head_with_kind_variables()?;
+        let (head, arguments) = self.head_with_kind_arguments()?;
         if self.at_res(ROp::DColon) {
             if !self.exts.is_on("StandaloneKindSignatures") {
                 return self.err("A standalone kind signature requires StandaloneKindSignatures");
             }
+            if arguments.iter().any(|argument| !matches!(argument.site, KindArgumentSite::TypeApplication)) {
+                return self.err("Write only the type name before ‘::’ in a standalone kind signature");
+            }
             // StandaloneKindSignatures: `type T :: kind`.
             self.bump();
             let kind = self.kind_type()?;
-            let (name, _) = self.decl_head(head)?;
+            let (name, _) = self.decl_head(head, &arguments)?;
             return Ok(Decl::KindSig { name, kind, loc });
         }
-        let (name, tyvars) = self.decl_head(head)?;
+        let erased_kind_variables = Self::erased_kind_variables(&arguments);
+        let (name, tyvars) = self.decl_head(head, &arguments)?;
         self.expect_res(ROp::Eq)?;
         let rhs = self.without_erased_kind_wildcards("the right-hand side of a type synonym", |p| {
             let mut rhs = p.sigtype()?;
@@ -661,8 +726,8 @@ impl Parser {
 
     /// `F a b [:: kind] [where equations]`, after `type family` or `data family`.
     fn type_family(&mut self, loc: Loc, module: &str, data: bool) -> PResult<Decl> {
-        let head = self.btype()?;
-        let (name, params) = self.decl_head(head)?;
+        let (head, arguments) = self.head_with_kind_arguments()?;
+        let (name, params) = self.decl_head(head, &arguments)?;
         if self.at_res(ROp::DColon) {
             self.bump();
             self.kind_type()?;
@@ -810,7 +875,8 @@ impl Parser {
 
     /// `F t1 .. tn = rhs`: the family name and the equation.
     fn type_equation(&mut self) -> PResult<(QName, TypeEquation)> {
-        let (lhs, erased_kind_variables) = self.head_with_kind_variables()?;
+        let (lhs, arguments) = self.head_with_kind_arguments()?;
+        let erased_kind_variables = self.family_pattern_kind_variables(&arguments)?;
         self.equation_from(lhs, erased_kind_variables)
     }
 
@@ -847,7 +913,8 @@ impl Parser {
     }
 
     /// Splits a declaration head `T a (b :: k)` or `a :+: b` into its name and binders.
-    pub(super) fn decl_head(&self, head: Type) -> PResult<(String, Vec<TyVarBind>)> {
+    fn decl_head(&self, head: Type, kind_arguments: &[KindArgument]) -> PResult<(String, Vec<TyVarBind>)> {
+        let invisible_binders = self.invisible_binders(kind_arguments)?;
         let mut args = Vec::new();
         let mut t = head;
         while let Type::App(f, a) = t {
@@ -867,24 +934,26 @@ impl Parser {
             },
             _ => return self.err("malformed declaration head"),
         };
-        let mut locations = HashMap::<String, Loc>::new();
-        let mut tyvars = Vec::new();
-        for arg in infix_args.into_iter().chain(args) {
-            let loc = arg.loc();
-            let binder = self.type_to_binder(arg)?;
-            if let Some(first) = locations.insert(binder.name.clone(), loc) {
+        let tyvars = infix_args.into_iter().chain(args)
+            .map(|arg| Ok((arg.loc(), self.type_to_binder(arg)?)))
+            .collect::<PResult<Vec<_>>>()?;
+        let mut binders = invisible_binders;
+        binders.extend(tyvars.iter().map(|(loc, binder)| (binder.name.as_str(), *loc)));
+        binders.sort_unstable_by_key(|(_, loc)| *loc);
+        let mut locations = HashMap::new();
+        for (binder, loc) in binders {
+            if let Some(first) = locations.insert(binder, loc) {
                 return Err(super::ParseError {
                     line: loc.line,
                     col: loc.col,
                     msg: format!(
-                        "Type variable ‘{}’ is bound more than once in the declaration of ‘{name}’\nThe first binder is at line {}, column {}.",
-                        binder.name, first.line, first.col,
+                        "Type variable ‘{binder}’ is bound more than once in the declaration of ‘{name}’\nThe first binder is at line {}, column {}.",
+                        first.line, first.col,
                     ),
                 });
             }
-            tyvars.push(binder);
         }
-        Ok((name, tyvars))
+        Ok((name, tyvars.into_iter().map(|(_, binder)| binder).collect()))
     }
 
     fn type_to_binder(&self, t: Type) -> PResult<TyVarBind> {
@@ -1382,9 +1451,10 @@ impl Parser {
     fn class_decl(&mut self, loc: Loc) -> PResult<Decl> {
         self.expect_kw(Kw::Class)?;
         let context = self.try_context();
-        let (head, erased_kind_variables) = self.head_with_kind_variables()?;
+        let (head, arguments) = self.head_with_kind_arguments()?;
         let head_loc = head.loc();
-        let (name, tyvars) = self.decl_head(head)?;
+        let (name, tyvars) = self.decl_head(head, &arguments)?;
+        let erased_kind_variables = Self::erased_kind_variables(&arguments);
         if tyvars.len() != 1 && !self.exts.is_on("MultiParamTypeClasses") {
             let count = if tyvars.is_empty() { "no parameters".into() } else { format!("{} parameters", tyvars.len()) };
             return Err(super::ParseError {
@@ -1464,7 +1534,7 @@ impl Parser {
         }
         let mut p = Parser {
             toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: self.exts.clone(),
-            kind_annotations: Vec::new(), head_kind_arguments: None, static_count: 0,
+            kind_annotations: Vec::new(), captured_kind_arguments: None, static_count: 0,
         };
         if p.at_eof() {
             return Ok(Minimal::All(Vec::new()));
@@ -1542,18 +1612,19 @@ impl Parser {
             if self.at_varid("family") {
                 self.bump();
             }
-            let (head, erased_kind_variables) = self.head_with_kind_variables()?;
+            let (head, arguments) = self.head_with_kind_arguments()?;
             if self.at_res(ROp::Eq) {
                 // `type F a = (r :: k) | r -> a` (TypeFamilyDependencies) declares an injective
                 // family with a named result; injectivity is not checked, so the clause is skipped.
                 let save = (self.pos, self.ctx.clone(), self.semi_done);
                 self.bump();
                 if let Some(result) = self.atype().ok().filter(|_| self.at_res(ROp::Bar)) {
-                    let (name, params) = self.decl_head(head)?;
+                    let (name, params) = self.decl_head(head, &arguments)?;
                     let injective = self.family_result(&name, &params, &result)?;
                     return Ok(Decl::TypeFamily { name, params, equations: None, abstract_closed: None, data: false, injective, loc });
                 }
                 (self.pos, self.ctx, self.semi_done) = save;
+                let erased_kind_variables = self.family_pattern_kind_variables(&arguments)?;
                 let (name, equation) = self.equation_from(head, erased_kind_variables)?;
                 return Ok(Decl::TypeInstance {
                     name,
@@ -1561,7 +1632,7 @@ impl Parser {
                     loc,
                 });
             }
-            let (name, params) = self.decl_head(head)?;
+            let (name, params) = self.decl_head(head, &arguments)?;
             if self.at_res(ROp::DColon) {
                 self.bump();
                 self.sigtype()?;

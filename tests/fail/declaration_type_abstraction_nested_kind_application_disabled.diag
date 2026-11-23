@@ -1,0 +1,2 @@
+declaration_type_abstraction_nested_kind_application_disabled.hs:5:19: error
+A visible kind application requires TypeApplications

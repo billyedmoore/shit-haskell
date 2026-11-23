@@ -1,0 +1,2 @@
+declaration_type_abstraction_datatype_nonvariable.hs:6:9: error
+An invisible type binder must be a type variable or ‘_’

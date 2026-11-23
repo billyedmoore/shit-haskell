@@ -1,0 +1,2 @@
+declaration_type_abstraction_associated_decl_disabled.hs:3:10: error
+An invisible ‘@’ binder requires TypeAbstractions

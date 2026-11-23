@@ -1,0 +1,3 @@
+declaration_type_abstraction_datatype_duplicate.hs:2:12: error
+Type variable ‘k’ is bound more than once
+The first binder is at line 2, column 9.

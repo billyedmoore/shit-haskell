@@ -1,0 +1,2 @@
+declaration_type_abstraction_datatype_standalone_with_binder.hs:3:11: error
+Write only the type name before ‘::’ in a standalone kind signature

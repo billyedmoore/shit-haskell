@@ -49,6 +49,17 @@ enum TopItem {
     Decl(Decl),
 }
 
+struct KindArgument {
+    ty: Type,
+    site: KindArgumentSite,
+}
+
+enum KindArgumentSite {
+    TypeApplication,
+    Head(Loc),
+    InfixOperand(Loc),
+}
+
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -57,7 +68,7 @@ pub struct Parser {
     semi_done: Option<(usize, usize)>,
     pub exts: Extensions,
     kind_annotations: Vec<Type>,
-    head_kind_arguments: Option<Vec<Type>>,
+    captured_kind_arguments: Option<Vec<KindArgument>>,
     /// The `static` forms parsed so far (each one's number keys its pointer).
     static_count: usize,
 }
@@ -76,7 +87,7 @@ pub(super) fn parse_module_with_warnings(
         semi_done: None,
         exts,
         kind_annotations: Vec::new(),
-        head_kind_arguments: None,
+        captured_kind_arguments: None,
         static_count: 0,
     };
     let mut m = p.module()?;
@@ -241,7 +252,7 @@ fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax:
                         ty_toks.push(eof_after(&bs[close]));
                         let mut tp = Parser {
                             toks: ty_toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(),
-                            kind_annotations: Vec::new(), head_kind_arguments: None, static_count: 0,
+                            kind_annotations: Vec::new(), captured_kind_arguments: None, static_count: 0,
                         };
                         let t = tp.sigtype()?;
                         if !tp.at_eof() {
@@ -266,7 +277,7 @@ fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax:
         ts.push(eof_after(&last));
         let mut ep = Parser {
             toks: ts, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(),
-            kind_annotations: Vec::new(), head_kind_arguments: None, static_count: 0,
+            kind_annotations: Vec::new(), captured_kind_arguments: None, static_count: 0,
         };
         let e = ep.expr()?;
         if !ep.at_eof() {
@@ -387,14 +398,14 @@ impl Parser {
 
     /// Snapshot of the cursor, layout, and collected kind arguments for bounded backtracking.
     fn pos_state(&self) -> (usize, Vec<Ctx>, Option<(usize, usize)>, Option<usize>) {
-        (self.pos, self.ctx.clone(), self.semi_done, self.head_kind_arguments.as_ref().map(Vec::len))
+        (self.pos, self.ctx.clone(), self.semi_done, self.captured_kind_arguments.as_ref().map(Vec::len))
     }
 
     fn restore_pos_state(&mut self, s: (usize, Vec<Ctx>, Option<(usize, usize)>, Option<usize>)) {
         self.pos = s.0;
         self.ctx = s.1;
         self.semi_done = s.2;
-        if let (Some(arguments), Some(len)) = (&mut self.head_kind_arguments, s.3) {
+        if let (Some(arguments), Some(len)) = (&mut self.captured_kind_arguments, s.3) {
             arguments.truncate(len);
         }
     }

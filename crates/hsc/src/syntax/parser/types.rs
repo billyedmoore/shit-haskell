@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{PResult, Parser};
+use super::{KindArgument, KindArgumentSite, PResult, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
 
@@ -71,12 +71,16 @@ impl Parser {
 
     /// `[forall binders .] [context =>] type`
     pub(super) fn sigtype(&mut self) -> PResult<Type> {
+        self.sigtype_with_head(false)
+    }
+
+    fn sigtype_with_head(&mut self, declaration_head: bool) -> PResult<Type> {
         if self.at_varid("forall") {
             let binders = self.forall_binders()?;
             let body = self.sigtype()?;
             return Ok(Type::Forall { binders, body: Box::new(body), parenthesized: false });
         }
-        let t = self.type_expr()?;
+        let t = self.type_expr_with_head(declaration_head)?;
         if self.at_res(ROp::DArrow) {
             self.bump();
             let ctx = context_items(t);
@@ -88,7 +92,11 @@ impl Parser {
 
     /// `btype [-> type]`
     pub(super) fn type_expr(&mut self) -> PResult<Type> {
-        let t = self.btype()?;
+        self.type_expr_with_head(false)
+    }
+
+    fn type_expr_with_head(&mut self, declaration_head: bool) -> PResult<Type> {
+        let t = self.btype_with_head(declaration_head)?;
         // LinearTypes: a multiplicity arrow `%1 ->` or `%m ->` is an ordinary arrow here.
         if self.real() && self.at_varsym("%") && !self.raw().space_after {
             let saved = self.pos_state();
@@ -112,36 +120,60 @@ impl Parser {
 
     /// Type application chain with infix type operators.
     pub(super) fn btype(&mut self) -> PResult<Type> {
+        self.btype_with_head(false)
+    }
+
+    pub(super) fn btype_with_head(&mut self, declaration_head: bool) -> PResult<Type> {
         let loc = self.loc();
+        let captured_before = self.captured_kind_arguments.as_ref().map(Vec::len);
         let mut items = Vec::new();
-        let mut app = self.app_type()?;
+        let mut app = self.app_type(declaration_head)?;
         loop {
             let op_loc = self.loc();
             let Some(op) = self.type_operator() else { break };
             items.push(TypeOpItem::Operand(app));
             items.push(TypeOpItem::Op(op, op_loc));
-            app = self.app_type()?;
+            app = self.app_type(declaration_head)?;
         }
         if items.is_empty() {
             return Ok(app);
+        }
+        // In an infix head, each operand is itself an argument to the operator.
+        // Interpret any `@` in those operands as part of their type.
+        if let (true, Some(before), Some(arguments)) =
+            (declaration_head, captured_before, &mut self.captured_kind_arguments)
+        {
+            for argument in &mut arguments[before..] {
+                if let KindArgumentSite::Head(at) = argument.site {
+                    argument.site = KindArgumentSite::InfixOperand(at);
+                }
+            }
         }
         items.push(TypeOpItem::Operand(app));
         Ok(Type::OpChain(items, loc))
     }
 
-    fn app_type(&mut self) -> PResult<Type> {
-        let mut t = self.atype()?;
+    fn app_type(&mut self, declaration_head: bool) -> PResult<Type> {
+        let mut t = self.atype_with_head(declaration_head)?;
         loop {
             if self.starts_atype() {
                 let a = self.atype()?;
                 t = Type::App(Box::new(t), Box::new(a));
             } else if self.real() && self.at_res(ROp::At) && self.raw().space_before && !self.raw().space_after {
-                // A visible kind argument `T @k`: kinds are not checked, so it is dropped.
-                self.require_ext("TypeApplications")?;
+                // A head can introduce a binder or match a kind pattern. Its caller
+                // knows which applies once it has seen the rest of the declaration.
+                let site = if declaration_head {
+                    KindArgumentSite::Head(self.loc())
+                } else {
+                    if !self.exts.is_on("TypeApplications") {
+                        return self.err("A visible kind application requires TypeApplications");
+                    }
+                    KindArgumentSite::TypeApplication
+                };
                 self.bump();
-                let argument = self.atype()?;
-                if let Some(arguments) = &mut self.head_kind_arguments {
-                    arguments.push(argument);
+                let ty = self.atype()?;
+                if let Some(arguments) = &mut self.captured_kind_arguments {
+                    arguments.push(KindArgument { ty, site });
                 }
             } else {
                 break;
@@ -217,6 +249,10 @@ impl Parser {
     }
 
     pub(super) fn atype(&mut self) -> PResult<Type> {
+        self.atype_with_head(false)
+    }
+
+    fn atype_with_head(&mut self, declaration_head: bool) -> PResult<Type> {
         let loc = self.loc();
         if !self.real() {
             return self.unexpected();
@@ -227,9 +263,9 @@ impl Parser {
                 let inner = if self.at_special('(') {
                     self.bump();
                     // A type annotation inside the splice expression has its own scope.
-                    let saved = self.head_kind_arguments.take();
+                    let saved = self.captured_kind_arguments.take();
                     let e = self.expr();
-                    self.head_kind_arguments = saved;
+                    self.captured_kind_arguments = saved;
                     let e = e?;
                     self.expect_special(')')?;
                     e
@@ -426,7 +462,7 @@ impl Parser {
                     let name = format!("({})", ",".repeat(n - 1));
                     return Ok(Type::Con(QName::unqual(name), loc));
                 }
-                let first = self.sigtype()?;
+                let first = self.sigtype_with_head(declaration_head)?;
                 if self.at_res(ROp::DColon) {
                     let kind = self.kind_signature()?;
                     self.expect_special(')')?;

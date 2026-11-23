@@ -1,0 +1,2 @@
+declaration_type_abstraction_standalone_eq_rhs_application_disabled.hs:5:36: error
+A visible kind application requires TypeApplications
