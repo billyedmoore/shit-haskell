@@ -1294,14 +1294,30 @@ impl Parser {
         self.expect_kw(Kw::Class)?;
         let context = self.try_context();
         let head = self.btype()?;
+        let head_loc = head.loc();
         let (name, tyvars) = self.decl_head(head)?;
+        if tyvars.len() != 1 && !self.exts.is_on("MultiParamTypeClasses") {
+            let count = if tyvars.is_empty() { "no parameters".into() } else { format!("{} parameters", tyvars.len()) };
+            return Err(super::ParseError {
+                line: head_loc.line,
+                col: head_loc.col,
+                msg: format!("Class ‘{name}’ has {count}.\nEnable MultiParamTypeClasses for this declaration."),
+            });
+        }
         let mut fundeps = Vec::new();
         if self.at_res(ROp::Bar) {
+            if !self.exts.is_on("FunctionalDependencies") {
+                return self.err(format!("Functional dependencies in class ‘{name}’ require FunctionalDependencies"));
+            }
+            let mut parameters: Vec<_> = tyvars.iter().map(|binder| binder.name.clone()).collect();
+            for kind in tyvars.iter().filter_map(|binder| binder.kind.as_ref()) {
+                collect_type_vars(kind, &mut parameters, true);
+            }
             self.bump();
             loop {
-                let from = self.tyvar_names();
+                let from = self.fundep_variables(&name, &parameters)?;
                 self.expect_res(ROp::RArrow)?;
-                let to = self.tyvar_names();
+                let to = self.fundep_variables(&name, &parameters)?;
                 fundeps.push((from, to));
                 if self.at_special(',') {
                     self.bump();
@@ -1402,18 +1418,23 @@ impl Parser {
         Ok(Minimal::Method(self.binder_name()?, loc))
     }
 
-    fn tyvar_names(&mut self) -> Vec<String> {
+    fn fundep_variables(&mut self, class: &str, parameters: &[String]) -> PResult<Vec<String>> {
         let mut names = Vec::new();
         while self.real() {
             match self.tok().clone() {
                 Tok::VarId(s) => {
+                    if !parameters.contains(&s) {
+                        return self.err(format!(
+                            "Not in scope: type variable ‘{s}’\nOnly variables from the head of class ‘{class}’ can appear in this functional dependency."
+                        ));
+                    }
                     self.bump();
                     names.push(s);
                 }
                 _ => break,
             }
         }
-        names
+        Ok(names)
     }
 
     fn class_body_decl(&mut self, in_instance: bool) -> PResult<Decl> {
@@ -1559,6 +1580,26 @@ impl Parser {
     fn instance_head(&mut self) -> PResult<(Type, bool)> {
         let start = self.pos;
         let head = self.btype()?;
+        if !self.exts.is_on("MultiParamTypeClasses") {
+            let mut class = &head;
+            let mut parameters = 0;
+            while let Type::App(f, _) = class {
+                class = f;
+                parameters += 1;
+            }
+            if matches!(class, Type::OpChain(..)) {
+                parameters += 2;
+            }
+            if parameters != 1 && matches!(class, Type::Con(..) | Type::OpChain(..)) {
+                let count = if parameters == 0 { "no class parameters".into() } else { format!("{parameters} class parameters") };
+                let loc = head.loc();
+                return Err(super::ParseError {
+                    line: loc.line,
+                    col: loc.col,
+                    msg: format!("Instance head supplies {count}.\nEnable MultiParamTypeClasses for this instance."),
+                });
+            }
+        }
         let unboxed_head = self.exts.is_on("UnboxedTuples")
             && self.toks[start..self.pos].windows(2).any(|pair| {
                 pair[0].tok == Tok::Special('(')
@@ -1790,31 +1831,53 @@ impl Parser {
 
 /// The type variables of a type, in order of first occurrence.
 fn type_vars_of(t: &Type, out: &mut Vec<String>) {
-    match t {
-        Type::Var(v, _) => {
-            if !out.contains(v) {
-                out.push(v.clone());
-            }
-        }
-        // A kind annotation's variables are kinds, not parameters of the type.
-        Type::Sig(t, _) => type_vars_of(t, out),
-        Type::App(f, a) | Type::Fun(f, a) => {
-            type_vars_of(f, out);
-            type_vars_of(a, out);
-        }
-        Type::List(e, _) => type_vars_of(e, out),
-        Type::Tuple(ts, _) => ts.iter().for_each(|x| type_vars_of(x, out)),
-        Type::Qual(cs, b) => {
-            cs.iter().for_each(|x| type_vars_of(x, out));
-            type_vars_of(b, out);
-        }
-        Type::OpChain(items, _) => {
-            for it in items {
-                if let TypeOpItem::Operand(x) = it {
-                    type_vars_of(x, out);
+    collect_type_vars(t, out, false);
+}
+
+fn collect_type_vars(t: &Type, out: &mut Vec<String>, include_kinds: bool) {
+    fn collect<'a>(t: &'a Type, out: &mut Vec<String>, bound: &mut Vec<&'a str>, include_kinds: bool) {
+        match t {
+            Type::Var(v, _) => {
+                if !bound.contains(&v.as_str()) && !out.contains(v) {
+                    out.push(v.clone());
                 }
             }
+            Type::Sig(t, kind) => {
+                collect(t, out, bound, include_kinds);
+                if include_kinds {
+                    collect(kind, out, bound, include_kinds);
+                }
+            }
+            Type::App(f, a) | Type::Fun(f, a) => {
+                collect(f, out, bound, include_kinds);
+                collect(a, out, bound, include_kinds);
+            }
+            Type::Forall(binders, body) if include_kinds => {
+                let mark = bound.len();
+                for binder in binders {
+                    if let Some(kind) = &binder.kind {
+                        collect(kind, out, bound, include_kinds);
+                    }
+                    bound.push(&binder.name);
+                }
+                collect(body, out, bound, include_kinds);
+                bound.truncate(mark);
+            }
+            Type::List(e, _) => collect(e, out, bound, include_kinds),
+            Type::Tuple(ts, _) => ts.iter().for_each(|x| collect(x, out, bound, include_kinds)),
+            Type::Qual(cs, b) => {
+                cs.iter().for_each(|x| collect(x, out, bound, include_kinds));
+                collect(b, out, bound, include_kinds);
+            }
+            Type::OpChain(items, _) => {
+                for it in items {
+                    if let TypeOpItem::Operand(x) = it {
+                        collect(x, out, bound, include_kinds);
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
+    collect(t, out, &mut Vec::new(), include_kinds);
 }

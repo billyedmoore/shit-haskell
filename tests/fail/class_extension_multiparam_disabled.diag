@@ -1,0 +1,3 @@
+class_extension_multiparam_disabled.hs:3:7: error:
+Class ‘Pair’ has 2 parameters.
+Enable MultiParamTypeClasses
