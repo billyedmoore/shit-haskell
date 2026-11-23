@@ -61,6 +61,27 @@ pub struct TopBind {
     pub body: Core,
 }
 
+/// The optimisation level of the program being compiled, as GHC's `-O0`, `-O1` and `-O2` set it.
+///
+/// - 0: no program-wide optimisation: the Core is lowered as the desugarer gave it.
+/// - 1: the simplifier (inlining, rules and fusion, specialisation, calls by value) and the
+///   native backend's lambda lifting and case-chain collapsing.
+/// - 2: as 1, with larger inlining and specialisation thresholds and more rounds.
+///
+/// One program is compiled per process, so the level is a setting of the process.
+static OPT_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(DEFAULT_OPT_LEVEL);
+
+/// The level without an `-O` flag.
+pub const DEFAULT_OPT_LEVEL: u8 = 1;
+
+pub fn opt_level() -> u8 {
+    OPT_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_opt_level(level: u8) {
+    OPT_LEVEL.store(level.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Where this compilation starts numbering the local names it makes: a number of its own (from
 /// the time and process), so that the names in Core loaded from the module cache, made by other
 /// compilations, are not made again here (the program-wide passes take local names to be

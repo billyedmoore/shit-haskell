@@ -13,6 +13,7 @@ cargo build --release -p hsc
 ```sh
 target/release/hsc Main.hs -o main
 target/release/hsc --native Main.hs -o main
+target/release/hsc --native -O2 Main.hs -o main   # -O0, -O1 (default), -O2 as GHC's
 target/release/hsc --runghc Main.hs
 target/release/hsc --install-ghc-shims DIR
 ```

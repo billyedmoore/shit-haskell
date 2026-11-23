@@ -44,6 +44,8 @@ pub struct Opts {
     pub native: bool,
     pub shared: bool,
     pub verbosity: u8,
+    /// `-O0`, `-O1`, `-O2`: the program's optimisation level (see `crate::core::opt_level`).
+    pub opt_level: u8,
     /// Development modes.
     pub run: bool,
     pub dump_ast: bool,
@@ -145,6 +147,7 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
         dynosuf: "dyn_o".into(),
         dynhisuf: "dyn_hi".into(),
         verbosity: 1,
+        opt_level: crate::core::DEFAULT_OPT_LEVEL,
         native: std::env::var_os("HSC_NATIVE").is_some(),
         ..Opts::default()
     };
@@ -203,6 +206,11 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
             "-cpp" => o.flags.push("-XCPP".into()),
             "-i" => o.search = Some(Vec::new()),
             "-v" => o.verbosity = 3,
+            // GHC's levels: `-O` is `-O1`, and any level above 2 is `-O2`.
+            "-O" => o.opt_level = 1,
+            _ if a.starts_with("-O") && a.len() > 2 && a[2..].chars().all(|c| c.is_ascii_digit()) => {
+                o.opt_level = a[2..].parse::<u32>().map_or(2, |n| n.min(2) as u8);
+            }
             _ if VALUE_FLAGS.contains(&a) => i += 1,
             _ if a.starts_with("-v") && a[2..].chars().all(|c| c.is_ascii_digit()) => {
                 o.verbosity = a[2..].parse().unwrap_or(1);
@@ -820,8 +828,9 @@ fn build_program(
     };
     // HSC_DEBUG builds keep symbols: a different executable.
     let mut key = format!(
-        "hsc {VERSION}\ncompat {GHC_COMPAT_VERSION}\nnative {}\ndebug {}\n",
+        "hsc {VERSION}\ncompat {GHC_COMPAT_VERSION}\nnative {}\nopt {}\ndebug {}\n",
         o.native,
+        o.opt_level,
         std::env::var_os("HSC_DEBUG").is_some()
     );
     for f in &o.flags {

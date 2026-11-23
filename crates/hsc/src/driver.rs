@@ -1622,11 +1622,18 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
     if flags.iter().any(|f| f == "-dcore-lint") {
         crate::core::lint::lint_program(&binds).map_err(|e| format!("Core lint error: {e}"))?;
     }
-    crate::core::opt::inline_prim_wrappers(&mut binds);
-    crate::core::opt::specialise_literals(&mut binds);
-    crate::core::opt::resolve_known_methods(&mut binds);
-    crate::core::simplify::simplify(&mut binds);
-    crate::core::opt::eliminate_alias_thunks(&mut binds);
+    // -O0 keeps only the cheap clean-ups (as GHC's -O0 keeps a gentle simplifier pass): an alias
+    // left as a thunk would change pointer identity (`casArray#`, `reallyUnsafePtrEquality#`).
+    {
+        let _t = timing::scope("optimise");
+        crate::core::opt::inline_prim_wrappers(&mut binds);
+        crate::core::opt::specialise_literals(&mut binds);
+        crate::core::opt::resolve_known_methods(&mut binds);
+        if crate::core::opt_level() > 0 {
+            crate::core::simplify::simplify(&mut binds);
+        }
+        crate::core::opt::eliminate_alias_thunks(&mut binds);
+    }
     if flags.iter().any(|f| f == "-dcore-lint") {
         crate::core::lint::lint_program(&binds).map_err(|e| format!("Core lint after optimization: {e}"))?;
     }
@@ -2212,8 +2219,10 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let t = std::time::Instant::now();
     let mut binds = crate::native::reachable(binds, &roots);
     let mut numeric = numeric.clone();
-    crate::native::lift::lambda_lift(&mut binds, &mut numeric);
-    crate::native::stg::collapse_case_chains(&mut binds);
+    if crate::core::opt_level() > 0 {
+        crate::native::lift::lambda_lift(&mut binds, &mut numeric);
+        crate::native::stg::collapse_case_chains(&mut binds);
+    }
     let prog = crate::native::stg::Lowering::program(&binds, &numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());

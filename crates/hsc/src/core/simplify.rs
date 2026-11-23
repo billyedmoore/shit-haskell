@@ -16,14 +16,58 @@ use std::collections::{HashMap, HashSet};
 
 use super::{Alt, Core, Lit, TopBind};
 
-/// The largest body (in nodes, under its parameters) of a global function that is inlined.
-const INLINE_SIZE: usize = 40;
-/// The same for a function with an (active) INLINE pragma: GHC inlines those whatever their
-/// size; this bounds the code a pragma can multiply (an inlined body is simplified again, so
-/// INLINE functions calling INLINE functions compound).
-const INLINE_PRAGMA_SIZE: usize = 120;
-/// The rounds of rewriting of one binding.
-const ROUNDS: usize = 8;
+/// The simplifier's size limits and effort, by optimisation level (`crate::core::opt_level`).
+#[derive(Clone, Copy, Debug)]
+struct Tuning {
+    /// The largest body (in nodes, under its parameters) of a global function that is inlined.
+    inline_size: usize,
+    /// The same for a function with an (active) INLINE pragma: GHC inlines those whatever their
+    /// size; this bounds the code a pragma can multiply (an inlined body is simplified again, so
+    /// INLINE functions calling INLINE functions compound).
+    inline_pragma_size: usize,
+    /// The rounds of rewriting of one binding.
+    rounds: usize,
+    /// The calls inlined into one binding in one round.
+    inline_budget: usize,
+    /// Static-argument specialisation: the largest function specialised, the specialisations
+    /// of one function and of the program.
+    spec_size: usize,
+    spec_per_fn: usize,
+    spec_total: usize,
+    /// The largest outer case body copied to each result of an inner case (see
+    /// `push_small_case`), and the larger limit when pushing into <= 2 results saturates a call
+    /// to the outer case binder (`foldl'` over `eftIntFB`: no PAP, no indirect `hsc_apply`).
+    push_size: usize,
+    push_call_size: usize,
+}
+
+const O1: Tuning = Tuning {
+    inline_size: 40,
+    inline_pragma_size: 120,
+    rounds: 8,
+    inline_budget: 64,
+    spec_size: 60,
+    spec_per_fn: 4,
+    spec_total: 32,
+    push_size: 30,
+    push_call_size: 90,
+};
+
+const O2: Tuning = Tuning {
+    inline_size: 80,
+    inline_pragma_size: 200,
+    rounds: 12,
+    inline_budget: 128,
+    spec_size: 120,
+    spec_per_fn: 8,
+    spec_total: 128,
+    push_size: 45,
+    push_call_size: 135,
+};
+
+fn tuning() -> Tuning {
+    if super::opt_level() >= 2 { O2 } else { O1 }
+}
 
 /// Primitives that evaluate all their arguments first: an argument that would be a thunk is
 /// evaluated in place instead.
@@ -35,8 +79,6 @@ const STRICT_PRIMS: &[&str] = &[
     "eqWord#", "neWord#", "ltWord#", "leWord#", "gtWord#", "geWord#", "uncheckedShiftL#",
     "uncheckedShiftRL#",
 ];
-/// The calls inlined into one binding in one round.
-const INLINE_BUDGET: usize = 64;
 
 /// The fresh-name counter, kept across passes so that names made in one are not made again.
 static FRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -127,9 +169,7 @@ fn extract_strict_cons(binds: &[TopBind]) -> HashMap<String, Vec<bool>> {
 /// turning indirect `hsc_apply` calls into direct calls (or inlined bodies) and shrinking recursive
 /// thunk captures.
 fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
-    const MAX_SPEC_SIZE: usize = 60;
-    const MAX_PER_FN: usize = 4;
-    const MAX_TOTAL: usize = 32;
+    let Tuning { spec_size, spec_per_fn, spec_total, .. } = tuning();
 
     let mut global_fns: HashSet<String> = HashSet::new();
     for b in binds.iter() {
@@ -206,7 +246,7 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
             continue;
         }
         let (ps, inner) = params(&b.body);
-        if ps.len() < 2 || size(&b.body, MAX_SPEC_SIZE + 1) > MAX_SPEC_SIZE {
+        if ps.len() < 2 || size(&b.body, spec_size + 1) > spec_size {
             continue;
         }
         if !mentions(inner, &b.name) {
@@ -295,6 +335,8 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
         global_fns: &'a HashSet<String>,
         created: HashMap<(String, Vec<Option<String>>), String>,
         per_fn: HashMap<String, usize>,
+        spec_per_fn: usize,
+        spec_total: usize,
         new_binds: Vec<TopBind>,
         fresh: u64,
     }
@@ -340,8 +382,8 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
                                     let key = (f_name.clone(), spec_args.clone());
                                     let spec_name = if let Some(existing) = self.created.get(&key) {
                                         Some(existing.clone())
-                                    } else if self.new_binds.len() < MAX_TOTAL
-                                        && self.per_fn.get(&f_name).copied().unwrap_or(0) < MAX_PER_FN
+                                    } else if self.new_binds.len() < self.spec_total
+                                        && self.per_fn.get(&f_name).copied().unwrap_or(0) < self.spec_per_fn
                                     {
                                         self.fresh += 1;
                                         let sname = format!("{f_name}$spec${}", self.fresh);
@@ -445,6 +487,8 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
         global_fns: &global_fns,
         created: HashMap::new(),
         per_fn: HashMap::new(),
+        spec_per_fn,
+        spec_total,
         new_binds: Vec::new(),
         fresh: FRESH.load(std::sync::atomic::Ordering::Relaxed),
     };
@@ -944,6 +988,7 @@ fn pass(
             (n + extra > 0).then_some((b.name.as_str(), n + extra))
         })
         .collect();
+    let tune = tuning();
     let mut templates: HashMap<String, (usize, Core)> = HashMap::new();
     let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
     for b in binds.iter() {
@@ -951,9 +996,9 @@ fn pass(
         // An INLINE pragma inlines a larger body, in its phases only; NOINLINE allows inlining
         // in its phases only.
         let limit = match rules.inlines.get(&b.name) {
-            Some((true, act)) if act.active(phase) => INLINE_PRAGMA_SIZE,
+            Some((true, act)) if act.active(phase) => tune.inline_pragma_size,
             Some((_, act)) if !act.active(phase) => 0,
-            _ => INLINE_SIZE,
+            _ => tune.inline_size,
         };
         // A partial application of a known function to atoms (`mconcat = foldr mappend mempty`)
         // inlines where it is applied, so that the call it makes is seen (and fuses).
@@ -1013,7 +1058,7 @@ fn pass(
         if trace.is_some() {
             eprintln!("== start\n{}", super::pretty::show(&bind.body));
         }
-        for _ in 0..ROUNDS {
+        for _ in 0..tune.rounds {
             let mut occ = HashMap::new();
             let mut depth = HashMap::new();
             occurrences(&bind.body, 0, &mut depth, &mut occ);
@@ -1057,8 +1102,9 @@ fn pass(
                     a
                 },
                 fresh: &mut fresh,
-                budget: INLINE_BUDGET,
+                budget: tune.inline_budget,
                 changed: false,
+                tune,
             };
             s.expr(&mut bind.body);
             if trace.is_some() {
@@ -1109,6 +1155,8 @@ struct Simp<'a> {
     fresh: &'a mut u64,
     budget: usize,
     changed: bool,
+    /// The thresholds of the optimisation level.
+    tune: Tuning,
 }
 
 impl Simp<'_> {
@@ -1629,9 +1677,9 @@ impl Simp<'_> {
         let Core::Case(s, b, alts) = c else { return false };
         let [Alt::Default(body)] = &alts[..] else { return false };
         let limit = if results(s, 3) <= 2 && app_head_mentions(body, b) {
-            PUSH_CALL_SIZE
+            self.tune.push_call_size
         } else {
-            PUSH_SIZE
+            self.tune.push_size
         };
         if !matches!(**s, Core::Case(..)) || size(body, limit + 1) > limit || results(s, PUSH_RESULTS) > PUSH_RESULTS {
             return false;
@@ -2612,11 +2660,8 @@ fn local_arities(e: &Core, out: &mut HashMap<String, usize>) {
     }
 }
 
-/// The largest outer case body copied to each result of an inner case, and the most results.
-const PUSH_SIZE: usize = 30;
-/// Larger threshold when pushing into <= 2 results saturates a call to the outer case binder
-/// (e.g. `foldl'` over `eftIntFB`, eliminating PAP allocation and indirect `hsc_apply`).
-const PUSH_CALL_SIZE: usize = 90;
+/// The most results of an inner case an outer case body is copied to (the body's size limits are
+/// `Tuning::push_size` and `push_call_size`).
 const PUSH_RESULTS: usize = 4;
 
 /// Whether `var` appears in the function head of an application inside `e`.
@@ -3814,7 +3859,7 @@ mod rule_tests {
         let mut s = Simp {
             once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates,
             this: "Test.x", rules: &rules, strict_cons: &no_strict_cons, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
-            fresh: &mut fresh, budget: 0, changed: false,
+            fresh: &mut fresh, budget: 0, changed: false, tune: O1,
         };
         s.rewrite(&mut e).then_some(e)
     }
