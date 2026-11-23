@@ -358,7 +358,7 @@ impl<'a> Renamer<'a> {
             }
         }
         for d in order {
-            if let Decl::PatSyn { name, args, pat, dir, loc } = d {
+            if let Decl::PatSyn { name, args, pat, dir, loc, .. } = d {
                 let sig = m.decls.iter().find_map(|s| match s {
                     Decl::PatSynSig { names, ty, .. } if names.iter().any(|n| n == name) => Some(ty.clone()),
                     _ => None,
@@ -658,9 +658,10 @@ impl<'a> Renamer<'a> {
                     add_val(name, *loc, &mut seen_vals)?;
                     own.push(entity(EntKind::Var, &module, name, vec![], vec![]));
                 }
-                Decl::PatSyn { name, loc, .. } => {
+                Decl::PatSyn { name, args, record, loc, .. } => {
                     add_val(name, *loc, &mut seen_vals)?;
-                    own.push(entity(EntKind::PatSyn, &module, name, vec![], vec![]));
+                    let fields = if *record { args.clone() } else { Vec::new() };
+                    own.push(entity(EntKind::PatSyn, &module, name, Vec::new(), fields));
                 }
                 Decl::Sig { names, loc, .. } if self.boot => {
                     for n in names {
@@ -2433,13 +2434,71 @@ impl<'a> Renamer<'a> {
                 continue;
             }
             let has = |l: &Vec<Entity>| l.iter().any(|x| x.global == c.global);
-            let scoped = self.vals.get(c.occ()).is_some_and(has)
-                || self.qvals.iter().any(|((_, occ), l)| occ == c.occ() && has(l));
+            let (unqualified, qualified) = if c.kind.is_value() {
+                (&self.vals, &self.qvals)
+            } else {
+                (&self.types, &self.qtypes)
+            };
+            let scoped = unqualified.get(c.occ()).is_some_and(has)
+                || qualified.iter().any(|((_, occ), l)| occ == c.occ() && has(l));
             if scoped {
                 out.push(c);
             }
         }
         out
+    }
+
+    fn export_named_children(
+        &self, parent: &Entity, names: &[String], loc: Loc, out: &mut Vec<Entity>, errors: &mut Vec<RnError>,
+    ) {
+        let available = self.children_in_scope(parent);
+        let patterns: Vec<_> = names.iter()
+            .filter_map(|name| self.lookup_global(&QName::unqual(name.clone()), Ns::Value).ok())
+            .filter(|entity| entity.kind == EntKind::PatSyn)
+            .collect();
+        let is_pattern_field = |child: &Entity| {
+            available.iter().chain(&patterns).any(|pattern| {
+                pattern.kind == EntKind::PatSyn
+                    && pattern.global.module == child.global.module
+                    && pattern.fields.contains(&child.global.name)
+            })
+        };
+        for name in names {
+            let mut children = available.iter().filter(|child| child.occ() == name).peekable();
+            if children.peek().is_some() {
+                for child in children {
+                    if !out.iter().any(|previous| previous.global == child.global && previous.kind == child.kind) {
+                        out.push(child.clone());
+                    }
+                }
+                continue;
+            }
+
+            // A pattern synonym can be bundled with a type that did not declare it,
+            // together with the selectors of its record fields.
+            let q = QName::unqual(name.clone());
+            match self.lookup_global(&q, Ns::Value) {
+                Ok(child) if child.kind == EntKind::PatSyn || is_pattern_field(&child) => {
+                    if !out.iter().any(|previous| previous.global == child.global && previous.kind == child.kind) {
+                        out.push(child);
+                    }
+                }
+                Ok(_) => errors.push(RnError {
+                    loc,
+                    msg: format!(
+                        "‘{}’ does not own ‘{name}’\nExport ‘{name}’ on its own or with its declaring type or class.",
+                        parent.occ(),
+                    ),
+                }),
+                Err(candidates) if candidates.is_empty() => {
+                    let con = name.starts_with(|c: char| c.is_uppercase() || c == ':');
+                    let mut error = self.unbound(&q, loc, Ns::Value, con);
+                    error.msg.push_str(&format!("\nIn the export of ‘{}’.", parent.occ()));
+                    errors.push(error);
+                }
+                Err(candidates) => errors.push(self.ambiguous(&q, &candidates, loc)),
+            }
+        }
     }
 
     fn compute_exports(
@@ -2549,25 +2608,12 @@ impl<'a> Renamer<'a> {
                         Subs::All => self.children_in_scope(&e),
                         Subs::AllPlus(extra) => {
                             let mut all = self.children_in_scope(&e);
-                            for n in extra {
-                                if let Ok(s) = self.lookup_global(&QName::unqual(n.clone()), Ns::Value) {
-                                    all.push(s);
-                                }
-                            }
+                            self.export_named_children(&e, extra, loc, &mut all, &mut errors);
                             all
                         }
                         Subs::Some(names) => {
-                            let mut some: Vec<Entity> =
-                                e.subs.iter().filter(|s| names.contains(&s.global.name)).cloned().collect();
-                            // A name that is not one of the type's own is a pattern synonym bundled
-                            // with it (`ByteString(BS, PS)`).
-                            for n in names {
-                                if !some.iter().any(|s| s.global.name == *n) {
-                                    if let Ok(s) = self.lookup_global(&QName::unqual(n.clone()), Ns::Value) {
-                                        some.push(s);
-                                    }
-                                }
-                            }
+                            let mut some = Vec::new();
+                            self.export_named_children(&e, names, loc, &mut some, &mut errors);
                             some
                         }
                     };

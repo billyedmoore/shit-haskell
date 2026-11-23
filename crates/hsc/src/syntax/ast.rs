@@ -168,6 +168,7 @@ pub enum Decl {
     PatSyn {
         name: String,
         args: Vec<String>,
+        record: bool,
         pat: Pat,
         dir: PatSynDir,
         loc: Loc,

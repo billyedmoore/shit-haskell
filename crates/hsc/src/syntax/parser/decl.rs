@@ -1733,7 +1733,7 @@ impl Parser {
         } else {
             return self.unexpected();
         };
-        let synonym = Decl::PatSyn { name: name.clone(), args: args.clone(), pat, dir, loc };
+        let synonym = Decl::PatSyn { name: name.clone(), args: args.clone(), record, pat, dir, loc };
         if !record {
             return Ok(synonym);
         }
