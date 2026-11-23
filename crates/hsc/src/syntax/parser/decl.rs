@@ -935,13 +935,17 @@ impl Parser {
         self.expect_special('{')?;
         self.ctx.push(Ctx::Explicit);
         let mut fields = Vec::new();
+        let mut locations = HashMap::new();
         loop {
             if self.at_special('}') {
                 break;
             }
             let mut names = Vec::new();
             loop {
-                names.push(self.binder_name()?);
+                let field_loc = self.loc();
+                let field = self.binder_name()?;
+                Self::check_record_field_binder(&name, &field, field_loc, &mut locations)?;
+                names.push(field);
                 if self.at_special(',') {
                     self.bump();
                 } else {
@@ -968,6 +972,22 @@ impl Parser {
             infix: false,
             loc,
         })
+    }
+
+    fn check_record_field_binder(
+        constructor: &str, field: &str, loc: Loc, locations: &mut HashMap<String, Loc>,
+    ) -> PResult<()> {
+        if let Some(first) = locations.insert(field.to_owned(), loc) {
+            return Err(super::ParseError {
+                line: loc.line,
+                col: loc.col,
+                msg: format!(
+                    "Constructor ‘{constructor}’ declares field ‘{field}’ more than once\nThe first field is at line {}, column {}.",
+                    first.line, first.col,
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// A ConSym or backticked constructor used as an infix constructor.
@@ -1113,11 +1133,13 @@ impl Parser {
             // Record braces open an explicit layout context (the `}` may be at the block's column).
             self.ctx.push(Ctx::Explicit);
             let mut groups: Vec<(Vec<String>, Field)> = Vec::new();
+            let mut locations = HashMap::new();
             while !self.at_special('}') {
                 let mut fnames = Vec::new();
                 loop {
                     match self.tok().clone() {
                         Tok::VarId(f) if self.real() => {
+                            Self::check_record_field_binder(&names[0], &f, self.loc(), &mut locations)?;
                             self.bump();
                             fnames.push(f);
                         }

@@ -1,0 +1,3 @@
+duplicate_record_field_declaration_different_types.hs:1:27: error:
+Constructor ‘T’ declares field ‘item’ more than once
+The first field is at line 1, column 14.

@@ -1,0 +1,3 @@
+duplicate_record_field_declaration_gadt_group.hs:5:7: error:
+Constructor ‘First’ declares field ‘item’ more than once
+The first field is at line 4, column 7.

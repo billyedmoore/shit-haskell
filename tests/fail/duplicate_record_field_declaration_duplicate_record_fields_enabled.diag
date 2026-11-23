@@ -1,0 +1,3 @@
+duplicate_record_field_declaration_duplicate_record_fields_enabled.hs:2:27: error:
+Constructor ‘A’ declares field ‘item’ more than once
+The first field is at line 2, column 14.
