@@ -1425,10 +1425,17 @@ impl<'a> Renamer<'a> {
                 name,
                 params,
                 equations,
+                abstract_closed,
                 data,
                 injective,
                 loc,
             } => {
+                if let Some(loc) = abstract_closed.filter(|_| !self.boot) {
+                    return Err(RnError {
+                        loc,
+                        msg: format!("The ‘..’ in closed type family ‘{name}’ is only allowed in an hs-boot file"),
+                    });
+                }
                 let equations = match equations {
                     Some(eqs) => Some(
                         eqs.into_iter()
@@ -1441,6 +1448,7 @@ impl<'a> Renamer<'a> {
                     name,
                     params,
                     equations,
+                    abstract_closed,
                     data,
                     injective,
                     loc,

@@ -1,0 +1,2 @@
+3:23: error:
+The ‘..’ in closed type family ‘F’ is only allowed in an hs-boot file

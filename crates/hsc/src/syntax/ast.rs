@@ -228,6 +228,8 @@ pub enum Decl {
         name: String,
         params: Vec<TyVarBind>,
         equations: Option<Vec<TypeEquation>>,
+        /// Location of the `..` in an abstract closed family from an hs-boot file.
+        abstract_closed: Option<Loc>,
         data: bool,
         /// The parameters an injectivity annotation (`= r | r -> a b`) names.
         injective: Vec<String>,

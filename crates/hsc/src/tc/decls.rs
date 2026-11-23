@@ -269,7 +269,17 @@ impl Checker {
         }
         for (d, default) in instance_eqs {
             if let Decl::TypeInstance { name, equation, .. } = d {
-                self.add_family_equation_as(&global_tycon_name(name), &equation.args, &equation.rhs, equation.loc, default)?;
+                let key = global_tycon_name(name);
+                if self.env.families.get(&key).is_some_and(|family| family.closed) {
+                    return Err(TcError {
+                        loc: equation.loc,
+                        msg: format!(
+                            "Closed type family ‘{}’ cannot have a separate instance\nPut the equation inside the family’s ‘where’ block.",
+                            name.name,
+                        ),
+                    });
+                }
+                self.add_family_equation_as(&key, &equation.args, &equation.rhs, equation.loc, default)?;
             }
         }
 

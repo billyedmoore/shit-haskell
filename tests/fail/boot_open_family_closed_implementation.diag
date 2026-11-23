@@ -1,0 +1,4 @@
+6:1: error:
+Family ‘F’ differs from its hs-boot declaration
+Implementation: closed type family
+Hs-boot file:   open type family

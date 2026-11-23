@@ -891,6 +891,24 @@ impl Driver {
             })
             .collect();
         let completing_boot = self.booted.contains(module);
+        if completing_boot {
+            for decl in &parsed.decls {
+                let Decl::TypeFamily { name, equations, data, loc, .. } = decl else { continue };
+                let Some(boot) = self.checker.env.families.get(&format!("{module}.{name}")) else { continue };
+                let category = |data, closed| match (data, closed) {
+                    (true, _) => "data family",
+                    (false, true) => "closed type family",
+                    (false, false) => "open type family",
+                };
+                let implementation = category(*data, equations.is_some());
+                let boot = category(boot.data, boot.closed);
+                if implementation != boot {
+                    return Err(crate::diagnostic::error(&shown, Some(&src), *loc, &format!(
+                        "Family ‘{name}’ differs from its hs-boot declaration\nImplementation: {implementation}\nHs-boot file:   {boot}",
+                    )));
+                }
+            }
+        }
         let boot_iface = completing_boot.then(|| self.ifaces.get(module).cloned()).flatten();
         let boot_values: Vec<_> = boot_iface.iter().flat_map(|iface| &iface.exports)
             .filter(|e| e.kind == crate::rename::iface::EntKind::Var)

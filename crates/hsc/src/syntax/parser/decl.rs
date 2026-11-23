@@ -629,12 +629,25 @@ impl Parser {
                 injective = self.injectivity()?;
             }
         }
+        let mut abstract_closed = None;
         let equations = if self.at_kw(Kw::Where) {
             if data {
                 return self.err("Define instances of a data family with separate ‘data instance’ declarations");
             }
             self.bump();
-            Some(self.block(|p| {
+            let mut equations = Vec::new();
+            self.block(|p| {
+                if abstract_closed.is_some() {
+                    return p.err("The ‘..’ in an abstract closed type family replaces all of its equations");
+                }
+                if p.at_res(ROp::DotDot) {
+                    if !equations.is_empty() {
+                        return p.err("The ‘..’ in an abstract closed type family replaces all of its equations");
+                    }
+                    abstract_closed = Some(p.loc());
+                    p.bump();
+                    return Ok(());
+                }
                 let (head, equation) = p.type_equation()?;
                 if head.name != name || head.qual.as_deref().is_some_and(|qual| qual != module) {
                     let actual = match head.qual {
@@ -649,8 +662,10 @@ impl Parser {
                         ),
                     });
                 }
-                Ok(equation)
-            })?)
+                equations.push(equation);
+                Ok(())
+            })?;
+            Some(equations)
         } else {
             None
         };
@@ -658,6 +673,7 @@ impl Parser {
             name,
             params,
             equations,
+            abstract_closed,
             data,
             injective,
             loc,
@@ -1370,7 +1386,7 @@ impl Parser {
                 if self.atype().is_ok() && self.at_res(ROp::Bar) {
                     let injective = self.injectivity()?;
                     let (name, params) = self.decl_head(head)?;
-                    return Ok(Decl::TypeFamily { name, params, equations: None, data: false, injective, loc });
+                    return Ok(Decl::TypeFamily { name, params, equations: None, abstract_closed: None, data: false, injective, loc });
                 }
                 (self.pos, self.ctx, self.semi_done) = save;
                 let (name, equation) = self.equation_from(head)?;
@@ -1389,6 +1405,7 @@ impl Parser {
                 name,
                 params,
                 equations: None,
+                abstract_closed: None,
                 data: false,
                 injective: Vec::new(),
                 loc,
