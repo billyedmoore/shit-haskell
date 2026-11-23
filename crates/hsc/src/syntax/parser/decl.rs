@@ -620,14 +620,15 @@ impl Parser {
         // TypeFamilyDependencies: `= r | r -> a` names the result and the parameters it determines.
         let mut injective = Vec::new();
         if self.at_res(ROp::Eq) {
+            if data {
+                return self.err("A data family cannot name its result with ‘=’\nUse ‘::’ to specify the result kind.");
+            }
             if !self.exts.is_on("TypeFamilyDependencies") {
                 return self.err("A named type family result requires TypeFamilyDependencies");
             }
             self.bump();
-            self.atype()?;
-            if self.at_res(ROp::Bar) {
-                injective = self.injectivity()?;
-            }
+            let result = self.atype()?;
+            injective = self.family_result(&name, &params, &result)?;
         }
         let mut abstract_closed = None;
         let equations = if self.at_kw(Kw::Where) {
@@ -680,22 +681,69 @@ impl Parser {
         })
     }
 
-    /// `| r -> a b`, at the bar: the parameters named after the arrow.
-    fn injectivity(&mut self) -> PResult<Vec<String>> {
+    /// Checks the named result and its optional injectivity annotation.
+    fn family_result(&mut self, family: &str, params: &[TyVarBind], result: &Type) -> PResult<Vec<String>> {
         if !self.exts.is_on("TypeFamilyDependencies") {
             return self.err("An injectivity annotation requires TypeFamilyDependencies");
         }
-        let mut names = Vec::new();
-        let mut after_arrow = false;
-        while self.real() && !self.at_kw(Kw::Where) {
-            if self.at_res(ROp::RArrow) {
-                after_arrow = true;
-            } else if after_arrow {
-                if let Tok::VarId(v) = self.tok().clone() {
-                    names.push(v.to_string());
-                }
+
+        let mut inputs = Vec::new();
+        for param in params {
+            inputs.push(param.name.clone());
+            if let Some(kind) = &param.kind {
+                type_vars_of(kind, &mut inputs);
             }
+        }
+        let mut binder = result;
+        while let Type::Sig(inner, kind) = binder {
+            type_vars_of(kind, &mut inputs);
+            binder = inner;
+        }
+        let Type::Var(result, loc) = binder else {
+            let loc = binder.loc();
+            return Err(super::ParseError {
+                line: loc.line,
+                col: loc.col,
+                msg: format!("A named result of type family ‘{family}’ must be a type variable"),
+            });
+        };
+        if inputs.contains(result) {
+            return Err(super::ParseError {
+                line: loc.line,
+                col: loc.col,
+                msg: format!(
+                    "The result variable ‘{result}’ of type family ‘{family}’ is already bound\nChoose a new name for the result."
+                ),
+            });
+        }
+
+        if !self.at_res(ROp::Bar) {
+            return Ok(Vec::new());
+        }
+        self.bump();
+        match self.tok() {
+            Tok::VarId(left) if self.real() && left == result => self.bump(),
+            Tok::VarId(left) if self.real() => {
+                return self.err(format!(
+                    "Injectivity for ‘{family}’ must start with its result variable ‘{result}’\nFound ‘{left}’ before ‘->’."
+                ));
+            }
+            _ => return self.err(format!("Expected the result variable ‘{result}’ before ‘->’")),
+        }
+        self.expect_res(ROp::RArrow)?;
+        let mut names = Vec::new();
+        while self.real() {
+            let Tok::VarId(input) = self.tok() else { break };
+            if !inputs.contains(input) {
+                return self.err(format!(
+                    "The injectivity annotation for ‘{family}’ names ‘{input}’, which is not a family input"
+                ));
+            }
+            names.push(input.clone());
             self.bump();
+        }
+        if names.is_empty() {
+            return self.err(format!("Injectivity for ‘{family}’ must name at least one input variable after ‘->’"));
         }
         Ok(names)
     }
@@ -1384,9 +1432,9 @@ impl Parser {
                 // family with a named result; injectivity is not checked, so the clause is skipped.
                 let save = (self.pos, self.ctx.clone(), self.semi_done);
                 self.bump();
-                if self.atype().is_ok() && self.at_res(ROp::Bar) {
-                    let injective = self.injectivity()?;
+                if let Some(result) = self.atype().ok().filter(|_| self.at_res(ROp::Bar)) {
                     let (name, params) = self.decl_head(head)?;
+                    let injective = self.family_result(&name, &params, &result)?;
                     return Ok(Decl::TypeFamily { name, params, equations: None, abstract_closed: None, data: false, injective, loc });
                 }
                 (self.pos, self.ctx, self.semi_done) = save;
