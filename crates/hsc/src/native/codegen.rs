@@ -31,6 +31,7 @@ pub const PAP: u8 = 7;
 pub const THUNK: u8 = 8;
 pub const IND: u8 = 9;
 pub const REF: u8 = 11;
+pub const BYTES: u8 = 13;
 
 /// Frame kinds, as the collector reads them from the info of a return address.
 pub mod frame {
@@ -365,6 +366,28 @@ fn int_op(name: &str) -> Option<K> {
         "eqWord#" => K::Cmp("sete"), "neWord#" => K::Cmp("setne"), "ltWord#" => K::Cmp("setb"),
         "leWord#" => K::Cmp("setbe"), "gtWord#" => K::Cmp("seta"), "geWord#" => K::Cmp("setae"),
         "uncheckedShiftL#" => K::Shift("shlq"), "uncheckedShiftRL#" => K::Shift("shrq"),
+        _ => return None,
+    })
+}
+
+/// The value a byte-array write stores, into `%rcx`.
+fn g_write(g: &mut Gen, a: &Atom, p: Pos) {
+    g.operand(a, p, "%rcx");
+}
+
+/// The inline `Double#` operations (see `Gen::double_fast_path`).
+#[derive(PartialEq, Clone, Copy)]
+enum D { Bin(&'static str), Cmp(DCmp), Sqrt, Negate, Abs }
+
+#[derive(PartialEq, Clone, Copy)]
+enum DCmp { Eq, Ne, Lt, Le, Gt, Ge }
+
+fn double_op(name: &str) -> Option<D> {
+    Some(match name {
+        "+##" => D::Bin("addsd"), "-##" => D::Bin("subsd"), "*##" => D::Bin("mulsd"), "/##" => D::Bin("divsd"),
+        "==##" => D::Cmp(DCmp::Eq), "/=##" => D::Cmp(DCmp::Ne), "<##" => D::Cmp(DCmp::Lt),
+        "<=##" => D::Cmp(DCmp::Le), ">##" => D::Cmp(DCmp::Gt), ">=##" => D::Cmp(DCmp::Ge),
+        "sqrtDouble#" => D::Sqrt, "negateDouble#" => D::Negate, "fabsDouble#" => D::Abs,
         _ => return None,
     })
 }
@@ -4156,6 +4179,109 @@ impl Gen {
         self.ret(p);
     }
 
+    /// A `Double#` operation on arguments that are already DOUBLE cells (or literals), computed
+    /// inline with SSE2; otherwise control goes to `slow`, the runtime's primitive. The result is a
+    /// new DOUBLE cell, or for a comparison one of the shared INT cells 0 and 1.
+    fn double_fast_path(&mut self, k: D, args: &[Atom], p: Pos, slow: &str) -> bool {
+        let arity = if matches!(k, D::Bin(_) | D::Cmp(_)) { 2 } else { 1 };
+        if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !matches!(l, SLit::Double(_)))) {
+            return false;
+        }
+        if args.iter().any(is_raw) {
+            return false;
+        }
+        for a in args {
+            if matches!(a, Atom::Lit(_)) || matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(DOUBLE))) {
+                continue;
+            }
+            self.load(a, p, "%rax");
+            self.emit(&format!("cmpb ${DOUBLE}, (%rax)"));
+            self.emit(&format!("jne {slow}"));
+            self.fast_slow_used = true;
+        }
+        // The operands into %xmm0 (and %xmm1), the result in %xmm0.
+        let compute = |g: &mut Self| {
+            for (i, a) in args.iter().enumerate() {
+                let x = if i == 0 { "%xmm0" } else { "%xmm1" };
+                match a {
+                    Atom::Lit(SLit::Double(v)) => {
+                        g.emit(&format!("movabsq ${}, %rdx", v.to_bits() as i64));
+                        g.emit(&format!("movq %rdx, {x}"));
+                    }
+                    a => {
+                        g.load(a, p, "%rdx");
+                        g.emit(&format!("movsd 8(%rdx), {x}"));
+                    }
+                }
+            }
+            match k {
+                D::Bin(op) => g.emit(&format!("{op} %xmm1, %xmm0")),
+                D::Sqrt => g.emit("sqrtsd %xmm0, %xmm0"),
+                D::Negate | D::Abs => {
+                    g.emit("movq %xmm0, %rcx");
+                    g.emit(if k == D::Negate { "btcq $63, %rcx" } else { "btrq $63, %rcx" });
+                    g.emit("movq %rcx, %xmm0");
+                }
+                D::Cmp(_) => {}
+            }
+        };
+        compute(self);
+        if let D::Cmp(c) = k {
+            let (zero, one) = self.bool_cells();
+            // `ucomisd b, a` sets the flags as for an unsigned comparison of a with b; an unordered
+            // (NaN) pair sets ZF, PF and CF, which makes every test but `/=` false.
+            let cond = match c {
+                DCmp::Lt => { self.emit("ucomisd %xmm0, %xmm1"); "a" }
+                DCmp::Le => { self.emit("ucomisd %xmm0, %xmm1"); "ae" }
+                DCmp::Gt => { self.emit("ucomisd %xmm1, %xmm0"); "a" }
+                DCmp::Ge => { self.emit("ucomisd %xmm1, %xmm0"); "ae" }
+                DCmp::Eq | DCmp::Ne => {
+                    self.emit("ucomisd %xmm1, %xmm0");
+                    if c == DCmp::Eq {
+                        self.emit("sete %cl");
+                        self.emit("setnp %dl");
+                        self.emit("andb %dl, %cl");
+                    } else {
+                        self.emit("setne %cl");
+                        self.emit("setp %dl");
+                        self.emit("orb %dl, %cl");
+                    }
+                    self.emit("testb %cl, %cl");
+                    "ne"
+                }
+            };
+            self.emit(&format!("leaq {zero}(%rip), %r14"));
+            self.emit(&format!("leaq {one}(%rip), %rax"));
+            self.emit(&format!("cmov{cond}q %rax, %r14"));
+            self.fast_ret(p);
+            return true;
+        }
+        let gc_lbl = self.label("gc");
+        let done_lbl = self.label("gc_done");
+        self.emit("leaq 16(%r12), %rax");
+        self.emit("cmpq %r13, %rax");
+        let _ = writeln!(self.out, "    ja {gc_lbl}");
+        self.put_label(&done_lbl);
+        self.emit("movq %r12, %r14");
+        self.emit("leaq 16(%r12), %r12");
+        self.emit(&format!("movq ${}, (%r14)", header(DOUBLE, 1, 0)));
+        self.emit("movsd %xmm0, 8(%r14)");
+        let cached = self.cache.clone();
+        self.emit_cold(|g| {
+            g.put_label(&gc_lbl);
+            g.save_cache(&cached, p);
+            g.zero_unsafe_slots(p, false);
+            g.emit("movl $2, %esi");
+            g.rt_call("hsc_gc", p, 1);
+            g.reload_cache(&cached, p);
+            // The collection moved the operands and may have changed the SSE registers.
+            compute(g);
+            let _ = writeln!(g.out, "    jmp {done_lbl}");
+        });
+        self.fast_ret(p);
+        true
+    }
+
     /// An `Int#` operation on arguments that are already INT cells, computed inline; otherwise (or
     /// when a division could fault) control goes to `slow`, the runtime's primitive. (Thread
     /// switches wait for a function's entry, see `closure_code`.) Answers whether the fast path
@@ -4165,8 +4291,14 @@ impl Gen {
         if self.raw_dest.is_none() && self.mutvar_fast_path(name, args, p, slow) {
             return true;
         }
+        if self.raw_dest.is_none() && self.bytes_fast_path(name, args, p, slow) {
+            return true;
+        }
         if self.integer_fast_path(name, args, p, slow) {
             return true;
+        }
+        if let Some(k) = double_op(name) {
+            return self.raw_dest.is_none() && self.double_fast_path(k, args, p, slow);
         }
         let Some(k) = int_op(name) else { return false };
         let arity = if matches!(k, K::Un(_) | K::Ord | K::Chr | K::TagToEnum) { 1 } else { 2 };
@@ -4768,6 +4900,81 @@ impl Gen {
             let unit = self.con_id("Builtin.()");
             let cell = self.nullary_con(unit);
             self.emit(&format!("leaq {cell}(%rip), %r14"));
+        }
+        self.fast_ret(p);
+        true
+    }
+
+    /// `index/read/write{Int,Word,Int8,Word8}Array#` on a byte array (its bytes follow the
+    /// header) with an index and value that are INT cells, raw numbers or literals, inline;
+    /// otherwise control goes to `slow`, the runtime's primitive. (Neither checks the bounds.)
+    fn bytes_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
+        let Some((access, elem)) = ["index", "read", "write"].iter().find_map(|a| name.strip_prefix(a).map(|r| (*a, r))) else {
+            return false;
+        };
+        // (load instruction, store instruction and register, scale)
+        let (load, store, scale) = match elem {
+            "IntArray#" | "WordArray#" => ("movq", "movq %rcx", 8),
+            "Int8Array#" => ("movsbq", "movb %cl", 1),
+            "Word8Array#" => ("movzbq", "movb %cl", 1),
+            _ => return false,
+        };
+        let arity = match access {
+            "index" => 2,
+            "read" => 3,
+            _ => 4,
+        };
+        if args.len() != arity || matches!(args[0], Atom::Lit(_)) || is_raw(&args[0]) {
+            return false;
+        }
+        let numbers = if access == "write" { &args[1..3] } else { &args[1..2] };
+        if numbers.iter().any(|a| matches!(a, Atom::Lit(l) if !matches!(l, SLit::Int(_)))) {
+            return false;
+        }
+        self.load(&args[0], p, "%rax");
+        self.emit(&format!("cmpb ${BYTES}, (%rax)"));
+        self.emit(&format!("jne {slow}"));
+        self.fast_slow_used = true;
+        for a in numbers {
+            if is_raw(a) || matches!(a, Atom::Lit(_)) || matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(INT))) {
+                continue;
+            }
+            self.load(a, p, "%rax");
+            self.emit(&format!("cmpb ${INT}, (%rax)"));
+            self.emit(&format!("jne {slow}"));
+        }
+        let element = |g: &mut Self| {
+            g.operand(&args[1], p, "%rdx");
+            g.load(&args[0], p, "%rax");
+        };
+        if access == "write" {
+            g_write(self, &args[2], p);
+            element(self);
+            self.emit(&format!("{store}, 8(%rax,%rdx,{scale})"));
+            let unit = self.con_id("Builtin.()");
+            let cell = self.nullary_con(unit);
+            self.emit(&format!("leaq {cell}(%rip), %r14"));
+            self.fast_ret(p);
+            return true;
+        }
+        // The result's cell (and for a read its pair with the state token) first: the allocation
+        // may move the array.
+        // The new object is held in %r14 (the result register; the cache registers may hold
+        // raw operands, and `load` writes only its target).
+        let words = if access == "read" { 5 } else { 2 };
+        self.alloc(words, p);
+        self.emit("movq %rax, %r14");
+        element(self);
+        self.emit(&format!("{load} 8(%rax,%rdx,{scale}), %rcx"));
+        self.emit(&format!("movq ${}, (%r14)", header(INT, 1, 0)));
+        self.emit("movq %rcx, 8(%r14)");
+        if access == "read" {
+            let pair = self.con_id("Builtin.(,)");
+            self.emit(&format!("movabsq ${}, %rcx", header(CON, 2, pair as u64)));
+            self.emit("movq %rcx, 16(%r14)");
+            self.emit("movq $0, 24(%r14)");
+            self.emit("movq %r14, 32(%r14)");
+            self.emit("addq $16, %r14");
         }
         self.fast_ret(p);
         true
