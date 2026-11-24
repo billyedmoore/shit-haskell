@@ -1,0 +1,3 @@
+default (Bool)
+
+main = pure ()

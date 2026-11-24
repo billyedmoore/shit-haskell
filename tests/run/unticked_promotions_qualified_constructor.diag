@@ -1,0 +1,3 @@
+[-Wunticked-promoted-constructors]
+Unticked promoted constructor ‘P.Leaf’
+Write ‘'P.Leaf’ to make the promotion explicit.

@@ -1,0 +1,2 @@
+The C value import ‘c_abs’ cannot have a function type
+Remove ‘value’ to import a function, or declare the type of the C value.

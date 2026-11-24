@@ -1,0 +1,3 @@
+traditional_scope_free_in_context.hs:2:9: error:
+Not in scope: type variable ‘a’
+Bind it in the datatype header.

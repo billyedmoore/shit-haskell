@@ -1,0 +1,2 @@
+A data family cannot name its result with ‘=’
+Use ‘::’ to specify the result kind.

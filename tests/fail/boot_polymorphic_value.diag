@@ -1,0 +1,4 @@
+BootPolymorphicValue.hs:3:1: error:
+The type of ‘value’ differs from its hs-boot signature
+Implementation: value :: forall a. a -> [a]
+Hs-boot file:   value :: forall a. a -> a

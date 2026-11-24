@@ -1,0 +1,2 @@
+visible_type_application_shared_wildcard.hs:5:33: error:
+Couldn't match expected type ‘(Bool, Bool)’ with actual type ‘(Bool, Char)’

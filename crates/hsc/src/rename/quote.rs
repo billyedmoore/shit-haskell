@@ -366,11 +366,12 @@ impl Q<'_, '_> {
                 }
                 acc
             }
-            Type::Forall(binders, body) => {
+            Type::Forall { binders, body, .. } => {
                 let tvs = binders
                     .iter()
                     .map(|b| {
-                        let spec = Expr::Con(QName { qual: Some(SYN.into()), name: "SpecifiedSpec".into() }, self.loc);
+                        let flag = if b.inferred { "InferredSpec" } else { "SpecifiedSpec" };
+                        let spec = Expr::Con(QName { qual: Some(SYN.into()), name: flag.into() }, self.loc);
                         let tv = app(app(Expr::Con(QName { qual: Some(SYN.into()), name: "PlainTV".into() }, self.loc), self.binder(&b.name)), spec);
                         self.pure(tv)
                     })

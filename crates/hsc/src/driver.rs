@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::TopBind;
 use crate::rename::iface::Iface;
-use crate::syntax::ast::{Decl, Module};
+use crate::syntax::ast::{Decl, Loc, Module};
 use crate::syntax::extensions::Extensions;
 use crate::tc::Checker;
 
@@ -27,6 +27,10 @@ pub struct Driver {
     flags: Vec<String>,
     /// Every module loaded: its name, source file, and whether it is one of the program's own.
     pub sources: Vec<(String, PathBuf, bool)>,
+    /// Explicit home targets need not use the module's name as their file name.
+    pub(crate) home_targets: HashMap<String, PathBuf>,
+    pub(crate) entry_module: String,
+    pub(crate) entry_name: String,
     /// The C sources of the packages the program uses, with the C compiler's flags for each.
     pub c_sources: Vec<(PathBuf, Vec<String>)>,
     /// The C include and macro flags of every package module loaded (for the capi wrappers).
@@ -358,6 +362,9 @@ impl Driver {
             loading: Vec::new(),
             flags,
             sources: Vec::new(),
+            home_targets: HashMap::new(),
+            entry_module: "Main".into(),
+            entry_name: "main".into(),
             c_sources: Vec::new(),
             c_flags: Vec::new(),
             renamed: BTreeMap::new(),
@@ -382,6 +389,9 @@ impl Driver {
         // `resolve_home_wired_imports`).
         if let Some(found) = self.wired_dir().and_then(|d| Self::find_in_package_dir(d, &stem)) {
             return Some(found);
+        }
+        if let Some(path) = self.home_targets.get(module) {
+            return Some(Found { path: path.clone(), flags: self.flags.clone(), home: true, pkg_dir: None });
         }
         for d in &self.search {
             if let Some(found) = self.find_home_in(d, &stem) {
@@ -619,10 +629,6 @@ impl Driver {
         }
     }
 
-    fn find_source(&self, module: &str) -> Option<PathBuf> {
-        self.find_module(module).map(|f| f.path)
-    }
-
     fn find_boot(&self, module: &str, source: Option<&Path>) -> Option<PathBuf> {
         let rel = format!("{}.hs-boot", module.replace('.', "/"));
         // A package module's boot file is beside its source.
@@ -653,8 +659,9 @@ impl Driver {
         let src = read_source(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = preprocess_if_needed(src, &path, &flags)?;
         let (mut parsed, mut exts) =
-            crate::syntax::parse_module_source(&src, &flags).map_err(|e| format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg))?;
-        strip_boot_bodies(&mut parsed);
+            crate::syntax::parse_module_source(&src, &flags).map_err(|e| e.render(&path, &src))?;
+        check_boot_declarations(&mut parsed)
+            .map_err(|(loc, msg)| crate::diagnostic::error(&path, Some(&src), loc, msg))?;
         let path_text = path.to_string_lossy();
         if ["/libs/ghc-internal/", "/libs/ghc-prim/", "/libs/ghc-bignum/", "/libs/base/"].iter().any(|p| path_text.contains(p)) {
             exts.apply("NoImplicitPrelude")?;
@@ -666,17 +673,13 @@ impl Driver {
             deps.insert(0, "Prelude".into());
         }
         for dep in deps {
-            if source.contains(&dep) {
-                self.load_boot(&dep)?;
-            } else {
-                self.load(&dep)?;
-            }
+            self.load_dependency(&parsed, &dep, source.contains(&dep), &path, &src)?;
             let name = if source.contains(&dep) { format!("{{boot}}{dep}") } else { dep };
             dep_names.push(name);
         }
         let dep_keys: Option<Vec<_>> = dep_names.iter().map(|name| self.dependency_key(name).map(|key| (name.clone(), key))).collect();
         self.checker.boot = true;
-        let result = self.compile_module(parsed, exts, &path);
+        let result = self.compile_module(parsed, exts, &path, Some(&src), None);
         self.checker.boot = false;
         result?;
         let own = format!("boot\0{module}\0{}\0{}\0{src}\0{}", path.display(), flags.join("\u{1}"), self.instance_key(module));
@@ -721,7 +724,7 @@ impl Driver {
 
     /// After the program is loaded: every module that was only known through its boot file is
     /// loaded for real, so that its definitions are compiled.
-    fn load_booted(&mut self) -> Result<(), String> {
+    pub(crate) fn load_booted(&mut self) -> Result<(), String> {
         loop {
             let pending: Vec<String> = self.booted.iter().filter(|m| !self.loaded.contains(*m)).cloned().collect();
             if pending.is_empty() {
@@ -808,10 +811,14 @@ impl Driver {
                 }
             }
         }
-        let (mut parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| {
-            format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg)
-        })?;
+        let (mut parsed, mut exts) = crate::syntax::parse_module_source(&src, &flags).map_err(|e| e.render(&path, &src))?;
         timing::add("parse", t_parse);
+        if parsed.name != self.real_name(module) {
+            return Err(crate::diagnostic::error(&path, Some(&src), parsed.loc, &format!(
+                "File name does not match module name\nExpected ‘{}’, but the file declares ‘{}’.",
+                self.real_name(module), parsed.name
+            )));
+        }
         if let Some((real, _)) = self.renamed.get(module) {
             // Loaded under an internal name: `module M` of its own name in its export list (base's
             // `module GHC.Internal.TH.Syntax`) is still the module itself.
@@ -857,13 +864,9 @@ impl Driver {
             eprintln!("full: {module} needs {deps:?} (loading {:?})", self.loading);
         }
         for d in &deps {
-            let loaded = if source.contains(d) { self.load_boot(d) } else { self.load(d) };
-            if let Err(e) = loaded {
+            if let Err(e) = self.load_dependency(&parsed, d, source.contains(d), &path, &src) {
                 self.loading.pop();
-                return Err(match self.find_source(d) {
-                    Some(_) => e,
-                    None => format!("{}:{}:{}: error:\n    {}", path.display(), parsed.loc.line, parsed.loc.col, e),
-                });
+                return Err(e);
             }
         }
         self.loading.pop();
@@ -888,6 +891,53 @@ impl Driver {
             })
             .collect();
         let completing_boot = self.booted.contains(module);
+        if completing_boot {
+            for decl in &parsed.decls {
+                let Decl::TypeFamily { name, equations, data, loc, .. } = decl else { continue };
+                let Some(boot) = self.checker.env.families.get(&format!("{module}.{name}")) else { continue };
+                let category = |data, closed| match (data, closed) {
+                    (true, _) => "data family",
+                    (false, true) => "closed type family",
+                    (false, false) => "open type family",
+                };
+                let implementation = category(*data, equations.is_some());
+                let boot = category(boot.data, boot.closed);
+                if implementation != boot {
+                    return Err(crate::diagnostic::error(&shown, Some(&src), *loc, &format!(
+                        "Family ‘{name}’ differs from its hs-boot declaration\nImplementation: {implementation}\nHs-boot file:   {boot}",
+                    )));
+                }
+            }
+        }
+        let boot_iface = completing_boot.then(|| self.ifaces.get(module).cloned()).flatten();
+        let boot_values: Vec<_> = boot_iface.iter().flat_map(|iface| &iface.exports)
+            .filter(|e| e.kind == crate::rename::iface::EntKind::Var)
+            .filter_map(|e| {
+                let name = e.occ();
+                let key = format!("{}.{}", e.global.module, e.global.name);
+                let signature_loc = parsed.decls.iter().find_map(|decl| match decl {
+                    Decl::Sig { names, loc, .. } if names.iter().any(|n| n == name) => Some(*loc),
+                    _ => None,
+                });
+                let scheme = self.checker.env.values.get(&key)
+                    .filter(|scheme| comparable_boot_signature(scheme, signature_loc.is_some()))?;
+                Some((key, name, scheme.clone(), signature_loc))
+            })
+            .collect();
+        let boot_class_defaults: Vec<_> = if completing_boot {
+            parsed.decls.iter().filter_map(|decl| {
+                let Decl::Class(class) = decl else { return None };
+                let key = format!("{module}.{}", class.name);
+                let boot = self.checker.class(&key)?;
+                let methods = boot.methods.iter()
+                    .map(|(method, _)| (method.clone(), boot.defaults.contains_key(method)))
+                    .collect::<Vec<_>>();
+                Some((key, class.name.clone(), class.loc, methods))
+            }).collect()
+        } else {
+            Vec::new()
+        };
+        let module_loc = parsed.loc;
         let boot_key = self.boot_key(module);
         let cacheable = cache_file.is_some() && !has_splices && dep_keys.is_some() && (!completing_boot || boot_key.is_some());
         let mut snapshot = cacheable.then(|| {
@@ -907,9 +957,58 @@ impl Driver {
             self.checker.env.instances.iter().filter(|i| i.dict.starts_with(&prefix) && !implemented.contains(i.dict.as_str())).cloned().collect()
         } else { Vec::new() };
         let binds_before = self.binds.len();
-        self.compile_module(parsed, exts, &shown)?;
+        let warnings = self.compile_module(parsed, exts, &shown, Some(&src), None)?;
         let mut new_binds = self.binds.split_off(binds_before);
         if completing_boot {
+            if let (Some(boot), Some(full)) = (&boot_iface, self.ifaces.get(module)) {
+                let exports: HashSet<_> = full.exports.iter()
+                    .flat_map(|e| std::iter::once(e).chain(&e.subs))
+                    .map(|e| (&e.global, e.kind.is_value()))
+                    .collect();
+                for e in boot.exports.iter().flat_map(|e| std::iter::once(e).chain(&e.subs)) {
+                    if !exports.contains(&(&e.global, e.kind.is_value())) {
+                        return Err(crate::diagnostic::error(&shown, Some(&src), module_loc, &format!(
+                            "The hs-boot interface for ‘{}’ exports ‘{}’\nExport it from the implementing module to match the interface.",
+                            self.real_name(module), e.occ()
+                        )));
+                    }
+                }
+            }
+            for (key, name, boot_scheme, signature_loc) in boot_values {
+                let Some(full_scheme) = self.checker.env.values.get(&key) else { continue };
+                if !comparable_boot_signature(full_scheme, signature_loc.is_some()) {
+                    continue;
+                }
+                let boot_type = self.checker.normalize(&boot_scheme.ty);
+                let full_type = self.checker.normalize(&full_scheme.ty);
+                if boot_scheme.nvars != full_scheme.nvars || boot_type != full_type || boot_scheme.preds != full_scheme.preds {
+                    let (implementation, boot) = self.checker.show_type_pair(&full_type, &boot_type);
+                    let show_pred = |pred: &crate::tc::types::Pred| self.checker.show_pred(pred);
+                    let qualify_context = full_scheme.preds != boot_scheme.preds
+                        && full_scheme.preds.iter().map(show_pred).eq(boot_scheme.preds.iter().map(show_pred));
+                    let implementation = self.checker.show_signature(full_scheme, &implementation, qualify_context, None);
+                    let boot = self.checker.show_signature(&boot_scheme, &boot, qualify_context, None);
+                    return Err(crate::diagnostic::error(&shown, Some(&src), signature_loc.unwrap_or(module_loc), &format!(
+                        "The type of ‘{name}’ differs from its hs-boot signature\nImplementation: {name} :: {}\nHs-boot file:   {name} :: {}",
+                        implementation, boot
+                    )));
+                }
+            }
+            for (key, class, loc, methods) in boot_class_defaults {
+                let Some(full) = self.checker.class(&key) else { continue };
+                for (method, boot_default) in methods {
+                    let full_default = full.defaults.contains_key(&method);
+                    if full_default == boot_default || !full.methods.iter().any(|(name, _)| name == &method) {
+                        continue;
+                    }
+                    let method = crate::tc::types::unqualify(&method);
+                    let status = |has_default| if has_default { "has a default" } else { "has no default" };
+                    return Err(crate::diagnostic::error(&shown, Some(&src), loc, &format!(
+                        "The default for method ‘{method}’ in class ‘{class}’ differs from its hs-boot declaration\nImplementation: {}\nHs-boot file:   {}",
+                        status(full_default), status(boot_default),
+                    )));
+                }
+            }
             if !self.checker.complete_boot_instances(&boot_instances, &mut new_binds).map_err(|e| e.msg)? {
                 snapshot = None;
             }
@@ -933,6 +1032,7 @@ impl Driver {
                         binds: self.binds[binds_before..].to_vec(),
                         env,
                         explicit_sigs: Vec::new(),
+                        warnings,
                     };
                     if std::env::var_os("HSC_DEBUG_CACHE").is_some() {
                         let prefix = format!("{module}.");
@@ -958,6 +1058,18 @@ impl Driver {
             }
         }
         Ok(())
+    }
+
+    fn load_dependency(&mut self, module: &Module, dep: &str, boot: bool, path: &Path, source: &str) -> Result<(), String> {
+        let result = if boot { self.load_boot(dep) } else { self.load(dep) };
+        result.map_err(|err| {
+            if err.starts_with(&format!("Could not find module ‘{dep}’")) {
+                let loc = module.imports.iter().find(|i| i.module == dep).map_or(module.loc, |i| i.loc);
+                crate::diagnostic::error(path, Some(source), loc, &err)
+            } else {
+                err
+            }
+        })
     }
 
     /// Loads a module from its cache entry, if the modules it imports (loaded first) are the
@@ -1005,6 +1117,9 @@ impl Driver {
         self.binds.extend(entry.binds);
         self.loaded.insert(module.to_string());
         self.sources.push((module.to_string(), path.to_path_buf(), home));
+        for warning in entry.warnings {
+            eprintln!("{warning}");
+        }
         if let Some(n) = std::env::var_os("HSC_DEBUG_SCHEME") {
             let n = n.to_string_lossy().to_string();
             if let Some(s) = self.checker.env.values.get(&n) {
@@ -1091,7 +1206,7 @@ impl Driver {
         let saved_kinds = self.checker.kinds.clone();
         let saved_families = self.checker.metas.families.clone();
         let run = (|| -> Result<Vec<Decl>, String> {
-            self.compile_module(smod, exts.clone(), path)?;
+            self.compile_module(smod, exts.clone(), path, None, None)?;
             let pre = self.reify_values(&m.name, exts, path, first)?;
             let pre_io = pre.as_ref().map(|p| format!("{p}IO"));
             match crate::th::run_decl_splices(&self.binds, &m.name, locs.clone(), pre) {
@@ -1185,7 +1300,7 @@ impl Driver {
         let vm = crate::th::reify_values_module(&refs, module, &name, loc);
         let mut exts = exts.clone();
         exts.apply("NoImplicitPrelude")?;
-        self.compile_module(vm, exts, path)?;
+        self.compile_module(vm, exts, path, None, None)?;
         self.ifaces.remove(&name);
         Ok(Some(format!("{name}.{}", crate::th::REIFY_VALUES)))
     }
@@ -1217,7 +1332,7 @@ impl Driver {
                 }
                 Type::List(e, _) => names(e, out),
                 Type::Tuple(ts, _) => ts.iter().for_each(|x| names(x, out)),
-                Type::Forall(_, b) | Type::Qual(_, b) => names(b, out),
+                Type::Forall { body: b, .. } | Type::Qual(_, b) => names(b, out),
                 Type::Sig(x, _) => names(x, out),
                 Type::OpChain(items, _) => {
                     for it in items {
@@ -1471,7 +1586,7 @@ impl Driver {
         let saved_kinds = self.checker.kinds.clone();
         let saved_families = self.checker.metas.families.clone();
         let results = (|| -> Result<Vec<crate::syntax::ast::Expr>, String> {
-            self.compile_module(smod, exts.clone(), path)?;
+            self.compile_module(smod, exts.clone(), path, None, None)?;
             let pre = if own { self.reify_values(&m.name, exts, path, first)? } else { None };
             if timing {
                 eprintln!("splices compiled: {:?}", t0.elapsed());
@@ -1501,7 +1616,9 @@ impl Driver {
         Ok(())
     }
 
-    fn compile_module(&mut self, m: Module, exts: Extensions, path: &Path) -> Result<(), String> {
+    fn compile_module(
+        &mut self, m: Module, exts: Extensions, path: &Path, source: Option<&str>, entry_name: Option<&str>,
+    ) -> Result<Vec<String>, String> {
         let name = m.name.clone();
         // HSC_PROGRESS: each module compiled, with the compiler's resident memory then.
         if std::env::var_os("HSC_PROGRESS").is_some() {
@@ -1509,6 +1626,16 @@ impl Driver {
             eprintln!("compiling {name} ({} decls, rss {} MB)", m.decls.len(), rss * 4096 / (1 << 20));
         }
         self.checker.user_module = !path.starts_with(default_lib_dir());
+        let mut warnings = Vec::new();
+        if self.checker.user_module && source.is_some() {
+            for (loc, message) in &exts.deprecated_flags {
+                let warning = crate::diagnostic::warning(
+                    path, source, *loc, message, crate::diagnostic::Warning::DeprecatedFlags, false,
+                );
+                eprintln!("{warning}");
+                warnings.push(warning);
+            }
+        }
         // Call stacks name a library file as GHC's build does (libraries/<package>/...).
         self.checker.source_name = if self.checker.user_module {
             path.display().to_string()
@@ -1519,26 +1646,194 @@ impl Driver {
                 None => text,
             }
         };
-        let located = |loc: crate::syntax::ast::Loc, msg: &str| {
-            format!("{}:{}:{}: error:\n    {}", path.display(), loc.line, loc.col, msg)
-        };
+        let located = |loc, msg: &str| crate::diagnostic::error(path, source, loc, msg);
         let boot = self.checker.boot;
         self.checker.overloaded_strings = exts.is_on("OverloadedStrings");
+        self.checker.flexible_instances = exts.is_on("FlexibleInstances");
+        self.checker.type_synonym_instances = exts.is_on("TypeSynonymInstances");
+        self.checker.undecidable_superclasses = exts.is_on("UndecidableSuperClasses");
+        self.checker.extended_default_rules = exts.is_on("ExtendedDefaultRules");
         self.checker.overloaded_lists = exts.is_on("OverloadedLists");
         self.checker.monomorphism_restriction = exts.is_on("MonomorphismRestriction");
         self.checker.mono_local_binds = exts.is_on("MonoLocalBinds");
+        self.checker.scoped_type_variables = exts.is_on("ScopedTypeVariables");
+        self.checker.named_wildcards = exts.is_on("NamedWildCards");
+        self.checker.impredicative_types = exts.is_on("ImpredicativeTypes");
         self.checker.applicative_do = exts.is_on("ApplicativeDo");
         self.checker.newtype_deriving = exts.is_on("GeneralizedNewtypeDeriving");
+        self.checker.derive_anyclass = exts.is_on("DeriveAnyClass");
+        // The renamer also adds the implicit Prelude import. Keep only the
+        // broad imports that appear in the source for the import-list warning.
+        let broad_imports: Vec<_> = if source.is_some()
+            && exts.warnings.level(crate::diagnostic::Warning::MissingImportLists).is_some()
+        {
+            m.imports.iter()
+                .filter(|import| !import.qualified && (import.items.is_none() || import.hiding))
+                .map(|import| (import.loc, self.real_name(&import.module).to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let t = std::time::Instant::now();
-        let (renamed, iface) = crate::rename::rename_module(m, &self.ifaces, exts.is_on("ImplicitPrelude"), boot, exts.is_on("RebindableSyntax"))
-            .map_err(|e| located(e.loc, &e.msg))?;
+        let (renamed, iface, rename_warnings) = crate::rename::rename_module_with_warnings(m, &self.ifaces, &exts, boot)
+            .map_err(|errors| errors.0.iter().map(|e| located(e.loc, &e.msg)).collect::<Vec<_>>().join("\n\n"))?;
         timing::add("rename", t);
         let t = std::time::Instant::now();
-        let binds = self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;
+        let entry = if let Some(entry_name) = entry_name {
+            let exported = iface.exports.iter().flat_map(|e| std::iter::once(e).chain(&e.subs))
+                .find(|e| e.kind.is_value() && e.occ() == entry_name);
+            let loc = renamed.decls.iter().find_map(|decl| match decl {
+                crate::syntax::ast::Decl::Fun { name, loc, .. }
+                | crate::syntax::ast::Decl::Foreign { import: true, name, loc, .. } if name == entry_name => Some(*loc),
+                crate::syntax::ast::Decl::PatBind { pat, .. } =>
+                    crate::rename::pat_vars(pat).into_iter().find_map(|(n, loc)| (n == entry_name).then_some(loc)),
+                _ => None,
+            });
+            match exported {
+                Some(e) => Some((format!("{}.{}", e.global.module, e.global.name), entry_name, loc.unwrap_or(renamed.loc))),
+                None => {
+                    // Report errors in the module itself before a missing entry point.
+                    self.checker.check_module(&renamed).map_err(|e| located(e.loc, &e.msg))?;
+                    let problem = if loc.is_some() || self.checker.env.values.contains_key(&format!("{name}.{entry_name}")) {
+                        "exported by"
+                    } else {
+                        "defined in"
+                    };
+                    return Err(located(renamed.loc, &format!("The IO action ‘{entry_name}’ is not {problem} module ‘{name}’")));
+                }
+            }
+        } else {
+            None
+        };
+        let binds = self.checker.check_module_with_main(&renamed, entry.as_ref().map(|(key, name, loc)| (key.as_str(), *name, *loc)))
+            .map_err(|e| located(e.loc, &e.msg))?;
         timing::add("typecheck", t);
+        if source.is_some() {
+            let module_warnings = self.module_warnings(&renamed, &broad_imports, &rename_warnings, &exts, path, source)?;
+            for warning in &module_warnings {
+                eprintln!("{warning}");
+            }
+            warnings.extend(module_warnings);
+        }
         self.binds.extend(binds);
         self.ifaces.insert(name, iface);
-        Ok(())
+        Ok(warnings)
+    }
+
+    fn module_warnings(
+        &self, module: &Module, broad_imports: &[(Loc, String)], rename_warnings: &[(Loc, String, crate::diagnostic::Warning)],
+        exts: &Extensions, path: &Path, source: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        use crate::diagnostic::Warning;
+        let mut warnings: Vec<_> = self.checker.warnings.iter().chain(rename_warnings).chain(&exts.syntax_warnings).filter_map(|(loc, msg, flag)| {
+            exts.warnings.level(*flag).map(|fatal| (*loc, msg.clone(), *flag, fatal))
+        }).collect();
+        if let Some(fatal) = exts.warnings.level(Warning::MissingExportLists).filter(|_| module.exports.is_none()) {
+            let name = self.real_name(&module.name);
+            warnings.push((
+                module.loc,
+                format!("Module ‘{name}’ has no explicit export list\nList the names to export after the module name."),
+                Warning::MissingExportLists,
+                fatal,
+            ));
+        }
+        if let Some(fatal) = exts.warnings.level(Warning::MissingImportLists) {
+            for (loc, name) in broad_imports {
+                warnings.push((
+                    *loc,
+                    format!("Unqualified import of ‘{name}’ has no explicit import list\nList the names to import or qualify the import."),
+                    Warning::MissingImportLists,
+                    fatal,
+                ));
+            }
+        }
+        if let Some(fatal) = exts.warnings.level(Warning::UnrecognisedPragmas) {
+            for (loc, name) in &exts.unknown_pragmas {
+                let mut message = format!("Unrecognised pragma ‘{name}’");
+                let suggestions: Vec<_> = crate::syntax::lexer::KNOWN_PRAGMAS.iter()
+                    .filter(|known| crate::diagnostic::one_edit_apart(name, known))
+                    .take(3).map(|known| format!("‘{known}’")).collect();
+                if !suggestions.is_empty() {
+                    message.push_str(&format!("\nPerhaps you meant {}.", suggestions.join(" or ")));
+                }
+                warnings.push((*loc, message, Warning::UnrecognisedPragmas, fatal));
+            }
+        }
+        if let (Some((loc, count)), Some(fatal)) = (exts.tabs, exts.warnings.level(Warning::Tabs)) {
+            let mut message = "Tab character found here.".to_string();
+            if count > 1 {
+                let others = count - 1;
+                let label = if others == 1 { "location" } else { "locations" };
+                message.push_str(&format!(" Tabs were also found at {others} other {label}."));
+            }
+            message.push_str("\nUse spaces for indentation.");
+            warnings.push((loc, message, Warning::Tabs, fatal));
+        }
+        if let Some(fatal) = exts.warnings.level(Warning::MissingDerivingStrategies) {
+            let message = if exts.is_on("DerivingStrategies") {
+                "No deriving strategy specified\nWrite an explicit strategy for this clause."
+            } else {
+                "No deriving strategy specified\nEnable DerivingStrategies to write an explicit strategy."
+            };
+            let mut report = |loc| warnings.push((loc, message.to_string(), Warning::MissingDerivingStrategies, fatal));
+            for decl in &module.decls {
+                match decl {
+                    Decl::Data(data) => {
+                        for clause in &data.deriving {
+                            if clause.strategy.is_none() && clause.via.is_none() {
+                                report(clause.loc);
+                            }
+                        }
+                    }
+                    Decl::Deriving(clause) if clause.strategy.is_none() && clause.via.is_none() => report(clause.loc),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(fatal) = exts.warnings.level(Warning::MissingSignatures) {
+            let signed: HashSet<_> = module.decls.iter().filter_map(|decl| match decl {
+                Decl::Sig { names, .. } => Some(names.iter().map(String::as_str)),
+                _ => None,
+            }).flatten().collect();
+            let mut report = |name: &str, loc: Loc| {
+                if signed.contains(name) || name.starts_with('$') || loc.line == 0 {
+                    return;
+                }
+                let key = format!("{}.{name}", module.name);
+                if let Some(scheme) = self.checker.env.values.get(&key) {
+                    let ty = self.checker.show(&scheme.ty);
+                    let preds: Vec<_> = scheme.preds.iter().map(|p| self.checker.show_pred(p)).collect();
+                    let context = match preds.as_slice() {
+                        [] => String::new(),
+                        [one] => format!("{one} => "),
+                        _ => format!("({}) => ", preds.join(", ")),
+                    };
+                    let message = format!("Top-level binding with no type signature: {name} :: {context}{ty}");
+                    warnings.push((loc, message, Warning::MissingSignatures, fatal));
+                }
+            };
+            for decl in &module.decls {
+                match decl {
+                    Decl::Fun { name, loc, .. } => report(name, *loc),
+                    Decl::PatBind { pat, .. } => {
+                        for (name, loc) in crate::rename::pat_vars(pat) {
+                            report(&name, loc);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        warnings.sort_by_key(|(loc, ..)| *loc);
+        warnings.dedup();
+        let has_fatal = warnings.iter().any(|(_, _, _, fatal)| *fatal);
+        let rendered: Vec<_> = warnings.into_iter().map(|(loc, msg, flag, fatal)| {
+            crate::diagnostic::warning(path, source, loc, &msg, flag, fatal)
+        }).collect();
+        if has_fatal {
+            return Err(rendered.join("\n\n"));
+        }
+        Ok(rendered)
     }
 }
 
@@ -1549,14 +1844,14 @@ pub fn compile_program(main_file: &Path, flags: Vec<String>) -> Result<Vec<TopBi
     compile_with(&mut d, main_file, &flags)
 }
 
-/// Compiles the program rooted at `main_file` with a driver set up for its search path and
-/// packages, returning all its Core bindings. The main module's flags are `flags`.
-pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Result<Vec<TopBind>, String> {
+pub(crate) fn check_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Result<(), String> {
+    compile_sources(d, main_file, flags, false)
+}
+
+fn compile_sources(d: &mut Driver, main_file: &Path, flags: &[String], with_runtime: bool) -> Result<(), String> {
     let src = read_source(main_file).map_err(|e| format!("{}: {e}", main_file.display()))?;
     let src = preprocess_if_needed(src, main_file, flags)?;
-    let (mut parsed, exts) = crate::syntax::parse_module_source(&src, flags).map_err(|e| {
-        format!("{}:{}:{}: error:\n    {}", main_file.display(), e.line, e.col, e.msg)
-    })?;
+    let (mut parsed, exts) = crate::syntax::parse_module_source(&src, flags).map_err(|e| e.render(main_file, &src))?;
     d.resolve_package_imports(&mut parsed);
     d.resolve_home_wired_imports(&mut parsed);
     let mut deps: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
@@ -1574,29 +1869,34 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
     }
     let source = Driver::source_imports(&src);
     for dep in &deps {
-        if source.contains(dep) {
-            d.load_boot(dep)?;
-        } else {
-            d.load(dep)?;
-        }
+        d.load_dependency(&parsed, dep, source.contains(dep), main_file, &src)?;
     }
     // A program on the real base runs under its top handler, which GHC links into every program.
     let real_base = d.loaded.iter().any(|m| m.starts_with("GHC.Internal."));
-    if real_base && !d.loaded.contains("GHC.Internal.TopHandler") {
+    if with_runtime && real_base && !d.loaded.contains("GHC.Internal.TopHandler") {
         d.load("GHC.Internal.TopHandler")?;
     }
     let name = parsed.name.clone();
     let mut parsed = parsed;
     d.expand_splices(&mut parsed, &exts, main_file)?;
-    d.compile_module(parsed, exts, main_file)?;
+    let entry = (name == d.entry_module).then(|| d.entry_name.clone());
+    d.compile_module(parsed, exts, main_file, Some(&src), entry.as_deref())?;
     d.sources.push((name.clone(), main_file.to_path_buf(), true));
-    d.load_booted()?;
-    if name == "Main" && !d.checker.env.values.contains_key("Main.main") {
-        return Err(format!(
-            "{}:1:1: error:\n    The IO action ‘main’ is not defined in module ‘Main’",
-            main_file.display()
-        ));
+    d.loaded.insert(name.clone());
+    // Explicit targets participate in the build even when the entry module does not import them.
+    let mut remaining: Vec<_> = d.home_targets.keys().filter(|module| **module != name).cloned().collect();
+    remaining.sort();
+    for module in remaining {
+        let key = d.home_wired_key(&module).unwrap_or(module);
+        d.load(&key)?;
     }
+    d.load_booted()
+}
+
+/// Compiles the program rooted at `main_file` with a driver set up for its search path and
+/// packages, returning all its Core bindings. The main module's flags are `flags`.
+pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Result<Vec<TopBind>, String> {
+    compile_sources(d, main_file, flags, true)?;
     let mut binds = std::mem::take(&mut d.binds);
     // HSC_DEBUG_BINDS=file: each binding's name and the size of its Core (to compare builds).
     if let Some(f) = std::env::var_os("HSC_DEBUG_BINDS") {
@@ -1671,7 +1971,7 @@ pub fn module_name_of(path: &Path, flags: &[String]) -> Result<String, String> {
     let src = read_source(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let src = preprocess_if_needed(src, path, flags)?;
     let (parsed, _) = crate::syntax::parse_module_source(&src, flags)
-        .map_err(|e| format!("{}:{}:{}: error:\n    {}", path.display(), e.line, e.col, e.msg))?;
+        .map_err(|e| e.render(path, &src))?;
     Ok(parsed.name)
 }
 
@@ -1748,16 +2048,84 @@ pub fn preprocess_if_needed(src: String, path: &Path, flags: &[String]) -> Resul
     pp.run(&src, &dir).map_err(|e| format!("{}: error: {e}", path.display()))
 }
 
-/// A boot file declares; it does not define. Method definitions and instance bodies are removed.
-fn strip_boot_bodies(m: &mut Module) {
+/// Boot interfaces may describe class defaults. Their method bodies are checked
+/// in the implementation.
+fn check_boot_declarations(m: &mut Module) -> Result<(), (Loc, &'static str)> {
+    if let Some(pragma) = m.inlines.first() {
+        return Err((pragma.loc, "INLINE and NOINLINE pragmas belong in the implementing module, on the binding."));
+    }
     for d in &mut m.decls {
         match d {
-            Decl::Class(cd) => cd.decls.retain(|x| !matches!(x, Decl::Fun { .. } | Decl::PatBind { .. })),
-            Decl::Instance(id) => id.decls.clear(),
+            Decl::Fun { loc, .. } | Decl::PatBind { loc, .. } | Decl::IPBind { loc, .. } => {
+                return Err((*loc, "Value bindings are not allowed in an hs-boot file. Use a type signature here."));
+            }
+            Decl::TypeInstance { loc, .. } => {
+                return Err((*loc, "A type-family instance is not allowed in an hs-boot file."));
+            }
+            Decl::Foreign { loc, .. } => {
+                return Err((*loc, "A foreign declaration is not allowed in an hs-boot file. Put it in the implementing module."));
+            }
+            Decl::Deriving(deriving) => {
+                return Err((deriving.loc, "An hs-boot file cannot derive instances. Write an instance declaration without a body."));
+            }
+            Decl::Data(data) => {
+                if let Some(clause) = data.deriving.iter().find(|clause| !clause.classes.is_empty()) {
+                    return Err((clause.loc, "An hs-boot file cannot derive instances. Write an instance declaration without a body."));
+                }
+            }
+            Decl::Instance(id) => {
+                for declaration in &id.decls {
+                    match declaration {
+                        Decl::Fun { loc, .. } | Decl::PatBind { loc, .. } | Decl::IPBind { loc, .. } => {
+                            return Err((*loc, "An instance in an hs-boot file cannot define methods. Put the binding in the implementing module."));
+                        }
+                        Decl::Sig { loc, .. } => {
+                            return Err((*loc, "An instance in an hs-boot file cannot contain method signatures. Put the signature with the binding in the implementing module."));
+                        }
+                        Decl::TypeInstance { loc, .. } => {
+                            return Err((*loc, "An associated type-family instance is not allowed in an hs-boot file. Put the equation in the implementing module."));
+                        }
+                        _ => {}
+                    }
+                }
+                id.decls.clear();
+            }
             _ => {}
         }
     }
-    m.decls.retain(|d| !matches!(d, Decl::Fun { .. } | Decl::PatBind { .. }));
+    Ok(())
+}
+
+/// Compare simple signatures by binder position. Inferred quantifiers and kind-only
+/// binders need extra information beyond the checker's type.
+fn comparable_boot_signature(scheme: &crate::tc::types::Scheme, allow_polymorphism: bool) -> bool {
+    use crate::tc::types::{tuple_arity, Ty, ARROW, LIST};
+    fn collect_variables(ty: &Ty, variables: &mut HashSet<u32>, allow_variables: bool) -> bool {
+        let (head, args) = ty.split_apps();
+        match head {
+            Ty::Con(name) => {
+                // Kind dependencies in arbitrary constructor arguments can change the order
+                // of implicit quantifiers. The type checker erases those dependencies here.
+                let allow_arguments = allow_variables
+                    && (name == ARROW || name == LIST || tuple_arity(name).is_some());
+                args.into_iter().all(|arg| collect_variables(arg, variables, allow_arguments))
+            }
+            Ty::Gen(i) if allow_variables && args.is_empty() => {
+                variables.insert(*i);
+                true
+            }
+            _ => false,
+        }
+    }
+    if !allow_polymorphism && (scheme.nvars != 0 || !scheme.preds.is_empty()) {
+        return false;
+    }
+    let mut variables = HashSet::new();
+    collect_variables(&scheme.ty, &mut variables, allow_polymorphism)
+        && variables.len() == scheme.nvars as usize
+        && scheme.preds.iter().all(|pred| {
+            !pred.args.is_empty() && pred.args.iter().all(|arg| matches!(arg, Ty::Gen(i) if variables.contains(i)))
+        })
 }
 
 #[cfg(test)]
@@ -1913,6 +2281,7 @@ mod cache_tests {
             binds: Vec::new(),
             env: crate::cache::EnvDelta::default(),
             explicit_sigs: Vec::new(),
+            warnings: Vec::new(),
         };
         assert!(!d.use_cached("A", entry, "source", &s.0.join("A.hs"), true));
         assert!(!d.loaded.contains("A"));
@@ -1923,6 +2292,7 @@ mod cache_tests {
             binds: Vec::new(),
             env: crate::cache::EnvDelta::default(),
             explicit_sigs: Vec::new(),
+            warnings: Vec::new(),
         };
         assert!(d.use_cached("A", entry, "source", &s.0.join("A.hs"), true));
     }
@@ -2229,9 +2599,10 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     // exits, as GHC's `hs_exit` does: `hsc$main` is `runMainIO Main.main >> flushStdHandles`.
     let mut binds = binds.to_vec();
     let has = |n: &str| binds.iter().any(|b| b.name == n);
-    if !has("hsc$main") && has("GHC.Internal.TopHandler.runMainIO") && has("Main.main") && has("GHC.Internal.TopHandler.flushStdHandles") && has("GHC.Internal.Base.thenIO") {
+    let action = if has(crate::core::MAIN_ENTRY) { crate::core::MAIN_ENTRY } else { "Main.main" };
+    if !has("hsc$main") && has("GHC.Internal.TopHandler.runMainIO") && has(action) && has("GHC.Internal.TopHandler.flushStdHandles") && has("GHC.Internal.Base.thenIO") {
         use crate::core::Core::{App, Var};
-        let run_main = App(Box::new(Var("GHC.Internal.TopHandler.runMainIO".into())), Box::new(Var("Main.main".into())));
+        let run_main = App(Box::new(Var("GHC.Internal.TopHandler.runMainIO".into())), Box::new(Var(action.into())));
         let body = App(
             Box::new(App(Box::new(Var("GHC.Internal.Base.thenIO".into())), Box::new(run_main))),
             Box::new(Var("GHC.Internal.TopHandler.flushStdHandles".into())),
@@ -2239,7 +2610,7 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
         binds.push(crate::core::TopBind { name: "hsc$main".into(), body });
     }
     // Only what the program reaches is compiled: its entry, and the bindings the runtime uses.
-    let entry = if binds.iter().any(|b| b.name == "hsc$main") { "hsc$main" } else { "Main.main" };
+    let entry = if binds.iter().any(|b| b.name == "hsc$main") { "hsc$main" } else { action };
     let mut roots: Vec<&str> = vec![entry];
     roots.extend_from_slice(crate::native::RTS_GLOBALS);
     let t = std::time::Instant::now();

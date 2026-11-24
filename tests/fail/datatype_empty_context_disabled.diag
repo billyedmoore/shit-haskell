@@ -1,0 +1,2 @@
+3:6: error:
+A context on a data or newtype declaration requires DatatypeContexts

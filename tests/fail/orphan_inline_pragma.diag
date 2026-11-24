@@ -1,0 +1,2 @@
+orphan_inline_pragma.hs:1:12: error
+The INLINE pragma for ‘id’ lacks an accompanying binding

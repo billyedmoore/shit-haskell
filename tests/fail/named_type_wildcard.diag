@@ -1,0 +1,3 @@
+named_type_wildcard.hs:1:9: error
+Found type wildcard ‘_a’
+Enable PartialTypeSignatures

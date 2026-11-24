@@ -1,0 +1,2 @@
+main_type.hs:1:1: error
+When checking the type of the IO action ‘main’

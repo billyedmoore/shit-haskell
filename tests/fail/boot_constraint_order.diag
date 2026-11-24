@@ -1,0 +1,3 @@
+The type of ‘value’ differs from its hs-boot signature
+Implementation: value :: forall a. (Show a, Eq a) => a -> a
+Hs-boot file:   value :: forall a. (Eq a, Show a) => a -> a

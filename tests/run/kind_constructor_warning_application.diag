@@ -1,0 +1,3 @@
+[-Wdata-kinds-tc]
+Using ‘Maybe Int’ as a kind requires DataKinds
+Using ‘Int’ as a kind requires DataKinds

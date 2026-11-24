@@ -134,6 +134,8 @@ pub enum Tok {
     QuoteOpen(char),
     /// `|]`, or `||]` when typed.
     QuoteClose(bool),
+    /// The body of a MINIMAL pragma and the position of its first token.
+    Minimal(String, super::ast::Loc),
     Eof,
 }
 
@@ -156,6 +158,7 @@ impl Tok {
             Tok::QuoteOpen('T') => "[||".to_string(),
             Tok::QuoteOpen(k) => format!("[{k}|"),
             Tok::QuoteClose(typed) => if *typed { "||]" } else { "|]" }.to_string(),
+            Tok::Minimal(..) => "MINIMAL pragma".to_string(),
             Tok::Eof => "end of input".to_string(),
         }
     }

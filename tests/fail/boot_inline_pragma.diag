@@ -1,0 +1,2 @@
+3:12: error:
+INLINE and NOINLINE pragmas belong in the implementing module, on the binding.

@@ -1,7 +1,7 @@
 {-# LANGUAGE MagicHash, UnboxedTuples, NoImplicitPrelude #-}
 -- A boxed view of the native bignum behind Integer and Natural, and its word access.
 module GHC.Num.BigNat
-  ( BigNat(..), BigNat#, unBigNat, bigNatIndex#, bigNatSize#, bigNatSize, gcdInt, gcdWord
+  ( BigNat(..), BigNat#, bigNatIndex#, bigNatSize#, bigNatSize, gcdInt, gcdWord
   , bigNatZero, bigNatOne, bigNatZero#, bigNatOne#, bigNatIsZero, bigNatIsZero#
   , bigNatFromWord#, bigNatFromWord, bigNatToWord#, bigNatToWord
   , bigNatAnd, bigNatOr, bigNatXor, bigNatAdd, bigNatMul, bigNatEq, bigNatEq#, bigNatCompare

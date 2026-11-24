@@ -1,0 +1,2 @@
+type_declaration_wildcard_binder_kinded_disabled.hs:3:9: error
+A wildcard ‘_’ binder requires TypeAbstractions

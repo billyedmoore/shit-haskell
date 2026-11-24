@@ -1,0 +1,2 @@
+6:3: error:
+An instance in an hs-boot file cannot contain method signatures.

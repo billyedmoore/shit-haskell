@@ -1,0 +1,2 @@
+declaration_wildcard_family_rhs_kind.hs:4:21: error
+Wildcard ‘_’ is not allowed in the right-hand side of a type family equation

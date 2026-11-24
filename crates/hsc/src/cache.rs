@@ -350,10 +350,10 @@ bin_struct!(Loc { line, col });
 bin_struct!(QName { qual, name });
 bin_enum!(PrimLit { 0 => Int(a), 1 => Word(a), 2 => Float(a), 3 => Double(a), 4 => Char(a), 5 => Str(a) });
 bin_enum!(Lit { 0 => Prim(a), 1 => Int(a), 2 => Frac(a), 3 => Char(a), 4 => Str(a) });
-bin_struct!(TyVarBind { name, kind });
+bin_struct!(TyVarBind { name, kind, inferred });
 bin_enum!(Type {
     0 => Var(a, b), 1 => Con(a, b), 2 => App(a, b), 3 => Fun(a, b), 4 => List(a, b), 5 => Tuple(a, b),
-    6 => Forall(a, b), 7 => Qual(a, b), 8 => Sig(a, b), 9 => OpChain(a, b), 10 => Lit(a, b), 11 => Wild(a),
+    6 => Forall { binders, body, parenthesized }, 7 => Qual(a, b), 8 => Sig(a, b), 9 => OpChain(a, b), 10 => Lit(a, b), 11 => Wild(a),
     12 => Splice(a, b),
 });
 bin_enum!(TypeOpItem { 0 => Operand(a), 1 => Op(a, b) });
@@ -413,10 +413,10 @@ bin_enum!(OpItem { 0 => Operand(a), 1 => Op(a, b), 2 => Neg(a) });
 
 bin_struct!(Field { ty, strict });
 bin_enum!(ConFields { 0 => Positional(a), 1 => Record(a) });
-bin_struct!(ConDecl { name, exist, context, fields, gadt_result, infix, loc });
+bin_struct!(ConDecl { name, exist, context, fields, gadt_result, gadt_forall, infix, loc });
 bin_enum!(Strategy { 0 => Stock, 1 => Newtype, 2 => Anyclass });
-bin_struct!(Deriving { strategy, classes, via });
-bin_struct!(DataDecl { newtype, context, name, tyvars, cons, deriving, loc });
+bin_struct!(Deriving { loc, strategy, classes, via });
+bin_struct!(DataDecl { newtype, context, name, tyvars, erased_kind_variables, cons, deriving, loc });
 bin_enum!(Assoc { 0 => Left, 1 => Right, 2 => None });
 
 bin_struct!(GName { module, name });
@@ -429,15 +429,16 @@ bin_struct!(Pred { class, args });
 bin_enum!(Ty {
     0 => Con(a), 1 => App(a, b), 2 => Meta(a), 3 => Skol(a, b), 4 => Gen(a), 5 => Qual(a, b), 6 => Bound(a), 7 => Forall(a, b, c),
 });
-bin_struct!(Scheme { nvars, names, preds, ty });
+bin_struct!(Scheme { nvars, names, visible, preds, ty });
 bin_enum!(Kind { 0 => Star, 1 => Arr(a, b), 2 => Meta(a), 3 => Gen(a) });
 bin_struct!(TyConInfo { arity, cons });
 bin_struct!(DataCon { name, tycon, tag, arity, scheme, fields, newtype, strict });
 bin_struct!(Synonym { nparams, rhs });
-bin_struct!(ClassInfo { name, nparams, supers, methods, defaults, default_schemes, dict_con, fundeps });
+bin_enum!(Minimal { 0 => Method(a, b), 1 => All(a), 2 => Any(a) });
+bin_struct!(ClassInfo { name, nparams, supers, methods, defaults, default_schemes, dict_con, fundeps, minimal });
 bin_struct!(InstInfo { class, nvars, ctx, head, dict, kinds });
 bin_struct!(FamEqn { nvars, args, rhs, kinds, default });
-bin_struct!(FamilyInfo { arity, closed, equations, injective });
+bin_struct!(FamilyInfo { arity, data, closed, equations, injective });
 
 bin_enum!(CLit { 0 => Integer(a), 1 => Int(a), 2 => Double(a), 3 => Frac(a), 4 => Char(a), 5 => Str(a), 6 => Addr(a) });
 bin_enum!(Core {
@@ -580,7 +581,7 @@ pub fn apply(env: &mut Env, kinds: &mut EnvMap<Kind>, d: EnvDelta) {
 
 // ----- entries ---------------------------------------------------------------------------
 
-const MAGIC: &str = "hsc-module-cache 6";
+const MAGIC: &str = "hsc-module-cache 14";
 
 /// A cached module: the keys of the modules it imports (as they were), its interface, Core and
 /// environment additions, and the extra state the driver keeps.
@@ -592,9 +593,11 @@ pub struct Entry {
     pub binds: Vec<TopBind>,
     pub env: EnvDelta,
     pub explicit_sigs: Vec<String>,
+    /// Nonfatal diagnostics produced when checking this module.
+    pub warnings: Vec<String>,
 }
 
-bin_struct!(Entry { boot_key, deps, iface, binds, env, explicit_sigs });
+bin_struct!(Entry { boot_key, deps, iface, binds, env, explicit_sigs, warnings });
 
 /// Dictionary names are part of the interface consumed by SOURCE importers. Their
 /// numbering can differ between a boot interface and its implementation. Include
@@ -742,7 +745,7 @@ mod tests {
         let mut kinds = EnvMap::default();
         env.values.insert("Boot.old".into(), Scheme::mono(Ty::con("Old")));
         env.families.insert("Boot.F".into(), FamilyInfo {
-            arity: 1, closed: false, equations: vec![equation("Old")], injective: Vec::new(),
+            arity: 1, data: false, closed: false, equations: vec![equation("Old")], injective: Vec::new(),
         });
         kinds.insert("Boot.T".into(), Kind::Star);
         (env, kinds)
@@ -812,11 +815,15 @@ mod tests {
         let name = GName { module: "Views".into(), name: "P".into() };
         let mut iface = Iface { module: "Views".into(), ..Iface::default() };
         iface.patsyns.insert(name.clone(), pattern.clone());
-        let mut entry = Entry { boot_key: None, deps: Vec::new(), iface, binds: Vec::new(), env: EnvDelta::default(), explicit_sigs: Vec::new() };
+        let mut entry = Entry {
+            boot_key: None, deps: Vec::new(), iface, binds: Vec::new(), env: EnvDelta::default(),
+            explicit_sigs: Vec::new(), warnings: vec!["Views.hs:4:1: warning: [-Wtabs]".into()],
+        };
         let path = std::env::temp_dir().join(format!("hsc-view-cache-{}.bin", std::process::id()));
         save(&path, &entry);
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.iface.patsyns[&name], pattern);
+        assert_eq!(loaded.warnings, entry.warnings);
         let before = std::fs::read(&path).unwrap();
         entry.iface.patsyns.get_mut(&name).unwrap().pat = Pat::View(
             Box::new(Expr::Let(Vec::new(), Box::new(view), l)), Box::new(Pat::Wild(l)), l);
@@ -900,6 +907,9 @@ mod tests {
         env.fields.get_or_insert_default("M.field".into()).push(("M.Con".into(), 0));
         env.fields.get_or_insert_default("M.field".into()).push(("M.Other".into(), 1));
         env.families.get_mut("Boot.F").unwrap().equations.push(equation("New"));
+        env.families.insert("M.Storage".into(), FamilyInfo {
+            arity: 1, data: true, closed: false, equations: Vec::new(), injective: Vec::new(),
+        });
         kinds.insert("M.T".into(), Kind::Star);
         env.instances.push(InstInfo {
             class: "M.C".into(), nvars: 0, ctx: Vec::new(), head: vec![Ty::con("M.T")],
@@ -932,6 +942,7 @@ mod tests {
         assert_eq!(env.values["Boot.old"].ty, Ty::con("Old"));
         assert_eq!(env.fields["M.field"].len(), 2);
         assert_eq!(env.families["Boot.F"].equations.len(), 2);
+        assert!(env.families["M.Storage"].data);
         assert_eq!(env.instances.for_class("M.C").count(), 1);
         let loaded = snapshot(&env, &kinds);
         env.values.insert("Next.value".into(), Scheme::mono(Ty::con("Next")));
@@ -956,10 +967,10 @@ mod tests {
         env.values.insert("M.value".into(), Scheme::mono(Ty::con("Boot")));
         env.tycons.insert("M.T".into(), TyConInfo { arity: 0, cons: Vec::new() });
         env.families.insert("M.F".into(), FamilyInfo {
-            arity: 1, closed: true, equations: Vec::new(), injective: Vec::new(),
+            arity: 1, data: false, closed: true, equations: Vec::new(), injective: Vec::new(),
         });
         env.families.insert("M.Sub.F".into(), FamilyInfo {
-            arity: 1, closed: false, equations: vec![equation("SubOld")], injective: Vec::new(),
+            arity: 1, data: false, closed: false, equations: vec![equation("SubOld")], injective: Vec::new(),
         });
         kinds.insert("M.T".into(), Kind::Star);
         for dict in ["Other.a", "M.dict", "Other.b"] {
@@ -1024,7 +1035,7 @@ mod tests {
     fn boot_family_context_is_not_cached_as_a_declaration() {
         let (mut env, kinds) = boot_env();
         env.families.insert("M.Open".into(), FamilyInfo {
-            arity: 1, closed: false, equations: Vec::new(), injective: Vec::new(),
+            arity: 1, data: false, closed: false, equations: Vec::new(), injective: Vec::new(),
         });
         assert!(boot_cacheable(&env, "M"));
         env.families.get_mut("M.Open").unwrap().equations.push(equation("Consumer"));

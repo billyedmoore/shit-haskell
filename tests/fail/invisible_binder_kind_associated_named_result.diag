@@ -1,0 +1,2 @@
+invisible_binder_kind_associated_named_result.hs:3:10: error
+Add a standalone kind signature for ‘C’

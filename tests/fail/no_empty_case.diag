@@ -1,0 +1,2 @@
+no_empty_case.hs:3:8: error
+A case expression without alternatives requires EmptyCase

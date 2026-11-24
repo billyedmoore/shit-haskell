@@ -76,6 +76,7 @@ pub struct Checker {
     pub dict_counter: u64,
     pub module: String,
     pub loc: Loc,
+    pub(crate) warnings: Vec<(Loc, String, crate::diagnostic::Warning)>,
     /// Variables bound by the pattern currently being checked, with their types.
     pub pat_bound: Vec<(String, Ty)>,
     /// Top-level Core bindings produced for the current module.
@@ -96,17 +97,27 @@ pub struct Checker {
     pub bound_counter: u32,
     /// Kinds of type constructors.
     pub kinds: kinds::KindEnv,
-    /// Type variables in scope from enclosing signatures with an explicit `forall`.
+    /// Type variables in scope from enclosing signatures, declarations and patterns.
     pub scoped: Vec<(String, Ty)>,
+    pub(crate) scoped_type_variables: bool,
+    pub(crate) named_wildcards: bool,
+    pub(crate) impredicative_types: bool,
     /// The variables a signature uses in kinds (`(a :: k)`, `TYPE r`), by binding key: they stay
     /// flexible when the binding is checked (kinds are not inferred).
     pub sig_kind_vars: HashMap<String, Vec<String>>,
     /// OverloadedStrings is on in the module being checked: string literals are `fromString`.
     pub overloaded_strings: bool,
+    pub flexible_instances: bool,
+    pub type_synonym_instances: bool,
+    pub undecidable_superclasses: bool,
+    pub extended_default_rules: bool,
+    /// The current module's explicit default types, including an empty list.
+    pub numeric_defaults: Option<Vec<Ty>>,
     /// OverloadedLists: list literals, sequences and list patterns go through `IsList`.
     pub overloaded_lists: bool,
     /// GeneralizedNewtypeDeriving: a newtype derives most classes through its representation.
     pub newtype_deriving: bool,
+    pub derive_anyclass: bool,
     /// MonomorphismRestriction (on unless the module turns it off).
     pub monomorphism_restriction: bool,
     /// The monads of the typed quotations being checked, innermost last (their splices share them).
@@ -114,8 +125,6 @@ pub struct Checker {
     /// The flexible kind variables of the signature being checked. Each clause of its body
     /// sees them afresh, as it would the rigid kind variables of a signature.
     pub flex_kinds: Vec<u32>,
-    /// Bindings whose signature has an explicit `forall` (their variables scope over the body).
-    pub explicit_sigs: std::collections::HashSet<String>,
     /// Equalities involving type families that cannot be decided yet.
     pub deferred_eqs: Vec<(Ty, Ty, Loc)>,
     /// Annotated kinds of skolem variables in scope (e.g. from kind-annotated instance heads).
@@ -169,6 +178,7 @@ impl Checker {
             dict_counter: 0,
             module: BUILTIN.to_string(),
             loc: Loc::default(),
+            warnings: Vec::new(),
             pat_bound: Vec::new(),
             out: Vec::new(),
             user_module: false,
@@ -179,14 +189,22 @@ impl Checker {
             callsites: HashMap::new(),
             kinds: kinds::KindEnv::default(),
             scoped: Vec::new(),
+            scoped_type_variables: true,
+            named_wildcards: true,
+            impredicative_types: false,
             sig_kind_vars: HashMap::new(),
             overloaded_strings: false,
+            flexible_instances: true,
+            type_synonym_instances: true,
+            undecidable_superclasses: false,
+            extended_default_rules: false,
+            numeric_defaults: None,
             overloaded_lists: false,
             newtype_deriving: false,
+            derive_anyclass: false,
             monomorphism_restriction: true,
             quote_monads: Vec::new(),
             flex_kinds: Vec::new(),
-            explicit_sigs: std::collections::HashSet::new(),
             deferred_eqs: Vec::new(),
             skol_kinds: HashMap::new(),
         };
@@ -214,8 +232,40 @@ impl Checker {
         types::show_ty(&self.metas, t)
     }
 
+    pub(crate) fn show_type_pair(&self, first: &Ty, second: &Ty) -> (String, String) {
+        let (a, b) = (self.show(first), self.show(second));
+        if a == b {
+            types::show_ty_pair_qualified(&self.metas, first, second)
+        } else {
+            (a, b)
+        }
+    }
+
     pub fn show_pred(&self, p: &Pred) -> String {
         types::show_pred(&self.metas, p)
+    }
+
+    pub(crate) fn show_signature(
+        &self, scheme: &Scheme, body: &str, qualified: bool, binders: Option<&[String]>,
+    ) -> String {
+        let mut signature = String::new();
+        if scheme.nvars != 0 {
+            let variables = binders.map_or_else(
+                || (0..scheme.nvars).map(|i| self.show(&Ty::Gen(i))).collect::<Vec<_>>().join(" "),
+                |names| names.join(" "),
+            );
+            signature.push_str(&format!("forall {variables}. "));
+        }
+        let context: Vec<_> = scheme.preds.iter()
+            .map(|pred| types::show_pred_with_names(&self.metas, pred, qualified))
+            .collect();
+        match context.as_slice() {
+            [] => {}
+            [pred] => signature.push_str(&format!("{pred} => ")),
+            _ => signature.push_str(&format!("({}) => ", context.join(", "))),
+        }
+        signature.push_str(body);
+        signature
     }
 
     /// Looks up the scheme of a variable: locals and this module's top-level bindings
@@ -661,7 +711,7 @@ impl Checker {
                 ))
             }
             Err(types::UnifyError::Mismatch) => {
-                let (a, e) = (self.show(actual), self.show(expected));
+                let (a, e) = self.show_type_pair(actual, expected);
                 self.err(format!(
                     "Couldn't match expected type ‘{e}’ with actual type ‘{a}’"
                 ))
@@ -716,6 +766,7 @@ impl Checker {
             Scheme {
                 nvars: 1,
                 names: vec!["a".into()],
+                visible: vec![0],
                 preds: vec![],
                 ty: list_a.clone(),
             },
@@ -730,6 +781,7 @@ impl Checker {
             Scheme {
                 nvars: 1,
                 names: vec!["a".into()],
+                visible: vec![0],
                 preds: vec![],
                 ty: Ty::funs(vec![a.clone(), list_a.clone()], list_a.clone()),
             },
@@ -758,6 +810,7 @@ impl Checker {
                 Scheme {
                     nvars: n as u32,
                     names: (0..n).map(|i| format!("t{i}")).collect(),
+                    visible: (0..n as u32).collect(),
                     preds: vec![],
                     ty,
                 },
@@ -781,6 +834,7 @@ impl Checker {
                     Scheme {
                         nvars: n as u32,
                         names: (0..n).map(|k| format!("t{k}")).collect(),
+                        visible: (0..n as u32).collect(),
                         preds: vec![],
                         ty: Ty::fun(vars[i].clone(), res.clone()),
                     },

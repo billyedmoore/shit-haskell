@@ -6,6 +6,7 @@ pub mod cache;
 pub mod ccall;
 pub mod cli;
 pub mod core;
+pub mod diagnostic;
 pub mod driver;
 pub mod filelock;
 pub mod hsc2hs;

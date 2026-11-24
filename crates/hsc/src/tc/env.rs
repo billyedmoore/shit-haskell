@@ -120,6 +120,7 @@ pub struct ClassInfo {
     pub dict_con: String,
     /// Functional dependencies, as parameter positions: determining and determined.
     pub fundeps: Vec<(Vec<usize>, Vec<usize>)>,
+    pub minimal: crate::syntax::ast::Minimal,
 }
 
 impl ClassInfo {
@@ -278,6 +279,7 @@ pub struct FamEqn {
 #[derive(Clone, Debug)]
 pub struct FamilyInfo {
     pub arity: usize,
+    pub data: bool,
     /// Closed families try their equations in order.
     pub closed: bool,
     pub equations: Vec<FamEqn>,

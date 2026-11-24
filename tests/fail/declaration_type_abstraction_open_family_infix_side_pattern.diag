@@ -1,0 +1,2 @@
+declaration_type_abstraction_open_family_infix_side_pattern.hs:5:26: error
+A visible kind application requires TypeApplications

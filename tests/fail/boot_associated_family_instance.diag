@@ -1,0 +1,2 @@
+6:3: error:
+An associated type-family instance is not allowed in an hs-boot file.

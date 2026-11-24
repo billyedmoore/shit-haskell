@@ -1,0 +1,2 @@
+invisible_binder_kind_associated_own_kinded.hs:5:10: error
+needs an explicit kind signature

@@ -1,0 +1,6 @@
+deprecated_extension_options_error.hs:1:25: error: [-Wdeprecated-flags]
+deprecated_extension_options_error.hs:1:47: error: [-Wdeprecated-flags]
+Language extension ‘NoPatternSignatures’ is deprecated
+Use ‘NoScopedTypeVariables’.
+Language extension ‘NoTypeInType’ is deprecated
+Use ‘NoDataKinds’ or ‘NoPolyKinds’ to disable those extensions explicitly.

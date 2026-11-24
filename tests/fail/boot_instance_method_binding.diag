@@ -1,0 +1,2 @@
+5:3: error:
+An instance in an hs-boot file cannot define methods.

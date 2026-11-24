@@ -1,0 +1,2 @@
+BootFamilyDefines.hs-boot:5:1: error
+A type-family instance is not allowed in an hs-boot file

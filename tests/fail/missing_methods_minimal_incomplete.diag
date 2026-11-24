@@ -1,0 +1,3 @@
+error: [-Werror]
+The MINIMAL pragma for ‘Measure’ allows omitting methods without defaults
+Require these methods in each alternative: ‘sizeOf’.

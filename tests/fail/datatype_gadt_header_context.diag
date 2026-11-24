@@ -1,0 +1,2 @@
+A GADT-style declaration cannot have a datatype context
+Put the constraints on the individual constructors

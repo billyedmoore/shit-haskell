@@ -7,6 +7,23 @@ pub struct Loc {
     pub col: u32,
 }
 
+impl Loc {
+    pub(crate) fn after(self, text: &str) -> Self {
+        let mut loc = self;
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    loc.line += 1;
+                    loc.col = 1;
+                }
+                '\t' => loc.col = ((loc.col - 1) / 8 + 1) * 8 + 1,
+                _ => loc.col += 1,
+            }
+        }
+        loc
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct QName {
     pub qual: Option<String>,
@@ -38,8 +55,12 @@ pub enum Lit {
 pub struct Module {
     pub name: String,
     pub exports: Option<Vec<IEItem>>,
+    /// Source locations of the explicit export items, in list order.
+    pub export_locs: Vec<Loc>,
     pub imports: Vec<Import>,
     pub decls: Vec<Decl>,
+    /// Source kind expressions retained for diagnostics, including family result kinds.
+    pub kind_annotations: Vec<Type>,
     pub loc: Loc,
     /// The module's rewrite rules (`{-# RULES #-}`): optimisations only, never needed for meaning.
     pub rules: Vec<Rule>,
@@ -149,6 +170,7 @@ pub enum Decl {
     PatSyn {
         name: String,
         args: Vec<String>,
+        record: bool,
         pat: Pat,
         dir: PatSynDir,
         loc: Loc,
@@ -185,6 +207,7 @@ pub enum Decl {
     TypeSyn {
         name: String,
         tyvars: Vec<TyVarBind>,
+        erased_kind_variables: Vec<String>,
         rhs: Type,
         loc: Loc,
     },
@@ -201,11 +224,19 @@ pub enum Decl {
         kind: Type,
         loc: Loc,
     },
-    /// A type family: open (`equations` is `None`) or closed.
+    RoleAnnotation {
+        name: QName,
+        roles: usize,
+        loc: Loc,
+    },
+    /// An open or closed type family, or a data family (always open).
     TypeFamily {
         name: String,
         params: Vec<TyVarBind>,
         equations: Option<Vec<TypeEquation>>,
+        /// Location of the `..` in an abstract closed family from an hs-boot file.
+        abstract_closed: Option<Loc>,
+        data: bool,
         /// The parameters an injectivity annotation (`= r | r -> a b`) names.
         injective: Vec<String>,
         loc: Loc,
@@ -234,6 +265,7 @@ pub enum Decl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeEquation {
     pub args: Vec<Type>,
+    pub erased_kind_variables: Vec<String>,
     pub rhs: Type,
     pub loc: Loc,
 }
@@ -420,6 +452,19 @@ pub enum Pat {
 pub struct TyVarBind {
     pub name: String,
     pub kind: Option<Type>,
+    /// Braces in an explicit `forall` leave this binder to inference.
+    pub inferred: bool,
+}
+
+impl TyVarBind {
+    pub(crate) fn declaration_scope(binders: &[Self], erased_kind_variables: &[String]) -> Vec<String> {
+        let mut scope: Vec<_> = binders.iter().map(|binder| binder.name.clone())
+            .chain(erased_kind_variables.iter().cloned()).collect();
+        for kind in binders.iter().filter_map(|binder| binder.kind.as_ref()) {
+            kind.extend_variable_scope(&mut scope);
+        }
+        scope
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -431,7 +476,12 @@ pub enum Type {
     List(Box<Type>, Loc),
     /// Tuple type; `Con("()")` is the unit type.
     Tuple(Vec<Type>, Loc),
-    Forall(Vec<TyVarBind>, Box<Type>),
+    Forall {
+        binders: Vec<TyVarBind>,
+        body: Box<Type>,
+        /// Parentheses separate this quantifier from the enclosing signature's binders.
+        parenthesized: bool,
+    },
     /// `context => body`.
     Qual(Vec<Type>, Box<Type>),
     /// `(t :: k)`.
@@ -442,6 +492,93 @@ pub enum Type {
     Wild(Loc),
     /// A Template Haskell type splice (`$t` or `$(expr)`).
     Splice(Box<Expr>, Loc),
+}
+
+impl Type {
+    pub fn loc(&self) -> Loc {
+        match self {
+            Self::Var(_, loc) | Self::Con(_, loc) | Self::List(_, loc) |
+            Self::Tuple(_, loc) | Self::OpChain(_, loc) | Self::Lit(_, loc) |
+            Self::Wild(loc) | Self::Splice(_, loc) => *loc,
+            Self::App(t, _) | Self::Fun(t, _) | Self::Sig(t, _) | Self::Forall { body: t, .. } => t.loc(),
+            Self::Qual(ctx, body) => ctx.first().map_or_else(|| body.loc(), Type::loc),
+        }
+    }
+
+    /// Named wildcards can be recognized when there are no enclosing type binders.
+    pub(crate) fn first_wildcard(&self, named: bool) -> Option<(&str, Loc)> {
+        self.find_signature_unbound(|ty, outer_binder_kind| match ty {
+            Type::Wild(loc) => Some(("_", *loc)),
+            Type::Var(name, loc) if named && !outer_binder_kind && name.starts_with('_') => Some((name.as_str(), *loc)),
+            _ => None,
+        })
+    }
+
+    /// The scope predicate also sees whether the variable occurs in an outer binder's kind.
+    pub(crate) fn first_unbound_variable(&self, mut in_scope: impl FnMut(&str, bool) -> bool) -> Option<(&str, Loc)> {
+        self.find_signature_unbound(|ty, outer_binder_kind| match ty {
+            Type::Var(name, loc) if !in_scope(name, outer_binder_kind) => Some((name.as_str(), *loc)),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn extend_variable_scope(&self, scope: &mut Vec<String>) {
+        self.first_unbound_variable(|name, _| {
+            if !scope.iter().any(|variable| variable == name) {
+                scope.push(name.to_owned());
+            }
+            true
+        });
+    }
+
+    fn find_signature_unbound<'a, T>(&'a self, mut inspect: impl FnMut(&'a Type, bool) -> Option<T>) -> Option<T> {
+        let mut bound = Vec::new();
+        let body = if let Type::Forall { binders, body, parenthesized: false } = self {
+            // The outer binder kinds are resolved before the signature's named wildcards.
+            for binder in binders {
+                if let Some(kind) = &binder.kind {
+                    if let Some(found) = kind.find_unbound(&mut bound, &mut |ty| inspect(ty, true)) {
+                        return Some(found);
+                    }
+                }
+                bound.push(binder.name.as_str());
+            }
+            body.as_ref()
+        } else {
+            self
+        };
+        body.find_unbound(&mut bound, &mut |ty| inspect(ty, false))
+    }
+
+    fn find_unbound<'a, T>(
+        &'a self, bound: &mut Vec<&'a str>, inspect: &mut impl FnMut(&'a Type) -> Option<T>,
+    ) -> Option<T> {
+        match self {
+            Type::Var(name, _) if !bound.contains(&name.as_str()) => inspect(self),
+            Type::Wild(_) => inspect(self),
+            Type::App(a, b) | Type::Fun(a, b) | Type::Sig(a, b) =>
+                a.find_unbound(bound, inspect).or_else(|| b.find_unbound(bound, inspect)),
+            Type::List(t, _) => t.find_unbound(bound, inspect),
+            Type::Forall { binders, body, .. } => {
+                let depth = bound.len();
+                let found = binders.iter().find_map(|binder| {
+                    let found = binder.kind.as_ref().and_then(|kind| kind.find_unbound(bound, inspect));
+                    bound.push(binder.name.as_str());
+                    found
+                }).or_else(|| body.find_unbound(bound, inspect));
+                bound.truncate(depth);
+                found
+            }
+            Type::Qual(ctx, body) =>
+                ctx.iter().find_map(|ty| ty.find_unbound(bound, inspect)).or_else(|| body.find_unbound(bound, inspect)),
+            Type::Tuple(types, _) => types.iter().find_map(|ty| ty.find_unbound(bound, inspect)),
+            Type::OpChain(items, _) => items.iter().find_map(|item| match item {
+                TypeOpItem::Operand(ty) => ty.find_unbound(bound, inspect),
+                TypeOpItem::Op(..) => None,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -470,6 +607,8 @@ pub struct ConDecl {
     pub fields: ConFields,
     /// Result type of a GADT-style constructor.
     pub gadt_result: Option<Type>,
+    /// An explicit outer `forall` in a GADT signature, including `forall .`.
+    pub gadt_forall: bool,
     /// Declared infix (`a :+: b`); used by derived `Show`.
     pub infix: bool,
     pub loc: Loc,
@@ -484,6 +623,7 @@ pub enum Strategy {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Deriving {
+    pub loc: Loc,
     pub strategy: Option<Strategy>,
     pub classes: Vec<Type>,
     pub via: Option<Type>,
@@ -495,6 +635,8 @@ pub struct DataDecl {
     pub context: Vec<Type>,
     pub name: String,
     pub tyvars: Vec<TyVarBind>,
+    /// Kind variables in the head that are erased from the datatype parameters.
+    pub erased_kind_variables: Vec<String>,
     pub cons: Vec<ConDecl>,
     pub deriving: Vec<Deriving>,
     pub loc: Loc,
@@ -505,17 +647,31 @@ pub struct ClassDecl {
     pub context: Vec<Type>,
     pub name: String,
     pub tyvars: Vec<TyVarBind>,
+    pub erased_kind_variables: Vec<String>,
     pub fundeps: Vec<(Vec<String>, Vec<String>)>,
     pub decls: Vec<Decl>,
+    pub minimal: Option<(Minimal, Loc)>,
     pub loc: Loc,
+}
+
+/// A class's minimal complete definition. An empty conjunction requires no methods.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Minimal {
+    Method(String, Loc),
+    All(Vec<Minimal>),
+    Any(Vec<Minimal>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstDecl {
     pub overlap: Option<String>,
+    /// The explicitly bound type variables from the instance header.
+    pub binders: Vec<TyVarBind>,
     pub context: Vec<Type>,
     /// The class and its argument types, as a type application chain.
     pub head: Type,
+    /// The parser erases the distinction between boxed and unboxed tuple types.
+    pub unboxed_head: bool,
     pub decls: Vec<Decl>,
     pub loc: Loc,
 }
@@ -526,5 +682,6 @@ pub struct StandaloneDeriving {
     pub via: Option<Type>,
     pub context: Vec<Type>,
     pub head: Type,
+    pub unboxed_head: bool,
     pub loc: Loc,
 }

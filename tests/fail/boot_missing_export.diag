@@ -1,0 +1,3 @@
+BootHides.hs:1:1: error
+The hs-boot interface for ‘BootHides’ exports ‘Token’
+Export it from the implementing module to match the interface

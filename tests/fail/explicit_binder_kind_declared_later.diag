@@ -1,0 +1,2 @@
+explicit_binder_kind_declared_later.hs:5:19: error:
+Not in scope: type variable ‘k’

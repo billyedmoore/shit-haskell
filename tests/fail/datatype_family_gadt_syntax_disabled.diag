@@ -1,0 +1,2 @@
+4:21: error:
+Using ‘where’ for data constructors requires GADTSyntax

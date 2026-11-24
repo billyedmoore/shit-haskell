@@ -1,0 +1,2 @@
+warning: [-Wdeprecated-flags]
+Language extension ‘PatternSignatures’ is deprecated

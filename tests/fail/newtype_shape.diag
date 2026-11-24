@@ -1,0 +1,3 @@
+Newtype constructor ‘Missing’ must have exactly one field, but has 0
+Newtype constructor ‘Extra’ must have exactly one field, but has 2
+Newtype constructor ‘Strict’ cannot have a strictness annotation on its field

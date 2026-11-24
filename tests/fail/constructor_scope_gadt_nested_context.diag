@@ -1,0 +1,3 @@
+constructor_scope_gadt_nested_context.hs:3:29: error:
+The signature of GADT constructor ‘T’ contains a nested ‘forall’ or context
+Use a single outer ‘forall’ and context.

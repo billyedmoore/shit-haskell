@@ -43,6 +43,9 @@ impl Checker {
     pub fn check(&mut self, e: &Expr, ty: &Ty) -> TR<Core> {
         // The expected type reaches the alternatives, so that a GADT match can refine it there.
         match e {
+            Expr::Wild(loc) => self.report_hole("_", *loc, Some(ty)),
+            Expr::Var(q, loc) if q.qual.as_deref() == Some(crate::rename::EXPR_HOLE) =>
+                self.report_hole(&q.name, *loc, Some(ty)),
             Expr::Case(scrut, alts, loc) => {
                 self.loc = *loc;
                 let (cs, ts) = self.infer(scrut)?;
@@ -378,7 +381,22 @@ impl Checker {
                 None => {
                     let x = self.meta();
                     let y = self.meta();
-                    self.unify_at(&tf, &Ty::fun(x.clone(), y.clone()))?;
+                    if let Err(err) = self.unify_at(&tf, &Ty::fun(x.clone(), y.clone())) {
+                        let result = self.normalize(&tf);
+                        if matches!(result.split_apps().0, Ty::Con(c) if !self.env.families.contains_key(c)) {
+                            if let Expr::Var(q, _) | Expr::Con(q, _) = head {
+                                let name = q.name.split('%').next().unwrap_or(&q.name);
+                                let used = params.len();
+                                let word = if used == 1 { "argument" } else { "arguments" };
+                                let supplied = spine.len();
+                                let ty = self.show(&result);
+                                return Err(super::TcError { loc: head.loc(), msg: format!(
+                                    "Too many arguments for ‘{name}’\nThis call supplies {supplied}. After {used} {word}, the type is ‘{ty}’."
+                                ) });
+                            }
+                        }
+                        return Err(err);
+                    }
                     (x, y)
                 }
             };
@@ -437,7 +455,15 @@ impl Checker {
             for (i, (a, p)) in spine.iter().zip(&params).enumerate() {
                 let rank = if constrained(self, p) { 2 } else if matches!(a, Expr::Lam(..)) { 1 } else { 0 };
                 if rank == pass && checked[i].is_none() {
-                    checked[i] = Some(self.check_arg(a, p)?);
+                    checked[i] = Some(self.check_arg(a, p).map_err(|mut err| {
+                        if let Expr::Var(q, _) | Expr::Con(q, _) = head {
+                            let name = q.name.split('%').next().unwrap_or(&q.name);
+                            if !name.starts_with('$') {
+                                err.msg.push_str(&format!("\nIn argument {} of ‘{name}’", i + 1));
+                            }
+                        }
+                        err
+                    })?);
                 }
             }
         }
@@ -508,6 +534,8 @@ impl Checker {
     pub fn infer(&mut self, e: &Expr) -> TR<(Core, Ty)> {
         self.loc = e.loc();
         match e {
+            Expr::Var(q, loc) if q.qual.as_deref() == Some(crate::rename::EXPR_HOLE) =>
+                self.report_hole(&q.name, *loc, None),
             Expr::Var(q, loc) => {
                 self.loc = *loc;
                 let key = self.resolve_key(&qkey(q));
@@ -560,25 +588,22 @@ impl Checker {
                     loc,
                     msg: format!("Variable not in scope: {key}"),
                 })?;
-                let mut explicit = Vec::with_capacity(tys.len());
-                for t in tys {
-                    if matches!(t, Type::Wild(_)) {
-                        explicit.push(self.metas.fresh(self.level));
-                        continue;
-                    }
-                    let mut tvs = Vec::new();
-                    let ty = self.convert_type(t, &mut tvs)?;
-                    if !tvs.is_empty() {
-                        return self.err(format!("Not in scope: type variable ‘{}’", tvs[0]));
-                    }
-                    explicit.push(ty);
-                }
-                if explicit.len() > scheme.nvars as usize {
-                    return self.err(format!(
-                        "Cannot apply expression of type ‘{}’ to {} visible type argument(s)",
-                        key,
-                        explicit.len()
-                    ));
+                let explicit = tys.iter().map(|t| self.visible_type_argument(t)).collect::<TR<Vec<_>>>()?;
+                let available = scheme.visible.len();
+                if let Some(extra) = tys.get(available) {
+                    let occ = super::types::unqualify(&key);
+                    let binders: Vec<_> = (0..scheme.nvars).map(|i| {
+                        let name = self.show(&Ty::Gen(i));
+                        if scheme.visible.contains(&i) { name } else { format!("{{{name}}}") }
+                    }).collect();
+                    let ty = self.show_signature(&scheme, &self.show(&scheme.ty), false, Some(&binders));
+                    let msg = if available == 0 {
+                        format!("‘{occ}’ has no type variables available for visible type application")
+                    } else {
+                        let argument = if available == 1 { "argument" } else { "arguments" };
+                        format!("‘{occ}’ accepts only {available} visible type {argument}")
+                    };
+                    return Err(super::TcError { loc: extra.loc(), msg: format!("{msg}\nType: {ty}") });
                 }
                 Ok(self.inst_var_explicit(&key, &scheme, loc, &explicit))
             }
@@ -904,7 +929,7 @@ impl Checker {
                 let scheme = self.sig_scheme(t, &[])?;
                 if scheme.nvars != 0 || !scheme.preds.is_empty() {
                     // `(e :: forall a. C a => t)` is `let v :: forall a. C a => t; v = e in v`.
-                    let v = self.fresh_name("sig");
+                    let v = self.fresh_name("$sig");
                     let binding = crate::syntax::ast::Decl::Fun {
                         name: v.clone(),
                         clauses: vec![crate::syntax::ast::Clause {
@@ -929,14 +954,20 @@ impl Checker {
                 let c = self.check(e, &scheme.ty)?;
                 Ok((c, scheme.ty))
             }
-            Expr::Wild(loc) => {
-                self.loc = *loc;
-                self.err("Found hole: _")
-            }
+            Expr::Wild(loc) => self.report_hole("_", *loc, None),
             Expr::AsPat(_, _, loc) | Expr::LazyPat(_, loc) | Expr::BangPat(_, loc) | Expr::ViewPat(_, _, loc) => {
                 self.loc = *loc;
                 self.err("Pattern syntax in expression context")
             }
+        }
+    }
+
+    fn report_hole<T>(&mut self, name: &str, loc: Loc, ty: Option<&Ty>) -> TR<T> {
+        self.loc = loc;
+        if let Some(ty) = ty {
+            self.err(format!("Found hole: {name} :: {}", self.show(ty)))
+        } else {
+            self.err(format!("Found hole: {name}"))
         }
     }
 
@@ -1035,12 +1066,10 @@ impl Checker {
     }
 
     pub fn inst_var_explicit(&mut self, name: &str, scheme: &Scheme, loc: Loc, explicit: &[Ty]) -> (Core, Ty) {
-        let args: Vec<Ty> = (0..scheme.nvars as usize)
-            .map(|i| match explicit.get(i) {
-                Some(t) => t.clone(),
-                None => self.metas.fresh(self.level),
-            })
-            .collect();
+        let mut args: Vec<Ty> = (0..scheme.nvars).map(|_| self.metas.fresh(self.level)).collect();
+        for (&index, ty) in scheme.visible.iter().zip(explicit) {
+            args[index as usize] = ty.clone();
+        }
         let ty = subst_gen(&scheme.ty, &args);
         // `coerce :: a -> b` (a primitive, its `Coercible a b` not checked): the two types are
         // kept to resolve a variable otherwise ambiguous (see `coercible_partner`).
@@ -1642,14 +1671,18 @@ impl Checker {
 
     // ----- desugaring to AST ------------------------------------------------
 
-    fn desugar_do(&mut self, stmts: &[Stmt], _loc: Loc) -> TR<Expr> {
+    fn desugar_do(&mut self, stmts: &[Stmt], loc: Loc) -> TR<Expr> {
         let Some((first, rest)) = stmts.split_first() else {
+            self.loc = loc;
             return self.err("Empty 'do' block");
         };
         if rest.is_empty() {
             return match first {
                 Stmt::Expr { expr, .. } => Ok(expr.clone()),
-                _ => self.err("The last statement in a 'do' block must be an expression"),
+                Stmt::Bind { loc, .. } | Stmt::Let { loc, .. } => {
+                    self.loc = *loc;
+                    self.err("The last statement in a 'do' block must be an expression")
+                }
             };
         }
         match first {
@@ -1905,6 +1938,24 @@ impl Checker {
             // A field of a rank-N type is checked like a constructor argument of that type.
             args[pos] = Some(self.check_arg(&value, &arg_tys[pos])?);
         }
+        let missing_fields = args.iter().enumerate().filter_map(|(i, arg)| arg.is_none().then_some(i));
+        let field_name = |i: usize| info.fields.get(i).map_or_else(
+                || format!("argument {}", i + 1),
+                |field| format!("‘{}’", crate::rename::iface::field_label(field)),
+            );
+        let missing_strict: Vec<_> = missing_fields.clone().filter(|&i| info.strict.get(i) == Some(&true))
+            .map(|i| format!("{} :: {}", field_name(i), self.show(&arg_tys[i]))).collect();
+        if !missing_strict.is_empty() {
+            return Err(super::TcError {
+                loc,
+                msg: format!("Record construction for ‘{}’ must supply its strict fields\nMissing: {}", con.name, missing_strict.join(", ")),
+            });
+        }
+        let missing_lazy: Vec<_> = missing_fields.map(field_name).collect();
+        if !missing_lazy.is_empty() {
+            self.warnings.push((loc, format!("Fields left uninitialized in ‘{}’: {}", con.name, missing_lazy.join(", ")),
+                crate::diagnostic::Warning::MissingFields));
+        }
         let core = args.into_iter().enumerate().fold(con_core, |acc, (i, a)| {
             let a = a.unwrap_or_else(|| {
                 Core::Fail(format!(
@@ -1969,7 +2020,7 @@ impl Checker {
                         return None;
                     }
                     let vars: Vec<String> = crate::rename::pat_vars(pat).into_iter().map(|(v, _)| v).collect();
-                    if vars.iter().any(|v| matches!(sig_of.get(v), Some(Type::Forall(..)) | Some(Type::Qual(..)))) {
+                    if vars.iter().any(|v| matches!(sig_of.get(v), Some(Type::Forall { .. }) | Some(Type::Qual(..)))) {
                         return None;
                     }
                     Some(Deferred::Pat { pat: pat.clone(), rhs: rhs.clone(), vars: vars.into_iter().map(|v| (v, Ty::Con(String::new()))).collect(), loc: *loc })
@@ -2193,7 +2244,7 @@ fn mentions_type_var(e: &Expr, scoped: &[String]) -> bool {
             Type::App(a, b) | Type::Fun(a, b) => ty_has_var(a, scoped, bound) || ty_has_var(b, scoped, bound),
             Type::List(a, _) => ty_has_var(a, scoped, bound),
             Type::Tuple(ts, _) => ts.iter().any(|x| ty_has_var(x, scoped, bound)),
-            Type::Forall(bs, b) => {
+            Type::Forall { binders: bs, body: b, .. } => {
                 let mark = bound.len();
                 bound.extend(bs.iter().map(|x| x.name.clone()));
                 let r = ty_has_var(b, scoped, bound);

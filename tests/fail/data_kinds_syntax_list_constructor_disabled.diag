@@ -1,0 +1,2 @@
+data_kinds_syntax_list_constructor_disabled.hs:5:17: error:
+The promoted list constructor ‘(:)’ requires DataKinds

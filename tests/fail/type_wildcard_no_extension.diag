@@ -1,0 +1,2 @@
+type_wildcard_no_extension.hs:1:12: error
+Enable PartialTypeSignatures

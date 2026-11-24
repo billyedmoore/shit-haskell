@@ -1,0 +1,2 @@
+class_extension_functional_dependencies_disabled.hs:3:16: error:
+Functional dependencies in class ‘Pair’ require FunctionalDependencies

@@ -1,0 +1,2 @@
+tabs_werror.hs:5:1: error: [-Wtabs]
+Tab character found here

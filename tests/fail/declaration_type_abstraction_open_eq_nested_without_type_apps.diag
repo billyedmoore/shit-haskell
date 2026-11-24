@@ -1,0 +1,2 @@
+declaration_type_abstraction_open_eq_nested_without_type_apps.hs:5:24: error
+A visible kind application requires TypeApplications

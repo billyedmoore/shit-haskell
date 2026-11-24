@@ -1,0 +1,2 @@
+has no type variables available for visible type application
+Type: forall {a}. a -> a

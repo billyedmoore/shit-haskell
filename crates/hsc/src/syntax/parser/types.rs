@@ -1,23 +1,177 @@
 //! Types, contexts and kinds.
 
-use super::{PResult, Parser};
+use std::collections::{HashMap, HashSet};
+
+use super::{InvisibleBinder, KindArgument, KindArgumentSite, PResult, Parser};
 use crate::syntax::ast::*;
 use crate::syntax::token::{Kw, ROp, Tok};
 
+/// Match each invisible binder after consuming the required kind arguments that precede it.
+pub(super) fn unmatched_kind_binder(
+    kind: &Type, aliases: &HashMap<&str, &Type>, imports: &[Import], binders: &[InvisibleBinder],
+) -> Option<Loc> {
+    #[derive(PartialEq, Eq)]
+    enum Parameter {
+        Specified,
+        Required,
+    }
+
+    let mut parameters = Vec::new();
+    if !matches!(kind, Type::Forall { .. }) {
+        let mut implicit = Vec::new();
+        kind.extend_variable_scope(&mut implicit);
+        parameters.extend(implicit.into_iter().map(|_| Parameter::Specified));
+    }
+    let mut result = kind;
+    let mut aliases_seen = HashSet::new();
+    let known_result = loop {
+        match result {
+            Type::Forall { binders, body, .. } => {
+                parameters.extend(binders.iter().filter(|b| !b.inferred).map(|_| Parameter::Specified));
+                result = body;
+            }
+            Type::Fun(_, body) => {
+                parameters.push(Parameter::Required);
+                result = body;
+            }
+            Type::Con(name, _) if name.qual.is_none() && aliases.contains_key(name.name.as_str()) => {
+                if !aliases_seen.insert(name.name.as_str()) {
+                    break false;
+                }
+                result = aliases[name.name.as_str()];
+            }
+            Type::Con(name, _) => break known_terminal_kind(name, imports),
+            Type::Var(..) => break true,
+            _ => break false,
+        }
+    };
+
+    let mut parameters = parameters.into_iter();
+    let mut consumed = 0;
+    for binder in binders {
+        while consumed < binder.preceding_parameters {
+            if !parameters.any(|parameter| parameter == Parameter::Required) {
+                return known_result.then_some(binder.at);
+            }
+            consumed += 1;
+        }
+        match parameters.next() {
+            Some(Parameter::Specified) => {}
+            Some(Parameter::Required) => return Some(binder.at),
+            None => return known_result.then_some(binder.at),
+        }
+    }
+    None
+}
+
+fn known_terminal_kind(name: &QName, imports: &[Import]) -> bool {
+    if !matches!(name.name.as_str(), "Type" | "Constraint") {
+        return false;
+    }
+    if name.qual.as_deref() == Some("%G:GHC.Types") {
+        return true;
+    }
+    imports.iter().any(|import| {
+        if !matches!(import.module.as_str(), "Data.Kind" | "GHC.Types" | "GHC.Exts") {
+            return false;
+        }
+        let visible = match &name.qual {
+            Some(qualifier) => import.alias.as_ref().unwrap_or(&import.module) == qualifier,
+            None => !import.qualified,
+        };
+        visible && import.items.as_ref().is_none_or(|items| {
+            items.iter().any(|item| {
+                matches!(item, IEItem::Thing { name: q, .. } if q.name == name.name)
+            }) != import.hiding
+        })
+    })
+}
+
 impl Parser {
+    fn require_data_kinds(&self, loc: Loc, construct: &str) -> PResult<()> {
+        if self.exts.is_on("DataKinds") {
+            return Ok(());
+        }
+        Err(super::ParseError {
+            line: loc.line,
+            col: loc.col,
+            msg: format!("{construct} requires DataKinds"),
+        })
+    }
+
+    pub(super) fn kind_signature(&mut self) -> PResult<Type> {
+        self.expect_res(ROp::DColon)?;
+        if !self.exts.is_on("KindSignatures") {
+            return self.err("A kind annotation requires KindSignatures");
+        }
+        self.kind_type()
+    }
+
+    pub(super) fn kind_type(&mut self) -> PResult<Type> {
+        let kind = self.sigtype()?;
+        if !self.exts.is_on("DataKinds") {
+            if let Some((construct, loc)) = kind_collection(&kind) {
+                self.require_data_kinds(loc, construct)?;
+            }
+            let flag = crate::diagnostic::Warning::DataKindsTypeConstructors;
+            if self.exts.warnings.level(flag).is_some() {
+                self.kind_annotations.push(kind.clone());
+            }
+        }
+        Ok(kind)
+    }
+
+    pub(super) fn forall_binders(&mut self) -> PResult<Vec<TyVarBind>> {
+        self.located_forall_binders()
+            .map(|binders| binders.into_iter().map(|(binder, _)| binder).collect())
+    }
+
+    pub(super) fn located_forall_binders(&mut self) -> PResult<Vec<(TyVarBind, Loc)>> {
+        if !self.exts.is_on("ExplicitForAll") {
+            return self.err("Explicit ‘forall’ in a type requires ExplicitForAll");
+        }
+        self.located_quantified_binders()
+    }
+
+    pub(super) fn quantified_binders(&mut self) -> PResult<Vec<TyVarBind>> {
+        self.located_quantified_binders()
+            .map(|binders| binders.into_iter().map(|(binder, _)| binder).collect())
+    }
+
+    fn located_quantified_binders(&mut self) -> PResult<Vec<(TyVarBind, Loc)>> {
+        self.bump();
+        let mut binders = Vec::new();
+        let mut locations = HashMap::new();
+        while !self.at_varsym(".") {
+            let (binder, loc) = self.tyvar_binder()?;
+            if let Some(first) = locations.insert(binder.name.clone(), loc) {
+                return Err(super::ParseError {
+                    line: loc.line,
+                    col: loc.col,
+                    msg: format!(
+                        "Duplicate binder ‘{}’ in this ‘forall’\nThe first binder is at line {}, column {}.",
+                        binder.name, first.line, first.col,
+                    ),
+                });
+            }
+            binders.push((binder, loc));
+        }
+        self.bump();
+        Ok(binders)
+    }
+
     /// `[forall binders .] [context =>] type`
     pub(super) fn sigtype(&mut self) -> PResult<Type> {
+        self.sigtype_with_head(false)
+    }
+
+    fn sigtype_with_head(&mut self, declaration_head: bool) -> PResult<Type> {
         if self.at_varid("forall") {
-            self.bump();
-            let mut vars = Vec::new();
-            while !self.at_varsym(".") {
-                vars.push(self.tyvar_binder()?);
-            }
-            self.bump();
+            let binders = self.forall_binders()?;
             let body = self.sigtype()?;
-            return Ok(Type::Forall(vars, Box::new(body)));
+            return Ok(Type::Forall { binders, body: Box::new(body), parenthesized: false });
         }
-        let t = self.type_expr()?;
+        let t = self.type_expr_with_head(declaration_head)?;
         if self.at_res(ROp::DArrow) {
             self.bump();
             let ctx = context_items(t);
@@ -29,7 +183,11 @@ impl Parser {
 
     /// `btype [-> type]`
     pub(super) fn type_expr(&mut self) -> PResult<Type> {
-        let t = self.btype()?;
+        self.type_expr_with_head(false)
+    }
+
+    fn type_expr_with_head(&mut self, declaration_head: bool) -> PResult<Type> {
+        let t = self.btype_with_head(declaration_head)?;
         // LinearTypes: a multiplicity arrow `%1 ->` or `%m ->` is an ordinary arrow here.
         if self.real() && self.at_varsym("%") && !self.raw().space_after {
             let saved = self.pos_state();
@@ -53,31 +211,61 @@ impl Parser {
 
     /// Type application chain with infix type operators.
     pub(super) fn btype(&mut self) -> PResult<Type> {
+        self.btype_with_head(false)
+    }
+
+    pub(super) fn btype_with_head(&mut self, declaration_head: bool) -> PResult<Type> {
         let loc = self.loc();
+        let captured_before = self.captured_kind_arguments.as_ref().map(Vec::len);
         let mut items = Vec::new();
-        let mut app = self.app_type()?;
-        while let Some(op) = self.type_operator() {
+        let mut app = self.app_type(declaration_head)?;
+        loop {
+            let op_loc = self.loc();
+            let Some(op) = self.type_operator() else { break };
             items.push(TypeOpItem::Operand(app));
-            items.push(TypeOpItem::Op(op, loc));
-            app = self.app_type()?;
+            items.push(TypeOpItem::Op(op, op_loc));
+            app = self.app_type(declaration_head)?;
         }
         if items.is_empty() {
             return Ok(app);
+        }
+        // In an infix head, each operand is itself an argument to the operator.
+        // Interpret any `@` in those operands as part of their type.
+        if let (true, Some(before), Some(arguments)) =
+            (declaration_head, captured_before, &mut self.captured_kind_arguments)
+        {
+            for argument in &mut arguments[before..] {
+                if let KindArgumentSite::Head(at) = argument.site {
+                    argument.site = KindArgumentSite::InfixOperand(at);
+                }
+            }
         }
         items.push(TypeOpItem::Operand(app));
         Ok(Type::OpChain(items, loc))
     }
 
-    fn app_type(&mut self) -> PResult<Type> {
-        let mut t = self.atype()?;
+    fn app_type(&mut self, declaration_head: bool) -> PResult<Type> {
+        let mut t = self.atype_with_head(declaration_head)?;
         loop {
             if self.starts_atype() {
                 let a = self.atype()?;
                 t = Type::App(Box::new(t), Box::new(a));
             } else if self.real() && self.at_res(ROp::At) && self.raw().space_before && !self.raw().space_after {
-                // A visible kind argument `T @k`: kinds are not checked, so it is dropped.
+                // A head can introduce a binder or match a kind pattern. Its caller
+                // knows which applies once it has seen the rest of the declaration.
+                let site = if declaration_head {
+                    KindArgumentSite::Head(self.loc())
+                } else {
+                    if !self.exts.is_on("TypeApplications") {
+                        return self.err("A visible kind application requires TypeApplications");
+                    }
+                    KindArgumentSite::TypeApplication
+                };
                 self.bump();
-                self.atype()?;
+                let ty = self.atype()?;
+                if let Some(arguments) = &mut self.captured_kind_arguments {
+                    arguments.push(KindArgument { ty, site });
+                }
             } else {
                 break;
             }
@@ -152,6 +340,10 @@ impl Parser {
     }
 
     pub(super) fn atype(&mut self) -> PResult<Type> {
+        self.atype_with_head(false)
+    }
+
+    fn atype_with_head(&mut self, declaration_head: bool) -> PResult<Type> {
         let loc = self.loc();
         if !self.real() {
             return self.unexpected();
@@ -161,7 +353,11 @@ impl Parser {
                 self.bump();
                 let inner = if self.at_special('(') {
                     self.bump();
-                    let e = self.expr()?;
+                    // A type annotation inside the splice expression has its own scope.
+                    let saved = self.captured_kind_arguments.take();
+                    let e = self.expr();
+                    self.captured_kind_arguments = saved;
+                    let e = e?;
                     self.expect_special(')')?;
                     e
                 } else {
@@ -218,6 +414,7 @@ impl Parser {
                         Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, loc))
                     }
                     Tok::Special('[') => {
+                        self.require_data_kinds(loc, "A promoted list")?;
                         self.bump();
                         let mut elems = Vec::new();
                         if !self.at_special(']') {
@@ -232,7 +429,16 @@ impl Parser {
                     }
                     // `'(:)` and `'(,)`: a parenthesised constructor, promoted.
                     Tok::Special('(') => match self.atype()? {
-                        Type::Con(q, l) => Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, l)),
+                        Type::Con(q, _) => {
+                            if q.qual.is_none() && (q.name == "()" || q.name.starts_with("(,")) {
+                                self.require_data_kinds(loc, "A promoted tuple")?;
+                            }
+                            Ok(Type::Con(QName { qual: q.qual, name: format!("'{}", q.name) }, loc))
+                        }
+                        tuple @ Type::Tuple(..) => {
+                            self.require_data_kinds(loc, "A promoted tuple")?;
+                            Ok(tuple)
+                        }
                         other => Ok(other),
                     },
                     _ => self.unexpected(),
@@ -244,15 +450,18 @@ impl Parser {
                 Ok(Type::Con(QName { qual: Some("%G:GHC.Types".into()), name: "Type".into() }, loc))
             }
             Tok::Int(s) => {
+                self.require_data_kinds(loc, "A type-level literal")?;
                 self.bump();
                 Ok(Type::Lit(Lit::Int(s), loc))
             }
             Tok::Str(s) => {
+                self.require_data_kinds(loc, "A type-level literal")?;
                 self.bump();
                 Ok(Type::Lit(Lit::Str(s), loc))
             }
             // A type-level character (DataKinds): `'x'`.
             Tok::Char(c) => {
+                self.require_data_kinds(loc, "A type-level literal")?;
                 self.bump();
                 Ok(Type::Lit(Lit::Char(c), loc))
             }
@@ -317,6 +526,9 @@ impl Parser {
                 };
                 if let Some(q) = op_name {
                     if *self.peek_raw(1) == Tok::Special(')') {
+                        if q.qual.is_none() && q.name == ":" {
+                            self.require_data_kinds(loc, "The promoted list constructor ‘(:)’")?;
+                        }
                         self.bump();
                         self.bump();
                         return Ok(Type::Con(q, loc));
@@ -341,10 +553,9 @@ impl Parser {
                     let name = format!("({})", ",".repeat(n - 1));
                     return Ok(Type::Con(QName::unqual(name), loc));
                 }
-                let first = self.sigtype()?;
+                let first = self.sigtype_with_head(declaration_head)?;
                 if self.at_res(ROp::DColon) {
-                    self.bump();
-                    let kind = self.sigtype()?;
+                    let kind = self.kind_signature()?;
                     self.expect_special(')')?;
                     return Ok(Type::Sig(Box::new(first), Box::new(kind)));
                 }
@@ -355,7 +566,11 @@ impl Parser {
                 }
                 self.expect_special(')')?;
                 if elems.len() == 1 {
-                    Ok(elems.pop().expect("one element"))
+                    let mut ty = elems.pop().expect("one element");
+                    if let Type::Forall { parenthesized, .. } = &mut ty {
+                        *parenthesized = true;
+                    }
+                    Ok(ty)
                 } else {
                     Ok(Type::Tuple(elems, loc))
                 }
@@ -369,12 +584,17 @@ impl Parser {
                 let t = self.sigtype()?;
                 if self.at_special(',') {
                     // DataKinds: a promoted list literal `[t1, t2, ...]` is `t1 ': t2 ': ... '[]`.
+                    self.require_data_kinds(loc, "A promoted list")?;
                     let mut elems = vec![t];
                     while self.at_special(',') {
                         self.bump();
                         elems.push(self.sigtype()?);
                     }
                     self.expect_special(']')?;
+                    let flag = crate::diagnostic::Warning::UntickedPromotedConstructors;
+                    if self.exts.warnings.level(flag).is_some() {
+                        self.exts.syntax_warnings.push((loc, "Unticked promoted list\nAdd a leading tick to the list.".into(), flag));
+                    }
                     return Ok(promoted_list(elems, loc));
                 }
                 self.expect_special(']')?;
@@ -385,46 +605,35 @@ impl Parser {
     }
 
     /// A type variable binder: `a` or `(a :: k)`.
-    pub(super) fn tyvar_binder(&mut self) -> PResult<TyVarBind> {
-        // Inferred binders `{a}` and `{a :: k}` are accepted like ordinary ones.
-        if self.at_special('{') {
+    fn tyvar_binder(&mut self) -> PResult<(TyVarBind, Loc)> {
+        // Inferred binders `{a}` and `{a :: k}` are skipped by visible type applications.
+        let closing = if self.at_special('{') {
             self.bump();
-            let name = match self.tok().clone() {
-                Tok::VarId(s) if self.real() => s,
-                _ => return self.unexpected(),
-            };
+            Some('}')
+        } else if self.at_special('(') {
             self.bump();
-            let kind = if self.at_res(ROp::DColon) {
-                self.bump();
-                Some(self.sigtype()?)
-            } else {
-                None
-            };
-            self.expect_special('}')?;
-            return Ok(TyVarBind { name, kind });
-        }
-        if self.at_special('(') {
-            self.bump();
-            let name = match self.tok().clone() {
-                Tok::VarId(s) if self.real() => s,
-                _ => return self.unexpected(),
-            };
-            self.bump();
-            self.expect_res(ROp::DColon)?;
-            let kind = self.sigtype()?;
-            self.expect_special(')')?;
-            return Ok(TyVarBind {
-                name,
-                kind: Some(kind),
-            });
-        }
-        match self.tok().clone() {
-            Tok::VarId(s) if self.real() => {
-                self.bump();
-                Ok(TyVarBind { name: s, kind: None })
+            Some(')')
+        } else {
+            None
+        };
+        let loc = self.loc();
+        let name = match self.tok().clone() {
+            Tok::VarId(name) if self.real() => name,
+            Tok::Kw(Kw::Underscore) if self.real() => {
+                return self.err("A ‘forall’ binder must name a type variable\nReplace ‘_’ with a fresh type variable.");
             }
-            _ => self.unexpected(),
+            _ => return self.unexpected(),
+        };
+        self.bump();
+        let kind = if closing == Some(')') || (closing == Some('}') && self.at_res(ROp::DColon)) {
+            Some(self.kind_signature()?)
+        } else {
+            None
+        };
+        if let Some(closing) = closing {
+            self.expect_special(closing)?;
         }
+        Ok((TyVarBind { name, kind, inferred: closing == Some('}') }, loc))
     }
 
     /// Parses `[context =>]` if present; otherwise rewinds and returns nothing.
@@ -449,6 +658,22 @@ fn context_items(t: Type) -> Vec<Type> {
         Type::Tuple(ts, _) => ts,
         Type::Con(q, _) if q.name == "()" => Vec::new(),
         other => vec![other],
+    }
+}
+
+fn kind_collection(ty: &Type) -> Option<(&'static str, Loc)> {
+    match ty {
+        Type::List(_, loc) => Some(("A list in a kind", *loc)),
+        Type::Tuple(_, loc) => Some(("A tuple in a kind", *loc)),
+        Type::Con(name, loc) if name.qual.is_none() && name.name == "()" => Some(("A tuple in a kind", *loc)),
+        Type::App(f, a) | Type::Fun(f, a) | Type::Sig(f, a) =>
+            kind_collection(f).or_else(|| kind_collection(a)),
+        Type::Forall { body, .. } | Type::Qual(_, body) => kind_collection(body),
+        Type::OpChain(items, _) => items.iter().find_map(|item| match item {
+            TypeOpItem::Operand(ty) => kind_collection(ty),
+            TypeOpItem::Op(..) => None,
+        }),
+        _ => None,
     }
 }
 

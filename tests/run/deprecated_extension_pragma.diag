@@ -1,0 +1,5 @@
+.hs:2:14: warning: [-Wdeprecated-flags]
+.hs:2:33: warning: [-Wdeprecated-flags]
+Language extension ‘PatternSignatures’ is deprecated
+Use ‘ScopedTypeVariables’.
+Use ‘DataKinds’ and ‘PolyKinds’.

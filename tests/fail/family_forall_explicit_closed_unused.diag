@@ -1,0 +1,2 @@
+family_forall_explicit_closed_unused.hs:5:12: error
+Type variable ‘b’ is bound by ‘forall’ but does not occur in a family pattern

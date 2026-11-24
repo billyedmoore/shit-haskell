@@ -1,0 +1,2 @@
+instance_binder_unscoped_unused_variable.hs:9:22: error:
+Not in scope: type variable ‘b’

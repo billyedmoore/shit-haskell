@@ -3,11 +3,13 @@
 //!
 //! Corpus layout: any tree of `.hs` files. A file's category is the name of its
 //! parent directory. Categories starting with `fail` must be rejected by the
-//! oracle; every other category must be accepted and its program run.
+//! oracle; every other category must be accepted and its program run unless
+//! `-fno-code` asks for type checking alone.
 //!
 //! Optional sidecars next to `NAME.hs`:
 //!   NAME.flags   extra compiler flags, whitespace separated
 //!   NAME.stdin   bytes fed to the compiled program's standard input
+//!   NAME.diag    text fragments that must appear in hsc's diagnostics, one per line
 //!
 //! Comparison: accept/reject must agree; for run tests the exit code, stdout and
 //! stderr of the program must agree. With `--diag`, compiler diagnostics must also
@@ -67,6 +69,21 @@ struct Test {
     src: Vec<u8>,
     flags: Vec<String>,
     stdin: Vec<u8>,
+    diagnostics: Vec<String>,
+}
+
+impl Test {
+    fn no_code(&self) -> bool {
+        self.flags.iter().rev().find_map(|flag| match flag.as_str() {
+            "-fno-code" => Some(true),
+            "-fobject-code" => Some(false),
+            _ => None,
+        }).unwrap_or(false)
+    }
+
+    fn runs_program(&self) -> bool {
+        !is_reject_category(&self.category) && !self.no_code()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,11 +189,11 @@ fn main() {
     }
     results.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let report = render_report(&results, &version);
+    let report = render_report(&results, &version, opts.verbose);
     print!("{report}");
     let _ = fs::write(opts.work.join("report.txt"), &report);
 
-    let failed = results.iter().any(|(_, v)| matches!(v, Verdict::Fail(_)));
+    let failed = results.iter().any(|(_, v)| !matches!(v, Verdict::Pass));
     std::process::exit(if failed { 1 } else { 0 });
 }
 
@@ -292,6 +309,12 @@ fn load(path: &Path) -> Result<Test, String> {
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_default();
     let stdin = fs::read(dir.join(format!("{stem}.stdin"))).unwrap_or_default();
+    let diagnostic_path = dir.join(format!("{stem}.diag"));
+    let diagnostics = match fs::read_to_string(&diagnostic_path) {
+        Ok(text) => text.lines().filter(|line| !line.trim().is_empty()).map(str::to_owned).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("{}: {e}", diagnostic_path.display())),
+    };
     Ok(Test {
         id: format!("{category}/{stem}"),
         category,
@@ -301,6 +324,7 @@ fn load(path: &Path) -> Result<Test, String> {
         src,
         flags,
         stdin,
+        diagnostics,
     })
 }
 
@@ -313,12 +337,19 @@ fn check(opts: &Opts, t: &Test, version: &str) -> Verdict {
         Ok(o) => o,
         Err(e) => return Verdict::Fail(format!("oracle could not be run: {e}")),
     };
-    let run = !is_reject_category(&t.category);
+    let run = t.runs_program();
     let hsc = match execute(&opts.hsc, t, &opts.work.join("hsc"), opts.timeout, run) {
         Ok(o) => o,
         Err(e) => return Verdict::Fail(format!("compiler could not be run: {e}")),
     };
-    let verdict = judge(t, &oracle, &hsc, opts.diag);
+    let mut verdict = judge(t, &oracle, &hsc, opts.diag);
+    if opts.verbose {
+        if let Verdict::Fail(reason) | Verdict::Broken(reason) = &mut verdict {
+            let oracle_err = String::from_utf8_lossy(&oracle.compile_err);
+            let hsc_err = String::from_utf8_lossy(&hsc.compile_err);
+            reason.push_str(&format!("\n  GHC stderr:\n{oracle_err}  hsc stderr:\n{hsc_err}"));
+        }
+    }
     if matches!(verdict, Verdict::Pass) {
         let _ = fs::remove_dir_all(opts.work.join("hsc").join(&t.category).join(&t.stem));
         let _ = fs::remove_dir_all(opts.work.join("oracle").join(&t.category).join(&t.stem));
@@ -336,10 +367,16 @@ fn judge(t: &Test, o: &Outcome, h: &Outcome, diag: bool) -> Verdict {
     }
     if o.compile_ok != h.compile_ok {
         return Verdict::Fail(if h.compile_ok {
-            "accepted a program the oracle rejects".into()
+            format!("accepted a program the oracle rejects: {}", first_line(&o.compile_err))
         } else {
             format!("rejected a program the oracle accepts: {}", first_line(&h.compile_err))
         });
+    }
+    if !t.diagnostics.is_empty() {
+        let stderr = String::from_utf8_lossy(&h.compile_err);
+        if let Some(missing) = t.diagnostics.iter().find(|text| !stderr.contains(text.as_str())) {
+            return Verdict::Fail(format!("hsc diagnostic is missing {missing:?}"));
+        }
     }
     if !o.compile_ok {
         if diag && o.compile_err != h.compile_err {
@@ -349,6 +386,9 @@ fn judge(t: &Test, o: &Outcome, h: &Outcome, diag: bool) -> Verdict {
     }
     if diag && o.compile_err != h.compile_err {
         return Verdict::Fail(format!("compiler output differs: {}", first_diff(&o.compile_err, &h.compile_err)));
+    }
+    if !t.runs_program() {
+        return Verdict::Pass;
     }
     let (Some(or), Some(hr)) = (&o.ran, &h.ran) else {
         return Verdict::Fail("program was not run".into());
@@ -370,7 +410,7 @@ fn judge(t: &Test, o: &Outcome, h: &Outcome, diag: bool) -> Verdict {
 
 fn first_line(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
-    s.lines().next().unwrap_or("").to_string()
+    s.lines().find(|line| !line.trim().is_empty()).unwrap_or("").to_string()
 }
 
 fn first_diff(a: &[u8], b: &[u8]) -> String {
@@ -404,7 +444,7 @@ fn oracle_outcome(opts: &Opts, t: &Test, version: &str) -> Result<Outcome, Strin
             }
         }
     }
-    let run = !is_reject_category(&t.category);
+    let run = t.runs_program();
     let o = execute(&opts.oracle, t, &opts.work.join("oracle"), opts.timeout, run)?;
     let timed_out = o.ran.as_ref().is_some_and(|r| r.timed_out);
     if !timed_out {
@@ -416,7 +456,8 @@ fn oracle_outcome(opts: &Opts, t: &Test, version: &str) -> Result<Outcome, Strin
 
 fn cache_key(t: &Test, version: &str) -> String {
     let flags = t.flags.join(" ");
-    let parts: [&[u8]; 6] = [
+    let parts: [&[u8]; 7] = [
+        b"compile-status-v2",
         version.as_bytes(),
         t.category.as_bytes(),
         t.file.as_bytes(),
@@ -458,10 +499,26 @@ fn execute(compiler: &str, t: &Test, work: &Path, timeout: Duration, run: bool) 
         .args(&t.flags)
         .arg(&t.file);
     let c = run_proc(cmd, &[], timeout).map_err(|e| format!("{compiler}: {e}"))?;
-    let compile_ok = c.code == 0 && !c.timed_out && bin.exists();
+    if c.timed_out {
+        return Err(format!("{compiler}: compiler timed out"));
+    }
+    if !matches!(c.code, 0 | 1) {
+        return Err(format!(
+            "{compiler}: unexpected compiler exit status {}: {}",
+            c.code,
+            first_line(&c.stderr)
+        ));
+    }
+    let compile_ok = c.code == 0;
+    if compile_ok && run && !bin.is_file() {
+        return Err(format!("{compiler}: did not produce an executable"));
+    }
+    if compile_ok && t.no_code() && bin.exists() {
+        return Err(format!("{compiler}: produced an executable with -fno-code"));
+    }
     let mut out = Outcome {
         compile_ok,
-        compile_err: if c.timed_out { b"compiler timed out".to_vec() } else { c.stderr },
+        compile_err: c.stderr,
         ran: None,
     };
     if compile_ok && run {
@@ -586,7 +643,7 @@ fn decode(data: &[u8]) -> Option<Outcome> {
     })
 }
 
-fn render_report(results: &[(String, Verdict)], version: &str) -> String {
+fn render_report(results: &[(String, Verdict)], version: &str, verbose: bool) -> String {
     let mut per_cat: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut lines = Vec::new();
     let mut broken = Vec::new();
@@ -601,8 +658,8 @@ fn render_report(results: &[(String, Verdict)], version: &str) -> String {
                 entry.0 += 1;
                 pass += 1;
             }
-            Verdict::Fail(why) => lines.push(format!("FAIL    {id}: {}", clip(why))),
-            Verdict::Broken(why) => broken.push(format!("BROKEN  {id}: {}", clip(why))),
+            Verdict::Fail(why) => lines.push(format!("FAIL    {id}: {}", if verbose { why.clone() } else { clip(why) })),
+            Verdict::Broken(why) => broken.push(format!("BROKEN  {id}: {}", if verbose { why.clone() } else { clip(why) })),
         }
     }
     let mut out = String::new();
@@ -636,7 +693,7 @@ fn bench(opts: &Opts, tests: &[Test], n: usize, version: &str) -> String {
     let mut out = format!("oracle: {version}\n{:<32} {:>10} {:>10} {:>8}\n", "test", "oracle ms", "hsc ms", "ratio");
     let mut logs: Vec<f64> = Vec::new();
     for t in tests {
-        if is_reject_category(&t.category) {
+        if !t.runs_program() {
             continue;
         }
         let built = |compiler: &str, side: &str| -> Result<PathBuf, String> {

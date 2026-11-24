@@ -1,0 +1,2 @@
+data_kinds_syntax_string_disabled.hs:5:17: error:
+A type-level literal requires DataKinds

@@ -1,0 +1,3 @@
+[-Wdata-kinds-tc]
+Using ‘[Type]’ as a kind requires DataKinds
+Using ‘(Type, Type)’ as a kind requires DataKinds

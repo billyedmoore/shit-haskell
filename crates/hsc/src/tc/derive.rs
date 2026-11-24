@@ -164,28 +164,38 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
                 continue;
             }
             let derived = match name.as_str() {
-                "Eq" => derive_eq(checker, dd),
-                "Ord" => derive_ord(checker, dd),
-                "Show" => derive_show(checker, dd),
-                "Enum" => derive_enum(checker, dd),
-                "Bounded" => derive_bounded(checker, dd),
-                "Read" => derive_read(checker, dd),
-                "Functor" => derive_functor(checker, dd),
-                "Foldable" => derive_foldable(checker, dd),
-                "Traversable" => derive_traversable(checker, dd),
-                "Lift" => derive_lift(checker, dd),
-                "Data" => derive_data(checker, dd),
-                "Generic" => derive_generic(checker, dd, false),
-                "Generic1" => derive_generic(checker, dd, true),
-                // DeriveAnyClass: an instance with the class's default methods. Derived
-                // instances of unknown classes are skipped when the instance is registered.
-                _ => Vec::new(),
+                _ if d.strategy == Some(Strategy::Anyclass) => None,
+                "Eq" => Some(derive_eq(checker, dd)),
+                "Ord" => Some(derive_ord(checker, dd)),
+                "Show" => Some(derive_show(checker, dd)),
+                "Enum" => Some(derive_enum(checker, dd)),
+                "Bounded" => Some(derive_bounded(checker, dd)),
+                "Read" => Some(derive_read(checker, dd)),
+                "Functor" => Some(derive_functor(checker, dd)),
+                "Foldable" => Some(derive_foldable(checker, dd)),
+                "Traversable" => Some(derive_traversable(checker, dd)),
+                "Lift" => Some(derive_lift(checker, dd)),
+                "Data" => Some(derive_data(checker, dd)),
+                "Generic" => Some(derive_generic(checker, dd, false)),
+                "Generic1" => Some(derive_generic(checker, dd, true)),
+                _ => None,
             };
             // Constructor classes are derived for the type constructor without its last parameter.
             let drop_last = matches!(name.as_str(), "Functor" | "Foldable" | "Traversable" | "Generic1");
-            let mut inst = instance(checker, dd, &class_qname, derived, drop_last);
+            let inferred_anyclass = d.strategy.is_none() && checker.derive_anyclass
+                && derived.is_none()
+                && !matches!(
+                    (name.as_str(), class_qname.qual.as_deref()),
+                    ("Ix", Some("GHC.Internal.Ix")) | ("Typeable", Some("GHC.Internal.Data.Typeable.Internal"))
+                );
+            let origin = if d.strategy == Some(Strategy::Anyclass) || inferred_anyclass {
+                DERIVED_ANYCLASS_MARK
+            } else {
+                DERIVED_MARK
+            };
+            let mut inst = instance(checker, dd, &class_qname, derived.unwrap_or_default(), drop_last);
             if let Decl::Instance(id) = &mut inst {
-                id.overlap = Some(DERIVED_MARK.into());
+                id.overlap = Some(origin.into());
             }
             out.push(inst);
         }
@@ -195,6 +205,11 @@ pub fn derive_instances(checker: &mut Checker, dd: &DataDecl) -> TR<Vec<Decl>> {
 
 /// Marks generated instances, so that a missing class is not an error for them.
 pub const DERIVED_MARK: &str = "derived";
+const DERIVED_ANYCLASS_MARK: &str = "derived anyclass";
+
+pub fn is_derived(instance: &InstDecl) -> bool {
+    matches!(instance.overlap.as_deref(), Some(DERIVED_MARK | DERIVED_ANYCLASS_MARK))
+}
 
 /// Whether a newtype derives a class the stock way when no strategy is given. With
 /// GeneralizedNewtypeDeriving, GHC derives every class through the representation except those
@@ -427,6 +442,35 @@ fn strip_last(t: &Type) -> Type {
     }
 }
 
+/// The variables quantified by a GADT constructor, in signature order.
+pub(crate) fn con_free_vars(c: &crate::syntax::ast::ConDecl) -> Vec<String> {
+    let mut vs = Vec::new();
+    for tv in &c.exist {
+        if !vs.contains(&tv.name) {
+            vs.push(tv.name.clone());
+        }
+    }
+    for p in &c.context {
+        type_vars(p, &mut vs);
+    }
+    match &c.fields {
+        ConFields::Positional(fs) => {
+            for f in fs {
+                type_vars(&f.ty, &mut vs);
+            }
+        }
+        ConFields::Record(groups) => {
+            for (_, f) in groups {
+                type_vars(&f.ty, &mut vs);
+            }
+        }
+    }
+    if let Some(res) = &c.gadt_result {
+        type_vars(res, &mut vs);
+    }
+    vs
+}
+
 /// The type variables mentioned by a type, in order of first occurrence.
 pub fn type_vars(t: &Type, out: &mut Vec<String>) {
     match t {
@@ -489,8 +533,10 @@ fn instance(checker: &Checker, dd: &DataDecl, class: &QName, decls: Vec<Decl>, d
     }
     Decl::Instance(InstDecl {
         overlap: None,
+        binders: Vec::new(),
         context,
         head,
+        unboxed_head: false,
         decls,
         loc,
     })
@@ -1130,7 +1176,7 @@ fn derive_generic(checker: &mut Checker, dd: &DataDecl, one: bool) -> Vec<Decl> 
     );
     let rep_inst = Decl::TypeInstance {
         name: QName { qual: Some(G.into()), name: if one { "Rep1" } else { "Rep" }.into() },
-        equation: crate::syntax::ast::TypeEquation { args: vec![head], rhs: rep, loc },
+        equation: crate::syntax::ast::TypeEquation { args: vec![head], erased_kind_variables: Vec::new(), rhs: rep, loc },
         loc,
     };
     // The conversions.
@@ -1609,7 +1655,7 @@ fn mentions(t: &Type, v: &str) -> bool {
         Type::List(e, _) => mentions(e, v),
         Type::Tuple(ts, _) => ts.iter().any(|x| mentions(x, v)),
         Type::Sig(x, _) => mentions(x, v),
-        Type::Forall(bs, body) => !bs.iter().any(|b| b.name == v) && mentions(body, v),
+        Type::Forall { binders: bs, body, .. } => !bs.iter().any(|b| b.name == v) && mentions(body, v),
         Type::Qual(ctx, body) => ctx.iter().any(|c| mentions(c, v)) || mentions(body, v),
         _ => false,
     }
@@ -1629,7 +1675,7 @@ fn map_fn(checker: &mut Checker, t: &Type, last: &str, f: &str, loc: Loc) -> Opt
         Type::Var(n, _) if n == last => Some(local(f, loc)),
         // A polymorphic field (`forall m. Monad m => StateT s m a`): mapped at each instance;
         // the constructor's argument is checked at the polymorphic type again.
-        Type::Forall(_, body) | Type::Qual(_, body) => map_fn(checker, body, last, f, loc),
+        Type::Forall { body, .. } | Type::Qual(_, body) => map_fn(checker, body, last, f, loc),
         Type::App(g, arg) if !mentions(g, last) => {
             let inner = map_fn(checker, arg, last, f, loc)?;
             Some(app(base_var("fmap", loc), vec![inner]))
@@ -1678,7 +1724,7 @@ fn co_map_fn(checker: &mut Checker, t: &Type, last: &str, f: &str, loc: Loc) -> 
         return None;
     }
     match t {
-        Type::Forall(_, body) | Type::Qual(_, body) => co_map_fn(checker, body, last, f, loc),
+        Type::Forall { body, .. } | Type::Qual(_, body) => co_map_fn(checker, body, last, f, loc),
         // `h :: A[b] -> B[b]` becomes `\x -> co_B (h (map_A x)) :: A[a] -> B[a]`.
         Type::Fun(a, b) => {
             let h = checker.fresh_name("h");

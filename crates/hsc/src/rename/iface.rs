@@ -51,7 +51,7 @@ pub struct Entity {
     pub global: GName,
     /// For types and classes: constructors and fields, or methods.
     pub subs: Vec<Entity>,
-    /// For constructors: record field names in declaration order.
+    /// For constructors and record pattern synonyms: field names in declaration order.
     pub fields: Vec<String>,
 }
 

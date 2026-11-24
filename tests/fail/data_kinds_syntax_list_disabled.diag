@@ -1,0 +1,2 @@
+data_kinds_syntax_list_disabled.hs:5:17: error:
+A promoted list requires DataKinds

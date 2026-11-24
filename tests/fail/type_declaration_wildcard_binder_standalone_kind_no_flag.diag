@@ -1,0 +1,2 @@
+type_declaration_wildcard_binder_standalone_kind_no_flag.hs:4:8: error
+A wildcard ‘_’ binder requires TypeAbstractions

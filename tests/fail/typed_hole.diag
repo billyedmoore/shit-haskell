@@ -1,0 +1,3 @@
+typed_hole.hs:1:17: error
+Found hole: _ :: [Char]
+In argument 1 of ‘putStrLn’

@@ -1,0 +1,4 @@
+warning: [-Wmissing-export-lists]
+Module ‘Main’ has no explicit export list
+warning: [-Wmissing-import-lists]
+Unqualified import of ‘Data.Maybe’ has no explicit import list

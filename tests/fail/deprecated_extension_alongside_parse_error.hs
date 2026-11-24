@@ -1,0 +1,2 @@
+{-# LANGUAGE TypeInType #-}
+main = let

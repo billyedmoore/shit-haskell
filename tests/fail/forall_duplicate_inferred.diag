@@ -1,0 +1,3 @@
+forall_duplicate_inferred.hs:3:17: error:
+Duplicate binder ‘a’ in this ‘forall’
+The first binder is at line 3, column 14.

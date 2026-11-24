@@ -1,0 +1,3 @@
+traditional_scope_existential_unbound.hs:2:26: error:
+Not in scope: type variable ‘missing’
+Bind it in the datatype header or in the ‘forall’ for constructor ‘T’.

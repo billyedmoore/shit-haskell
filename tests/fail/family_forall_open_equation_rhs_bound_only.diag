@@ -1,0 +1,2 @@
+family_forall_open_equation_rhs_bound_only.hs:5:24: error
+Type variable ‘b’ is bound by ‘forall’ but does not occur in a family pattern

@@ -1,0 +1,3 @@
+error: [-Wmissing-methods]
+Incomplete instance ‘Choose Int’
+Implement ‘cost’ or ‘estimate’.

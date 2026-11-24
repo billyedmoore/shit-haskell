@@ -1,0 +1,3 @@
+constructor_scope_gadt_empty_forall.hs:3:17: error:
+Not in scope: type variable ‘missing’
+Bind it in the ‘forall’ for constructor ‘T’.

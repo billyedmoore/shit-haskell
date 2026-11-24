@@ -1,0 +1,2 @@
+missing_signature_warning.hs:4:1: warning: [-Wmissing-signatures]
+Top-level binding with no type signature: answer :: Bool

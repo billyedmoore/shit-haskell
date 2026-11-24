@@ -1,0 +1,2 @@
+Could not deduce ‘Needs a’ from the class method and instance contexts
+Required by class:  [a] -> Bool

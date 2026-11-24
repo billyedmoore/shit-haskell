@@ -1,0 +1,3 @@
+class_extension_imported_instance_disabled.hs:5:10: error:
+Instance head supplies 2 class parameters.
+Enable MultiParamTypeClasses

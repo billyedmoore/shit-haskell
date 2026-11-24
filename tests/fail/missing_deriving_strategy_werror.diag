@@ -1,0 +1,3 @@
+missing_deriving_strategy_werror.hs:3:16: error: [-Wmissing-deriving-strategies]
+No deriving strategy specified
+Enable DerivingStrategies to write an explicit strategy.

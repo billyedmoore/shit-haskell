@@ -1,0 +1,2 @@
+explicit_binder_parenthesized_does_not_scope.hs:4:7: error:
+Couldn't match expected type ‘a1’ with actual type ‘a’

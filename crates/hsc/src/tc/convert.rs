@@ -1,7 +1,7 @@
 //! Conversion of renamed syntactic types into checker types and schemes.
 
 use super::types::{Pred, Scheme, Ty};
-use super::{Checker, TR};
+use super::{Checker, TcError, TR};
 use crate::syntax::ast::{Lit, QName, Type};
 
 /// The global name of a renamed type-level name, e.g. `Prelude.Int` or `Builtin.[]`.
@@ -13,6 +13,51 @@ pub fn global_tycon_name(q: &QName) -> String {
 }
 
 impl Checker {
+    /// A visible type argument uses enclosing binders and its own wildcards.
+    pub(super) fn visible_type_argument(&mut self, arg: &Type) -> TR<Ty> {
+        let mut wildcards = Vec::new();
+        if let Some((name, loc)) = arg.first_unbound_variable(|name, _| {
+            if self.scoped.iter().any(|(binder, _)| binder == name)
+                || self.bound_scope.iter().any(|(binder, _)| binder == name)
+            {
+                return true;
+            }
+            if self.named_wildcards && name.starts_with('_') {
+                if !wildcards.iter().any(|wildcard| wildcard == name) {
+                    wildcards.push(name.to_owned());
+                }
+                return true;
+            }
+            false
+        }) {
+            return Err(TcError { loc, msg: format!("Not in scope: type variable ‘{name}’") });
+        }
+
+        let mark = self.scoped.len();
+        for name in wildcards {
+            let wildcard = self.meta();
+            self.scoped.push((name, wildcard));
+        }
+        let loc = std::mem::replace(&mut self.loc, arg.loc());
+        let ty = self.convert_type(arg, &mut Vec::new());
+        self.scoped.truncate(mark);
+        self.loc = loc;
+        let ty = ty?;
+        if !self.impredicative_types {
+            if let Some(poly) = ty.first_polymorphic_component() {
+                let what = match poly {
+                    Ty::Forall(ids, _, _) if !ids.is_empty() => "polymorphic",
+                    _ => "qualified",
+                };
+                return Err(TcError {
+                    loc: arg.loc(),
+                    msg: format!("A {what} visible type argument requires ImpredicativeTypes"),
+                });
+            }
+        }
+        Ok(ty)
+    }
+
     /// Converts a type. Type variables are looked up in (or appended to) `tvs`, so that
     /// the caller decides how they are quantified.
     pub fn convert_type(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Ty> {
@@ -73,7 +118,7 @@ impl Checker {
             // A nested forall is approximated by quantifying its variables at the
             // enclosing signature. This accepts rank-N programs whose uses are
             // instantiation-compatible, such as `runST`, without checking them rank-N.
-            Type::Forall(binders, body) => {
+            Type::Forall { binders, body, .. } => {
                 // A nested polymorphic type: its variables are bound here, not by the signature.
                 let mut ids = Vec::with_capacity(binders.len());
                 let mark = self.bound_scope.len();
@@ -139,7 +184,7 @@ impl Checker {
     pub fn convert_context_item(&mut self, t: &Type, tvs: &mut Vec<String>) -> TR<Vec<Pred>> {
         // QuantifiedConstraints: `forall x. ctx => C t` or `ctx => C t` in a context is a
         // predicate holding that polymorphic/implication type (see `solve::QUANTIFIED_CLASS`).
-        if let Type::Forall(..) | Type::Qual(..) = t {
+        if let Type::Forall { .. } | Type::Qual(..) = t {
             let ty = match self.convert_type(t, tvs)? {
                 f @ Ty::Forall(..) => f,
                 Ty::Qual(preds, body) => Ty::Forall(Vec::new(), preds, body),
@@ -151,14 +196,34 @@ impl Checker {
         while let Type::App(f, _) = head {
             head = f;
         }
-        if let Type::Con(q, _) = head {
-            let name = global_tycon_name(q);
-            if !q.name.starts_with('?') && self.env.synonyms.contains_key(&name) {
-                let ty = self.convert_type(t, tvs)?;
-                return Ok(ty_to_preds(&ty));
+        let synonym = matches!(head, Type::Con(q, _) if !q.name.starts_with('?') && self.env.synonyms.contains_key(&global_tycon_name(q)));
+        let preds = if synonym {
+            ty_to_preds(&self.convert_type(t, tvs)?)
+        } else {
+            vec![self.convert_pred(t, tvs)?]
+        };
+        for pred in &preds {
+            if pred.class != "Builtin.()" && self.env.data_decls.contains_key(&pred.class) {
+                return Err(TcError {
+                    loc: t.loc(),
+                    msg: format!("Expected a constraint, but ‘{}’ is a type", self.show_pred(pred)),
+                });
+            }
+            if let Some(info) = self.class(&pred.class) {
+                if pred.args.len() != info.nparams as usize {
+                    let n = info.nparams;
+                    let plural = if n == 1 { "" } else { "s" };
+                    return Err(TcError {
+                        loc: t.loc(),
+                        msg: format!(
+                            "Class ‘{}’ expects {n} type argument{plural}, but has been given {}",
+                            super::types::unqualify(&pred.class), pred.args.len()
+                        ),
+                    });
+                }
             }
         }
-        Ok(vec![self.convert_pred(t, tvs)?])
+        Ok(preds)
     }
 
     /// Converts a context item such as `Show a` into a predicate.
@@ -203,7 +268,7 @@ impl Checker {
         let mut cur = t;
         loop {
             match cur {
-                Type::Forall(binders, body) => {
+                Type::Forall { binders, body, .. } => {
                     for b in binders {
                         tvar_index(tvs, &b.name);
                     }
@@ -224,17 +289,56 @@ impl Checker {
         }
     }
 
+    pub(super) fn check_signature_scope(&self, t: &Type, fixed: &[String]) -> TR<()> {
+        if matches!(t, Type::Forall { parenthesized: false, .. }) {
+            let in_scope = |name: &str, outer_binder_kind: bool| {
+                fixed.iter().any(|binder| binder == name)
+                    || self.scoped.iter().any(|(binder, _)| binder == name)
+                    || self.bound_scope.iter().any(|(binder, _)| binder == name)
+                    || (self.named_wildcards && !outer_binder_kind && name.starts_with('_'))
+            };
+            if let Some((name, loc)) = t.first_unbound_variable(in_scope) {
+                return Err(TcError {
+                    loc,
+                    msg: format!("Not in scope: type variable ‘{name}’\nBind it before using it in this explicitly quantified type."),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The scheme of a signature. Free type variables are quantified in order of appearance.
     pub fn sig_scheme(&mut self, t: &Type, fixed: &[String]) -> TR<Scheme> {
+        self.check_signature_scope(t, fixed)?;
         let mut tvs: Vec<String> = fixed.to_vec();
         let (preds, ty) = self.sig_parts(t, &mut tvs)?;
         Ok(Scheme {
             nvars: tvs.len() as u32,
+            visible: visible_signature_vars(t, &tvs, fixed.len()),
             names: tvs,
             preds,
             ty,
         })
     }
+}
+
+/// Quantified variables introduced by a signature can be supplied unless braced.
+pub(super) fn visible_signature_vars(t: &Type, vars: &[String], fixed: usize) -> Vec<u32> {
+    let mut inferred = Vec::new();
+    let mut current = t;
+    loop {
+        match current {
+            Type::Forall { binders, body, .. } => {
+                inferred.extend(binders.iter().filter(|binder| binder.inferred).map(|binder| &binder.name));
+                current = body;
+            }
+            Type::Qual(_, body) => current = body,
+            _ => break,
+        }
+    }
+    vars.iter().enumerate().filter_map(|(index, name)| {
+        (index < fixed || !inferred.contains(&name)).then_some(index as u32)
+    }).collect()
 }
 
 /// The index of a type variable name, appending it if new.

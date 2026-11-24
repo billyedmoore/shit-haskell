@@ -1,0 +1,2 @@
+invisible_binder_kind_closed_plain.hs:4:15: error
+needs an explicit kind signature

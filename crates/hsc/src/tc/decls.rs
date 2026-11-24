@@ -1,13 +1,14 @@
 //! Module-level declarations: types, constructors, classes, instances, foreign imports.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::convert::{global_tycon_name, tvar_index};
+use super::bind::explicit_binders;
+use super::convert::{global_tycon_name, tvar_index, visible_signature_vars};
 use super::env::{ClassInfo, InstInfo, Synonym, TyConInfo};
-use super::types::{subst_gen, Pred, Scheme, Ty};
+use super::types::{subst_gen, subst_gen_pred, Pred, Scheme, Ty};
 use super::{count_args, Checker, Given, TcError, Wanted, TR};
 use crate::core::{Alt, Core, TopBind};
-use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Module, QName, Type};
+use crate::syntax::ast::{ClassDecl, ConFields, DataDecl, Decl, InstDecl, Loc, Minimal, Module, QName, Type};
 
 impl Checker {
     /// Compare quantified heads independently of each registration path's variable order.
@@ -48,6 +49,24 @@ impl Checker {
                 && old.ctx.len() == ctx.len()
                 && old.ctx.iter().zip(ctx).all(|(a, b)| a.class == b.class && Self::alpha_heads(&a.args, &b.args, &mut lr, &mut rl))
         })
+    }
+
+    fn check_duplicate_instance(&self, class: &str, head: &[Ty], kinds: &[Option<String>], declared: &HashMap<String, Loc>) -> TR<()> {
+        let reps = self.instance_reps(head, kinds);
+        let duplicate = self.env.instances.for_class(class).find(|old| {
+            // The implementation may repeat an instance declared in its own boot interface.
+            declared.contains_key(&old.dict)
+                && self.instance_reps(&old.head, &old.kinds) == reps
+                && Self::alpha_heads(&old.head, head, &mut HashMap::new(), &mut HashMap::new())
+        });
+        if let Some(previous) = duplicate.and_then(|old| declared.get(&old.dict)) {
+            let head = Pred { class: class.into(), args: head.to_vec() };
+            return self.err(format!(
+                "Duplicate instance declaration for ‘{}’\nThe previous declaration is at line {}, column {}.",
+                self.show_pred(&head), previous.line, previous.col
+            ));
+        }
+        Ok(())
     }
 
     fn fresh_derived_dict(&mut self, strategy: &str, class: &str, tycon: &str) -> String {
@@ -152,15 +171,22 @@ impl Checker {
     /// Checks a renamed module and returns its Core bindings. The environment is
     /// extended with everything the module defines.
     pub fn check_module(&mut self, m: &Module) -> TR<Vec<TopBind>> {
+        self.check_module_with_main(m, None)
+    }
+
+    pub(crate) fn check_module_with_main(&mut self, m: &Module, main: Option<(&str, &str, Loc)>) -> TR<Vec<TopBind>> {
         self.module = m.name.clone();
         self.coercions.clear();
         // Equalities a previous module left stuck are of no use to this one.
         self.deferred_eqs.clear();
         self.closed_locals.clear();
         self.dict_counter = 0;
+        self.numeric_defaults = None;
+        self.warnings.clear();
         let decls = &m.decls;
 
         // 0. Kinds of this module's type constructors.
+        check_type_synonym_cycles(&m.name, decls)?;
         self.check_kinds(decls)?;
 
         // Type families: declared first, so that equations and uses can refer to them.
@@ -173,9 +199,9 @@ impl Checker {
             }
         }
         for d in &family_decls {
-            if let Decl::TypeFamily { name, params, equations, injective, .. } = d {
+            if let Decl::TypeFamily { name, params, equations, data, injective, .. } = d {
                 let key = format!("{}.{name}", self.module);
-                self.register_family(&key, params.len(), equations.is_some());
+                self.register_family(&key, params.len(), equations.is_some(), *data);
                 let positions: Vec<usize> =
                     params.iter().enumerate().filter(|(_, p)| injective.contains(&p.name)).map(|(i, _)| i).collect();
                 if let Some(f) = self.env.families.get_mut(&key) {
@@ -191,7 +217,7 @@ impl Checker {
         for _ in 0..=synonym_decls.len() {
             let mut changed = false;
             for d in &synonym_decls {
-                if let Decl::TypeSyn { name, tyvars, rhs, loc } = d {
+                if let Decl::TypeSyn { name, tyvars, rhs, loc, .. } = d {
                     self.loc = *loc;
                     let mut tvs: Vec<String> = tyvars.iter().map(|t| t.name.clone()).collect();
                     let rhs_ty = self.convert_type(rhs, &mut tvs)?;
@@ -208,6 +234,7 @@ impl Checker {
                 break;
             }
         }
+        self.warn_kind_constructors(&m.kind_annotations);
         for d in decls {
             if let Decl::Data(dd) = d {
                 let cons: Vec<String> = dd.cons.iter().map(|c| format!("{}.{}", self.module, c.name)).collect();
@@ -244,7 +271,17 @@ impl Checker {
         }
         for (d, default) in instance_eqs {
             if let Decl::TypeInstance { name, equation, .. } = d {
-                self.add_family_equation_as(&global_tycon_name(name), &equation.args, &equation.rhs, equation.loc, default)?;
+                let key = global_tycon_name(name);
+                if self.env.families.get(&key).is_some_and(|family| family.closed) {
+                    return Err(TcError {
+                        loc: equation.loc,
+                        msg: format!(
+                            "Closed type family ‘{}’ cannot have a separate instance\nPut the equation inside the family’s ‘where’ block.",
+                            name.name,
+                        ),
+                    });
+                }
+                self.add_family_equation_as(&key, &equation.args, &equation.rhs, equation.loc, default)?;
             }
         }
 
@@ -273,16 +310,27 @@ impl Checker {
                 class_decls.push(cd);
             }
         }
+        if !self.undecidable_superclasses {
+            self.check_superclass_cycles(&class_decls)?;
+        }
         // Newtype deriving and standalone deriving, once this module's classes are known.
+        let mut instance_locs = HashMap::new();
         for d in decls {
             if let Decl::Data(dd) = d {
-                self.register_newtype_deriving(dd)?;
+                self.register_newtype_deriving(dd, &mut instance_locs)?;
             }
         }
         for d in decls {
             if let Decl::Deriving(sd) = d {
                 self.loc = sd.loc;
-                derived.extend(self.standalone_derive(sd)?);
+                let mut instances = self.standalone_derive(sd, &mut instance_locs)?;
+                for decl in &mut instances {
+                    if let Decl::Instance(id) = decl {
+                        id.unboxed_head = sd.unboxed_head;
+                        id.loc = sd.loc;
+                    }
+                }
+                derived.extend(instances);
             }
         }
         // The associated type equations of derived instances (`Rep T` of a derived Generic).
@@ -309,14 +357,14 @@ impl Checker {
         let mut derived_insts: Vec<(usize, DataDecl)> = Vec::new();
         for d in decls {
             if let Decl::Instance(id) = d {
-                self.instance_header(id)?;
+                self.instance_header(id, &mut instance_locs)?;
                 all_insts.push(id.clone());
             }
         }
         for (i, d) in derived.iter().enumerate() {
             if let Decl::Instance(id) = d {
                 let before = self.env.instances.len();
-                self.instance_header(id)?;
+                self.instance_header(id, &mut instance_locs)?;
                 all_insts.push(id.clone());
                 if let Some(dd) = derived_from.get(i).filter(|_| self.env.instances.len() > before) {
                     derived_insts.push((self.env.instances.len() - 1, dd.clone()));
@@ -324,6 +372,9 @@ impl Checker {
             }
         }
         self.reduce_derived_contexts(&derived_insts);
+        if let Some(Decl::Default { types, loc }) = decls.iter().find(|d| matches!(d, Decl::Default { .. })) {
+            self.check_default_types(types, *loc)?;
+        }
         // 6. Top-level values.
         let is_rule = |d: &Decl| matches!(d, Decl::Fun { name, .. } if name.starts_with(crate::rename::RULE_PREFIX));
         let value_decls: Vec<Decl> = decls
@@ -407,17 +458,21 @@ impl Checker {
             }
         }
 
-        // `main` is an IO action: a type the monomorphism restriction left open (`main = return
-        // ()`) is fixed to `IO t` before the remaining constraints are solved, as GHC checks it.
-        if self.module == "Main" {
-            if let Some(scheme) = self.vars.get("Main.main").cloned() {
-                let ty = self.metas.zonk(&scheme.ty);
-                let mut ms = Vec::new();
-                self.metas.free_metas(&ty, &mut ms);
-                if !ms.is_empty() {
-                    let t = self.meta();
-                    let _ = self.unify_at(&ty, &Ty::app(Ty::con("GHC.Types.IO"), t));
-                }
+        // Check the entry action before defaulting, so e.g. the monomorphic binding
+        // `main = pure ()` fixes its applicative to IO.
+        if let Some((key, name, loc)) = main {
+            self.loc = loc;
+            let Some(scheme) = self.lookup_var(key) else {
+                return self.err(format!("The IO action ‘{name}’ is not defined in module ‘{}’", m.name));
+            };
+            let (body, ty) = self.inst_var(key, &scheme, loc);
+            let expected = Ty::app(Ty::con("GHC.Types.IO"), self.meta());
+            self.unify_at(&ty, &expected).map_err(|mut err| {
+                err.msg.push_str(&format!("\nWhen checking the type of the IO action ‘{name}’"));
+                err
+            })?;
+            if key != "Main.main" || !scheme.preds.is_empty() {
+                self.out.push(TopBind { name: crate::core::MAIN_ENTRY.into(), body });
             }
         }
 
@@ -471,6 +526,7 @@ impl Checker {
 
         // Field types per constructor, with occurrence names of record fields.
         let mut per_con: Vec<(String, Vec<String>, Vec<Ty>, Scheme)> = Vec::new();
+        let mut record_fields = HashMap::new();
         for (tag, c) in dd.cons.iter().enumerate() {
             self.loc = c.loc;
             let mut vars = tvs.clone();
@@ -489,6 +545,23 @@ impl Checker {
                     for (names, f) in groups {
                         let t = self.convert_type(&f.ty, &mut vars)?;
                         for nm in names {
+                            // In an ordinary datatype the constructors share the header's
+                            // type variables. Repeated field labels must give the same type.
+                            if c.gadt_result.is_none() && c.exist.is_empty() {
+                                if let Some((first_con, first_ty)) = record_fields.get(nm) {
+                                    let a = self.normalize(first_ty);
+                                    let b = self.normalize(&t);
+                                    if simple_record_type(&a, n) && simple_record_type(&b, n) && a != b {
+                                        let field = crate::rename::iface::field_label(nm);
+                                        return self.err(format!(
+                                            "Constructors ‘{first_con}’ and ‘{}’ give different types for field ‘{field}’\n‘{first_con}’ uses ‘{}’, while ‘{}’ uses ‘{}’.",
+                                            c.name, self.show(&a), c.name, self.show(&b)
+                                        ));
+                                    }
+                                } else {
+                                    record_fields.insert(nm.clone(), (c.name.as_str(), t.clone()));
+                                }
+                            }
                             occs.push(nm.clone());
                             field_tys.push(t.clone());
                         }
@@ -496,7 +569,30 @@ impl Checker {
                 }
             }
             let res = match &c.gadt_result {
-                Some(t) => self.convert_type(t, &mut vars)?,
+                Some(t) => {
+                    let result = self.convert_type(t, &mut vars)?;
+                    let (head, _) = result.split_apps();
+                    // A data-family instance has a synthetic representation name. Its
+                    // constructor returns the public family application instead.
+                    if !dd.name.starts_with("R:") && !matches!(head, Ty::Con(name) if name == &tycon) {
+                        let parent = Ty::Con(tycon.clone());
+                        let expected = self.show(&parent);
+                        let (expected, actual) = if expected == self.show(head) {
+                            let show = |ty| super::types::show_ty_qualified(&self.metas, ty);
+                            (show(&parent), show(&result))
+                        } else {
+                            (expected, self.show(&result))
+                        };
+                        return Err(TcError {
+                            loc: t.loc(),
+                            msg: format!(
+                                "Constructor ‘{}’ must return its parent type\nExpected a result headed by ‘{expected}’\nActual result: ‘{actual}’",
+                                c.name
+                            ),
+                        });
+                    }
+                    result
+                }
                 None => result_head.clone(),
             };
             let mut preds = Vec::new();
@@ -504,9 +600,15 @@ impl Checker {
                 preds.extend(self.convert_context_item(ctx, &mut vars)?);
             }
             let name = format!("{}.{}", self.module, c.name);
+            let visible_names = if c.gadt_result.is_some() { super::derive::con_free_vars(c) } else { vars.clone() };
+            let visible = visible_names.iter()
+                .filter(|name| !c.exist.iter().any(|binder| binder.inferred && binder.name.as_str() == name.as_str()))
+                .filter_map(|name| vars.iter().position(|var| var == name).map(|i| i as u32))
+                .collect();
             let scheme = Scheme {
                 nvars: vars.len() as u32,
                 names: vars,
+                visible,
                 preds,
                 ty: Ty::funs(field_tys.clone(), res),
             };
@@ -565,6 +667,7 @@ impl Checker {
                     Scheme {
                         nvars: n,
                         names: tvs.clone(),
+                        visible: (0..n).collect(),
                         preds: Vec::new(),
                         ty: Ty::fun(result_head.clone(), field_ty),
                     },
@@ -574,6 +677,78 @@ impl Checker {
                     self.env.values[&format!("{}.{f}", self.module)].clone(),
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn check_default_types(&mut self, types: &[Type], loc: Loc) -> TR<()> {
+        let num = if self.env.classes.contains_key("GHC.Internal.Num.Num") { "GHC.Internal.Num.Num" } else { "Base.Num" };
+        let string = "GHC.Internal.Data.String.IsString";
+        let mut classes = vec![num];
+        if self.overloaded_strings {
+            classes.push(string);
+        }
+        classes.retain(|class| self.env.classes.contains_key(*class));
+
+        let mut defaults = Vec::with_capacity(types.len());
+        for t in types {
+            self.loc = t.loc();
+            let mut vars = Vec::new();
+            let ty = self.convert_type(t, &mut vars)?;
+            if let Some(var) = vars.first() {
+                return self.err(format!("Type variable ‘{var}’ is not in scope in this default declaration"));
+            }
+            let ty = self.normalize(&ty);
+            if !self.extended_default_rules && !classes.is_empty() && !classes.iter().any(|class| {
+                self.find_instance(&Pred { class: (*class).into(), args: vec![ty.clone()] }).is_some()
+            }) {
+                self.loc = loc;
+                let names: Vec<_> = classes.iter().map(|class| format!("‘{}’", super::types::unqualify(class))).collect();
+                return self.err(format!("The default type ‘{}’ is not an instance of {}", self.show(&ty), names.join(" or ")));
+            }
+            defaults.push(ty);
+        }
+        self.numeric_defaults = Some(defaults);
+        Ok(())
+    }
+
+    fn check_superclass_cycles(&self, decls: &[&ClassDecl]) -> TR<()> {
+        let keys: Vec<_> = decls.iter().map(|cd| format!("{}.{}", self.module, cd.name)).collect();
+        let names: HashMap<_, _> = keys.iter().enumerate().map(|(index, key)| (key.as_str(), index)).collect();
+        let mut edges = vec![Vec::new(); decls.len()];
+        for (index, name) in keys.iter().enumerate() {
+            let Some(info) = self.env.classes.get(name) else { continue };
+            for pred in &info.supers {
+                if pred.class == super::convert::CONSTRAINT_VAR || self.env.families.contains_key(&pred.class) {
+                    let cd = decls[index];
+                    let dependency = if pred.class == super::convert::CONSTRAINT_VAR {
+                        "a type variable".into()
+                    } else {
+                        format!("type family ‘{}’", super::types::unqualify(&pred.class))
+                    };
+                    return Err(TcError {
+                        loc: cd.loc,
+                        msg: format!(
+                            "Potential superclass cycle for ‘{}’ through {dependency}\nEnable UndecidableSuperClasses to permit this constraint.",
+                            cd.name
+                        ),
+                    });
+                }
+                if let Some(other) = names.get(pred.class.as_str()) {
+                    edges[index].push(*other);
+                }
+            }
+        }
+        if let Some(group) = cyclic_components(&edges).next() {
+            let first = decls[group[0]];
+            let classes: Vec<_> = group.iter().map(|&i| format!("‘{}’", decls[i].name)).collect();
+            return Err(TcError {
+                loc: first.loc,
+                msg: format!(
+                    "Superclass cycle involving {}\nEnable UndecidableSuperClasses to permit cyclic superclass constraints.",
+                    classes.join(", ")
+                ),
+            });
         }
         Ok(())
     }
@@ -594,10 +769,12 @@ impl Checker {
             args: (0..nparams).map(Ty::Gen).collect(),
         };
 
+        let class_scope = crate::syntax::ast::TyVarBind::declaration_scope(&cd.tyvars, &cd.erased_kind_variables);
         let mut methods: Vec<(String, Scheme)> = Vec::new();
         for d in &cd.decls {
             if let Decl::Sig { names, ty, loc } = d {
                 self.loc = *loc;
+                self.check_signature_scope(ty, &class_scope)?;
                 for name in names {
                     let mut mtvs = class_vars.clone();
                     let (own_preds, mty) = self.sig_parts(ty, &mut mtvs)?;
@@ -608,6 +785,7 @@ impl Checker {
                         key,
                         Scheme {
                             nvars: mtvs.len() as u32,
+                            visible: visible_signature_vars(ty, &mtvs, nparams as usize),
                             names: mtvs,
                             preds,
                             ty: mty,
@@ -625,6 +803,38 @@ impl Checker {
                 defaults.insert(format!("{}.{name}", self.module), format!("{}.$dm{name}", self.module));
             }
         }
+        let required = methods.iter()
+            .filter(|(key, _)| !defaults.contains_key(key))
+            .map(|(key, _)| super::types::unqualify(key));
+        let minimal = if let Some((formula, loc)) = &cd.minimal {
+            if let Some((name, loc)) = formula.unknown_method(&|occ| {
+                occ == "()" || methods.iter().any(|(key, _)| super::types::unqualify(key) == occ)
+            }) {
+                return Err(TcError {
+                    loc,
+                    msg: format!("‘{name}’ is not a method of class ‘{}’", cd.name),
+                });
+            }
+            if !self.boot {
+                let omitted: Vec<_> = required
+                    .filter(|method| formula.is_met(&|name| name != *method))
+                    .map(|method| format!("‘{method}’"))
+                    .collect();
+                if !omitted.is_empty() {
+                    self.warnings.push((
+                        *loc,
+                        format!(
+                            "The MINIMAL pragma for ‘{}’ allows omitting methods without defaults\nRequire these methods in each alternative: {}.",
+                            cd.name, omitted.join(", ")
+                        ),
+                        crate::diagnostic::Warning::IncompleteMinimal,
+                    ));
+                }
+            }
+            formula.clone()
+        } else {
+            Minimal::All(required.map(|method| Minimal::Method(method.into(), cd.loc)).collect())
+        };
         // The dictionary constructor, and a selector for each method.
         self.env.tycons.insert(
             class_key.clone(),
@@ -667,6 +877,7 @@ impl Checker {
         for d in &cd.decls {
             if let Decl::DefaultSig { names, ty, loc } = d {
                 self.loc = *loc;
+                self.check_signature_scope(ty, &class_scope)?;
                 for name in names {
                     let mut mtvs = class_vars.clone();
                     let (own_preds, mty) = self.sig_parts(ty, &mut mtvs)?;
@@ -674,7 +885,13 @@ impl Checker {
                     preds.extend(own_preds);
                     default_schemes.insert(
                         format!("{}.{name}", self.module),
-                        Scheme { nvars: mtvs.len() as u32, names: mtvs, preds, ty: mty },
+                        Scheme {
+                            nvars: mtvs.len() as u32,
+                            visible: visible_signature_vars(ty, &mtvs, nparams as usize),
+                            names: mtvs,
+                            preds,
+                            ty: mty,
+                        },
                     );
                 }
             }
@@ -688,6 +905,7 @@ impl Checker {
             default_schemes,
             dict_con,
             fundeps,
+            minimal,
         };
         self.add_class_info(info);
         Ok(())
@@ -722,9 +940,15 @@ impl Checker {
                         })?,
                 };
                 let dm = format!("{}.$dm{name}", self.module);
-                // The class's variables scope over its default methods.
-                self.explicit_sigs.insert(dm.clone());
-                let core = self.check_method(clauses, &scheme, &dm, *loc)?;
+                let has_default_signature = info.default_schemes.contains_key(&mkey);
+                let signature = cd.decls.iter().find_map(|decl| match decl {
+                    Decl::DefaultSig { names, ty, .. } if has_default_signature && names.contains(name) => Some(ty),
+                    Decl::Sig { names, ty, .. } if !has_default_signature && names.contains(name) => Some(ty),
+                    _ => None,
+                });
+                // The class parameters and the chosen signature's explicit binders are in scope.
+                let scoped_binders = info.nparams as usize + signature.map_or(0, explicit_binders);
+                let core = self.check_method(clauses, &scheme, &dm, *loc, scoped_binders)?;
                 self.out.push(TopBind { name: dm, body: core });
             }
         }
@@ -733,8 +957,10 @@ impl Checker {
 
     /// Checks a method implementation against its full scheme. The class predicate is
     /// the first predicate, so the result takes the class dictionary first.
-    fn check_method(&mut self, clauses: &[crate::syntax::ast::Clause], scheme: &Scheme, name: &str, loc: crate::syntax::ast::Loc) -> TR<Core> {
-        let binds = self.check_signed(name, clauses, scheme, loc)?;
+    fn check_method(
+        &mut self, clauses: &[crate::syntax::ast::Clause], scheme: &Scheme, name: &str, loc: Loc, scoped_binders: usize,
+    ) -> TR<Core> {
+        let binds = self.check_signed(name, clauses, scheme, loc, scoped_binders)?;
         Ok(binds.into_iter().next().expect("one binding").1)
     }
 
@@ -825,14 +1051,8 @@ impl Checker {
     }
 
     fn foreign_import(&mut self, name: &str, entity: Option<&str>, ty: &Type, is_prim: bool) -> TR<()> {
-        let mut tvs = Vec::new();
-        let (preds, body) = self.sig_parts(ty, &mut tvs)?;
-        let scheme = Scheme {
-            nvars: tvs.len() as u32,
-            names: tvs,
-            preds,
-            ty: body.clone(),
-        };
+        let scheme = self.sig_scheme(ty, &[])?;
+        let body = scheme.ty.clone();
         let key = format!("{}.{name}", self.module);
         // The C entity: an optional `static`, an optional header (`HsBase.h`), then the symbol.
         let capi = entity.is_some_and(|e| e.split_whitespace().any(|w| w == "%capi"));
@@ -842,11 +1062,22 @@ impl Checker {
         let header = entity
             .and_then(|e| e.split_whitespace().find(|w| w.ends_with(".h")).map(str::to_string))
             .unwrap_or_default();
-        let value = entity.is_some_and(|e| e.split_whitespace().any(|w| w == "value"));
+        // Only capi recognizes the marker before a symbol. A bare `value` can be
+        // the symbol itself.
+        let value = capi && entity.is_some_and(|e| {
+            let mut words = e.split_whitespace().rev();
+            words.next().is_some_and(|symbol| !symbol.starts_with('&')) && words.next() == Some("value")
+        });
+        if value && (!scheme.preds.is_empty() || self.normalize(&body).as_fun().is_some()) {
+            self.loc = ty.loc();
+            return self.err(format!(
+                "The C value import ‘{name}’ cannot have a function type\nRemove ‘value’ to import a function, or declare the type of the C value."
+            ));
+        }
         let prim = entity
             .and_then(|e| {
                 e.split_whitespace()
-                    .filter(|w| *w != "static" && *w != "%capi" && *w != "%unsafe" && *w != "%interruptible" && *w != "value" && !w.ends_with(".h"))
+                    .filter(|w| *w != "static" && *w != "%capi" && *w != "%unsafe" && *w != "%interruptible" && !w.ends_with(".h"))
                     .last()
                     .map(str::to_string)
             })
@@ -949,7 +1180,7 @@ impl Checker {
     }
 
     /// Registers an instance: its context, head and dictionary name.
-    fn instance_header(&mut self, id: &InstDecl) -> TR<()> {
+    fn instance_header(&mut self, id: &InstDecl, declared: &mut HashMap<String, Loc>) -> TR<()> {
         self.loc = id.loc;
         let (class_name, args) = instance_head_parts(&id.head).ok_or_else(|| TcError {
             loc: id.loc,
@@ -959,19 +1190,65 @@ impl Checker {
             Type::Con(q, _) => global_tycon_name(q),
             _ => return self.err("Malformed instance head"),
         };
-        if !self.env.classes.contains_key(&class) {
-            if id.overlap.as_deref() == Some(super::derive::DERIVED_MARK) {
+        let derived = super::derive::is_derived(id);
+        let Some(info) = self.env.classes.get(&class) else {
+            if derived {
                 // A derived instance of a class this library does not provide.
                 return Ok(());
             }
             return self.err(format!("‘{}’ is not a class", super::types::unqualify(&class)));
+        };
+        if args.len() != info.nparams as usize {
+            return self.err(format!(
+                "Instance of ‘{}’ expects {} class parameters, but the head supplies {}",
+                super::types::unqualify(&class), info.nparams, args.len()
+            ));
         }
-        let mut tvs = Vec::new();
+        let mut tvs: Vec<_> = id.binders.iter().map(|binder| binder.name.clone()).collect();
         let mut head = Vec::new();
         for a in &args {
+            if !derived && !self.type_synonym_instances {
+                let mut head = *a;
+                loop {
+                    match head {
+                        Type::App(f, _) | Type::Sig(f, _) => head = f,
+                        _ => break,
+                    }
+                }
+                if let Type::Con(q, loc) = head {
+                    if self.env.synonyms.contains_key(&global_tycon_name(q)) {
+                        return Err(TcError {
+                            loc: *loc,
+                            msg: format!(
+                                "Type synonym ‘{}’ is not allowed in this instance head\nEnable TypeSynonymInstances to permit it.",
+                                q.name
+                            ),
+                        });
+                    }
+                }
+            }
             // A head may name a data family instance: it is the representation type then.
             let converted = self.convert_type(a, &mut tvs)?;
-            head.push(self.normalize(&converted));
+            let normalized = self.normalize(&converted);
+            if contains_polytype(&normalized) {
+                return Err(TcError {
+                    loc: a.loc(),
+                    msg: format!(
+                        "A polymorphic type is not allowed in the head of an instance of ‘{}’",
+                        super::types::unqualify(&class)
+                    ),
+                });
+            }
+            if !derived && !self.flexible_instances && !standard_instance_argument(&normalized) {
+                return Err(TcError {
+                    loc: a.loc(),
+                    msg: format!(
+                        "Illegal instance type ‘{}’\nUse a type constructor applied to distinct type variables, or enable FlexibleInstances.",
+                        self.show(&normalized)
+                    ),
+                });
+            }
+            head.push(normalized);
         }
         let mut ctx = Vec::new();
         // An instance's context may hold quantified constraints (`(forall a. Show a => Show (m a))
@@ -982,6 +1259,11 @@ impl Checker {
         // A module can be registered twice (first as a boot file, then for real): the same instance
         // keeps its dictionary name, so that what was compiled against the first still refers to it.
         let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
+        // Unboxed tuples share the internal representation of boxed tuples. Their
+        // erased types do not establish that two source instance heads are equal.
+        if !id.unboxed_head {
+            self.check_duplicate_instance(&class, &head, &kinds, declared)?;
+        }
         let earlier = self.prior_instance(&class, &head, &kinds, &ctx);
         let dict = match earlier {
             Some(i) => self.env.instances.remove(i).dict,
@@ -996,6 +1278,9 @@ impl Checker {
                 }
             }
         };
+        if !id.unboxed_head {
+            declared.insert(dict.clone(), id.loc);
+        }
         self.env.instances.push(InstInfo {
             class,
             nvars: tvs.len() as u32,
@@ -1107,6 +1392,91 @@ impl Checker {
         Some(())
     }
 
+    /// Check that a caller of the class method can use the instance signature.
+    /// The returned wrapper supplies its dictionaries in the order it expects.
+    fn instance_signature_adapter(
+        &mut self, method: &str, supplied: &Scheme, required: &Scheme, instance_vars: &[String], loc: Loc,
+    ) -> TR<impl FnOnce(Core) -> Core> {
+        let binder_names = |names: &[String]| {
+            let mut used: HashSet<_> = instance_vars.iter().chain(names).cloned().collect();
+            names.iter().map(|name| {
+                if instance_vars.contains(name) {
+                    (1..).map(|i| format!("{name}{i}")).find(|n| used.insert(n.clone())).unwrap()
+                } else {
+                    name.clone()
+                }
+            }).collect::<Vec<_>>()
+        };
+        let class_names = binder_names(&required.names);
+        let givens = self.givens.len();
+        let refinements = self.metas.skol_binds.clone();
+        let kinds = self.skol_kinds.clone();
+        let coercions = self.coercions.len();
+        let deferred = std::mem::take(&mut self.deferred_eqs);
+        let result = self.with_application_scope(|tc| {
+            tc.loc = loc;
+            let skolems: Vec<_> = class_names.iter().map(|name| tc.metas.fresh_skolem(name)).collect();
+            let expected = subst_gen(&required.ty, &skolems);
+            let params: Vec<_> = required.preds.iter().map(|_| tc.fresh_name("imd")).collect();
+            for (pred, name) in required.preds.iter().zip(&params) {
+                tc.add_given(Given { pred: subst_gen_pred(pred, &skolems), ev: Core::Var(name.clone()) });
+            }
+            let (actual, preds, _) = tc.metas.instantiate(supplied, tc.level);
+            tc.unify_at(&actual, &expected)?;
+            let wanted: Vec<_> = preds.into_iter().map(|pred| Wanted {
+                pred, ev: tc.fresh_name("imw"), loc,
+            }).collect();
+            let args: Vec<_> = wanted.iter().map(|w| Core::Var(w.ev.clone())).collect();
+            let (evidence, residual) = tc.solve_allowing_unsolved(wanted)?;
+            if let Some(w) = residual.first() {
+                let pred = tc.metas_zonk_pred(&w.pred);
+                return tc.err(format!("Could not deduce ‘{}’ from the class method and instance contexts", tc.show_pred(&pred)));
+            }
+            tc.retry_deferred()?;
+            if let Some((a, b, _)) = tc.deferred_eqs.first() {
+                let (a, b) = tc.show_type_pair(a, b);
+                return tc.err(format!("Could not establish the type equality ‘{a} ~ {b}’"));
+            }
+            Ok((params, evidence, args))
+        });
+        self.givens.truncate(givens);
+        self.metas.skol_binds = refinements;
+        self.skol_kinds = kinds;
+        self.coercions.truncate(coercions);
+        self.deferred_eqs = deferred;
+        let (params, evidence, args) = result.map_err(|error| {
+            let qualified = |t| super::types::show_ty_qualified(&self.metas, t);
+            let qualify_type = self.show(&supplied.ty) == self.show(&required.ty)
+                && qualified(&supplied.ty) != qualified(&required.ty);
+            let qualify_context = supplied.preds != required.preds
+                && supplied.preds.iter().map(|p| self.show_pred(p)).eq(required.preds.iter().map(|p| self.show_pred(p)));
+            let mut show = |scheme: &Scheme, names: &[String]| {
+                let vars: Vec<_> = names.iter().map(|name| self.metas.fresh_skolem(name)).collect();
+                let ty = subst_gen(&scheme.ty, &vars);
+                let body = if qualify_type { super::types::show_ty_qualified(&self.metas, &ty) } else { self.show(&ty) };
+                let display = Scheme {
+                    preds: scheme.preds.iter().map(|p| subst_gen_pred(p, &vars)).collect(),
+                    ..scheme.clone()
+                };
+                self.show_signature(&display, &body, qualify_context, Some(names))
+            };
+            let instance = show(supplied, &binder_names(&supplied.names));
+            let class = show(required, &class_names);
+            TcError {
+                loc,
+                msg: format!(
+                    "Instance signature for ‘{method}’ is not general enough\n{}\nInstance signature: {instance}\nRequired by class:  {class}",
+                    error.msg,
+                ),
+            }
+        })?;
+        Ok(move |body| {
+            let body = args.into_iter().fold(body, |body, arg| Core::App(Box::new(body), Box::new(arg)));
+            let body = super::expr::wrap_let(evidence, body);
+            params.into_iter().rev().fold(body, |body, name| Core::Lam(name, Box::new(body)))
+        })
+    }
+
     /// Builds the dictionary for an instance and checks its methods.
     fn instance_body(&mut self, id: &InstDecl) -> TR<()> {
         // GADT refinements made inside the declaration end with it.
@@ -1120,7 +1490,7 @@ impl Checker {
 
     fn instance_body_body(&mut self, id: &InstDecl) -> TR<()> {
         self.loc = id.loc;
-        if id.overlap.as_deref() == Some(super::derive::DERIVED_MARK) {
+        if super::derive::is_derived(id) {
             let known = {
                 let (class_name, _) = instance_head_parts(&id.head).expect("validated");
                 matches!(class_name, Type::Con(q, _) if self.env.classes.contains_key(&global_tycon_name(q)))
@@ -1136,7 +1506,7 @@ impl Checker {
         };
         // Find this instance's registered info by its head (and context, when kind-dispatched
         // instances share an erased head).
-        let mut tvs = Vec::new();
+        let mut tvs: Vec<_> = id.binders.iter().map(|binder| binder.name.clone()).collect();
         let mut head_check = Vec::new();
         let kinds: Vec<Option<String>> = args.iter().map(|a| annotated_rep(a)).collect();
         for a in &args {
@@ -1165,8 +1535,24 @@ impl Checker {
                     .find(|i| i.head == head_check && (i.kinds.is_empty() || i.kinds == kinds))
             })
             .cloned()
-            .expect("instance registered");
+            .ok_or_else(|| TcError {
+                loc: id.loc,
+                msg: format!("Could not resolve the instance for ‘{}’", self.show_pred(&Pred { class: class.clone(), args: head_check })),
+            })?;
         let info = self.class(&class).cloned().expect("class registered");
+        if id.overlap.as_deref() != Some(super::derive::DERIVED_MARK) {
+            let implemented = |method: &str| {
+                id.decls.iter().any(|decl| matches!(decl, Decl::Fun { name, .. } if name == method))
+            };
+            if let Some(missing) = info.minimal.missing_methods(&implemented, false) {
+                let instance = self.show_pred(&Pred { class: class.clone(), args: inst.head.clone() });
+                self.warnings.push((
+                    id.head.loc(),
+                    format!("Incomplete instance ‘{instance}’\nImplement {missing}."),
+                    crate::diagnostic::Warning::MissingMethods,
+                ));
+            }
+        }
 
         // Skolemise the instance variables (named as in the source); the context is given.
         let names: Vec<String> =
@@ -1190,8 +1576,10 @@ impl Checker {
         let givens_len = self.givens.len();
         // The instance head's variables scope over its methods.
         let scope_len = self.scoped.len();
-        for (n, sk) in tvs.iter().zip(&skolems) {
-            self.scoped.push((n.clone(), sk.clone()));
+        if self.scoped_type_variables {
+            for (n, sk) in tvs.iter().zip(&skolems) {
+                self.scoped.push((n.clone(), sk.clone()));
+            }
         }
         for (p, d) in ctx.iter().zip(&dparams) {
             self.add_given(Given {
@@ -1244,29 +1632,15 @@ impl Checker {
             });
             let field = match impl_decl {
                 Some((clauses, loc)) => {
-                    let mut sch = instantiate_method(mscheme, info.nparams, &head);
+                    let sch = instantiate_method(mscheme, info.nparams, &head);
                     let method_key = format!("{}.{occ}@inst", self.module);
-                    let mut scoped_sig = false;
-                    if let Some(sig_ty) = inst_sig {
-                        let has_forall = matches!(sig_ty, Type::Forall(..));
-                        if let Ok(inst_sch) = self.sig_scheme(sig_ty, &[]) {
-                            if inst_sch.preds.len() == sch.preds.len() {
-                                sch = inst_sch;
-                                scoped_sig = has_forall;
-                            } else if has_forall && inst_sch.nvars == sch.nvars {
-                                sch.names = inst_sch.names;
-                                scoped_sig = true;
-                            }
-                        }
-                    }
-                    if scoped_sig {
-                        self.explicit_sigs.insert(method_key.clone());
-                    }
-                    let core = self.check_method(clauses, &sch, &method_key, loc);
-                    if scoped_sig {
-                        self.explicit_sigs.remove(&method_key);
-                    }
-                    let core = core?;
+                    let core = if let Some(sig_ty) = inst_sig {
+                        let inst_sch = self.sig_scheme(sig_ty, &[])?;
+                        let adapt = self.instance_signature_adapter(&occ, &inst_sch, &sch, &tvs, sig_ty.loc())?;
+                        adapt(self.check_method(clauses, &inst_sch, &method_key, loc, explicit_binders(sig_ty))?)
+                    } else {
+                        self.check_method(clauses, &sch, &method_key, loc, 0)?
+                    };
                     let name = self.fresh_name("mi");
                     method_binds.push((name.clone(), core));
                     Core::Var(name)
@@ -1423,7 +1797,7 @@ impl Checker {
 
     /// Newtype deriving: the dictionary of the derived class at the representation type
     /// serves as the dictionary of the newtype, because newtypes are erased at run time.
-    fn register_newtype_deriving(&mut self, dd: &DataDecl) -> TR<()> {
+    fn register_newtype_deriving(&mut self, dd: &DataDecl, declared: &mut HashMap<String, Loc>) -> TR<()> {
         use crate::syntax::ast::Strategy;
         self.loc = dd.loc;
         // The representation of a newtype (its one field), for newtype deriving.
@@ -1454,10 +1828,12 @@ impl Checker {
                     let head_args: Vec<Ty> = (0..kept.len() as u32).map(Ty::Gen).collect();
                     let head = Ty::apps(Ty::Con(format!("{}.{}", self.module, dd.name)), head_args);
                     let ctx = vec![Pred { class: cls_name.clone(), args: vec![rep] }];
+                    self.check_duplicate_instance(&cls_name, std::slice::from_ref(&head), &[], declared)?;
                     let dict = match self.prior_instance(&cls_name, std::slice::from_ref(&head), &[], &ctx) {
                         Some(i) => { self.dict_counter += 1; self.env.instances.remove(i).dict },
                         None => self.fresh_derived_dict("Via", &cls_name, &dd.name),
                     };
+                    declared.insert(dict.clone(), dd.loc);
                     self.env.instances.push(InstInfo {
                         class: cls_name.clone(),
                         nvars: tvs.len() as u32,
@@ -1539,10 +1915,12 @@ impl Checker {
                 let mut heads = pre;
                 heads.push(head);
                 let ctx = vec![Pred { class: cls_name.clone(), args: ctx_args }];
+                self.check_duplicate_instance(&cls_name, &heads, &[], declared)?;
                 let dict = match self.prior_instance(&cls_name, &heads, &[], &ctx) {
                     Some(i) => { self.dict_counter += 1; self.env.instances.remove(i).dict },
                     None => self.fresh_derived_dict("GND", &cls_name, &dd.name),
                 };
+                declared.insert(dict.clone(), dd.loc);
                 self.env.instances.push(InstInfo {
                     class: cls_name.clone(),
                     nvars: tvs.len() as u32,
@@ -1582,7 +1960,7 @@ impl Checker {
         }
     }
 
-    fn standalone_derive(&mut self, sd: &crate::syntax::ast::StandaloneDeriving) -> TR<Vec<Decl>> {
+    fn standalone_derive(&mut self, sd: &crate::syntax::ast::StandaloneDeriving, declared: &mut HashMap<String, Loc>) -> TR<Vec<Decl>> {
         use crate::syntax::ast::{Deriving, Type};
         let (cls, arg) = match &sd.head {
             Type::App(c, a) => (c.as_ref().clone(), a.as_ref().clone()),
@@ -1624,6 +2002,7 @@ impl Checker {
                     context: Vec::new(),
                     fields: ConFields::Positional(fields),
                     gadt_result: None,
+                    gadt_forall: false,
                     infix,
                     loc: at,
                 };
@@ -1631,7 +2010,8 @@ impl Checker {
                     newtype: false,
                     context: Vec::new(),
                     name: "[]".to_string(),
-                    tyvars: vec![TyVarBind { name: "a".into(), kind: None }],
+                    tyvars: vec![TyVarBind { name: "a".into(), kind: None, inferred: false }],
+                    erased_kind_variables: Vec::new(),
                     cons: vec![
                         con("[]", Vec::new(), false),
                         con(
@@ -1643,7 +2023,7 @@ impl Checker {
                             true,
                         ),
                     ],
-                    deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
+                    deriving: vec![Deriving { loc: sd.loc, strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
                     loc: sd.loc,
                 };
                 let here = std::mem::replace(&mut self.module, "Builtin".to_string());
@@ -1656,7 +2036,7 @@ impl Checker {
             }
             let arity = if occ == "()" { 0 } else { occ.matches(',').count() + 1 };
             let tyvars: Vec<TyVarBind> = (0..arity)
-                .map(|i| TyVarBind { name: format!("t{i}"), kind: None })
+                .map(|i| TyVarBind { name: format!("t{i}"), kind: None, inferred: false })
                 .collect();
             let field_types: Vec<Field> = (0..arity)
                 .map(|i| Field {
@@ -1669,16 +2049,18 @@ impl Checker {
                 context: Vec::new(),
                 name: occ.to_string(),
                 tyvars,
+                erased_kind_variables: Vec::new(),
                 cons: vec![ConDecl {
                     name: occ.to_string(),
                     exist: Vec::new(),
                     context: Vec::new(),
                     fields: ConFields::Positional(field_types),
                     gadt_result: None,
+                    gadt_forall: false,
                     infix: false,
                     loc: Loc { line: 0, col: 0 },
                 }],
-                deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
+                deriving: vec![Deriving { loc: sd.loc, strategy: sd.strategy.clone(), classes: vec![cls], via: None }],
                 loc: sd.loc,
             };
             let here = std::mem::replace(&mut self.module, "Builtin".to_string());
@@ -1696,13 +2078,14 @@ impl Checker {
             return self.err(format!("Cannot derive an instance for ‘{}’: its declaration is not known", super::types::unqualify(&tycon)));
         };
         let synthetic = DataDecl {
-            deriving: vec![Deriving { strategy: sd.strategy.clone(), classes: vec![cls], via: sd.via.clone() }],
+            deriving: vec![Deriving { loc: sd.loc, strategy: sd.strategy.clone(), classes: vec![cls], via: sd.via.clone() }],
+            loc: sd.loc,
             ..dd
         };
         // The constructors and the instance head are named in the declaring module.
         let here = std::mem::replace(&mut self.module, defining);
         // A newtype's class instance by newtype deriving (no generated code).
-        let via_newtype = self.register_newtype_deriving(&synthetic);
+        let via_newtype = self.register_newtype_deriving(&synthetic, declared);
         let derived = via_newtype.and_then(|_| self.derive_instances(&synthetic));
         self.module = here;
         // A standalone deriving declaration states its own context and head; the inferred ones
@@ -1718,6 +2101,92 @@ impl Checker {
                 other => other,
             })
             .collect())
+    }
+}
+
+fn check_type_synonym_cycles(module: &str, decls: &[Decl]) -> TR<()> {
+    let synonyms: Vec<_> = decls.iter().filter_map(|decl| match decl {
+        Decl::TypeSyn { name, rhs, loc, .. } => Some((name.as_str(), rhs, *loc)),
+        _ => None,
+    }).collect();
+    if synonyms.is_empty() {
+        return Ok(());
+    }
+    let names: HashMap<_, _> = synonyms.iter().enumerate().map(|(i, (name, _, _))| (*name, i)).collect();
+    fn dependencies(ty: &Type, module: &str, names: &HashMap<&str, usize>, out: &mut Vec<usize>) {
+        let mut add = |ty: &Type| dependencies(ty, module, names, out);
+        match ty {
+            Type::Con(q, _) if q.qual.as_deref() == Some(module) => {
+                if let Some(&index) = names.get(q.name.as_str()) {
+                    out.push(index);
+                }
+            }
+            Type::App(a, b) | Type::Fun(a, b) | Type::Sig(a, b) => {
+                add(a);
+                add(b);
+            }
+            Type::List(t, _) => add(t),
+            Type::Tuple(ts, _) => ts.iter().for_each(add),
+            Type::Qual(ctx, body) => {
+                ctx.iter().for_each(&mut add);
+                add(body);
+            }
+            Type::Forall { binders, body, .. } => {
+                binders.iter().filter_map(|b| b.kind.as_ref()).for_each(&mut add);
+                add(body);
+            }
+            _ => {}
+        }
+    }
+    let edges: Vec<_> = synonyms.iter().map(|(_, rhs, _)| {
+        let mut refs = Vec::new();
+        dependencies(rhs, module, &names, &mut refs);
+        refs.sort_unstable();
+        refs.dedup();
+        refs
+    }).collect();
+    if let Some(group) = cyclic_components(&edges).next() {
+        let mut msg = "Cycle in type synonym declarations".to_string();
+        for &index in &group {
+            let (name, _, loc) = synonyms[index];
+            msg.push_str(&format!("\n‘{name}’ is declared at line {}, column {}.", loc.line, loc.col));
+        }
+        return Err(TcError { loc: synonyms[group[0]].2, msg });
+    }
+    Ok(())
+}
+
+fn cyclic_components(edges: &[Vec<usize>]) -> impl Iterator<Item = Vec<usize>> + '_ {
+    super::bind::tarjan(edges.len(), edges).into_iter().filter_map(|mut group| {
+        if group.len() == 1 && !edges[group[0]].contains(&group[0]) {
+            return None;
+        }
+        group.sort_unstable();
+        Some(group)
+    })
+}
+
+fn standard_instance_argument(ty: &Ty) -> bool {
+    let (head, args) = ty.split_apps();
+    let mut seen = std::collections::HashSet::new();
+    matches!(head, Ty::Con(name) if !name.starts_with('#'))
+        && args.iter().all(|arg| matches!(arg, Ty::Gen(id) if seen.insert(*id)))
+}
+
+fn contains_polytype(ty: &Ty) -> bool {
+    match ty {
+        Ty::Qual(..) | Ty::Forall(..) => true,
+        Ty::App(f, a) => contains_polytype(f) || contains_polytype(a),
+        _ => false,
+    }
+}
+
+fn simple_record_type(ty: &Ty, parameters: u32) -> bool {
+    match ty {
+        Ty::Con(_) => true,
+        Ty::Gen(i) => *i < parameters,
+        Ty::App(f, a) => simple_record_type(f, parameters) && simple_record_type(a, parameters),
+        _ => false,
     }
 }
 
@@ -1775,6 +2244,43 @@ fn is_constructor_class(cls: &str) -> bool {
 }
 
 /// The strictness of each field of the constructor with the given position.
+impl Minimal {
+    fn unknown_method(&self, known: &impl Fn(&str) -> bool) -> Option<(&str, Loc)> {
+        match self {
+            Self::Method(name, loc) => (!known(name)).then_some((name, *loc)),
+            Self::All(items) | Self::Any(items) => items.iter().find_map(|item| item.unknown_method(known)),
+        }
+    }
+
+    fn is_met(&self, present: &impl Fn(&str) -> bool) -> bool {
+        match self {
+            Self::Method(name, _) => present(name),
+            Self::All(items) => items.iter().all(|item| item.is_met(present)),
+            Self::Any(items) => items.iter().any(|item| item.is_met(present)),
+        }
+    }
+
+    fn missing_methods(&self, present: &impl Fn(&str) -> bool, nested: bool) -> Option<String> {
+        let (items, separator) = match self {
+            Self::Method(name, _) => return (!present(name)).then(|| format!("‘{name}’")),
+            Self::All(items) => (
+                items.iter().filter_map(|item| item.missing_methods(present, true)).collect::<Vec<_>>(),
+                " and ",
+            ),
+            Self::Any(items) => (
+                items.iter().map(|item| item.missing_methods(present, true)).collect::<Option<Vec<_>>>()?,
+                " or ",
+            ),
+        };
+        match items.len() {
+            0 => None,
+            1 => items.into_iter().next(),
+            _ if nested => Some(format!("({})", items.join(separator))),
+            _ => Some(items.join(separator)),
+        }
+    }
+}
+
 fn strict_flags(dd: &DataDecl, tag: usize) -> Vec<bool> {
     match dd.cons.get(tag).map(|c| &c.fields) {
         Some(ConFields::Positional(fs)) => fs.iter().map(|f| f.strict).collect(),
@@ -1828,6 +2334,7 @@ pub fn instantiate_method(mscheme: &Scheme, nparams: u32, head: &[Ty]) -> Scheme
     Scheme {
         nvars: own,
         names: mscheme.names.iter().skip(nparams as usize).cloned().collect(),
+        visible: mscheme.visible.iter().filter_map(|index| index.checked_sub(nparams)).collect(),
         preds,
         ty,
     }

@@ -1,0 +1,2 @@
+family_forall_closed_equation_unbound_lhs.hs:5:19: error
+Not in scope: type variable ‘b’

@@ -1,0 +1,2 @@
+visible_type_application_free_kind.hs:5:22: error:
+Not in scope: type variable ‘missing’

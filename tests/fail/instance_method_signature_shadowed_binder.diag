@@ -1,0 +1,3 @@
+Could not deduce ‘Show a1’ from the class method and instance contexts
+Instance signature: forall b. Show b => [a] -> b -> Bool
+Required by class:  forall a1. Eq a1 => [a] -> a1 -> Bool

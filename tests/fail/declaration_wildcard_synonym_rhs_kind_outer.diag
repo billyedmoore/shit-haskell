@@ -1,0 +1,2 @@
+declaration_wildcard_synonym_rhs_kind_outer.hs:2:18: error
+Wildcard ‘_’ is not allowed in the right-hand side of a type synonym

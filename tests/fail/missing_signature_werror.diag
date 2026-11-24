@@ -1,0 +1,2 @@
+missing_signature_werror.hs:1:1: error: [-Wmissing-signatures]
+Top-level binding with no type signature: answer :: Bool

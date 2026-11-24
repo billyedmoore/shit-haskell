@@ -1,0 +1,2 @@
+data_kinds_syntax_unit_disabled.hs:5:17: error:
+A promoted tuple requires DataKinds

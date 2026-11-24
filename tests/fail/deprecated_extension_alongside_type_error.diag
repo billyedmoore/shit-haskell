@@ -1,0 +1,3 @@
+.hs:1:14: warning: [-Wdeprecated-flags]
+Use ‘DataKinds’ and ‘PolyKinds’.
+expected type ‘Int’ with actual type ‘Bool’

@@ -1,0 +1,3 @@
+duplicate_inline_pragma.hs:2:14: error
+Duplicate NOINLINE pragma for ‘answer’
+The earlier pragma is at line 1, column 12

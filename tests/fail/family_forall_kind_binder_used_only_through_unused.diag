@@ -1,0 +1,2 @@
+family_forall_kind_binder_used_only_through_unused.hs:5:22: error
+Type variables ‘k’, ‘a’ are bound by ‘forall’ but do not occur in any family pattern

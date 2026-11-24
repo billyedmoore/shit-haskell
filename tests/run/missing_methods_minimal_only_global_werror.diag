@@ -1,0 +1,2 @@
+warning:
+The MINIMAL pragma for ‘Measure’ allows omitting methods without defaults

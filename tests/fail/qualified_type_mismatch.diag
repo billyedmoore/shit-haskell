@@ -1,0 +1,2 @@
+expected type ‘FirstType.T’ with actual type ‘SecondType.T’
+|         ^^^^^^^^

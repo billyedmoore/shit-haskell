@@ -1,0 +1,3 @@
+class_extension_fundep_unbound_left.hs:3:18: error:
+Not in scope: type variable ‘extra’
+Only variables from the head of class ‘Pair’ can appear in this functional dependency.

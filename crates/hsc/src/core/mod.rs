@@ -12,6 +12,9 @@ pub mod pretty;
 pub mod serial;
 pub mod simplify;
 
+/// An entry action that applies dictionaries or delegates to an imported main.
+pub(crate) const MAIN_ENTRY: &str = "Main.$hscEntry";
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lit {
     /// Arbitrary-precision integer in decimal.

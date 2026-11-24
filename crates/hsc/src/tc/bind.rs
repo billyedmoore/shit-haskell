@@ -7,7 +7,7 @@ use super::types::{subst_gen, Pred, Scheme, Ty};
 use super::{Checker, Given, Wanted, TR};
 use crate::core::matcher::{compile_body, compile_rows, CBody, Row};
 use crate::core::Core;
-use crate::syntax::ast::{Alt, Body, Clause, Decl, Expr, Loc, Pat, Rhs, Stmt};
+use crate::syntax::ast::{Alt, Body, Clause, Decl, Expr, Loc, Pat, Rhs, Stmt, Type};
 
 enum Kind<'d> {
     Fun(&'d [Clause]),
@@ -23,6 +23,14 @@ struct Item<'d> {
     loc: Loc,
     /// Whether the item has a type signature.
     signed: bool,
+}
+
+/// Only the outer syntactically visible `forall` binds variables in the body.
+pub(super) fn explicit_binders(ty: &Type) -> usize {
+    match ty {
+        Type::Forall { binders, parenthesized: false, .. } => binders.len(),
+        _ => 0,
+    }
 }
 
 impl Checker {
@@ -52,7 +60,6 @@ impl Checker {
             if let Decl::Sig { names, ty, loc } = d {
                 self.loc = *loc;
                 let scheme = self.sig_scheme(ty, &[])?;
-                let explicit = matches!(ty, crate::syntax::ast::Type::Forall(..));
                 let mut kvs = Vec::new();
                 kind_vars_of(ty, false, &mut kvs);
                 // A local binding with a closed signature (one not mentioning an enclosing scoped
@@ -62,9 +69,6 @@ impl Checker {
                 }
                 for n in names {
                     self.sig_kind_vars.insert(if top { format!("{module}.{n}") } else { n.clone() }, kvs.clone());
-                    if explicit {
-                        self.explicit_sigs.insert(if top { format!("{module}.{n}") } else { n.clone() });
-                    }
                     sigs.insert(n.clone(), scheme.clone());
                 }
             }
@@ -149,7 +153,8 @@ impl Checker {
         for it in &items {
             if let (true, Kind::Fun(clauses)) = (it.signed, &it.kind) {
                 let scheme = sigs[&it.occ].clone();
-                out.extend(self.check_signed(&it.keys[0], clauses, &scheme, it.loc)?);
+                let scoped_binders = explicit_binders(&sig_types[&it.occ]);
+                out.extend(self.check_signed(&it.keys[0], clauses, &scheme, it.loc, scoped_binders)?);
             }
         }
         Ok(out)
@@ -396,6 +401,7 @@ impl Checker {
                 Scheme {
                     nvars: qmetas.len() as u32,
                     names: names.clone(),
+                    visible: Vec::new(),
                     preds,
                     ty,
                 },
@@ -424,17 +430,21 @@ impl Checker {
 
     /// Checks a binding with a signature: its type variables are rigid, and its
     /// predicates are givens for the body.
-    pub fn check_signed(&mut self, key: &str, clauses: &[Clause], scheme: &Scheme, loc: Loc) -> TR<Vec<(String, Core)>> {
+    pub(super) fn check_signed(
+        &mut self, key: &str, clauses: &[Clause], scheme: &Scheme, loc: Loc, scoped_binders: usize,
+    ) -> TR<Vec<(String, Core)>> {
         // GADT refinements made by the binding's patterns end with it.
         let refinements = self.metas.skol_binds.clone();
         let outer_flex = std::mem::take(&mut self.flex_kinds);
-        let r = self.with_application_scope(|tc| tc.check_signed_body(key, clauses, scheme, loc));
+        let r = self.with_application_scope(|tc| tc.check_signed_body(key, clauses, scheme, loc, scoped_binders));
         self.flex_kinds = outer_flex;
         self.metas.skol_binds = refinements;
         r
     }
 
-    fn check_signed_body(&mut self, key: &str, clauses: &[Clause], scheme: &Scheme, loc: Loc) -> TR<Vec<(String, Core)>> {
+    fn check_signed_body(
+        &mut self, key: &str, clauses: &[Clause], scheme: &Scheme, loc: Loc, scoped_binders: usize,
+    ) -> TR<Vec<(String, Core)>> {
         self.loc = loc;
         let outer_level = self.level;
         self.level += 1;
@@ -485,18 +495,18 @@ impl Checker {
                 ev: Core::Var(d.clone()),
             });
         }
-        // With an explicit forall, the signature's variables scope over the body.
         let scope_mark = self.scoped.len();
-        if self.explicit_sigs.contains(key) {
-            for (n, sk) in scheme.names.iter().zip(&skolems) {
+        if self.scoped_type_variables {
+            for (n, sk) in scheme.names.iter().zip(&skolems).take(scoped_binders) {
                 self.scoped.push((n.clone(), sk.clone()));
             }
         }
         let outer_wanted = std::mem::take(&mut self.wanted);
         // The variables made while checking the body (only those may take this signature's types).
         let first_meta = self.metas.subst.len() as u32;
-        let body = self.fun_clauses(clauses, &ty, key)?;
+        let body = self.fun_clauses(clauses, &ty, key);
         self.scoped.truncate(scope_mark);
+        let body = body?;
         let wanted = std::mem::replace(&mut self.wanted, outer_wanted);
         self.level = outer_level;
 
@@ -602,7 +612,19 @@ impl Checker {
     }
 
     pub fn fun_clauses(&mut self, clauses: &[Clause], ty: &Ty, name: &str) -> TR<Core> {
-        self.with_application_scope(|tc| tc.fun_clauses_body(clauses, ty, name))
+        self.with_application_scope(|tc| tc.fun_clauses_body(clauses, ty, name)).map_err(|mut err| {
+            let name = super::types::unqualify(name).split('%').next().unwrap_or(name);
+            if name == "$sig" {
+                err.msg.push_str("\nIn an expression type signature");
+            } else if let Some(method) = name.strip_prefix("$dm") {
+                err.msg.push_str(&format!("\nIn the default equation for ‘{method}’"));
+            } else if let Some(method) = name.strip_suffix("@inst") {
+                err.msg.push_str(&format!("\nIn an instance method for ‘{method}’"));
+            } else if !name.starts_with('$') {
+                err.msg.push_str(&format!("\nIn an equation for ‘{name}’"));
+            }
+            err
+        })
     }
 
     fn fun_clauses_body(&mut self, clauses: &[Clause], ty: &Ty, name: &str) -> TR<Core> {
@@ -748,7 +770,7 @@ fn qualify_pat(p: &Pat, module: &str) -> Pat {
 }
 
 /// Strongly connected components, dependencies first (Tarjan's algorithm).
-fn tarjan(n: usize, edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+pub(super) fn tarjan(n: usize, edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     struct St {
         index: Vec<Option<usize>>,
         low: Vec<usize>,
@@ -1005,7 +1027,7 @@ fn kind_vars_of(t: &crate::syntax::ast::Type, in_kind: bool, out: &mut Vec<Strin
         }
         Type::List(e, _) => kind_vars_of(e, in_kind, out),
         Type::Tuple(ts, _) => ts.iter().for_each(|x| kind_vars_of(x, in_kind, out)),
-        Type::Forall(binds, body) => {
+        Type::Forall { binders: binds, body, .. } => {
             for b in binds {
                 if let Some(k) = &b.kind {
                     kind_vars_of(k, true, out);

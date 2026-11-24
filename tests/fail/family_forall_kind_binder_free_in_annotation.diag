@@ -1,0 +1,2 @@
+family_forall_kind_binder_free_in_annotation.hs:5:28: error
+Not in scope: type variable ‘k’

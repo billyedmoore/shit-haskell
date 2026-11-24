@@ -91,6 +91,10 @@ fn real_main() -> ExitCode {
         print!("{}", cli::info(what));
         return ExitCode::SUCCESS;
     }
+    if let Err(diagnostics) = cli::check_command_line_flags(&opts.flags) {
+        eprintln!("{diagnostics}");
+        return ExitCode::from(1);
+    }
     if opts.preprocess_only || opts.dump_ast || opts.run {
         return dev_mode(&opts);
     }
@@ -178,6 +182,10 @@ fn runghc(args: Vec<String>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Err(diagnostics) = cli::check_command_line_flags(&opts.flags) {
+        eprintln!("{diagnostics}");
+        return ExitCode::from(1);
+    }
     let run = |path: &Path, args: Vec<String>| -> Result<i32, String> { cli::run_program(&opts, path, args) };
     let result = if !exprs.is_empty() {
         // Each expression in turn: as an IO action if it is one, else printed.
@@ -250,7 +258,7 @@ fn dev_mode(opts: &cli::Opts) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("{file}:{}:{}: error:\n    {}", e.line, e.col, e.msg);
+                eprintln!("{}", e.render(path, &src));
                 ExitCode::from(1)
             }
         };

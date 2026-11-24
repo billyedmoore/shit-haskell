@@ -1,0 +1,2 @@
+explicit_binder_unbound_definition.hs:1:21: error:
+Not in scope: type variable ‘b’

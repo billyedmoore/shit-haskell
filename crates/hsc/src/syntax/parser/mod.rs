@@ -49,6 +49,29 @@ enum TopItem {
     Decl(Decl),
 }
 
+struct KindArgument {
+    ty: Type,
+    site: KindArgumentSite,
+}
+
+enum KindArgumentSite {
+    TypeApplication,
+    Head(Loc),
+    InfixOperand(Loc),
+}
+
+struct InvisibleBinder {
+    at: Loc,
+    preceding_parameters: usize,
+}
+
+struct KindSignatureRequirement {
+    declaration: String,
+    signature_name: String,
+    binders: Vec<InvisibleBinder>,
+    has_cusk: bool,
+}
+
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -56,22 +79,34 @@ pub struct Parser {
     /// The (token index, context depth) for which a virtual semicolon was consumed.
     semi_done: Option<(usize, usize)>,
     pub exts: Extensions,
+    kind_annotations: Vec<Type>,
+    captured_kind_arguments: Option<Vec<KindArgument>>,
+    kind_signature_requirements: Vec<KindSignatureRequirement>,
     /// The `static` forms parsed so far (each one's number keys its pointer).
     static_count: usize,
 }
 
 pub fn parse_module(toks: Vec<Token>, exts: Extensions) -> PResult<Module> {
+    parse_module_with_warnings(toks, exts).map(|(module, _)| module)
+}
+
+pub(super) fn parse_module_with_warnings(
+    toks: Vec<Token>, exts: Extensions,
+) -> PResult<(Module, Vec<(Loc, String, crate::diagnostic::Warning)>)> {
     let mut p = Parser {
         toks,
         pos: 0,
         ctx: Vec::new(),
         semi_done: None,
         exts,
+        kind_annotations: Vec::new(),
+        captured_kind_arguments: None,
+        kind_signature_requirements: Vec::new(),
         static_count: 0,
     };
     let mut m = p.module()?;
     mark_gadt_infix(&mut m);
-    Ok(m)
+    Ok((m, p.exts.syntax_warnings))
 }
 
 /// Parses the body of a `{-# RULES #-}` pragma (lexed, with the pragma's line) into its rules.
@@ -229,7 +264,10 @@ fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax:
                     let ty = if matches!(bs.get(j + 2).map(|t| &t.tok), Some(Tok::Res(ROp::DColon))) {
                         let mut ty_toks = bs[j + 3..close].to_vec();
                         ty_toks.push(eof_after(&bs[close]));
-                        let mut tp = Parser { toks: ty_toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(), static_count: 0 };
+                        let mut tp = Parser {
+                            toks: ty_toks, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(),
+                            kind_annotations: Vec::new(), captured_kind_arguments: None, kind_signature_requirements: Vec::new(), static_count: 0,
+                        };
                         let t = tp.sigtype()?;
                         if !tp.at_eof() {
                             return Err(fail("unreadable binder type"));
@@ -251,7 +289,10 @@ fn parse_rule(mut toks: Vec<Token>, exts: &Extensions) -> PResult<crate::syntax:
         }
         let last = ts[ts.len() - 1].clone();
         ts.push(eof_after(&last));
-        let mut ep = Parser { toks: ts, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(), static_count: 0 };
+        let mut ep = Parser {
+            toks: ts, pos: 0, ctx: Vec::new(), semi_done: None, exts: exts.clone(),
+            kind_annotations: Vec::new(), captured_kind_arguments: None, kind_signature_requirements: Vec::new(), static_count: 0,
+        };
         let e = ep.expr()?;
         if !ep.at_eof() {
             return Err(fail("unread tokens after a side"));
@@ -369,15 +410,18 @@ impl Parser {
         self.real() && *self.tok() == Tok::Eof
     }
 
-    /// Snapshot of the cursor and layout state, for bounded backtracking.
-    fn pos_state(&self) -> (usize, Vec<Ctx>, Option<(usize, usize)>) {
-        (self.pos, self.ctx.clone(), self.semi_done)
+    /// Snapshot of the cursor, layout, and collected kind arguments for bounded backtracking.
+    fn pos_state(&self) -> (usize, Vec<Ctx>, Option<(usize, usize)>, Option<usize>) {
+        (self.pos, self.ctx.clone(), self.semi_done, self.captured_kind_arguments.as_ref().map(Vec::len))
     }
 
-    fn restore_pos_state(&mut self, s: (usize, Vec<Ctx>, Option<(usize, usize)>)) {
+    fn restore_pos_state(&mut self, s: (usize, Vec<Ctx>, Option<(usize, usize)>, Option<usize>)) {
         self.pos = s.0;
         self.ctx = s.1;
         self.semi_done = s.2;
+        if let (Some(arguments), Some(len)) = (&mut self.captured_kind_arguments, s.3) {
+            arguments.truncate(len);
+        }
     }
 
     /// The token immediately after the current raw token, ignoring layout.
@@ -647,11 +691,12 @@ impl Parser {
 
     fn module(&mut self) -> PResult<Module> {
         let loc = self.loc();
+        let mut export_locs = Vec::new();
         let (name, exports) = if self.at_kw(Kw::Module) {
             self.bump();
             let name = self.modid()?;
             let exports = if self.at_special('(') {
-                Some(self.ie_list()?)
+                Some(self.ie_list(Some(&mut export_locs))?)
             } else {
                 None
             };
@@ -664,7 +709,7 @@ impl Parser {
             )
         };
 
-        let items = self.block(|p| p.top_item())?;
+        let items = self.block(|p| p.top_item(&name))?;
         if !self.at_eof() {
             return self.unexpected();
         }
@@ -687,22 +732,75 @@ impl Parser {
                 TopItem::Decl(d) => decls.push(d),
             }
         }
+        self.check_kind_signature_requirements(&decls, &imports)?;
         Ok(Module {
             name,
             exports,
+            export_locs,
             imports,
             decls: group_binds(decls),
+            kind_annotations: std::mem::take(&mut self.kind_annotations),
             loc,
             rules: Vec::new(),
             inlines: Vec::new(),
         })
     }
 
-    fn top_item(&mut self) -> PResult<TopItem> {
+    fn check_kind_signature_requirements(&self, declarations: &[Decl], imports: &[Import]) -> PResult<()> {
+        if self.kind_signature_requirements.is_empty() {
+            return Ok(());
+        }
+        let mut signatures = std::collections::HashMap::new();
+        let mut aliases = std::collections::HashMap::new();
+        for declaration in declarations {
+            match declaration {
+                Decl::KindSig { name, kind, loc } => {
+                    signatures.insert(name.as_str(), (kind, *loc));
+                }
+                Decl::TypeSyn { name, tyvars, rhs, .. } if tyvars.is_empty() => {
+                    aliases.insert(name.as_str(), rhs);
+                }
+                _ => {}
+            }
+        }
+        for requirement in &self.kind_signature_requirements {
+            let name = &requirement.signature_name;
+            match signatures.get(name.as_str()) {
+                Some((kind, signature_at)) if requirement.declaration == *name => {
+                    if let Some(at) = types::unmatched_kind_binder(kind, &aliases, imports, &requirement.binders) {
+                        return Err(ParseError {
+                            line: at.line,
+                            col: at.col,
+                            msg: format!(
+                                "No matching ‘forall’ binder for this invisible parameter of ‘{name}’\nThe standalone kind signature at line {}, column {} needs a specified ‘forall’ binder at this position.",
+                                signature_at.line, signature_at.col,
+                            ),
+                        });
+                    }
+                }
+                Some(_) => {}
+                None if requirement.has_cusk => {}
+                None => {
+                    let at = requirement.binders[0].at;
+                    return Err(ParseError {
+                        line: at.line,
+                        col: at.col,
+                        msg: format!(
+                            "An invisible binder in ‘{}’ needs an explicit kind signature\nAdd a standalone kind signature for ‘{name}’, or supply a complete kind with CUSKs enabled.",
+                            requirement.declaration,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn top_item(&mut self, module: &str) -> PResult<TopItem> {
         if self.at_kw(Kw::Import) {
             return Ok(TopItem::Import(self.import_decl()?));
         }
-        Ok(TopItem::Decl(self.topdecl()?))
+        Ok(TopItem::Decl(self.topdecl(module)?))
     }
 
     fn import_decl(&mut self) -> PResult<Import> {
@@ -744,7 +842,7 @@ impl Parser {
             false
         };
         let items = if self.at_special('(') {
-            Some(self.ie_list()?)
+            Some(self.ie_list(None)?)
         } else {
             None
         };
@@ -759,15 +857,33 @@ impl Parser {
         })
     }
 
-    fn ie_list(&mut self) -> PResult<Vec<IEItem>> {
+    fn ie_list(&mut self, mut locations: Option<&mut Vec<Loc>>) -> PResult<Vec<IEItem>> {
         self.expect_special('(')?;
+        let exporting = locations.is_some();
         let mut items = Vec::new();
         loop {
             if self.at_special(')') {
                 self.bump();
                 break;
             }
-            items.push(self.ie_item()?);
+            let loc = self.loc();
+            let item = self.ie_item()?;
+            if matches!(item, IEItem::Thing { subs: Subs::AllPlus(_), .. }) {
+                let problem = if !exporting {
+                    Some("An import list cannot mix ‘..’ with named members\nUse this form in a module export to bundle pattern synonyms.")
+                } else if !self.exts.is_on("PatternSynonyms") {
+                    Some("Mixing ‘..’ with named export members requires PatternSynonyms")
+                } else {
+                    None
+                };
+                if let Some(msg) = problem {
+                    return Err(ParseError { line: loc.line, col: loc.col, msg: msg.into() });
+                }
+            }
+            if let Some(locations) = &mut locations {
+                locations.push(loc);
+            }
+            items.push(item);
             if self.at_special(',') {
                 self.bump();
                 continue;
@@ -786,6 +902,9 @@ impl Parser {
         if self.at_kw(Kw::Type) {
             // ExplicitNamespaces: `type (op)` or `type T`. A parenthesised operator after `type`
             // names a type-level operator, not a value.
+            if !self.exts.is_on("ExplicitNamespaces") {
+                return self.err("The ‘type’ namespace requires ExplicitNamespaces");
+            }
             self.bump();
             if self.at_special('(') {
                 let name = self.paren_op()?;
@@ -794,13 +913,18 @@ impl Parser {
                 return Ok(IEItem::Thing { name, subs });
             }
         }
-        if self.at_varid("pattern") && matches!(self.peek_raw(1), Tok::ConId(_) | Tok::QConId(..)) {
-            self.bump();
-            return Ok(IEItem::Pattern(self.qcon()?));
-        }
-        if self.at_varid("pattern") && *self.peek_raw(1) == Tok::Special('(') && matches!(self.peek_raw(2), Tok::ConSym(_) | Tok::QConSym(..)) {
-            self.bump();
-            return Ok(IEItem::Pattern(self.paren_op()?));
+        if self.at_varid("pattern") {
+            let constructor = matches!(self.peek_raw(1), Tok::ConId(_) | Tok::QConId(..));
+            let operator = *self.peek_raw(1) == Tok::Special('(')
+                && matches!(self.peek_raw(2), Tok::ConSym(_) | Tok::QConSym(..));
+            if constructor || operator {
+                if !self.exts.is_on("PatternSynonyms") {
+                    return self.err("The ‘pattern’ namespace requires PatternSynonyms");
+                }
+                self.bump();
+                let name = if operator { self.paren_op()? } else { self.qcon()? };
+                return Ok(IEItem::Pattern(name));
+            }
         }
         if self.at_special('(') {
             let name = self.paren_op()?;

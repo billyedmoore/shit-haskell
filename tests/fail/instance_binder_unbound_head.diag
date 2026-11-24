@@ -1,0 +1,3 @@
+instance_binder_unbound_head.hs:2:23: error:
+Not in scope: type variable ‘b’
+Bind it before using it in this instance header.

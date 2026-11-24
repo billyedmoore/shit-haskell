@@ -236,7 +236,7 @@ fn splice_module_at(imports: Vec<Import>, before: Vec<Decl>, splices: &[Splice],
             loc,
         });
     }
-    Module { name: name.to_string(), exports: None, imports, decls, loc: module_loc, rules: Vec::new(), inlines: Vec::new() }
+    Module { name: name.to_string(), exports: None, export_locs: Vec::new(), imports, decls, kind_annotations: Vec::new(), loc: module_loc, rules: Vec::new(), inlines: Vec::new() }
 }
 
 // ----- walking the expressions of a module -----------------------------------------------
@@ -969,7 +969,7 @@ impl Conv<'_> {
             Type::Con(q, _) => q,
             _ => return Err("malformed Template Haskell type family instance head".into()),
         };
-        Ok((name, TypeEquation { args, rhs, loc }))
+        Ok((name, TypeEquation { args, erased_kind_variables: Vec::new(), rhs, loc }))
     }
 
     // ----- top-level declarations -----
@@ -986,26 +986,29 @@ impl Conv<'_> {
                     let newtype = k == "NewtypeD";
                     let context = self.cxt(&a[0])?;
                     let name = self.binder(&a[1])?;
-                    let tyvars = self.tyvar_binds(&a[2])?;
+                    let tyvars = self.tyvar_binds(&a[2], false)?;
                     let cons = if newtype { vec![self.con_decl(&a[4])?] } else { self.list(&a[4])?.iter().map(|x| self.con_decl(x)).collect::<CR<_>>()? };
                     let deriving = self.deriv_clauses(&a[5])?;
-                    out.push(Decl::Data(DataDecl { newtype, context, name, tyvars, cons, deriving, loc }));
+                    out.push(Decl::Data(DataDecl { newtype, context, name, tyvars, erased_kind_variables: Vec::new(), cons, deriving, loc }));
                 }
-                "TySynD" => out.push(Decl::TypeSyn { name: self.binder(&a[0])?, tyvars: self.tyvar_binds(&a[1])?, rhs: self.ty(&a[2])?, loc }),
+                "TySynD" => out.push(Decl::TypeSyn { name: self.binder(&a[0])?, tyvars: self.tyvar_binds(&a[1], false)?, erased_kind_variables: Vec::new(), rhs: self.ty(&a[2])?, loc }),
                 "InstanceD" => {
                     let overlap = match self.maybe(&a[0])? {
                         Some(o) => Some(self.con(&o)?.0.to_uppercase()),
                         None => None,
                     };
                     let decls = self.decs(&a[3])?;
-                    out.push(Decl::Instance(InstDecl { overlap, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, decls, loc }));
+                    out.push(Decl::Instance(InstDecl {
+                        overlap, binders: Vec::new(), context: self.cxt(&a[1])?, head: self.ty(&a[2])?,
+                        unboxed_head: false, decls, loc,
+                    }));
                 }
                 "StandaloneDerivD" => {
                     let strategy = match self.maybe(&a[0])? {
                         Some(s) => self.strategy(&s)?,
                         None => None,
                     };
-                    out.push(Decl::Deriving(StandaloneDeriving { strategy, via: None, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, loc }));
+                    out.push(Decl::Deriving(StandaloneDeriving { strategy, via: None, context: self.cxt(&a[1])?, head: self.ty(&a[2])?, unboxed_head: false, loc }));
                 }
                 // Pragmas and kind signatures change nothing here.
                 "PragmaD" | "KiSigD" => {}
@@ -1019,13 +1022,14 @@ impl Conv<'_> {
         self.list(c)?.iter().map(|t| self.ty(t)).collect()
     }
 
-    fn tyvar_binds(&self, c: &crate::interp::Cell) -> CR<Vec<TyVarBind>> {
+    fn tyvar_binds(&self, c: &crate::interp::Cell, with_specificity: bool) -> CR<Vec<TyVarBind>> {
         let mut out = Vec::new();
         for b in self.list(c)? {
             let (bk, ba) = self.con(&b)?;
             let name = self.binder(&ba[0])?;
             let kind = if bk == "KindedTV" { Some(self.ty(&ba[2])?) } else { None };
-            out.push(TyVarBind { name, kind });
+            let inferred = with_specificity && self.con(&ba[1])?.0 == "InferredSpec";
+            out.push(TyVarBind { name, kind, inferred });
         }
         Ok(out)
     }
@@ -1041,7 +1045,7 @@ impl Conv<'_> {
     fn con_decl(&self, c: &crate::interp::Cell) -> CR<ConDecl> {
         let loc = self.loc;
         let (k, a) = self.con(c)?;
-        let plain = |name: String, fields: ConFields, infix: bool| ConDecl { name, exist: Vec::new(), context: Vec::new(), fields, gadt_result: None, infix, loc };
+        let plain = |name: String, fields: ConFields, infix: bool| ConDecl { name, exist: Vec::new(), context: Vec::new(), fields, gadt_result: None, gadt_forall: false, infix, loc };
         Ok(match k.as_str() {
             "NormalC" => plain(self.binder(&a[0])?, ConFields::Positional(self.list(&a[1])?.iter().map(|f| self.field(f)).collect::<CR<_>>()?), false),
             "RecC" => {
@@ -1058,7 +1062,8 @@ impl Conv<'_> {
             "InfixC" => plain(self.binder(&a[1])?, ConFields::Positional(vec![self.field(&a[0])?, self.field(&a[2])?]), true),
             "ForallC" => {
                 let mut inner = self.con_decl(&a[2])?;
-                inner.exist = self.tyvar_binds(&a[0])?;
+                inner.exist = self.tyvar_binds(&a[0], true)?;
+                inner.gadt_forall = inner.gadt_result.is_some();
                 inner.context = self.cxt(&a[1])?;
                 inner
             }
@@ -1083,7 +1088,7 @@ impl Conv<'_> {
                 Some(s) => self.strategy(&s)?,
                 None => None,
             };
-            out.push(Deriving { strategy, classes: self.cxt(&da[1])?, via: None });
+            out.push(Deriving { loc: self.loc, strategy, classes: self.cxt(&da[1])?, via: None });
         }
         Ok(out)
     }
@@ -1176,20 +1181,14 @@ impl Conv<'_> {
         }
         Ok(match k.as_str() {
             "ForallT" => {
-                let mut binders = Vec::new();
-                for b in self.list(&a[0])? {
-                    let (bk, ba) = self.con(&b)?;
-                    let name = self.binder(&ba[0])?;
-                    let kind = if bk == "KindedTV" { Some(self.ty(&ba[2])?) } else { None };
-                    binders.push(TyVarBind { name, kind });
-                }
+                let binders = self.tyvar_binds(&a[0], true)?;
                 let cxt = self.list(&a[1])?.iter().map(|t| self.ty(t)).collect::<CR<Vec<_>>>()?;
                 let body = self.ty(&a[2])?;
                 let body = if cxt.is_empty() { body } else { Type::Qual(cxt, Box::new(body)) };
                 if binders.is_empty() {
                     body
                 } else {
-                    Type::Forall(binders, Box::new(body))
+                    Type::Forall { binders, body: Box::new(body), parenthesized: false }
                 }
             }
             "SigT" => Type::Sig(Box::new(self.ty(&a[0])?), Box::new(self.ty(&a[1])?)),
@@ -1396,7 +1395,7 @@ impl Reify {
             Type::Con(q, _) if q.name == "*" || q.name == "Type" => self.syn("StarT"),
             Type::Fun(a, b) => appt(appt(self.syn("ArrowT"), self.kind_ty(a)), self.kind_ty(b)),
             Type::App(f, a) => appt(self.kind_ty(f), self.kind_ty(a)),
-            Type::Sig(x, _) | Type::Forall(_, x) | Type::Qual(_, x) => self.kind_ty(x),
+            Type::Sig(x, _) | Type::Forall { body: x, .. } | Type::Qual(_, x) => self.kind_ty(x),
             _ => self.ty(t),
         }
     }
@@ -1435,7 +1434,7 @@ impl Reify {
             ty = app(app(self.syn("AppT"), app(app(self.syn("AppT"), arrow.clone()), self.ty(f))), ty);
         }
         let qvars: Vec<String> = if c.gadt_result.is_some() {
-            Self::con_free_vars(c)
+            crate::tc::derive::con_free_vars(c)
         } else {
             let mut vs: Vec<String> = default_tyvars.iter().map(|tv| tv.name.clone()).collect();
             for tv in &c.exist {
@@ -1446,7 +1445,10 @@ impl Reify {
             vs
         };
         if !qvars.is_empty() || !c.context.is_empty() {
-            let binders: Vec<Expr> = qvars.iter().map(|v| kinded(v, "SpecifiedSpec")).collect();
+            let binders: Vec<Expr> = qvars.iter().map(|v| {
+                let inferred = c.exist.iter().any(|b| b.name == *v && b.inferred);
+                kinded(v, if inferred { "InferredSpec" } else { "SpecifiedSpec" })
+            }).collect();
             let cxt: Vec<Expr> = c.context.iter().map(|p| self.ty(p)).collect();
             ty = app(app(app(self.syn("ForallT"), Expr::List(binders, loc)), Expr::List(cxt, loc)), ty);
         }
@@ -1557,7 +1559,7 @@ impl Reify {
             Type::App(f, a) | Type::Fun(f, a) => Self::ast_var_arity(f, v).max(Self::ast_var_arity(a, v)),
             Type::List(e, _) | Type::Sig(e, _) => Self::ast_var_arity(e, v),
             Type::Tuple(ts, _) => ts.iter().map(|x| Self::ast_var_arity(x, v)).max().unwrap_or(0),
-            Type::Forall(bs, b) => {
+            Type::Forall { binders: bs, body: b, .. } => {
                 if bs.iter().any(|tv| tv.name == v) {
                     0
                 } else {
@@ -1615,34 +1617,6 @@ impl Reify {
         vs.iter().any(|x| x == v)
     }
 
-    fn con_free_vars(c: &ConDecl) -> Vec<String> {
-        let mut vs = Vec::new();
-        for tv in &c.exist {
-            if !vs.contains(&tv.name) {
-                vs.push(tv.name.clone());
-            }
-        }
-        for p in &c.context {
-            crate::tc::derive::type_vars(p, &mut vs);
-        }
-        match &c.fields {
-            ConFields::Positional(fs) => {
-                for f in fs {
-                    crate::tc::derive::type_vars(&f.ty, &mut vs);
-                }
-            }
-            ConFields::Record(groups) => {
-                for (_, f) in groups {
-                    crate::tc::derive::type_vars(&f.ty, &mut vs);
-                }
-            }
-        }
-        if let Some(res) = &c.gadt_result {
-            crate::tc::derive::type_vars(res, &mut vs);
-        }
-        vs
-    }
-
     fn bang_type(&self, f: &Field) -> Expr {
         let strictness = if f.strict { "SourceStrict" } else { "NoSourceStrictness" };
         let bang = app(app(self.syn("Bang"), self.syn("NoSourceUnpackedness")), self.syn(strictness));
@@ -1680,7 +1654,7 @@ impl Reify {
                     app(app(app(self.syn("RecGadtC"), names), record_fields(groups)), res_ty)
                 }
             };
-            (gadt, Self::con_free_vars(c))
+            (gadt, crate::tc::derive::con_free_vars(c))
         } else {
             let vanilla = match &c.fields {
                 ConFields::Positional(fs) if c.infix && fs.len() == 2 => {
@@ -1724,7 +1698,7 @@ impl Reify {
             Type::Fun(a, b) => appt(appt(self.syn("ArrowT"), self.ty(a)), self.ty(b)),
             Type::List(e, _) => appt(self.syn("ListT"), self.ty(e)),
             Type::Tuple(ts, _) => ts.iter().fold(tuple(ts.len()), |acc, x| appt(acc, self.ty(x))),
-            Type::Sig(x, _) | Type::Forall(_, x) | Type::Qual(_, x) => self.ty(x),
+            Type::Sig(x, _) | Type::Forall { body: x, .. } | Type::Qual(_, x) => self.ty(x),
             Type::Lit(Lit::Int(n), _) => app(self.syn("LitT"), app(self.syn("NumTyLit"), Expr::Lit(Lit::Int(n.clone()), loc))),
             Type::Lit(Lit::Str(s), _) => app(self.syn("LitT"), app(self.syn("StrTyLit"), self.str(s))),
             _ => self.syn("WildCardT"),
@@ -1925,7 +1899,7 @@ pub fn reify_values_module(values: &[(String, &crate::tc::types::Scheme)], modul
         loc,
     };
     let decls = vec![fun(REIFY_VALUES, body), fun(REIFY_VALUES_IO, Expr::Sig(Box::new(set), io_unit, loc))];
-    Module { name: name.to_string(), exports: None, imports: Vec::new(), decls, loc, rules: Vec::new(), inlines: Vec::new() }
+    Module { name: name.to_string(), exports: None, export_locs: Vec::new(), imports: Vec::new(), decls, kind_annotations: Vec::new(), loc, rules: Vec::new(), inlines: Vec::new() }
 }
 
 /// The binding of `reify_values_module`.

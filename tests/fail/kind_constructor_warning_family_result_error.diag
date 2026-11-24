@@ -1,0 +1,2 @@
+error: [-Wdata-kinds-tc]
+Using ‘Mark’ as a kind requires DataKinds

@@ -1,0 +1,4 @@
+instance_method_signature_equal_count_wrong_constraint.hs:4:13: error:
+Could not deduce ‘Show b’ from the class method and instance contexts
+Instance signature: forall b. Show b => Int -> b -> Bool
+Required by class:  forall b. Eq b => Int -> b -> Bool

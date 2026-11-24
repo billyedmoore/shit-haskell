@@ -1,7 +1,7 @@
 //! Language extension sets. GHC 9.12 defaults to GHC2021 when no `{-# LANGUAGE #-}`
 //! or cabal setting selects another edition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Extensions enabled by the GHC2021 language edition.
 const GHC2021: &[&str] = &[
@@ -26,7 +26,7 @@ const GHC2021: &[&str] = &[
     "FlexibleInstances",
     "ForeignFunctionInterface",
     "GADTSyntax",
-    "GeneralisedNewtypeDeriving",
+    "GeneralizedNewtypeDeriving",
     "HexFloatLiterals",
     "ImplicitPrelude",
     "ImportQualifiedPost",
@@ -51,6 +51,12 @@ const GHC2021: &[&str] = &[
     "TypeApplications",
     "TypeOperators",
     "TypeSynonymInstances",
+];
+
+/// Extensions added by GHC2024 to the GHC2021 edition.
+const GHC2024_ADDITIONS: &[&str] = &[
+    "DataKinds", "DerivingStrategies", "DisambiguateRecordFields", "ExplicitNamespaces",
+    "GADTs", "MonoLocalBinds", "LambdaCase", "RoleAnnotations",
 ];
 
 /// Extensions enabled by the Haskell2010 language edition.
@@ -106,6 +112,12 @@ pub const KNOWN: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct Extensions {
     on: BTreeSet<String>,
+    overrides: BTreeMap<String, bool>,
+    pub(crate) warnings: crate::diagnostic::WarningOptions,
+    pub(crate) tabs: Option<(crate::syntax::ast::Loc, usize)>,
+    pub(crate) unknown_pragmas: Vec<(crate::syntax::ast::Loc, String)>,
+    pub(crate) deprecated_flags: Vec<(crate::syntax::ast::Loc, String)>,
+    pub(crate) syntax_warnings: Vec<(crate::syntax::ast::Loc, String, crate::diagnostic::Warning)>,
 }
 
 impl Default for Extensions {
@@ -118,6 +130,12 @@ impl Extensions {
     pub fn ghc2021() -> Self {
         Extensions {
             on: GHC2021.iter().map(|s| s.to_string()).collect(),
+            overrides: BTreeMap::new(),
+            warnings: Default::default(),
+            tabs: None,
+            unknown_pragmas: Vec::new(),
+            deprecated_flags: Vec::new(),
+            syntax_warnings: Vec::new(),
         }
     }
 
@@ -136,22 +154,28 @@ impl Extensions {
         if item.is_empty() {
             return Ok(());
         }
-        match item {
-            "GHC2021" => {
-                *self = Extensions::ghc2021();
-                return Ok(());
+        let defaults: Option<BTreeSet<String>> = match item {
+            "GHC2021" => Some(GHC2021.iter().map(|s| s.to_string()).collect()),
+            "GHC2024" => Some(GHC2021.iter().chain(GHC2024_ADDITIONS).map(|s| s.to_string()).collect()),
+            "Haskell2010" | "Haskell98" => Some(HASKELL2010.iter().map(|s| s.to_string()).collect()),
+            _ => None,
+        };
+        if let Some(mut defaults) = defaults {
+            if item == "Haskell98" {
+                defaults.remove("ForeignFunctionInterface");
+                defaults.insert("NondecreasingIndentation".to_string());
+                defaults.insert("NPlusKPatterns".to_string());
             }
-            "Haskell2010" | "Haskell98" => {
-                self.on = HASKELL2010.iter().map(|s| s.to_string()).collect();
-                // GHC's Haskell98 also allows a nested block at its enclosing block's column (as
-                // GHC always did; Cabal's default language) and n+k patterns.
-                if item == "Haskell98" {
-                    self.on.insert("NondecreasingIndentation".to_string());
-                    self.on.insert("NPlusKPatterns".to_string());
+            // The edition sets defaults. Explicit switches apply even when they precede it.
+            for (name, enabled) in &self.overrides {
+                if *enabled {
+                    defaults.insert(name.clone());
+                } else {
+                    defaults.remove(name);
                 }
-                return Ok(());
             }
-            _ => {}
+            self.on = defaults;
+            return Ok(());
         }
         // Old names of extensions.
         let canonical = |n: &str| -> String {
@@ -160,7 +184,8 @@ impl Extensions {
                 "GeneralisedNewtypeDeriving" => "GeneralizedNewtypeDeriving".into(),
                 "RecordPuns" => "NamedFieldPuns".into(),
                 "PatternSignatures" => "ScopedTypeVariables".into(),
-                "AutoDeriveTypeable" | "NullaryTypeClasses" => "MultiParamTypeClasses".into(),
+                "NullaryTypeClasses" => "MultiParamTypeClasses".into(),
+                "DoRec" => "RecursiveDo".into(),
                 other => other.to_string(),
             }
         };
@@ -176,30 +201,82 @@ impl Extensions {
         let name = name.as_str();
         // RebindableSyntax implies NoImplicitPrelude, as in GHC.
         if enable && name == "RebindableSyntax" {
-            self.on.remove("ImplicitPrelude");
+            self.set_extension("ImplicitPrelude", false);
         }
+        self.set_extension(name, enable || name == "RelaxedPolyRec");
         if enable {
-            self.on.insert(name.to_string());
             for implied in implied_by(name) {
-                self.on.insert(implied.to_string());
+                self.set_extension(implied, true);
             }
-        } else {
-            self.on.remove(name);
         }
         Ok(())
     }
+
+    pub(super) fn apply_source_flag(&mut self, item: &str, loc: crate::syntax::ast::Loc) -> Result<(), String> {
+        self.apply(item)?;
+        if let Some(message) = deprecated_extension(item) {
+            self.deprecated_flags.push((loc, message));
+        }
+        Ok(())
+    }
+
+    fn set_extension(&mut self, name: &str, enabled: bool) {
+        if enabled && name == "StandaloneKindSignatures" {
+            self.set_extension("CUSKs", false);
+        }
+        self.overrides.insert(name.to_string(), enabled);
+        if enabled {
+            self.on.insert(name.to_string());
+        } else {
+            self.on.remove(name);
+        }
+    }
+}
+
+pub(crate) fn deprecated_extension(item: &str) -> Option<String> {
+    let (prefix, name) = item.strip_prefix("No").map_or(("", item), |name| ("No", name));
+    let replacement = match name {
+        "PatternSignatures" => Some("ScopedTypeVariables"),
+        "RecordPuns" => Some("NamedFieldPuns"),
+        "NullaryTypeClasses" => Some("MultiParamTypeClasses"),
+        "DoRec" => Some("RecursiveDo"),
+        _ => None,
+    };
+    let advice = if let Some(replacement) = replacement {
+        format!("Use ‘{prefix}{replacement}’.")
+    } else {
+        match item {
+            "TypeInType" => "Use ‘DataKinds’ and ‘PolyKinds’.".into(),
+            "NoTypeInType" => "Remove this flag. Use ‘NoDataKinds’ or ‘NoPolyKinds’ to disable those extensions explicitly.".into(),
+            "OverlappingInstances" | "NoOverlappingInstances" =>
+                "Use an OVERLAPPING, OVERLAPPABLE, or OVERLAPS pragma on each relevant instance.".into(),
+            "AutoDeriveTypeable" => "Typeable instances are generated automatically.".into(),
+            "DatatypeContexts" => "Move the constraints to the functions that need them.".into(),
+            "NoRelaxedPolyRec" => "RelaxedPolyRec is always enabled. Remove this flag.".into(),
+            _ => return None,
+        }
+    };
+    Some(format!("Language extension ‘{item}’ is deprecated\n{advice}"))
 }
 
 /// Extensions switched on by enabling `name`.
 fn implied_by(name: &str) -> &'static [&'static str] {
     match name {
         "GADTs" => &["GADTSyntax", "MonoLocalBinds"],
+        "FlexibleInstances" => &["TypeSynonymInstances"],
+        "FunctionalDependencies" => &["MultiParamTypeClasses"],
         "TypeFamilies" => &["MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
+        "TypeFamilyDependencies" => &["TypeFamilies", "MonoLocalBinds", "KindSignatures", "ExplicitNamespaces"],
+        "TypeOperators" => &["ExplicitNamespaces"],
+        "PolyKinds" => &["KindSignatures"],
+        "ImpredicativeTypes" => &["RankNTypes", "ExplicitForAll"],
+        "TypeInType" => &["DataKinds", "PolyKinds", "KindSignatures"],
         "RecordWildCards" => &["DisambiguateRecordFields"],
-        "RankNTypes" => &["ExplicitForAll"],
-        "ScopedTypeVariables" => &["ExplicitForAll"],
+        "RankNTypes" | "ScopedTypeVariables" | "ExistentialQuantification"
+        | "LiberalTypeSynonyms" | "QuantifiedConstraints" => &["ExplicitForAll"],
         "TemplateHaskell" => &["TemplateHaskellQuotes"],
         "DerivingVia" => &["DerivingStrategies"],
+        "UnliftedDatatypes" => &["DataKinds", "StandaloneKindSignatures"],
         "Strict" => &["StrictData"],
         _ => &[],
     }

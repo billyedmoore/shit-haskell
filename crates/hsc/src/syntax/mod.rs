@@ -7,60 +7,113 @@ pub mod lexer;
 pub mod parser;
 pub mod token;
 
+use crate::diagnostic::{self, Warning};
+use ast::Loc;
 use extensions::Extensions;
 
 #[derive(Debug, Clone)]
-pub struct SyntaxError {
-    pub line: u32,
-    pub col: u32,
-    pub msg: String,
+pub enum SyntaxError {
+    At { loc: Loc, message: String },
+    DeprecatedFlags {
+        flags: Vec<(Loc, String)>,
+        parse_error: Option<Box<SyntaxError>>,
+    },
+}
+
+impl SyntaxError {
+    fn at(line: u32, col: u32, message: String) -> Self {
+        Self::At { loc: Loc { line, col }, message }
+    }
+
+    pub fn render(&self, path: &std::path::Path, source: &str) -> String {
+        match self {
+            Self::At { loc, message } => diagnostic::error(path, Some(source), *loc, message),
+            Self::DeprecatedFlags { flags, parse_error } => {
+                let mut diagnostics: Vec<_> = flags.iter().map(|(loc, message)| {
+                    diagnostic::warning(path, Some(source), *loc, message, Warning::DeprecatedFlags, parse_error.is_none())
+                }).collect();
+                if let Some(error) = parse_error {
+                    diagnostics.push(error.render(path, source));
+                }
+                diagnostics.join("\n\n")
+            }
+        }
+    }
 }
 
 /// Parses one module. `flags` are compiler flags such as `-XLambdaCase`; pragmas
 /// in the source are applied on top of them.
 pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, Extensions), SyntaxError> {
-    let lexed = lexer::lex(src).map_err(|e| SyntaxError {
-        line: e.line,
-        col: e.col,
-        msg: e.msg,
-    })?;
+    let lexed = lexer::lex(src).map_err(|e| SyntaxError::at(e.line, e.col, e.msg))?;
     let mut exts = Extensions::ghc2021();
+    exts.tabs = lexed.tabs;
     for flag in flags {
+        exts.warnings.apply(flag);
         if let Some(x) = flag.strip_prefix("-X") {
-            exts.apply(x).map_err(|msg| SyntaxError {
-                line: 0,
-                col: 0,
-                msg,
-            })?;
+            exts.apply(x).map_err(|msg| SyntaxError::at(0, 0, msg))?;
         }
     }
     // Only the file header's pragmas (before the first token) name extensions, as in GHC: one later
     // in the file is ignored (base16's stray `{-# LANGUAGE lenientLoop #-}`).
     let header_end = lexed.tokens.first().map(|t| (t.line, t.col));
     for p in lexed.pragmas.iter().filter(|p| header_end.is_none_or(|end| (p.line, p.col) < end)) {
-        let items: Vec<String> = match p.name.as_str() {
-            "LANGUAGE" => p.body.split(',').map(|s| s.trim().to_string()).collect(),
-            "OPTIONS_GHC" => p
-                .body
-                .split_whitespace()
-                .filter_map(|w| w.strip_prefix("-X").map(str::to_string))
-                .collect(),
-            _ => Vec::new(),
-        };
-        for item in items {
-            exts.apply(&item).map_err(|msg| SyntaxError {
-                line: p.line,
-                col: 1,
-                msg,
-            })?;
+        let at = |loc: Loc, msg| SyntaxError::at(loc.line, loc.col, msg);
+        match p.name.as_str() {
+            "LANGUAGE" => {
+                let mut loc = p.body_loc;
+                for part in p.body.split(',') {
+                    let item = part.trim();
+                    let start = loc.after(&part[..part.len() - part.trim_start().len()]);
+                    if item.is_empty() {
+                        return Err(at(start, "Expected an extension name in the LANGUAGE pragma".into()));
+                    }
+                    exts.apply_source_flag(item, start).map_err(|msg| at(start, msg))?;
+                    loc = loc.after(part).after(",");
+                }
+            }
+            "OPTIONS_GHC" => {
+                let mut loc = p.body_loc;
+                for part in p.body.split_inclusive(char::is_whitespace) {
+                    let flag = part.trim_end();
+                    exts.warnings.apply(flag);
+                    if let Some(ext) = flag.strip_prefix("-X") {
+                        let start = loc.after("-X");
+                        exts.apply_source_flag(ext, start).map_err(|msg| at(start, msg))?;
+                    }
+                    loc = loc.after(part);
+                }
+            }
+            _ => {}
         }
     }
+    match exts.warnings.level(Warning::DeprecatedFlags) {
+        Some(true) if !exts.deprecated_flags.is_empty() => {
+            return Err(SyntaxError::DeprecatedFlags { flags: exts.deprecated_flags, parse_error: None });
+        }
+        None => exts.deprecated_flags.clear(),
+        _ => {}
+    }
+    let at = |line, col, msg| {
+        let error = SyntaxError::at(line, col, msg);
+        if exts.deprecated_flags.is_empty() {
+            error
+        } else {
+            SyntaxError::DeprecatedFlags {
+                flags: exts.deprecated_flags.clone(),
+                parse_error: Some(Box::new(error)),
+            }
+        }
+    };
     // Names end in `#` only with MagicHash; Unicode symbols are reserved ones only with
     // UnicodeSyntax (the first lexing assumed MagicHash on and UnicodeSyntax off).
     let magic = exts.is_on("MagicHash");
     let unicode = exts.is_on("UnicodeSyntax");
-    let lexed = if (!magic && src.contains('#')) || (unicode && !src.is_ascii()) {
-        lexer::lex_with(src, magic, unicode).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?
+    let binary = exts.is_on("BinaryLiterals");
+    let foreign_interface = exts.is_on("ForeignFunctionInterface");
+    let lexed = if (!magic && src.contains('#')) || (unicode && !src.is_ascii()) || (!binary && lexed.saw_binary)
+        || (!foreign_interface && src.contains("foreign"))
+    {
+        lexer::lex_for_module(src, &exts).map_err(|e| at(e.line, e.col, e.msg))?
     } else {
         lexed
     };
@@ -69,29 +122,33 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
     // the source lexed again.
     let lexed = if exts.is_on("QuasiQuotes") {
         match rewrite_quasiquotes(src, th_quotes) {
-            Some(rewritten) => lexer::lex_with(&rewritten, magic, unicode).map_err(|e| SyntaxError { line: e.line, col: e.col, msg: e.msg })?,
+            Some(rewritten) => lexer::lex_for_module(&rewritten, &exts).map_err(|e| at(e.line, e.col, e.msg))?,
             None => lexed,
         }
     } else {
         lexed
     };
+    if !exts.is_on("NumericUnderscores") {
+        if let Some(loc) = lexed.numeric_separator {
+            return Err(at(loc.line, loc.col, "Underscore separators in numeric literals require NumericUnderscores".into()));
+        }
+    }
     let rule_pragmas: Vec<lexer::Pragma> = lexed.pragmas.iter().filter(|p| p.name == "RULES").cloned().collect();
     // Top-level INLINE and NOINLINE pragmas (those in class, instance and local bodies are
     // indented, and ignored).
     let inline_pragmas: Vec<lexer::Pragma> =
         lexed.pragmas.iter().filter(|p| (p.name == "INLINE" || p.name == "NOINLINE") && p.col == 1).cloned().collect();
+    exts.unknown_pragmas = lexed.unknown_pragmas;
     let mut tokens = lexed.tokens;
     if th_quotes {
         tokens = quote_brackets(tokens);
     }
-    let mut module = parser::parse_module(tokens, exts.clone()).map_err(|e| SyntaxError {
-        line: e.line,
-        col: e.col,
-        msg: e.msg,
-    })?;
+    let (mut module, syntax_warnings) = parser::parse_module_with_warnings(tokens, exts.clone())
+        .map_err(|e| at(e.line, e.col, e.msg))?;
+    exts.syntax_warnings = syntax_warnings;
     // Rewrite rules: each pragma's body is lexed on its own, at the pragma's lines.
     for p in rule_pragmas {
-        let Ok(lexed) = lexer::lex_with(&p.body, magic, unicode) else { continue };
+        let Ok(lexed) = lexer::lex_for_module(&p.body, &exts) else { continue };
         let tokens: Vec<token::Token> = lexed
             .tokens
             .into_iter()
@@ -104,10 +161,16 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
         module.rules.extend(parser::parse_rules(tokens, &exts));
     }
     for p in inline_pragmas {
-        let Ok(lexed) = lexer::lex_with(&p.body, magic, unicode) else { continue };
+        let Ok(lexed) = lexer::lex_for_module(&p.body, &exts) else { continue };
         let tokens: Vec<token::Token> = lexed.tokens.into_iter().map(|mut t| {
-            t.line += p.line - 1;
-            t.end_line += p.line - 1;
+            if t.line == 1 {
+                t.col += p.body_loc.col - 1;
+            }
+            if t.end_line == 1 {
+                t.end_col += p.body_loc.col - 1;
+            }
+            t.line += p.body_loc.line - 1;
+            t.end_line += p.body_loc.line - 1;
             t
         }).collect();
         module.inlines.extend(parser::parse_inline(&tokens, p.name == "INLINE"));

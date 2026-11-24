@@ -18,12 +18,27 @@ pub struct Pragma {
     pub line: u32,
     /// The column of its `{-#` (1 for one at a module's top level).
     pub col: u32,
+    pub(crate) body_loc: super::ast::Loc,
 }
 
 pub struct Lexed {
     pub tokens: Vec<Token>,
     pub pragmas: Vec<Pragma>,
+    pub(crate) tabs: Option<(super::ast::Loc, usize)>,
+    pub(crate) saw_binary: bool,
+    pub(crate) numeric_separator: Option<super::ast::Loc>,
+    pub(crate) unknown_pragmas: Vec<(super::ast::Loc, String)>,
 }
+
+/// Known pragma names, including GHC's spelling variants and legacy pragmas it ignores.
+pub(crate) const KNOWN_PRAGMAS: &[&str] = &[
+    "ANN", "CFILES", "COLUMN", "COMPLETE", "CONTRACT", "CTYPE", "DEPRECATED",
+    "INCLUDE", "INCOHERENT", "INLINABLE", "INLINE", "INLINEABLE", "LANGUAGE", "LINE",
+    "MINIMAL", "NOINLINE", "NOTINLINE", "NOUNPACK", "OPAQUE", "OPTIONS", "OPTIONS_CATCH",
+    "OPTIONS_DERIVE", "OPTIONS_GHC", "OPTIONS_HADDOCK", "OPTIONS_HUGS", "OPTIONS_JHC",
+    "OPTIONS_NHC98", "OPTIONS_YHC", "OVERLAPPABLE", "OVERLAPPING", "OVERLAPS", "RULES",
+    "SCC", "SOURCE", "SPECIALISE", "SPECIALIZE", "UNPACK", "WARNING",
+];
 
 const SYMBOL_CHARS: &str = "!#$%&*+./<=>?@\\^|-~:";
 
@@ -39,7 +54,7 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '\''
 }
 
-fn keyword(word: &str) -> Option<Kw> {
+fn keyword(word: &str, foreign_interface: bool) -> Option<Kw> {
     Some(match word {
         "case" => Kw::Case,
         "class" => Kw::Class,
@@ -48,7 +63,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "deriving" => Kw::Deriving,
         "do" => Kw::Do,
         "else" => Kw::Else,
-        "foreign" => Kw::Foreign,
+        "foreign" if foreign_interface => Kw::Foreign,
         "if" => Kw::If,
         "import" => Kw::Import,
         "in" => Kw::In,
@@ -114,21 +129,22 @@ pub fn lex(src: &str) -> Result<Lexed, LexError> {
 /// that `(# q, r#)` closes its unboxed tuple. With `unicode` (UnicodeSyntax), `∷ ⇒ → ← ∀ ★` are
 /// the reserved symbols they stand for; without it they are ordinary operators.
 pub fn lex_with(src: &str, magic_hash: bool, unicode: bool) -> Result<Lexed, LexError> {
-    let mut lx = Lexer {
-        chars: src.chars().collect(),
-        pos: 0,
-        line: 1,
-        col: 1,
-        pragmas: Vec::new(),
-        toks: Vec::new(),
-        magic_hash,
-        unicode,
-    };
-    lx.run()?;
-    Ok(Lexed {
-        tokens: lx.toks,
-        pragmas: lx.pragmas,
-    })
+    Lexer::new(src.chars().collect(), magic_hash, unicode).finish()
+}
+
+pub(crate) fn lex_for_module(src: &str, exts: &super::extensions::Extensions) -> Result<Lexed, LexError> {
+    let mut lexer = Lexer::new(src.chars().collect(), exts.is_on("MagicHash"), exts.is_on("UnicodeSyntax"));
+    lexer.binary = exts.is_on("BinaryLiterals");
+    lexer.foreign_interface = exts.is_on("ForeignFunctionInterface");
+    lexer.finish()
+}
+
+/// Measures the token starting at a diagnostic position on one displayed line.
+pub(crate) fn first_token_width(chars: impl Iterator<Item = char>) -> Option<usize> {
+    let mut lexer = Lexer::new(chars.collect(), true, true);
+    lexer.peek(0)?;
+    lexer.lex_token().ok()?;
+    Some(lexer.pos)
 }
 
 struct Lexer {
@@ -141,9 +157,46 @@ struct Lexer {
     magic_hash: bool,
     /// UnicodeSyntax: the Unicode forms of reserved symbols are those symbols.
     unicode: bool,
+    tabs: Option<(super::ast::Loc, usize)>,
+    binary: bool,
+    foreign_interface: bool,
+    saw_binary: bool,
+    numeric_separator: Option<super::ast::Loc>,
+    unknown_pragmas: Vec<(super::ast::Loc, String)>,
 }
 
 impl Lexer {
+    fn new(chars: Vec<char>, magic_hash: bool, unicode: bool) -> Self {
+        Self {
+            chars,
+            pos: 0,
+            line: 1,
+            col: 1,
+            pragmas: Vec::new(),
+            toks: Vec::new(),
+            magic_hash,
+            unicode,
+            tabs: None,
+            binary: true,
+            foreign_interface: true,
+            saw_binary: false,
+            numeric_separator: None,
+            unknown_pragmas: Vec::new(),
+        }
+    }
+
+    fn finish(mut self) -> Result<Lexed, LexError> {
+        self.run()?;
+        Ok(Lexed {
+            tokens: self.toks,
+            pragmas: self.pragmas,
+            tabs: self.tabs,
+            saw_binary: self.saw_binary,
+            numeric_separator: self.numeric_separator,
+            unknown_pragmas: self.unknown_pragmas,
+        })
+    }
+
     fn peek(&self, k: usize) -> Option<char> {
         self.chars.get(self.pos + k).copied()
     }
@@ -173,8 +226,14 @@ impl Lexer {
     fn run(&mut self) -> Result<(), LexError> {
         let mut bol = true;
         loop {
-            let (saw_nl, saw_space) = self.skip_space()?;
+            let (saw_nl, saw_space, pragma) = self.skip_space()?;
             bol |= saw_nl;
+            if let Some(mut pragma) = pragma {
+                pragma.first_on_line = bol;
+                self.toks.push(pragma);
+                bol = false;
+                continue;
+            }
             let (line, col) = (self.line, self.col);
             if self.pos >= self.chars.len() {
                 self.toks.push(Token {
@@ -214,14 +273,18 @@ impl Lexer {
         }
     }
 
-    /// Skips whitespace and comments. Returns (saw a newline, saw any space).
-    fn skip_space(&mut self) -> Result<(bool, bool), LexError> {
+    /// Skips whitespace and comments, stopping at a pragma that participates in layout.
+    fn skip_space(&mut self) -> Result<(bool, bool, Option<Token>), LexError> {
         let (mut nl, mut sp) = (false, false);
         loop {
             match self.peek(0) {
                 Some(c) if c.is_whitespace() => {
                     nl |= c == '\n';
                     sp = true;
+                    if c == '\t' {
+                        let loc = super::ast::Loc { line: self.line, col: self.col };
+                        self.tabs.get_or_insert((loc, 0)).1 += 1;
+                    }
                     self.bump();
                 }
                 Some('-') if self.peek(1) == Some('-') && self.is_line_comment() => {
@@ -234,15 +297,27 @@ impl Lexer {
                     sp = true;
                 }
                 Some('{') if self.peek(1) == Some('-') => {
-                    let newline = if self.peek(2) == Some('#') {
-                        self.pragma()?
+                    if self.peek(2) == Some('#') {
+                        let (line, col) = (self.line, self.col);
+                        let (newline, tok) = self.pragma()?;
+                        if let Some(tok) = tok {
+                            let pragma = Token {
+                                tok, line, col,
+                                end_line: self.line,
+                                end_col: self.col.saturating_sub(1),
+                                first_on_line: false,
+                                space_before: true,
+                                space_after: true,
+                            };
+                            return Ok((nl, sp, Some(pragma)));
+                        }
+                        nl |= newline;
                     } else {
-                        self.block_comment()?
-                    };
-                    nl |= newline;
+                        nl |= self.block_comment()?;
+                    }
                     sp = true;
                 }
-                _ => return Ok((nl, sp)),
+                _ => return Ok((nl, sp, None)),
             }
         }
     }
@@ -286,7 +361,7 @@ impl Lexer {
         }
     }
 
-    fn pragma(&mut self) -> Result<bool, LexError> {
+    fn pragma(&mut self) -> Result<(bool, Option<Tok>), LexError> {
         let (line, col) = (self.line, self.col);
         self.bump();
         self.bump();
@@ -314,23 +389,41 @@ impl Lexer {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect::<String>()
             .to_ascii_uppercase();
-        let name = if name == "NOTINLINE" { "NOINLINE".to_string() } else { name };
-        if ["LANGUAGE", "OPTIONS_GHC", "RULES", "INLINE", "NOINLINE"].contains(&name.as_str()) {
+        let name_len = name.len();
+        if !name.is_empty() && !KNOWN_PRAGMAS.contains(&name.as_str()) {
+            let padding = body.len() - body.trim_start().len();
+            let at = super::ast::Loc { line, col: col as u32 + 3 }.after(&body[..padding]);
+            self.unknown_pragmas.push((at, name));
+            return Ok((nl, None));
+        }
+        let name = match name.as_str() {
+            "NOTINLINE" => "NOINLINE".into(),
+            "OPTIONS" => "OPTIONS_GHC".into(),
+            _ => name,
+        };
+        if ["LANGUAGE", "OPTIONS_GHC", "RULES", "INLINE", "NOINLINE", "MINIMAL"].contains(&name.as_str()) {
+            let body_start = body.len() - body.trim_start().len() + name_len;
+            let after_name = &body[body_start..];
+            let padding = after_name.len() - after_name.trim_start().len();
+            let body_loc = super::ast::Loc { line, col: col as u32 + 3 }.after(&body[..body_start + padding]);
+            if name == "MINIMAL" {
+                return Ok((nl, Some(Tok::Minimal(after_name.trim_start().to_string(), body_loc))));
+            }
             // A RULES body keeps its line breaks (its rules' positions count lines from here).
             let rest = if name == "RULES" {
-                let at = body.len() - body.trim_start().len() + name.len();
-                body[at.min(body.len())..].to_string()
+                after_name.to_string()
             } else {
-                trimmed[name.len().min(trimmed.len())..].trim().to_string()
+                after_name.trim().to_string()
             };
             self.pragmas.push(Pragma {
                 name,
                 body: rest,
                 line,
                 col: col as u32,
+                body_loc,
             });
         }
-        Ok(nl)
+        Ok((nl, None))
     }
 
     fn lex_token(&mut self) -> Result<Tok, LexError> {
@@ -430,7 +523,7 @@ impl Lexer {
                             .iter()
                             .take_while(|c| is_ident_char(**c))
                             .collect();
-                        if keyword(&next_word).is_some() {
+                        if keyword(&next_word, self.foreign_interface).is_some() {
                             if quals.is_empty() {
                                 return Ok(Tok::ConId(word));
                             }
@@ -457,7 +550,7 @@ impl Lexer {
                 });
             }
             if quals.is_empty() {
-                if let Some(kw) = keyword(&word) {
+                if let Some(kw) = keyword(&word, self.foreign_interface) {
                     return Ok(Tok::Kw(kw));
                 }
                 return Ok(Tok::VarId(word));
@@ -513,8 +606,21 @@ impl Lexer {
         })
     }
 
+    fn digit_sequence_len(&self, offset: usize, radix: u32) -> usize {
+        let mut end = 0;
+        for (i, &c) in self.chars[self.pos + offset..].iter().enumerate() {
+            if c.is_digit(radix) {
+                end = i + 1;
+            } else if c != '_' {
+                break;
+            }
+        }
+        end
+    }
+
     fn take_digits(&mut self) -> String {
-        self.take_while(|c| c.is_ascii_digit() || c == '_')
+        let len = self.digit_sequence_len(0, 10);
+        (0..len).map(|_| self.bump()).collect()
     }
 
     /// Counts and consumes the MagicHash suffix of a literal (`3#` is 1, `3##` is 2).
@@ -531,17 +637,22 @@ impl Lexer {
     }
 
     fn lex_number(&mut self) -> Result<Tok, LexError> {
+        let loc = super::ast::Loc { line: self.line, col: self.col };
         if self.peek(0) == Some('0') {
-            let radix = match (self.peek(1), self.peek(2)) {
-                (Some('x' | 'X'), Some(c)) if c.is_ascii_hexdigit() => Some(16),
-                (Some('o' | 'O'), Some(c)) if c.is_digit(8) => Some(8),
-                (Some('b' | 'B'), Some(c)) if c.is_digit(2) => Some(2),
+            let radix = match self.peek(1) {
+                Some('x' | 'X') => Some(16),
+                Some('o' | 'O') => Some(8),
+                Some('b' | 'B') if self.binary => Some(2),
                 _ => None,
             };
-            if let Some(r) = radix {
+            if let Some((r, len)) = radix.map(|r| (r, self.digit_sequence_len(2, r))).filter(|&(_, len)| len != 0) {
+                self.saw_binary |= r == 2;
                 self.bump();
                 self.bump();
-                let digits = self.take_while(|c| c == '_' || c.is_digit(r));
+                let digits: String = (0..len).map(|_| self.bump()).collect();
+                if digits.contains('_') {
+                    self.numeric_separator.get_or_insert(loc);
+                }
                 let hashes = self.take_hashes();
                 let value = to_decimal(&digits, r);
                 return Ok(match hashes {
@@ -576,6 +687,9 @@ impl Lexer {
             }
         }
         let hashes = self.take_hashes();
+        if text.contains('_') {
+            self.numeric_separator.get_or_insert(loc);
+        }
         let clean: String = text.chars().filter(|c| *c != '_').collect();
         Ok(match (is_float, hashes) {
             (false, 0) => Tok::Int(clean),

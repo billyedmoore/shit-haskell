@@ -1,0 +1,3 @@
+unknown_pragma_werror.hs:2:5: error: [-Wunrecognised-pragmas]
+Unrecognised pragma ‘INLNE’
+Perhaps you meant ‘INLINE’

@@ -1,0 +1,3 @@
+command line: warning: [-Wdeprecated-flags]
+Language extension ‘NoRelaxedPolyRec’ is deprecated
+Use ‘NoRecursiveDo’.
