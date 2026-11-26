@@ -114,7 +114,7 @@ pub struct SClosure {
     pub body: SExpr,
 }
 
-/// The bit that marks a slot number as a raw slot: it holds an unboxed `Int#`/`Word#`/`Char#`
+/// The bit that marks a slot number as a raw slot: it holds an unboxed `Int#`/`Word#`/`Char#`/`Double#`
 /// (a number, not a pointer), which the collector does not read.
 pub const RAW: u32 = 1 << 31;
 
@@ -126,6 +126,8 @@ pub const RAW_RESULT_PRIMS: &[&str] = &[
     "neWord#", "ltWord#", "leWord#", "gtWord#", "geWord#", "uncheckedShiftL#",
     "uncheckedShiftRL#", "not#", "int2Word#", "word2Int#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#", "geChar#",
     "ord#", "chr#",
+    "+##", "-##", "*##", "/##", "==##", "/=##", "<##", "<=##", ">##", ">=##",
+    "sqrtDouble#", "negateDouble#", "fabsDouble#", "int2Double#", "double2Int#",
 ];
 
 /// Primitives that can take raw operands in every argument (those, and `tagToEnum#`).
@@ -156,12 +158,18 @@ fn prim_accepts_any_raw(p: &str) -> bool {
     raw_operand_prim(p) || is_bytes_index_prim(p) || is_bytes_read_prim(p) || is_bytes_write_prim(p)
 }
 
-/// A raw slot holding a `Char#` (its boxed form is a CHAR cell); others hold `Int#`/`Word#`.
+/// A raw slot holding a `Char#` (its boxed form is a CHAR cell).
 pub const RAW_CHAR: u32 = 1 << 30;
+/// A raw slot holding a `Double#` (64-bit IEEE-754 bit pattern; its boxed form is a DOUBLE cell).
+pub const RAW_DOUBLE: u32 = 1 << 29;
+/// Kind-tag bits on a raw slot (`RAW_CHAR | RAW_DOUBLE`).
+pub const RAW_KIND_MASK: u32 = RAW_CHAR | RAW_DOUBLE;
+/// All tag bits on a raw slot (`RAW | RAW_CHAR | RAW_DOUBLE`).
+pub const RAW_MASK: u32 = RAW | RAW_CHAR | RAW_DOUBLE;
 
 /// Sentinel slot index for an unused (dead) `Case` binder or `SAlt::Con` field.
-/// High bits (`RAW`, `RAW_CHAR`) are clear so `slot & RAW == 0` stays false.
-pub const UNUSED_SLOT: u32 = 0x3fff_ffff;
+/// High bits (`RAW`, `RAW_CHAR`, `RAW_DOUBLE`) are clear so `slot & RAW == 0` stays true.
+pub const UNUSED_SLOT: u32 = 0x1fff_ffff;
 
 /// Whether a Core application of `g` to `nargs` arguments is a known diverging error call.
 fn is_diverging_call(g: &str, nargs: usize) -> bool {
@@ -206,7 +214,7 @@ pub type Workers = HashMap<String, Vec<bool>>;
 
 /// What the types say of each global function's parameters (in Core order, dictionaries
 /// first): 0 not known to be a number, `NUM_INT` an `Int`/`Int#`/`Word`/`Word#`, `NUM_CHAR` a
-/// `Char`/`Char#`. Core is untyped, so only these may be passed raw.
+/// `Char`/`Char#`, `NUM_DOUBLE` a `Double`/`Double#`. Core is untyped, so only these may be passed raw.
 #[derive(Clone, Default, Debug)]
 pub struct NumericParams {
     /// Each function's parameters' kinds.
@@ -217,6 +225,32 @@ pub struct NumericParams {
 }
 pub const NUM_INT: u8 = 1;
 pub const NUM_CHAR: u8 = 2;
+pub const NUM_DOUBLE: u8 = 3;
+
+/// Raw slot tag bits for a numeric kind (`NUM_INT`, `NUM_CHAR`, `NUM_DOUBLE`).
+pub fn raw_kind_bits(kind: u8) -> u32 {
+    match kind {
+        NUM_CHAR => RAW_CHAR,
+        NUM_DOUBLE => RAW_DOUBLE,
+        _ => 0,
+    }
+}
+
+/// Numeric result kind (`NUM_INT`, `NUM_CHAR`, `NUM_DOUBLE`) of a primitive in `RAW_RESULT_PRIMS`.
+pub fn raw_prim_result_kind(p: &str) -> Option<u8> {
+    if p == "chr#" {
+        Some(NUM_CHAR)
+    } else if matches!(
+        p,
+        "+##" | "-##" | "*##" | "/##" | "sqrtDouble#" | "negateDouble#" | "fabsDouble#" | "int2Double#"
+    ) {
+        Some(NUM_DOUBLE)
+    } else if RAW_RESULT_PRIMS.contains(&p) {
+        Some(NUM_INT)
+    } else {
+        None
+    }
+}
 
 /// Primitives in `RAW_RESULT_PRIMS` that cannot trap (excludes integer division/remainder by zero).
 fn total_raw_prim(p: &str) -> bool {
@@ -227,7 +261,7 @@ fn total_raw_prim(p: &str) -> bool {
 /// given that every variable in `whnf` is already in WHNF (or raw).
 fn is_whnf_expr(e: &Core, whnf: &std::collections::HashSet<String>) -> bool {
     match e {
-        Core::Lit(Lit::Int(_) | Lit::Char(_)) => true,
+        Core::Lit(Lit::Int(_) | Lit::Char(_) | Lit::Double(_)) => true,
         Core::Var(v) => whnf.contains(v.as_str()),
         Core::Prim(p, args) if total_raw_prim(p) => args.iter().all(|a| is_whnf_expr(a, whnf)),
         Core::Prim(p, args) if matches!(p.as_str(), "lazy" | "oneShot" | "inline" | "noinline") && args.len() == 1 => {
@@ -461,7 +495,7 @@ fn raw_returns(
     ) -> bool {
         match e {
             Core::Con(..) | Core::Lam(..) => false,
-            Core::Lit(l) => matches!(l, Lit::Int(_) | Lit::Char(_)),
+            Core::Lit(l) => matches!(l, Lit::Int(_) | Lit::Char(_) | Lit::Double(_)),
             Core::Var(_) | Core::Fail(_) => true,
             Core::App(..) => {
                 let (f, args) = spine(e);
@@ -1011,7 +1045,7 @@ impl Lowering {
                 let mut reg_raws = 0usize;
                 for (i, p) in params.iter().enumerate() {
                     if let Some((_, kinds)) = raw.filter(|(r, _)| r[i]) {
-                        let kind = if kinds.get(i) == Some(&NUM_CHAR) { RAW_CHAR } else { 0 };
+                        let kind = raw_kind_bits(kinds.get(i).copied().unwrap_or(0));
                         let r = RAW | kind | top.nraw;
                         top.nraw += 1;
                         top.locals.insert(p.clone(), r);
@@ -1154,7 +1188,7 @@ impl Lowering {
     /// `case e as r of _ -> r` with a raw binder of the given kind: the number of `e` (unboxed,
     /// or taken raw from a worker returning raw), as the result of the case.
     fn through_raw(&mut self, e: SExpr, kind: u8) -> SExpr {
-        let slot = self.bind_raw(&format!("r%{}", self.next_join), kind == NUM_CHAR);
+        let slot = self.bind_raw(&format!("r%{}", self.next_join), kind);
         self.next_join += 1;
         SExpr::Case(Box::new(e), slot, vec![SAlt::Default(SExpr::Atom(Atom::Slot(slot)))])
     }
@@ -1293,7 +1327,10 @@ impl Lowering {
                                 && !matches!(&args[1], Core::Lit(l) if !matches!(l, Lit::Int(_))))
                 ) || raw_call.is_some())
                     && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder, &self.workers, &self.worker_strict, &alt_base_whnf));
-                let char = matches!(scrut.as_ref(), Core::Prim(p, _) if p == "chr#") || raw_call == Some(NUM_CHAR);
+                let raw_kind = match scrut.as_ref() {
+                    Core::Prim(p, _) => raw_prim_result_kind(p).unwrap_or(NUM_INT),
+                    _ => raw_call.unwrap_or(NUM_INT),
+                };
                 let flat_alts = if !raw { flatten_case_alts(scrut, binder, alts) } else { None };
                 let alts: &[Alt] = flat_alts.as_deref().unwrap_or(alts);
                 // Temporaries allocated only to evaluate the scrutinee are dead once it returns.
@@ -1329,7 +1366,7 @@ impl Lowering {
                     }
                     UNUSED_SLOT
                 } else if raw {
-                    self.bind_raw(binder, char)
+                    self.bind_raw(binder, raw_kind)
                 } else if needs_bslot {
                     self.bind_local(binder)
                 } else {
@@ -1378,7 +1415,7 @@ impl Lowering {
                                     UNUSED_SLOT
                                 };
                                 let s1 = if val_raw {
-                                    self.bind_raw(&vars[1], false)
+                                    self.bind_raw(&vars[1], NUM_INT)
                                 } else if free_mentions(body, &vars[1]) {
                                     self.bind_local(&vars[1])
                                 } else {
@@ -1498,7 +1535,7 @@ impl Lowering {
                 let prim = self.allocating(mark, SExpr::Prim(name.clone(), atoms));
                 match self.raw_result() {
                     // A primitive's result returned raw: its number (stored raw, or unboxed).
-                    Some(kind) => self.through_raw(prim, if name == "chr#" { NUM_CHAR } else { kind }),
+                    Some(kind) => self.through_raw(prim, raw_prim_result_kind(name).unwrap_or(kind)),
                     None => prim,
                 }
             }
@@ -1515,6 +1552,7 @@ impl Lowering {
             return None;
         }
         let raw = self.workers.get(g.as_str())?.clone();
+        let kinds = self.numeric.params.get(g.as_str()).cloned();
         let mut evals: Vec<(u32, SExpr)> = Vec::new();
         let mut atoms: Vec<Option<Atom>> = vec![None; args.len()];
         for (i, a) in args.iter().enumerate() {
@@ -1526,14 +1564,15 @@ impl Lowering {
                     at @ Atom::Slot(k) if k & RAW != 0 => Some(at),
                     _ => None,
                 },
-                Core::Lit(l @ (Lit::Int(_) | Lit::Char(_))) => Some(Atom::Lit(slit(l))),
+                Core::Lit(l @ (Lit::Int(_) | Lit::Char(_) | Lit::Double(_))) => Some(Atom::Lit(slit(l))),
                 _ => None,
             };
             match direct {
                 Some(at) => atoms[i] = Some(at),
                 None => {
                     let scrut = self.strict_in(a, Ctx::RawScrut);
-                    let slot = self.bind_raw(&format!("w%{}", self.next_join), false);
+                    let kind = kinds.as_ref().and_then(|ks| ks.get(i).copied()).unwrap_or(NUM_INT);
+                    let slot = self.bind_raw(&format!("w%{}", self.next_join), kind);
                     self.next_join += 1;
                     evals.push((slot, scrut));
                     atoms[i] = Some(Atom::Slot(slot));
@@ -1566,11 +1605,11 @@ impl Lowering {
         b.joins.get(name).filter(|(_, arity)| *arity == n).map(|(id, _)| *id)
     }
 
-    /// Binds a name to a fresh raw slot.
-    fn bind_raw(&mut self, name: &str, char: bool) -> u32 {
+    /// Binds a name to a fresh raw slot of the given numeric kind (`NUM_INT`, `NUM_CHAR`, `NUM_DOUBLE`).
+    fn bind_raw(&mut self, name: &str, kind: u8) -> u32 {
         let b = self.bodies.last_mut().expect("body");
         b.joins.remove(name);
-        let s = RAW | if char { RAW_CHAR } else { 0 } | b.nraw;
+        let s = RAW | raw_kind_bits(kind) | b.nraw;
         b.nraw += 1;
         b.locals.insert(name.to_string(), s);
         s
@@ -1679,7 +1718,7 @@ fn compact_raw_slots(c: &mut SClosure) {
 
     let raw_bit = |s: u32| -> u64 {
         if s & RAW != 0 {
-            1u64 << (s & !(RAW | RAW_CHAR))
+            1u64 << (s & !RAW_MASK)
         } else {
             0
         }
@@ -1732,7 +1771,7 @@ fn compact_raw_slots(c: &mut SClosure) {
                 let mut u = 0u64;
                 for (_, b) in binds {
                     match b {
-                        SBind::BoxRaw(r) => u |= 1u64 << (*r & !(RAW | RAW_CHAR)),
+                        SBind::BoxRaw(r) => u |= 1u64 << (*r & !RAW_MASK),
                         _ => {
                             for a in b.atoms() {
                                 u |= atom_bit(a);
@@ -1753,7 +1792,7 @@ fn compact_raw_slots(c: &mut SClosure) {
                     let mut branch_in = liveness(b, live_after, all_mask, joins, adj, active, atom_bit, interfere);
                     for &s in con_slots {
                         if s & RAW != 0 {
-                            let d = (s & !(RAW | RAW_CHAR)) as usize;
+                            let d = (s & !RAW_MASK) as usize;
                             *active |= 1u64 << d;
                             interfere(adj, d, branch_in);
                             branch_in &= !(1u64 << d);
@@ -1762,7 +1801,7 @@ fn compact_raw_slots(c: &mut SClosure) {
                     alts_in |= branch_in;
                 }
                 if *bslot & RAW != 0 {
-                    let d = (*bslot & !(RAW | RAW_CHAR)) as usize;
+                    let d = (*bslot & !RAW_MASK) as usize;
                     *active |= 1u64 << d;
                     interfere(adj, d, alts_in);
                     alts_in &= !(1u64 << d);
@@ -1793,12 +1832,12 @@ fn compact_raw_slots(c: &mut SClosure) {
     let body_in = liveness(&c.body, 0, all_mask, &mut joins, &mut adj, &mut active, &atom_bit, &interfere);
     let mut raw_args_mask = 0u64;
     for &(_, r) in &c.raw_args {
-        let d = (r & !(RAW | RAW_CHAR)) as usize;
+        let d = (r & !RAW_MASK) as usize;
         raw_args_mask |= 1u64 << d;
         active |= 1u64 << d;
     }
     for &(_, r) in &c.raw_args {
-        let d = (r & !(RAW | RAW_CHAR)) as usize;
+        let d = (r & !RAW_MASK) as usize;
         interfere(&mut adj, d, body_in | raw_args_mask);
     }
 
@@ -1807,7 +1846,7 @@ fn compact_raw_slots(c: &mut SClosure) {
     let mut colored_any = false;
     // Keep raw_args in their original 0.. order when possible.
     for &(_, r) in &c.raw_args {
-        let i = (r & !(RAW | RAW_CHAR)) as usize;
+        let i = (r & !RAW_MASK) as usize;
         if color[i] == u32::MAX {
             let mut used = 0u64;
             let mut nb = adj[i];
@@ -1850,10 +1889,10 @@ fn compact_raw_slots(c: &mut SClosure) {
 
     let remap = |s: &mut u32| {
         if *s & RAW != 0 {
-            let idx = (*s & !(RAW | RAW_CHAR)) as usize;
+            let idx = (*s & !RAW_MASK) as usize;
             let col = color[idx];
             debug_assert!(col != u32::MAX, "internal: uncolored raw slot {idx}");
-            *s = RAW | (*s & RAW_CHAR) | col;
+            *s = RAW | (*s & RAW_KIND_MASK) | col;
         }
     };
     let remap_atom = |a: &mut Atom| {
@@ -3699,6 +3738,82 @@ mod raw_slot_tests {
             !has_worker_call(&prog.globals[2].closure.body),
             "non-WHNF step must not invoke worker: {:?}",
             prog.globals[2].closure.body
+        );
+    }
+
+    #[test]
+    fn raw_double_chain_and_worker() {
+        // f x acc = case x <=## 0.0 of 1# -> acc; _ -> f (x -## 1.0) (acc +## (x *## x))
+        let f_body = Core::Lam(
+            "x".into(),
+            Box::new(Core::Lam(
+                "acc".into(),
+                Box::new(case(
+                    prim("<=##", vec![var("x"), Core::Lit(Lit::Double(0.0))]),
+                    "c",
+                    Core::Case(
+                        Box::new(var("c")),
+                        "_".into(),
+                        vec![
+                            Alt::Lit(Lit::Int(1), var("acc")),
+                            Alt::Default(case(
+                                prim("*##", vec![var("x"), var("x")]),
+                                "sq",
+                                case(
+                                    prim("+##", vec![var("acc"), var("sq")]),
+                                    "acc2",
+                                    case(
+                                        prim("-##", vec![var("x"), Core::Lit(Lit::Double(1.0))]),
+                                        "x2",
+                                        app(app(var("Test.sumSq"), var("x2")), var("acc2")),
+                                    ),
+                                ),
+                            )),
+                        ],
+                    ),
+                )),
+            )),
+        );
+        let caller = Core::Lam(
+            "n".into(),
+            Box::new(app(
+                app(var("Test.sumSq"), var("n")),
+                Core::Lit(Lit::Double(0.0)),
+            )),
+        );
+        let binds = vec![
+            TopBind { name: "Test.sumSq".into(), body: f_body },
+            TopBind { name: "Test.run".into(), body: caller },
+        ];
+        let numeric = NumericParams {
+            params: [("Test.sumSq".to_string(), vec![NUM_DOUBLE, NUM_DOUBLE])].into_iter().collect(),
+            results: [("Test.sumSq".to_string(), (2, NUM_DOUBLE))].into_iter().collect(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, raw) = prog.globals[0].worker.as_ref().expect("Test.sumSq should get worker");
+        assert_eq!(raw, &vec![true, true], "both Double params should be raw");
+        assert!(worker.ret_raw, "Double-returning worker should return raw");
+        // Verify intermediate binders carry RAW_DOUBLE while comparison binder does not.
+        fn collect_binders(e: &SExpr, out: &mut Vec<u32>) {
+            if let SExpr::Case(s, b, alts) = e {
+                out.push(*b);
+                collect_binders(s, out);
+                for a in alts {
+                    match a {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => collect_binders(b, out),
+                    }
+                }
+            }
+        }
+        let mut binders = Vec::new();
+        collect_binders(&worker.body, &mut binders);
+        assert!(
+            binders.iter().any(|&b| b & RAW != 0 && b & RAW_DOUBLE != 0),
+            "expected RAW_DOUBLE intermediate binders: {binders:#x?}"
+        );
+        assert!(
+            binders.iter().any(|&b| b & RAW != 0 && b & RAW_DOUBLE == 0),
+            "expected RAW int comparison binder: {binders:#x?}"
         );
     }
 }
