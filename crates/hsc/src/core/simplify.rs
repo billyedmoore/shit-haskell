@@ -665,6 +665,16 @@ fn cheap_arity(e: &Core, globals: &HashMap<String, usize>, local: &HashMap<Strin
                 h = f;
             }
             let Core::Var(f) = h else { return 0 };
+            if n >= 1
+                && (f.starts_with("GHC.Internal.Control.Exception.Base.")
+                    || f.starts_with("Control.Exception.Base."))
+                && matches!(
+                    f.rsplit('.').next(),
+                    Some("patError" | "irrefutPatError" | "nonExhaustiveGuardsError")
+                )
+            {
+                return BOTTOM;
+            }
             let k = arity_of(f).saturating_sub(n);
             if k == 0 {
                 return 0;
@@ -680,7 +690,20 @@ fn cheap_arity(e: &Core, globals: &HashMap<String, usize>, local: &HashMap<Strin
         }
         Core::Let(bs, body) => {
             if bs.iter().all(|(_, r)| is_cheap_value(r, globals, local)) {
-                cheap_arity(body, globals, local)
+                let mut inner;
+                let env = if bs.iter().any(|(_, r)| value_arity(r) > 0) {
+                    inner = local.clone();
+                    for (x, r) in bs {
+                        let n = value_arity(r);
+                        if n > 0 {
+                            inner.insert(x.clone(), n);
+                        }
+                    }
+                    &inner
+                } else {
+                    local
+                };
+                cheap_arity(body, globals, env)
             } else {
                 0
             }
@@ -4551,6 +4574,51 @@ mod rule_tests {
         assert!(
             matches!(binds[0].body, Core::Lam(..)),
             "expected floating top-level dict to expose outer lambda: {:?}",
+            binds[0].body
+        );
+    }
+
+    #[test]
+    fn eta_expand_through_pat_error_and_let_fn() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // f = \x -> case x of
+        //   T.A a -> let g = \s -> s in case a of _ -> g
+        //   _ -> GHC.Internal.Control.Exception.Base.patError "err"
+        let bind = TopBind {
+            name: "T.f".into(),
+            body: Core::Lam(
+                "x".into(),
+                Box::new(Core::Case(
+                    Box::new(v("x")),
+                    "cb".into(),
+                    vec![
+                        Alt::Con(
+                            "T.A".into(),
+                            vec!["a".into()],
+                            Core::Let(
+                                vec![("g".into(), Core::Lam("s".into(), Box::new(v("s"))))],
+                                Box::new(Core::Case(
+                                    Box::new(v("a")),
+                                    "sq".into(),
+                                    vec![Alt::Default(v("g"))],
+                                )),
+                            ),
+                        ),
+                        Alt::Default(app(
+                            v("GHC.Internal.Control.Exception.Base.patError"),
+                            Core::Lit(Lit::Str("err".into())),
+                        )),
+                    ],
+                )),
+            ),
+        };
+        let mut binds = vec![bind];
+        simplify(&mut binds);
+        assert_eq!(
+            value_arity(&binds[0].body),
+            2,
+            "expected T.f to eta-expand to arity 2 through patError and let-bound g: {:?}",
             binds[0].body
         );
     }
