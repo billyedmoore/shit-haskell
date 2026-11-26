@@ -92,7 +92,7 @@ const FALSE: &str = "GHC.Types.False";
 
 pub fn simplify(binds: &mut Vec<TopBind>) {
     float_closed_dicts(binds, 0);
-    float_con_fields(binds);
+    float_con_fields(binds, 0);
     // The rewrite rules, taken before any pass changes their sides, and the functions they
     // mention, which are not inlined while rules may still need to see them (phases 2 and 1).
     // HSC_NO_RULES: without them (to compare, or to rule them out).
@@ -109,6 +109,7 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
     pass(binds, 2, &rules, &strict_cons, None);
     pass(binds, 1, &rules, &strict_cons, None);
     float_closed_dicts(binds, 1);
+    float_con_fields(binds, 1);
     specialise_static_args(binds, &rules);
     call_by_value(binds);
     pass(binds, 0, &rules, &strict_cons, None);
@@ -723,22 +724,41 @@ fn is_cheap_value(e: &Core, globals: &HashMap<String, usize>, local: &HashMap<St
 /// with a default method, say) gets those fields as globals of their own, `g%f<i>`: then the
 /// global is known (see `pass`), and cases of it select their field, as they do for
 /// dictionaries of atoms. A top-level binding is as lazy and shared as the field was.
-fn float_con_fields(binds: &mut Vec<TopBind>) {
-    let mut extra = Vec::new();
-    for b in binds.iter_mut() {
-        if is_rule_binding(&b.name) {
+fn float_con_fields(binds: &mut Vec<TopBind>, run: u32) {
+    let mut idx = 0;
+    while idx < binds.len() {
+        if is_rule_binding(&binds[idx].name) {
+            idx += 1;
             continue;
         }
-        let Core::Con(_, fields) = &mut b.body else { continue };
-        for (i, f) in fields.iter_mut().enumerate() {
-            if is_atom(f) {
-                continue;
+        let owner = binds[idx].name.clone();
+        let mut extra = Vec::new();
+        if let Core::Con(_, fields) = &mut binds[idx].body {
+            for (i, f) in fields.iter_mut().enumerate() {
+                if is_atom(f) {
+                    continue;
+                }
+                let name = if run == 0 {
+                    format!("{owner}%f{i}")
+                } else {
+                    format!("{owner}%f{run}_{i}")
+                };
+                let mut body = std::mem::replace(f, Core::Var(name.clone()));
+                if let Core::Let(mut inner, inner_body) = body {
+                    if inner.len() == 1 && matches!(&*inner_body, Core::Var(v) if v == &inner[0].0) {
+                        let (this, mut rhs) = inner.pop().unwrap();
+                        rename_free(&mut rhs, &this, &name);
+                        body = rhs;
+                    } else {
+                        body = Core::Let(inner, inner_body);
+                    }
+                }
+                extra.push(TopBind { name, body });
             }
-            let name = format!("{}%f{i}", b.name);
-            extra.push(TopBind { name: name.clone(), body: std::mem::replace(f, Core::Var(name)) });
         }
+        binds.extend(extra);
+        idx += 1;
     }
-    binds.extend(extra);
 }
 
 /// Class dictionaries built inside a function from globals only (a `Typeable (Maybe [Int])`,
@@ -849,19 +869,26 @@ fn float_dicts_in(c: &mut Core, locals: &mut HashSet<String>, in_lam: bool, owne
             float_dicts_in(b, locals, true, owner, n, extra);
         }
         Core::Let(bs, body) => {
-            if in_lam {
-                // Repeatedly: a dictionary of the group that mentions no local (nor a binding
-                // of the group still here) moves out; its uses name the new global.
+            let trivial_self = !in_lam && bs.len() == 1 && matches!(&**body, Core::Var(v) if v == &bs[0].0);
+            if !trivial_self {
+                // Repeatedly: a closed dictionary of the group (possibly self-recursive, mentioning
+                // no local nor any other binding still in the group) moves out to top level.
                 loop {
                     let group: HashSet<String> = bs.iter().map(|(x, _)| x.clone()).collect();
-                    let Some(i) = bs.iter().position(|(_, r)| {
-                        matches!(r, Core::Con(k, _) if is_dict_con(k)) && !mentions_any(r, locals) && !mentions_any(r, &group)
+                    let Some(i) = bs.iter().position(|(x, r)| {
+                        if !matches!(r, Core::Con(k, _) if is_dict_con(k)) || mentions_any(r, locals) {
+                            return false;
+                        }
+                        let mut others = group.clone();
+                        others.remove(x);
+                        !mentions_any(r, &others)
                     }) else {
                         break;
                     };
-                    let (x, rhs) = bs.remove(i);
+                    let (x, mut rhs) = bs.remove(i);
                     let global = format!("{owner}{n}");
                     *n += 1;
+                    rename_free(&mut rhs, &x, &global);
                     for (_, r) in bs.iter_mut() {
                         rename_free(r, &x, &global);
                     }
@@ -4487,6 +4514,43 @@ mod rule_tests {
         assert!(
             !has_case(&binds[0].body),
             "expected local dictionary selectors to cancel completely: {:?}",
+            binds[0].body
+        );
+    }
+
+    #[test]
+    fn float_top_level_self_recursive_dict_exposes_lambda_and_known_fields() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // topFn = let d = D:Cls (\x -> x) (T.dm d) in \a -> case d of D:Cls f _ -> f a
+        let bind = TopBind {
+            name: "T.topFn".into(),
+            body: Core::Let(
+                vec![(
+                    "d".into(),
+                    Core::Con(
+                        "T.D:Cls".into(),
+                        vec![
+                            Core::Lam("x".into(), Box::new(v("x"))),
+                            app(v("T.dm"), v("d")),
+                        ],
+                    ),
+                )],
+                Box::new(Core::Lam(
+                    "a".into(),
+                    Box::new(Core::Case(
+                        Box::new(v("d")),
+                        "cb".into(),
+                        vec![Alt::Con("T.D:Cls".into(), vec!["f".into(), "u".into()], app(v("f"), v("a")))],
+                    )),
+                )),
+            ),
+        };
+        let mut binds = vec![bind];
+        simplify(&mut binds);
+        assert!(
+            matches!(binds[0].body, Core::Lam(..)),
+            "expected floating top-level dict to expose outer lambda: {:?}",
             binds[0].body
         );
     }
