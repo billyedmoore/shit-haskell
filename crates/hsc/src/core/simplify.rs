@@ -2005,33 +2005,60 @@ impl Simp<'_> {
             cur = f;
         }
         let Core::App(_, arg) = cur else { return false };
-        let Core::Case(_, b, alts) = arg.as_ref() else { return false };
-        if !matches!(&alts[..], [Alt::Default(_)]) {
-            return false;
-        }
-        let binder = b.clone();
-        // Ensure `binder` is not mentioned in any sibling argument or head of the call.
-        let mut check = &*c;
-        for i in 0..nargs {
-            let Core::App(f, a) = check else { return false };
-            if i != steps && mentions(a, &binder) {
-                return false;
+        match arg.as_ref() {
+            Core::Case(_, b, alts) if matches!(&alts[..], [Alt::Default(_)]) => {
+                let binder = b.clone();
+                // Ensure `binder` is not mentioned in any sibling argument or head of the call.
+                let mut check = &*c;
+                for i in 0..nargs {
+                    let Core::App(f, a) = check else { return false };
+                    if i != steps && mentions(a, &binder) {
+                        return false;
+                    }
+                    check = f;
+                }
+                // Extract the `Case` from position `strict_pos` and wrap the whole call in it.
+                let mut cur_mut = &mut *c;
+                for _ in 0..steps {
+                    let Core::App(f, _) = cur_mut else { unreachable!() };
+                    cur_mut = f;
+                }
+                let Core::App(_, arg_mut) = cur_mut else { unreachable!() };
+                let Core::Case(s, b, mut alts) = take(arg_mut) else { unreachable!() };
+                let Some(Alt::Default(inner)) = alts.pop() else { unreachable!() };
+                *arg_mut = Box::new(inner);
+                let call = take(c);
+                *c = Core::Case(s, b, vec![Alt::Default(call)]);
+                true
             }
-            check = f;
+            Core::Let(bs, _) => {
+                // Ensure no let-bound name captures a free variable in a sibling argument or head.
+                let names: Vec<&str> = bs.iter().map(|(n, _)| n.as_str()).collect();
+                if names.contains(&g.as_str()) {
+                    return false;
+                }
+                let mut check = &*c;
+                for i in 0..nargs {
+                    let Core::App(f, a) = check else { return false };
+                    if i != steps && names.iter().any(|n| mentions(a, n)) {
+                        return false;
+                    }
+                    check = f;
+                }
+                let mut cur_mut = &mut *c;
+                for _ in 0..steps {
+                    let Core::App(f, _) = cur_mut else { unreachable!() };
+                    cur_mut = f;
+                }
+                let Core::App(_, arg_mut) = cur_mut else { unreachable!() };
+                let Core::Let(bs, inner) = take(arg_mut) else { unreachable!() };
+                *arg_mut = inner;
+                let call = take(c);
+                *c = Core::Let(bs, Box::new(call));
+                true
+            }
+            _ => false,
         }
-        // Extract the `Case` from position `strict_pos` and wrap the whole call in it.
-        let mut cur_mut = &mut *c;
-        for _ in 0..steps {
-            let Core::App(f, _) = cur_mut else { unreachable!() };
-            cur_mut = f;
-        }
-        let Core::App(_, arg_mut) = cur_mut else { unreachable!() };
-        let Core::Case(s, b, mut alts) = take(arg_mut) else { unreachable!() };
-        let Some(Alt::Default(inner)) = alts.pop() else { unreachable!() };
-        *arg_mut = Box::new(inner);
-        let call = take(c);
-        *c = Core::Case(s, b, vec![Alt::Default(call)]);
-        true
     }
 
     /// Rewrites a call that matches an active rule's left side by the rule's right side (a fresh
@@ -5082,6 +5109,46 @@ mod rule_tests {
         assert!(
             !mentions(&binds[0].body, "done"),
             "expected tiny local lambda `done` to be inlined and dropped: {:?}",
+            binds[0].body
+        );
+    }
+
+    #[test]
+    fn float_let_out_of_foldr_enables_fold_build() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // T.f = \k z -> foldr k z (let s = T.mk 1# in build (\c n -> T.gen s c n))
+        let body = Core::Lam(
+            "k".into(),
+            Box::new(Core::Lam(
+                "z".into(),
+                Box::new(app(
+                    app(
+                        app(v("GHC.Internal.Base.foldr"), v("k")),
+                        v("z"),
+                    ),
+                    Core::Let(
+                        vec![("s".into(), app(v("T.mk"), Core::Lit(Lit::Int(1))))],
+                        Box::new(app(
+                            v("GHC.Internal.Base.build"),
+                            Core::Lam(
+                                "c".into(),
+                                Box::new(Core::Lam(
+                                    "n".into(),
+                                    Box::new(app(app(app(v("T.gen"), v("s")), v("c")), v("n"))),
+                                )),
+                            ),
+                        )),
+                    ),
+                )),
+            )),
+        );
+        let mut binds = vec![TopBind { name: "T.f".into(), body }];
+        simplify(&mut binds);
+        assert!(
+            !mentions(&binds[0].body, "GHC.Internal.Base.foldr")
+                && !mentions(&binds[0].body, "GHC.Internal.Base.build"),
+            "expected fold/build to fire after floating let out of foldr: {:?}",
             binds[0].body
         );
     }
