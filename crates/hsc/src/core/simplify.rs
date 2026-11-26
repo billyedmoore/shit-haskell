@@ -77,7 +77,11 @@ const STRICT_PRIMS: &[&str] = &[
     "uncheckedIShiftRL#", "tagToEnum#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#",
     "geChar#", "ord#", "chr#", "plusWord#", "minusWord#", "timesWord#", "and#", "or#", "xor#",
     "eqWord#", "neWord#", "ltWord#", "leWord#", "gtWord#", "geWord#", "uncheckedShiftL#",
-    "uncheckedShiftRL#",
+    "uncheckedShiftRL#", "+##", "-##", "*##", "/##", "==##", "/=##", "<##", "<=##", ">##", ">=##",
+    "sqrtDouble#", "negateDouble#", "fabsDouble#", "int2Double#", "double2Int#", "word2Double#",
+    "plusFloat#", "minusFloat#", "timesFloat#", "divideFloat#", "eqFloat#", "neFloat#", "ltFloat#",
+    "leFloat#", "gtFloat#", "geFloat#", "sqrtFloat#", "negateFloat#", "fabsFloat#", "int2Float#",
+    "float2Int#", "word2Float#",
 ];
 
 /// The fresh-name counter, kept across passes so that names made in one are not made again.
@@ -4161,5 +4165,42 @@ mod rule_tests {
             "expected Case(+#) floated out of strict call argument: {:?}",
             binds[2].body,
         );
+    }
+
+    #[test]
+    fn double_prims_turn_demanded_lets_into_strict_cases() {
+        let v = |s: &str| Core::Var(s.into());
+        // \x y -> let dx = x -## y in dx *## dx
+        let bind = TopBind {
+            name: "T.sqDiff".into(),
+            body: Core::Lam(
+                "x".into(),
+                Box::new(Core::Lam(
+                    "y".into(),
+                    Box::new(Core::Let(
+                        vec![("dx".into(), Core::Prim("-##".into(), vec![v("x"), v("y")]))],
+                        Box::new(Core::Prim("*##".into(), vec![v("dx"), v("dx")])),
+                    )),
+                )),
+            ),
+        };
+        let mut binds = vec![bind];
+        simplify(&mut binds);
+        fn has_let(e: &Core) -> bool {
+            match e {
+                Core::Let(..) => true,
+                Core::App(f, a) => has_let(f) || has_let(a),
+                Core::Lam(_, b) => has_let(b),
+                Core::Case(s, _, alts) => {
+                    has_let(s)
+                        || alts.iter().any(|a| match a {
+                            Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => has_let(b),
+                        })
+                }
+                Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(has_let),
+                _ => false,
+            }
+        }
+        assert!(!has_let(&binds[0].body), "expected demanded Double# let to become a strict case: {:?}", binds[0].body);
     }
 }
