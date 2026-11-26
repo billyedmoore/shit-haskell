@@ -92,6 +92,8 @@ const FALSE: &str = "GHC.Types.False";
 
 pub fn simplify(binds: &mut Vec<TopBind>) {
     float_closed_dicts(binds, 0);
+    tie_dict_builder_knots(binds);
+    expand_closed_dict_apps(binds);
     float_con_fields(binds, 0);
     // The rewrite rules, taken before any pass changes their sides, and the functions they
     // mention, which are not inlined while rules may still need to see them (phases 2 and 1).
@@ -109,6 +111,8 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
     pass(binds, 2, &rules, &strict_cons, None);
     pass(binds, 1, &rules, &strict_cons, None);
     float_closed_dicts(binds, 1);
+    tie_dict_builder_knots(binds);
+    expand_closed_dict_apps(binds);
     float_con_fields(binds, 1);
     specialise_static_args(binds, &rules);
     call_by_value(binds);
@@ -802,6 +806,273 @@ fn float_closed_dicts(binds: &mut Vec<TopBind>, run: u32) {
     binds.extend(extra);
 }
 
+/// Replaces unshadowed self-calls `(fn_name p1 ... pk)` with `replacement` inside a dictionary
+/// builder's body.
+fn replace_exact_self_call(c: &mut Core, fn_name: &str, params: &[String], replacement: &str) {
+    let matches_call = {
+        let mut args = Vec::new();
+        let mut h = &*c;
+        while let Core::App(f, a) = h {
+            args.push(&**a);
+            h = f;
+        }
+        args.reverse();
+        matches!(h, Core::Var(v) if v == fn_name)
+            && args.len() == params.len()
+            && args
+                .iter()
+                .zip(params)
+                .all(|(a, p)| matches!(a, Core::Var(v) if v == p))
+    };
+    if matches_call {
+        *c = Core::Var(replacement.to_string());
+        return;
+    }
+    match c {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+        Core::App(f, a) => {
+            replace_exact_self_call(f, fn_name, params, replacement);
+            replace_exact_self_call(a, fn_name, params, replacement);
+        }
+        Core::Lam(x, b) => {
+            if x != fn_name && !params.iter().any(|p| p == x) {
+                replace_exact_self_call(b, fn_name, params, replacement);
+            }
+        }
+        Core::Let(bs, body) => {
+            let shadowed = bs
+                .iter()
+                .any(|(x, _)| x == fn_name || params.iter().any(|p| p == x));
+            if !shadowed {
+                for (_, r) in bs.iter_mut() {
+                    replace_exact_self_call(r, fn_name, params, replacement);
+                }
+                replace_exact_self_call(body, fn_name, params, replacement);
+            }
+        }
+        Core::Case(s, b, alts) => {
+            replace_exact_self_call(s, fn_name, params, replacement);
+            if b == fn_name || params.iter().any(|p| p == b) {
+                return;
+            }
+            for a in alts {
+                match a {
+                    Alt::Con(_, vs, e) => {
+                        if !vs.iter().any(|v| v == fn_name || params.iter().any(|p| p == v)) {
+                            replace_exact_self_call(e, fn_name, params, replacement);
+                        }
+                    }
+                    Alt::Lit(_, e) | Alt::Default(e) => {
+                        replace_exact_self_call(e, fn_name, params, replacement);
+                    }
+                }
+            }
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => {
+            for a in args {
+                replace_exact_self_call(a, fn_name, params, replacement);
+            }
+        }
+    }
+}
+
+/// Ties the recursive knot in parametric dictionary builders of the form
+/// `f = \p1..pk -> let this = [D:Class ...] in this` by replacing self-calls `(f p1..pk)` inside
+/// `this` with `this`. This avoids building a chain of duplicate dictionaries at runtime and makes
+/// `f` non-recursive so closed applications (`$fOrd_10 $fOrdChar_11`) can specialise cleanly.
+fn tie_dict_builder_knots(binds: &mut [TopBind]) {
+    for b in binds.iter_mut() {
+        if is_rule_binding(&b.name) {
+            continue;
+        }
+        let mut params = Vec::new();
+        let mut cur = &mut b.body;
+        while let Core::Lam(p, inner) = cur {
+            params.push(p.clone());
+            cur = inner;
+        }
+        if params.is_empty() {
+            continue;
+        }
+        // Distinct parameter names and no shadowing of the global name.
+        if params.iter().any(|p| p == &b.name) {
+            continue;
+        }
+        let distinct: HashSet<&str> = params.iter().map(String::as_str).collect();
+        if distinct.len() != params.len() {
+            continue;
+        }
+        let Core::Let(bs, body) = cur else { continue };
+        let [(this, rhs)] = &mut bs[..] else { continue };
+        if !matches!(&**body, Core::Var(v) if v == this) {
+            continue;
+        }
+        if !matches!(rhs, Core::Con(con, _) if is_dict_con(con)) {
+            continue;
+        }
+        if this == &b.name || params.iter().any(|p| p == this) {
+            continue;
+        }
+        let this_name = this.clone();
+        replace_exact_self_call(rhs, &b.name, &params, &this_name);
+    }
+}
+
+/// Specialises top-level closed dictionary applications `g = ($f... d1 ... dk)` (floated by
+/// `float_closed_dicts`) when `$f...` is a non-recursive dictionary builder and at least one
+/// argument is a known `D:` dictionary global. Deduplicates identical `(builder, args)` pairs into
+/// aliases so `float_con_fields` exposes one canonical known `D:` dictionary of direct methods.
+fn expand_closed_dict_apps(binds: &mut [TopBind]) {
+    const MAX_BUILDER_SIZE: usize = 800;
+    const MAX_EXPANSIONS: usize = 64;
+
+    let all_globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
+    let mut known_dicts: HashSet<String> = HashSet::new();
+    for b in binds.iter() {
+        if matches!(&b.body, Core::Con(con, _) if is_dict_con(con)) {
+            known_dicts.insert(b.name.clone());
+        }
+    }
+    loop {
+        let mut added = false;
+        for b in binds.iter() {
+            if let Core::Var(v) = &b.body {
+                if known_dicts.contains(v) && known_dicts.insert(b.name.clone()) {
+                    added = true;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    struct DictBuilder {
+        params: Vec<String>,
+        this: Option<String>,
+        con_expr: Core,
+    }
+
+    let mut builders: HashMap<String, DictBuilder> = HashMap::new();
+    for b in binds.iter() {
+        if is_rule_binding(&b.name) || mentions(&b.body, &b.name) || size(&b.body, MAX_BUILDER_SIZE + 1) > MAX_BUILDER_SIZE {
+            continue;
+        }
+        let mut params = Vec::new();
+        let mut cur = &b.body;
+        while let Core::Lam(p, inner) = cur {
+            params.push(p.clone());
+            cur = inner;
+        }
+        if params.is_empty() {
+            continue;
+        }
+        let distinct: HashSet<&str> = params.iter().map(String::as_str).collect();
+        if distinct.len() != params.len() {
+            continue;
+        }
+        let parsed = match cur {
+            Core::Con(con, _) if is_dict_con(con) => Some((None, cur.clone())),
+            Core::Let(bs, body) => match (&bs[..], &**body) {
+                ([(this, rhs @ Core::Con(con, _))], Core::Var(v))
+                    if v == this && is_dict_con(con) && !params.iter().any(|p| p == this) =>
+                {
+                    Some((Some(this.clone()), rhs.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((this, con_expr)) = parsed {
+            builders.insert(b.name.clone(), DictBuilder { params, this, con_expr });
+        }
+    }
+    if builders.is_empty() {
+        return;
+    }
+
+    let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
+    let mut expanded: HashMap<(String, Vec<String>), String> = HashMap::new();
+    let mut total = 0usize;
+
+    for _ in 0..4 {
+        let mut changed = false;
+        for b in binds.iter_mut() {
+            if is_rule_binding(&b.name) || !matches!(&b.body, Core::App(..)) {
+                continue;
+            }
+            let mut args = Vec::new();
+            let mut head = &b.body;
+            while let Core::App(f, a) = head {
+                args.push(&**a);
+                head = f;
+            }
+            args.reverse();
+            let Core::Var(f_name) = head else { continue };
+            let Some(builder) = builders.get(f_name.as_str()) else { continue };
+            if args.len() != builder.params.len() {
+                continue;
+            }
+            let mut arg_names = Vec::with_capacity(args.len());
+            let mut all_valid = true;
+            let mut has_known_dict = false;
+            for a in &args {
+                let Core::Var(g) = a else {
+                    all_valid = false;
+                    break;
+                };
+                if g == &b.name || !all_globals.contains(g) {
+                    all_valid = false;
+                    break;
+                }
+                if known_dicts.contains(g) {
+                    has_known_dict = true;
+                }
+                arg_names.push(g.clone());
+            }
+            if !all_valid || !has_known_dict {
+                continue;
+            }
+            let key = (f_name.clone(), arg_names.clone());
+            if let Some(prev) = expanded.get(&key) {
+                if prev != &b.name {
+                    b.body = Core::Var(prev.clone());
+                    known_dicts.insert(b.name.clone());
+                    changed = true;
+                }
+                continue;
+            }
+            if total >= MAX_EXPANSIONS {
+                continue;
+            }
+            let mut body = builder.con_expr.clone();
+            let mut protected = all_globals.clone();
+            for p in &builder.params {
+                protected.insert(p.clone());
+            }
+            if let Some(this) = &builder.this {
+                protected.insert(this.clone());
+            }
+            uniquify(&mut body, &protected, &mut HashSet::new(), &mut HashMap::new(), &mut fresh);
+            for (p, arg) in builder.params.iter().zip(&arg_names) {
+                rename_free(&mut body, p, arg);
+            }
+            if let Some(this) = &builder.this {
+                rename_free(&mut body, this, &b.name);
+            }
+            b.body = body;
+            expanded.insert(key, b.name.clone());
+            known_dicts.insert(b.name.clone());
+            total += 1;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    FRESH.store(fresh, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Renames the free occurrences of `from`: not under a binder of the same name (names are not
 /// yet unique before the first pass).
 fn rename_free(c: &mut Core, from: &str, to: &str) {
@@ -1362,7 +1633,9 @@ impl Simp<'_> {
                 }
                 for (name, rhs) in &kept {
                     if let Core::Con(con, args) = rhs {
-                        if args.iter().all(is_atom) || is_dict_con(con) {
+                        if args.iter().all(is_atom)
+                            || (is_dict_con(con) && !group.iter().any(|g| mentions(rhs, g)))
+                        {
                             self.local_known.insert(name.clone(), (con.clone(), args.clone()));
                         }
                     }
@@ -5711,5 +5984,172 @@ mod rule_tests {
         let Core::Case(_, _, alts) = &**inner else { panic!("expected case") };
         let Alt::Con(_, _, branch) = &alts[0] else { panic!("expected Con alt") };
         assert_eq!(*branch, Core::Prim("+#".into(), vec![v("p"), v("q")]));
+    }
+
+    #[test]
+    fn ties_dict_builder_knot_and_specialises_closed_dict_apps() {
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // Base dict: T.$fOrdChar = [T.D:Ord T.cmpChar]
+        let ord_char = TopBind {
+            name: "T.$fOrdChar".into(),
+            body: Core::Con("T.D:Ord".into(), vec![v("T.cmpChar")]),
+        };
+        let cmp_char = TopBind {
+            name: "T.cmpChar".into(),
+            body: Core::Lam(
+                "x".into(),
+                Box::new(Core::Lam(
+                    "y".into(),
+                    Box::new(Core::Prim("==#".into(), vec![v("x"), v("y")])),
+                )),
+            ),
+        };
+        // Parametric dict builder with recursive self-call:
+        // T.$fOrdList = \di -> let this = [T.D:Ord (let d = T.$fOrdList di in \xs ys ->
+        //   case xs of { (x:xs') -> case ys of { (y:ys') ->
+        //     case di of D:Ord cmp_a -> case cmp_a x y of { 1# -> case d of D:Ord cmp_xs -> cmp_xs xs' ys'; _ -> 0# }; _ -> 0# }; _ -> 1# })] in this
+        let rec_body = Core::Lam(
+            "xs".into(),
+            Box::new(Core::Lam(
+                "ys".into(),
+                Box::new(Core::Case(
+                    Box::new(v("xs")),
+                    "bx".into(),
+                    vec![
+                        Alt::Con(
+                            "Builtin.:".into(),
+                            vec!["x".into(), "xs'".into()],
+                            Core::Case(
+                                Box::new(v("ys")),
+                                "by".into(),
+                                vec![
+                                    Alt::Con(
+                                        "Builtin.:".into(),
+                                        vec!["y".into(), "ys'".into()],
+                                        Core::Case(
+                                            Box::new(v("di")),
+                                            "bd".into(),
+                                            vec![Alt::Con(
+                                                "T.D:Ord".into(),
+                                                vec!["cmp_a".into()],
+                                                Core::Case(
+                                                    Box::new(app(app(v("cmp_a"), v("x")), v("y"))),
+                                                    "r".into(),
+                                                    vec![
+                                                        Alt::Lit(
+                                                            Lit::Int(1),
+                                                            Core::Case(
+                                                                Box::new(v("d")),
+                                                                "bd2".into(),
+                                                                vec![Alt::Con(
+                                                                    "T.D:Ord".into(),
+                                                                    vec!["cmp_xs".into()],
+                                                                    app(app(v("cmp_xs"), v("xs'")), v("ys'")),
+                                                                )],
+                                                            ),
+                                                        ),
+                                                        Alt::Default(Core::Lit(Lit::Int(0))),
+                                                    ],
+                                                ),
+                                            )],
+                                        ),
+                                    ),
+                                    Alt::Default(Core::Lit(Lit::Int(0))),
+                                ],
+                            ),
+                        ),
+                        Alt::Default(Core::Lit(Lit::Int(1))),
+                    ],
+                )),
+            )),
+        );
+        let ord_list = TopBind {
+            name: "T.$fOrdList".into(),
+            body: Core::Lam(
+                "di".into(),
+                Box::new(Core::Let(
+                    vec![(
+                        "this".into(),
+                        Core::Con(
+                            "T.D:Ord".into(),
+                            vec![Core::Let(
+                                vec![("d".into(), app(v("T.$fOrdList"), v("di")))],
+                                Box::new(rec_body),
+                            )],
+                        ),
+                    )],
+                    Box::new(v("this")),
+                )),
+            ),
+        };
+        // Two closed dict applications that should expand once and deduplicate.
+        let dict1 = TopBind { name: "T.dict1".into(), body: app(v("T.$fOrdList"), v("T.$fOrdChar")) };
+        let dict2 = TopBind { name: "T.dict2".into(), body: app(v("T.$fOrdList"), v("T.$fOrdChar")) };
+        let user = TopBind {
+            name: "T.use".into(),
+            body: Core::Lam(
+                "a".into(),
+                Box::new(Core::Lam(
+                    "b".into(),
+                    Box::new(Core::Case(
+                        Box::new(v("T.dict2")),
+                        "bu".into(),
+                        vec![Alt::Con("T.D:Ord".into(), vec!["cmp".into()], app(app(v("cmp"), v("a")), v("b")))],
+                    )),
+                )),
+            ),
+        };
+        let mut binds = vec![ord_char, cmp_char, ord_list, dict1, dict2, user];
+        simplify(&mut binds);
+        // 1. Builder no longer mentions itself (knot tied).
+        let builder = binds.iter().find(|b| b.name == "T.$fOrdList").unwrap();
+        assert!(!mentions(&builder.body, "T.$fOrdList"), "knot should eliminate self-call: {:?}", builder.body);
+        // 2. dict1 expanded to known D:Ord constructor of atoms; dict2 deduplicated to dict1.
+        let d1 = binds.iter().find(|b| b.name == "T.dict1").unwrap();
+        let Core::Con(con, fields) = &d1.body else { panic!("expected D:Ord con: {:?}", d1.body) };
+        assert_eq!(con, "T.D:Ord");
+        let Core::Var(method_name) = &fields[0] else { panic!("expected floated method atom: {:?}", fields) };
+        let d2 = binds.iter().find(|b| b.name == "T.dict2").unwrap();
+        assert_eq!(d2.body, v("T.dict1"), "expected duplicate closed dict to alias dict1");
+        // 3. Specialized method calls itself directly (no D:Ord unpack on recursive step) and inlines ==#.
+        let method = binds.iter().find(|b| b.name == *method_name).unwrap();
+        assert!(mentions(&method.body, method_name), "expected direct self-recursion in {}: {:?}", method_name, method.body);
+        assert!(!mentions(&method.body, "T.dict1"), "expected no D:Ord unpack in {}: {:?}", method_name, method.body);
+        // 4. Caller T.use calls the specialized method directly with no D:Ord unpack.
+        let u = binds.iter().find(|b| b.name == "T.use").unwrap();
+        assert!(mentions(&u.body, method_name), "expected T.use to call {} directly: {:?}", method_name, u.body);
+        assert!(!mentions(&u.body, "T.dict2"), "expected T.use to eliminate dict2 unpack: {:?}", u.body);
+    }
+
+    #[test]
+    fn recursive_local_dict_does_not_infinitely_unfold() {
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // \y -> let d = [T.D:Loop (\x -> case d of T.D:Loop f -> f (x +# y))] in case d of T.D:Loop g -> g 1#
+        let rec_field = Core::Lam(
+            "x".into(),
+            Box::new(Core::Case(
+                Box::new(v("d")),
+                "b1".into(),
+                vec![Alt::Con(
+                    "T.D:Loop".into(),
+                    vec!["f".into()],
+                    app(v("f"), Core::Prim("+#".into(), vec![v("x"), v("y")])),
+                )],
+            )),
+        );
+        let body = Core::Lam(
+            "y".into(),
+            Box::new(Core::Let(
+                vec![("d".into(), Core::Con("T.D:Loop".into(), vec![rec_field]))],
+                Box::new(Core::Case(
+                    Box::new(v("d")),
+                    "b2".into(),
+                    vec![Alt::Con("T.D:Loop".into(), vec!["g".into()], app(v("g"), Core::Lit(Lit::Int(1))))],
+                )),
+            )),
+        );
+        let mut binds = vec![TopBind { name: "T.loop".into(), body }];
+        simplify(&mut binds);
+        assert_eq!(binds.len(), 1);
     }
 }
