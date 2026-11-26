@@ -1486,6 +1486,18 @@ fn pass(
     FRESH.store(fresh, std::sync::atomic::Ordering::Relaxed);
 }
 
+enum LocalTrigger {
+    /// Always inline saturated calls (tiny body).
+    Always,
+    /// Inline saturated calls when a higher-order parameter receives a known function/lambda/PAP,
+    /// or when the body immediately scrutinizes a variable/parameter known to be a constructor.
+    Conditional {
+        ho_params: Vec<usize>,
+        scrut_free: Option<String>,
+        scrut_param: Option<usize>,
+    },
+}
+
 struct Simp<'a> {
     once: &'a HashSet<String>,
     dead: &'a HashSet<String>,
@@ -1495,10 +1507,8 @@ struct Simp<'a> {
     local_known: HashMap<String, (String, Vec<Core>)>,
     /// Case binders known to hold `tagToEnum# <lit>`, resolved when scrutinized at Bool/Ordering cases.
     known_enum_tags: HashMap<String, i64>,
-    /// Small or higher-order non-recursive local lambdas eligible for saturated call-site inlining.
-    /// `(arity, body, ho_params)`: when `ho_params` is `Some(idxs)`, inline only when at least one
-    /// argument at an index in `idxs` is a known function/lambda/PAP.
-    local_templates: HashMap<String, (usize, Core, Option<Vec<usize>>)>,
+    /// Small, higher-order, or known-scrutinee non-recursive local lambdas eligible for saturated call-site inlining.
+    local_templates: HashMap<String, (usize, Core, LocalTrigger)>,
     /// Globals that are literals.
     literals: &'a HashMap<String, Lit>,
     aliases: &'a HashMap<String, String>,
@@ -1653,14 +1663,32 @@ impl Simp<'_> {
                                 .enumerate()
                                 .filter_map(|(i, p)| app_head_mentions(inner, p).then_some(i))
                                 .collect();
+                            let (scrut_free, scrut_param) = match immediate_case_scrut(inner) {
+                                Some(v) => match ps.iter().position(|p| *p == v) {
+                                    Some(i) => (None, Some(i)),
+                                    None => (Some(v.to_string()), None),
+                                },
+                                None => (None, None),
+                            };
                             if hot_size(inner, TINY_LOCAL_SIZE + 1) <= TINY_LOCAL_SIZE {
-                                self.local_templates.insert(name.clone(), (arity, rhs.clone(), None));
+                                self.local_templates
+                                    .insert(name.clone(), (arity, rhs.clone(), LocalTrigger::Always));
                                 local_template_added = Some(name.clone());
-                            } else if !ho_params.is_empty()
+                            } else if (!ho_params.is_empty() || scrut_free.is_some() || scrut_param.is_some())
                                 && hot_size(inner, self.tune.push_call_size + 1) <= self.tune.push_call_size
                             {
-                                self.local_templates
-                                    .insert(name.clone(), (arity, rhs.clone(), Some(ho_params)));
+                                self.local_templates.insert(
+                                    name.clone(),
+                                    (
+                                        arity,
+                                        rhs.clone(),
+                                        LocalTrigger::Conditional {
+                                            ho_params,
+                                            scrut_free,
+                                            scrut_param,
+                                        },
+                                    ),
+                                );
                                 local_template_added = Some(name.clone());
                             }
                         }
@@ -2278,36 +2306,90 @@ impl Simp<'_> {
         false
     }
 
-    /// `case (case s of alts1) as b of _ -> body` with `body` small: `body` (a fresh copy) after
-    /// each result of the inner case, which then needs no join point.
+    /// Whether a leaf result expression is a known constructor, literal, or enum tag that
+    /// immediately resolves an enclosing `case`.
+    fn is_known_result(&self, e: &Core) -> bool {
+        match e {
+            Core::Con(..) | Core::Lit(Lit::Int(_) | Lit::Char(_)) => true,
+            Core::Var(v) => {
+                self.local_known.contains_key(v.as_str())
+                    || self.known.contains_key(v.as_str())
+                    || self.literals.contains_key(v.as_str())
+                    || self.known_enum_tags.contains_key(v.as_str())
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether at least one non-diverging result of `e` is a known constructor/literal.
+    fn any_result_known(&self, e: &Core) -> bool {
+        match e {
+            Core::Case(_, _, alts) => alts.iter().any(|a| {
+                let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                !is_bottom_expr(b) && self.any_result_known(b)
+            }),
+            Core::Let(_, b) => self.any_result_known(b),
+            Core::Fail(_) => false,
+            _ => self.is_known_result(e),
+        }
+    }
+
+    /// `case (case s of alts1) as b of alts2` with `alts2` small: pushes a fresh copy of `alts2`
+    /// into each result of the inner case, avoiding join-point/constructor materialisation.
+    /// Single-default outer cases use `push_size` / `push_call_size`; multi-alt outer cases push
+    /// within `push_size` whenever at least one inner result is a known constructor/literal.
     fn push_small_case(&mut self, c: &mut Core) -> bool {
-        let Core::Case(s, b, alts) = c else { return false };
-        let [Alt::Default(body)] = &alts[..] else { return false };
-        let limit = if results(s, 3) <= 2 && app_head_mentions(body, b) {
-            self.tune.push_call_size
-        } else {
-            self.tune.push_size
-        };
-        if !matches!(**s, Core::Case(..)) || size(body, limit + 1) > limit || results(s, PUSH_RESULTS) > PUSH_RESULTS {
+        if self.budget == 0 {
             return false;
+        }
+        let Core::Case(s, b, alts) = c else { return false };
+        if !matches!(**s, Core::Case(..)) || results(s, PUSH_RESULTS) > PUSH_RESULTS {
+            return false;
+        }
+        if let [Alt::Default(body)] = &alts[..] {
+            let limit = if results(s, 3) <= 2 && app_head_mentions(body, b) {
+                self.tune.push_call_size
+            } else {
+                self.tune.push_size
+            };
+            if size(body, limit + 1) > limit {
+                return false;
+            }
+        } else {
+            if !self.any_result_known(s) {
+                return false;
+            }
+            let limit = self.tune.push_size;
+            let mut total = 0usize;
+            for a in alts.iter() {
+                let (Alt::Con(_, _, body) | Alt::Lit(_, body) | Alt::Default(body)) = a;
+                total += hot_size(body, (limit + 1).saturating_sub(total));
+                if total > limit {
+                    return false;
+                }
+            }
         }
         // A single-use binding waiting for its occurrence (see `pending`) must keep one.
-        if self.pending.keys().any(|x| mentions(body, x)) {
+        if self.pending.keys().any(|x| {
+            alts.iter().any(|a| {
+                let (Alt::Con(_, _, body) | Alt::Lit(_, body) | Alt::Default(body)) = a;
+                mentions(body, x)
+            })
+        }) {
             return false;
         }
-        let Core::Case(inner, b, mut alts) = take(c) else { unreachable!() };
-        let Alt::Default(body) = alts.pop().expect("one alternative") else { unreachable!() };
+        let Core::Case(inner, b, alts) = take(c) else { unreachable!() };
         let mut inner = *inner;
         let fresh = &mut *self.fresh;
         at_results(&mut inner, &mut |r: &mut Core| {
             *fresh += 1;
             let tag = format!("~p{fresh}");
-            let mut copy = body.clone();
-            let mut map = HashMap::new();
-            let b2 = format!("{b}{tag}");
-            map.insert(b.clone(), b2.clone());
-            freshen(&mut copy, &tag, &mut map);
-            *r = Core::Case(Box::new(take(r)), b2, vec![Alt::Default(copy)]);
+            let mut copy = Core::Case(Box::new(Core::Lit(Lit::Int(0))), b.clone(), alts.clone());
+            freshen(&mut copy, &tag, &mut HashMap::new());
+            if let Core::Case(scrut, _, _) = &mut copy {
+                **scrut = take(r);
+            }
+            *r = copy;
         });
         *c = inner;
         true
@@ -2622,17 +2704,37 @@ impl Simp<'_> {
         let Core::Var(name) = head_ref else { return };
         let n = args.len();
         args.reverse();
-        if let Some((arity, body, ho_params)) = self.local_templates.get(name.as_str()) {
+        if let Some((arity, body, trigger)) = self.local_templates.get(name.as_str()) {
             if n < *arity {
                 return;
             }
-            if let Some(positions) = ho_params {
-                if !positions
-                    .iter()
-                    .any(|&i| args.get(i).is_some_and(|a| self.is_interesting_fn_arg(a)))
-                {
-                    return;
+            let fire = match trigger {
+                LocalTrigger::Always => true,
+                LocalTrigger::Conditional {
+                    ho_params,
+                    scrut_free,
+                    scrut_param,
+                } => {
+                    ho_params
+                        .iter()
+                        .any(|&i| args.get(i).is_some_and(|a| self.is_interesting_fn_arg(a)))
+                        || scrut_free
+                            .as_deref()
+                            .is_some_and(|v| self.local_known.contains_key(v) || self.known.contains_key(v))
+                        || scrut_param.is_some_and(|i| {
+                            args.get(i).is_some_and(|a| match a {
+                                Core::Con(..) => true,
+                                Core::Var(v) => {
+                                    self.local_known.contains_key(v.as_str())
+                                        || self.known.contains_key(v.as_str())
+                                }
+                                _ => false,
+                            })
+                        })
                 }
+            };
+            if !fire {
+                return;
             }
             let mut copy = body.clone();
             *self.fresh += 1;
@@ -3622,6 +3724,24 @@ fn local_arities(e: &Core, out: &mut HashMap<String, usize>) {
 /// The most results of an inner case an outer case body is copied to (the body's size limits are
 /// `Tuning::push_size` and `push_call_size`).
 const PUSH_RESULTS: usize = 4;
+
+/// If `e` (skipping leading non-shadowing `Let`s) immediately scrutinizes a variable with at
+/// least one constructor alternative (`case v of Con ... -> ...`), returns `Some(v)`.
+fn immediate_case_scrut(mut e: &Core) -> Option<&str> {
+    let mut let_bound: Vec<&str> = Vec::new();
+    while let Core::Let(bs, body) = e {
+        for (n, _) in bs {
+            let_bound.push(n.as_str());
+        }
+        e = body;
+    }
+    let Core::Case(scrut, _, alts) = e else { return None };
+    let Core::Var(v) = scrut.as_ref() else { return None };
+    if let_bound.contains(&v.as_str()) {
+        return None;
+    }
+    alts.iter().any(|a| matches!(a, Alt::Con(..))).then_some(v.as_str())
+}
 
 /// Whether `var` appears in the function head of an application inside `e`.
 fn app_head_mentions(e: &Core, var: &str) -> bool {
@@ -6151,5 +6271,162 @@ mod rule_tests {
         let mut binds = vec![TopBind { name: "T.loop".into(), body }];
         simplify(&mut binds);
         assert_eq!(binds.len(), 1);
+    }
+
+    #[test]
+    fn inlines_known_scrutinee_join_points_into_single_case() {
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // Simulates GHC's list `compare` pattern-match chain:
+        // \xs ys ->
+        //   let k1 = \u1 ->
+        //     let k2 = \u2 -> case xs of
+        //       Builtin.: x xs' -> case ys of { Builtin.: y ys' -> app(app(T.step, x), y); _ -> Fail }
+        //       _ -> Fail
+        //     in case xs of
+        //       Builtin.: _ _ -> case ys of { Builtin.[] -> GHC.Types.GT; _ -> k2 () }
+        //       _ -> k2 ()
+        //   in case xs of
+        //     Builtin.[] -> case ys of { Builtin.[] -> GHC.Types.EQ; _ -> k1 () }
+        //     _ -> k1 ()
+        let unit = Core::Con("Builtin.()".into(), vec![]);
+        let k2_body = Core::Lam(
+            "u2".into(),
+            Box::new(Core::Case(
+                Box::new(v("xs")),
+                "b_k2x".into(),
+                vec![
+                    Alt::Con(
+                        "Builtin.:".into(),
+                        vec!["x".into(), "xs'".into()],
+                        Core::Case(
+                            Box::new(v("ys")),
+                            "b_k2y".into(),
+                            vec![
+                                Alt::Con(
+                                    "Builtin.:".into(),
+                                    vec!["y".into(), "ys'".into()],
+                                    app(app(v("T.step"), v("x")), v("y")),
+                                ),
+                                Alt::Default(Core::Fail("exhaust".into())),
+                            ],
+                        ),
+                    ),
+                    Alt::Default(Core::Fail("exhaust".into())),
+                ],
+            )),
+        );
+        let k1_body = Core::Lam(
+            "u1".into(),
+            Box::new(Core::Let(
+                vec![("k2".into(), k2_body)],
+                Box::new(Core::Case(
+                    Box::new(v("xs")),
+                    "b_k1x".into(),
+                    vec![
+                        Alt::Con(
+                            "Builtin.:".into(),
+                            vec!["x1".into(), "xs1".into()],
+                            Core::Case(
+                                Box::new(v("ys")),
+                                "b_k1y".into(),
+                                vec![
+                                    Alt::Con("Builtin.[]".into(), vec![], Core::Con("GHC.Types.GT".into(), vec![])),
+                                    Alt::Default(app(v("k2"), unit.clone())),
+                                ],
+                            ),
+                        ),
+                        Alt::Default(app(v("k2"), unit.clone())),
+                    ],
+                )),
+            )),
+        );
+        let outer = Core::Lam(
+            "xs".into(),
+            Box::new(Core::Lam(
+                "ys".into(),
+                Box::new(Core::Let(
+                    vec![("k1".into(), k1_body)],
+                    Box::new(Core::Case(
+                        Box::new(v("xs")),
+                        "b_ox".into(),
+                        vec![
+                            Alt::Con(
+                                "Builtin.[]".into(),
+                                vec![],
+                                Core::Case(
+                                    Box::new(v("ys")),
+                                    "b_oy".into(),
+                                    vec![
+                                        Alt::Con("Builtin.[]".into(), vec![], Core::Con("GHC.Types.EQ".into(), vec![])),
+                                        Alt::Default(app(v("k1"), unit.clone())),
+                                    ],
+                                ),
+                            ),
+                            Alt::Default(app(v("k1"), unit)),
+                        ],
+                    )),
+                )),
+            )),
+        );
+        let mut binds = vec![TopBind { name: "T.cmp".into(), body: outer }];
+        simplify(&mut binds);
+        let body = &binds[0].body;
+        assert!(!mentions(body, "k1"), "expected k1 join point to be eliminated: {:?}", body);
+        assert!(!mentions(body, "k2"), "expected k2 join point to be eliminated: {:?}", body);
+        // Should now be `\xs ys -> case xs of { [] -> ...; (:) -> ... }` with no Let.
+        let Core::Lam(_, b1) = body else { panic!("expected Lam") };
+        let Core::Lam(_, b2) = b1.as_ref() else { panic!("expected Lam") };
+        let Core::Case(s, _, alts) = b2.as_ref() else { panic!("expected single outer Case: {:?}", b2) };
+        assert_eq!(**s, v("xs"));
+        assert!(alts.iter().any(|a| matches!(a, Alt::Con(k, _, _) if k == "Builtin.[]")));
+        assert!(alts.iter().any(|a| matches!(a, Alt::Con(k, _, _) if k == "Builtin.:")));
+    }
+
+    #[test]
+    fn pushes_small_multi_alt_case_into_known_constructor_results() {
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // \u v xs ys ->
+        //   case (case u of { 1# -> EQ; _ -> case v of { 1# -> LT; _ -> GT } }) as scrut of
+        //     EQ -> T.rec xs ys
+        //     _  -> scrut
+        let inner = Core::Case(
+            Box::new(v("u")),
+            "bu".into(),
+            vec![
+                Alt::Lit(Lit::Int(1), Core::Con("GHC.Types.EQ".into(), vec![])),
+                Alt::Default(Core::Case(
+                    Box::new(v("v")),
+                    "bv".into(),
+                    vec![
+                        Alt::Lit(Lit::Int(1), Core::Con("GHC.Types.LT".into(), vec![])),
+                        Alt::Default(Core::Con("GHC.Types.GT".into(), vec![])),
+                    ],
+                )),
+            ],
+        );
+        let outer = Core::Case(
+            Box::new(inner),
+            "scrut".into(),
+            vec![
+                Alt::Con("GHC.Types.EQ".into(), vec![], app(app(v("T.rec"), v("xs")), v("ys"))),
+                Alt::Default(v("scrut")),
+            ],
+        );
+        let body = Core::Lam(
+            "u".into(),
+            Box::new(Core::Lam(
+                "v".into(),
+                Box::new(Core::Lam("xs".into(), Box::new(Core::Lam("ys".into(), Box::new(outer))))),
+            )),
+        );
+        let mut binds = vec![TopBind { name: "T.rec".into(), body }];
+        simplify(&mut binds);
+        let (_, inner_res) = params(&binds[0].body);
+        let Core::Case(s, _, alts) = inner_res else { panic!("expected outer Case on u: {:?}", inner_res) };
+        assert_eq!(**s, v("u"));
+        // Branch `1#` must directly call `T.rec xs ys` without constructing `GHC.Types.EQ`.
+        let eq_alt = alts.iter().find(|a| matches!(a, Alt::Lit(Lit::Int(1), _))).expect("1# alt");
+        let Alt::Lit(_, eq_body) = eq_alt else { unreachable!() };
+        assert_eq!(*eq_body, app(app(v("T.rec"), v("xs")), v("ys")));
     }
 }
