@@ -6118,7 +6118,7 @@ hsc_apply:
     movq 8(%r14), %rdx
     jmp *%rdx
 .Lap_arity:
-    ja .Lap_slow
+    ja .Lap_under
     # Over-application (arity rdx < rcx): the first rdx arguments move down two words, and an
     # apply frame [hsc_apply_ret][count] holds the rest, which stay where they are.
     subq $16, %rbp
@@ -6137,6 +6137,35 @@ hsc_apply:
     movq %rcx, 8(%rbp,%rdx,8)
     movq 8(%r14), %rdx
     jmp *%rdx
+.Lap_under:
+    # Under-application (arity rdx > rcx): allocate a PAP object inline when heap room permits,
+    # falling back to hsc_apply_slow on GC or extreme argument counts.
+    cmpq $0xfffffe, %rcx
+    ja .Lap_slow
+    leaq 16(%r12,%rcx,8), %r9
+    cmpq %r13, %r9
+    ja .Lap_slow
+    movq %rcx, %rdx
+    shlq $32, %rdx
+    leaq 1(%rcx), %r8
+    shlq $8, %r8
+    orq %r8, %rdx
+    orq $7, %rdx
+    movq %rdx, (%r12)
+    movq %r14, 8(%r12)
+    xorl %r8d, %r8d
+.Lap_under_copy:
+    cmpq %rcx, %r8
+    jae .Lap_under_done
+    movq (%rbp,%r8,8), %rax
+    movq %rax, 16(%r12,%r8,8)
+    incq %r8
+    jmp .Lap_under_copy
+.Lap_under_done:
+    leaq (%rbp,%rcx,8), %rbp
+    movq %r12, %r14
+    movq %r9, %r12
+    jmp *(%rbp)
 .Lap_pap:
     # A partial application: its held arguments go below the new ones, and its function is
     # applied to all of them.
