@@ -33,6 +33,20 @@ pub const IND: u8 = 9;
 pub const REF: u8 = 11;
 pub const BYTES: u8 = 13;
 
+/// Maximum byte length of a string literal emitted as static `Builtin.:`/`Builtin.[]` cells in
+/// `.data.rel.ro` rather than constructed dynamically via `hsc_mk_literal`.
+const MAX_STATIC_STR_LEN: usize = 128;
+
+/// Whether `l` is lowered to a static label (`leaq ...(%rip)`) with zero allocation and no GC.
+fn is_static_slit(l: &SLit) -> bool {
+    match l {
+        SLit::Int(_) | SLit::Char(_) | SLit::Double(_) => true,
+        SLit::Integer(s) => s.parse::<i64>().is_ok(),
+        SLit::Str(s) => s.len() <= MAX_STATIC_STR_LEN,
+        SLit::Frac(_) | SLit::Addr(_) => false,
+    }
+}
+
 /// Frame kinds, as the collector reads them from the info of a return address.
 pub mod frame {
     /// A body's frame. Its size word is `words | raw << 32`: the lowest `raw` of its `words` hold
@@ -165,6 +179,10 @@ pub struct Gen {
     self_dead_state_params: u64,
     /// Static objects (label, header, payload: a number or a label).
     statics: Vec<(String, u64, String)>,
+    /// Multi-field static constructor objects emitted in `.data.rel.ro`: `(label, header, fields)`.
+    rel_cons: Vec<(String, u64, Vec<String>)>,
+    /// Deduplicated static multi-field constructors, keyed by `(con_id, field_labels)`.
+    static_cons: HashMap<(u32, Vec<String>), String>,
     /// Deduplicated static numeric/char/IS literal cells, keyed by `(header, payload_bits)`.
     static_cells: HashMap<(u64, u64), String>,
     /// Shared static cells for constructors without fields, indexed by constructor ID.
@@ -461,6 +479,8 @@ impl Gen {
             current_self: None,
             self_dead_state_params: 0,
             statics: Vec::new(),
+            rel_cons: Vec::new(),
+            static_cons: HashMap::new(),
             static_cells: HashMap::new(),
             nullary_cons: HashMap::new(),
             nullary_globals: HashMap::new(),
@@ -758,6 +778,13 @@ impl Gen {
         for (l, h, w) in rel_statics {
             let _ = writeln!(g.out, "{l}:\n    .quad {h}, {w}");
         }
+        for (l, h, fields) in std::mem::take(&mut g.rel_cons) {
+            let _ = write!(g.out, "{l}:\n    .quad {h}");
+            for f in fields {
+                let _ = write!(g.out, ", {f}");
+            }
+            g.out.push('\n');
+        }
         let main_index = prog.index.get("hsc$main")
             .or_else(|| prog.index.get(crate::core::MAIN_ENTRY))
             .or_else(|| prog.index.get("Main.main")).copied().unwrap_or(0);
@@ -1009,8 +1036,7 @@ impl Gen {
     fn is_pure_leaf_case(e: &SExpr) -> bool {
         fn pure(e: &SExpr) -> bool {
             match e {
-                SExpr::Atom(Atom::Lit(SLit::Str(_) | SLit::Frac(_) | SLit::Addr(_))) => false,
-                SExpr::Atom(Atom::Lit(SLit::Integer(s))) => s.parse::<i64>().is_ok(),
+                SExpr::Atom(Atom::Lit(l)) => is_static_slit(l),
                 SExpr::Atom(_) | SExpr::Fail(_) => true,
                 SExpr::Con(_, args) => args.is_empty(),
                 SExpr::Prim(name, args) => {
@@ -2721,8 +2747,7 @@ impl Gen {
             SExpr::Prim(name, args) => self.prim(name, args, p),
             SExpr::Let(binds, body) => {
                 let non_alloc = |a: &Atom| match a {
-                    Atom::Lit(SLit::Str(_) | SLit::Frac(_) | SLit::Addr(_)) => false,
-                    Atom::Lit(SLit::Integer(s)) => s.parse::<i64>().is_ok(),
+                    Atom::Lit(l) => is_static_slit(l),
                     _ => true,
                 };
                 let fuse_con = match body.as_ref() {
@@ -2957,8 +2982,7 @@ impl Gen {
                             let non_alloc = |a: &Atom| {
                                 !is_raw(a)
                                     && match a {
-                                        Atom::Lit(SLit::Str(_) | SLit::Frac(_) | SLit::Addr(_)) => false,
-                                        Atom::Lit(SLit::Integer(s)) => s.parse::<i64>().is_ok(),
+                                        Atom::Lit(l) => is_static_slit(l),
                                         _ => true,
                                     }
                             };
@@ -3100,8 +3124,7 @@ impl Gen {
                             let non_alloc = |a: &Atom| {
                                 !is_raw(a)
                                     && match a {
-                                        Atom::Lit(SLit::Str(_) | SLit::Frac(_) | SLit::Addr(_)) => false,
-                                        Atom::Lit(SLit::Integer(s)) => s.parse::<i64>().is_ok(),
+                                        Atom::Lit(l) => is_static_slit(l),
                                         _ => true,
                                     }
                             };
@@ -4213,6 +4236,18 @@ impl Gen {
                     lbl
                 }
             }
+            // Short string literals are static lists of static CHAR cells in `.data.rel.ro`,
+            // avoiding repeated `hsc_mk_literal` runtime calls and heap allocations in loops.
+            SLit::Str(s) if s.len() <= MAX_STATIC_STR_LEN => {
+                let nil_id = self.con_id("Builtin.[]");
+                let cons_id = self.con_id("Builtin.:");
+                let mut cur = self.nullary_con(nil_id);
+                for c in s.chars().rev() {
+                    let ch = self.static_literal_label(&SLit::Char(c)).expect("char literal is static");
+                    cur = self.static_con(cons_id, vec![ch, cur]);
+                }
+                cur
+            }
             _ => return None,
         })
     }
@@ -4222,7 +4257,7 @@ impl Gen {
             let _ = writeln!(self.out, "    leaq {lbl}(%rip), {reg}");
             return;
         }
-        // Strings, big integers, fractions and addresses: the runtime builds the object (the
+        // Long strings, big integers, fractions and addresses: the runtime builds the object (the
         // call allocates, so the atom is loaded last).
         self.zero_unsafe_slots(p, true);
         let (kind, text) = match l {
@@ -4254,6 +4289,21 @@ impl Gen {
         self.statics.push((label.clone(), header(CON, 0, id as u64), "0".into()));
         self.nullary_cons.insert(id, label.clone());
         label
+    }
+
+    fn static_con(&mut self, id: u32, fields: Vec<String>) -> String {
+        if fields.is_empty() {
+            return self.nullary_con(id);
+        }
+        let key = (id, fields.clone());
+        if let Some(lbl) = self.static_cons.get(&key) {
+            return lbl.clone();
+        }
+        let lbl = self.label("scon");
+        let hdr = header(CON, fields.len() as u64, id as u64);
+        self.rel_cons.push((lbl.clone(), hdr, fields));
+        self.static_cons.insert(key, lbl.clone());
+        lbl
     }
 
     fn string_label(&mut self, bytes: &[u8]) -> String {
@@ -5795,8 +5845,7 @@ impl Gen {
             }
         }
         fn is_non_static_slit(l: &SLit) -> bool {
-            matches!(l, SLit::Str(_) | SLit::Frac(_) | SLit::Addr(_))
-                || matches!(l, SLit::Integer(s) if s.parse::<i64>().is_err())
+            !is_static_slit(l)
         }
         fn walk(
             g: &Gen,
@@ -5930,8 +5979,7 @@ impl Gen {
         let non_alloc = |a: &Atom| {
             !is_raw(a)
                 && match a {
-                    Atom::Lit(SLit::Str(_) | SLit::Frac(_) | SLit::Addr(_)) => false,
-                    Atom::Lit(SLit::Integer(s)) => s.parse::<i64>().is_ok(),
+                    Atom::Lit(l) => is_static_slit(l),
                     _ => true,
                 }
         };
@@ -7707,6 +7755,42 @@ mod sprint6_codegen_tests {
         assert_eq!(hot.matches(&format!("cmpb ${BYTES}")).count(), 1, "expected single BYTES check:\n{hot}");
         assert!(!hot.contains("ja .Lgc"), "expected zero heap allocation on hot path:\n{hot}");
         assert!(hot.contains("8(%rax,%rdx,8)"), "expected indexed word array load/store:\n{hot}");
+    }
+
+    #[test]
+    fn static_short_string_literals_emit_static_cons_and_share_tails() {
+        let g_empty = SGlobal {
+            name: "Test.empty".into(),
+            closure: simple_closure(0, 1, 0, SExpr::Atom(Atom::Lit(SLit::Str(String::new())))),
+            worker: None,
+        };
+        let g_ka = SGlobal {
+            name: "Test.ka".into(),
+            closure: simple_closure(0, 1, 0, SExpr::Atom(Atom::Lit(SLit::Str("ka".into())))),
+            worker: None,
+        };
+        let g_a = SGlobal {
+            name: "Test.a".into(),
+            closure: simple_closure(0, 1, 0, SExpr::Atom(Atom::Lit(SLit::Str("a".into())))),
+            worker: None,
+        };
+        let long_s = "x".repeat(MAX_STATIC_STR_LEN + 1);
+        let g_long = SGlobal {
+            name: "Test.long".into(),
+            closure: simple_closure(0, 1, 0, SExpr::Atom(Atom::Lit(SLit::Str(long_s)))),
+            worker: None,
+        };
+        let prog = make_prog(vec![g_empty, g_ka, g_a, g_long]);
+        let asm = Gen::program(&prog);
+        let rel = asm.split_once(".section .data.rel.ro").expect("rel.ro section").1;
+        // "ka" and "a" share the 'a':[] cons cell, so only 2 static cons objects are emitted.
+        assert_eq!(rel.matches(".Lscon").count(), 3, "2 label defs + 1 tail ref expected:\n{rel}");
+        // Only the oversized string calls hsc_mk_literal.
+        assert_eq!(
+            asm.matches("call hsc_mk_literal_rt").count(),
+            1,
+            "only long string should call hsc_mk_literal_rt"
+        );
     }
 }
 
