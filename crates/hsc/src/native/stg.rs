@@ -162,6 +162,12 @@ pub const UNUSED_SLOT: u32 = 0x3fff_ffff;
 /// Whether a Core application of `g` to `nargs` arguments is a known diverging error call.
 fn is_diverging_call(g: &str, nargs: usize) -> bool {
     let Some((mod_name, base)) = g.rsplit_once('.') else { return false };
+    if matches!(mod_name, "GHC.Internal.Ix" | "GHC.Ix") && base == "indexError" {
+        return nargs >= 4;
+    }
+    if mod_name == "GHC.Prim" && base == "raise#" {
+        return nargs >= 1;
+    }
     let std_err_mod = matches!(
         mod_name,
         "GHC.Internal.Control.Exception.Base"
@@ -324,6 +330,9 @@ fn raw_uses_in(
         Core::App(..) => {
             let (f, args) = spine(e);
             if let Core::Var(g) = f {
+                if g != x && is_diverging_call(g.as_str(), args.len()) {
+                    return no_bad_raw_case(e, x);
+                }
                 if can_call_worker(g.as_str(), &args, w, strict_map, whnf) {
                     let raw = &w[g.as_str()];
                     // A raw parameter's argument is evaluated in place (see `worker_call`); the others
@@ -390,6 +399,7 @@ fn raw_uses_in(
                 }
             })
         }
+        Core::Prim(p, _) if p == "raise#" => no_bad_raw_case(e, x),
         Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, x)),
     }
 }
@@ -3563,6 +3573,50 @@ mod raw_slot_tests {
         assert_eq!(wp, "writeWordArray#");
         assert!(matches!(wargs[1], Atom::Slot(k) if k & RAW != 0));
         assert!(matches!(wargs[2], Atom::Slot(k) if k & RAW != 0));
+    }
+
+    #[test]
+    fn cold_diverging_error_keeps_hot_index_unboxed() {
+        // Test.f = \j -> case j -# 2# as i of
+        //   _ -> case 0# <=# i as c of
+        //     1# -> i +# 1#
+        //     _  -> GHC.Internal.Err.error cs (Test.show i)
+        let err_branch = app(
+            app(var("GHC.Internal.Err.error"), var("cs")),
+            app(var("Test.show"), var("i")),
+        );
+        let body = Core::Lam(
+            "j".into(),
+            Box::new(case(
+                prim("-#", vec![var("j"), Core::Lit(Lit::Int(2))]),
+                "i",
+                Core::Case(
+                    Box::new(prim("<=#", vec![Core::Lit(Lit::Int(0)), var("i")])),
+                    "c".into(),
+                    vec![
+                        Alt::Lit(Lit::Int(1), prim("+#", vec![var("i"), Core::Lit(Lit::Int(1))])),
+                        Alt::Default(err_branch),
+                    ],
+                ),
+            )),
+        );
+        let binds = vec![
+            TopBind { name: "Test.f".into(), body },
+            TopBind { name: "Test.show".into(), body: Core::Lam("x".into(), Box::new(var("x"))) },
+            TopBind { name: "GHC.Internal.Err.error".into(), body: Core::Lam("a".into(), Box::new(Core::Lam("b".into(), Box::new(Core::Fail("err".into()))))) },
+            TopBind { name: "cs".into(), body: Core::Lit(Lit::Int(0)) },
+        ];
+        let numeric = NumericParams {
+            params: [("Test.f".to_string(), vec![NUM_INT])].into_iter().collect(),
+            results: HashMap::new(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, raw) = prog.globals[0].worker.as_ref().expect("Test.f should get raw worker");
+        assert_eq!(raw, &vec![true]);
+        let SExpr::Case(_, i_slot, _) = &worker.body else {
+            panic!("expected Case binding i: {:?}", worker.body);
+        };
+        assert!(i_slot & RAW != 0, "i = j -# 2# should remain raw despite cold error use: {:?}", worker.body);
     }
 }
 
