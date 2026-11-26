@@ -1173,6 +1173,7 @@ fn pass(
                 pending: HashMap::new(),
                 known: &known,
                 local_known: HashMap::new(),
+                known_enum_tags: HashMap::new(),
                 local_templates: HashMap::new(),
                 literals: &literals,
                 aliases: &aliases,
@@ -1221,6 +1222,8 @@ struct Simp<'a> {
     known: &'a HashMap<String, (String, Vec<Core>)>,
     /// Local let-bound constructors with atomic fields (`let r = STRef mv`), for known-case elimination.
     local_known: HashMap<String, (String, Vec<Core>)>,
+    /// Case binders known to hold `tagToEnum# <lit>`, resolved when scrutinized at Bool/Ordering cases.
+    known_enum_tags: HashMap<String, i64>,
     /// Small or higher-order non-recursive local lambdas eligible for saturated call-site inlining.
     /// `(arity, body, ho_params)`: when `ho_params` is `Some(idxs)`, inline only when at least one
     /// argument at an index in `idxs` is a known function/lambda/PAP.
@@ -1575,17 +1578,23 @@ impl Simp<'_> {
                         }
                     }
                 }
+                if self.merge_same_scrutinee_case(c) {
+                    self.changed = true;
+                    self.expr(c);
+                    return;
+                }
                 self.tag_to_enum(c);
                 let Core::Case(s, binder, alts) = c else { return };
                 let mut added: Vec<String> = Vec::new();
                 if self.evaluated.insert(binder.clone()) {
                     added.push(binder.clone());
                 }
-                match s.as_ref() {
+                let scrut_var: Option<String> = match s.as_ref() {
                     Core::Var(v) => {
                         if self.evaluated.insert(v.clone()) {
                             added.push(v.clone());
                         }
+                        Some(v.clone())
                     }
                     Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
                         for a in args {
@@ -1595,9 +1604,24 @@ impl Simp<'_> {
                                 }
                             }
                         }
+                        None
                     }
-                    _ => {}
-                }
+                    _ => None,
+                };
+                let added_enum_tag = if let (Core::Prim(p, args), [Alt::Default(_)]) = (&**s, &alts[..]) {
+                    if p == "tagToEnum#" {
+                        if let [Core::Lit(Lit::Int(tag))] = &args[..] {
+                            let prev = self.known_enum_tags.insert(binder.clone(), *tag);
+                            Some((binder.clone(), prev))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 for a in &mut *alts {
                     match a {
                         Alt::Con(con, vars, b) => {
@@ -1609,7 +1633,25 @@ impl Simp<'_> {
                                     }
                                 }
                             }
+                            let known_val = (con.clone(), vars.iter().map(|v| Core::Var(v.clone())).collect::<Vec<_>>());
+                            let prev_binder = self.local_known.insert(binder.clone(), known_val.clone());
+                            let prev_scrut = scrut_var
+                                .as_ref()
+                                .filter(|sv| *sv != binder)
+                                .map(|sv| (sv.clone(), self.local_known.insert(sv.clone(), known_val)));
                             self.expr(b);
+                            if let Some(prev) = prev_binder {
+                                self.local_known.insert(binder.clone(), prev);
+                            } else {
+                                self.local_known.remove(binder.as_str());
+                            }
+                            if let Some((sv, prev)) = prev_scrut {
+                                if let Some(p) = prev {
+                                    self.local_known.insert(sv, p);
+                                } else {
+                                    self.local_known.remove(&sv);
+                                }
+                            }
                             for v in alt_added {
                                 self.evaluated.remove(&v);
                             }
@@ -1617,21 +1659,34 @@ impl Simp<'_> {
                         Alt::Lit(_, b) | Alt::Default(b) => self.expr(b),
                     }
                 }
+                if let Some((k, prev)) = added_enum_tag {
+                    if let Some(t) = prev {
+                        self.known_enum_tags.insert(k, t);
+                    } else {
+                        self.known_enum_tags.remove(&k);
+                    }
+                }
                 for v in added {
                     self.evaluated.remove(&v);
+                }
+                if self.merge_same_scrutinee_case(c) {
+                    self.changed = true;
+                    return;
                 }
                 // `case v as b of _ -> body` is redundant when `body` immediately forces `v` (or
                 // `b`) before any other demand (e.g. from `I#`/`C#` pattern matching wrapping a
                 // strict primitive such as `(I# x) == (I# y) = tagToEnum# (x ==# y)`).
-                if let (Core::Var(v), [Alt::Default(body)]) = (&**s, &alts[..]) {
-                    if forces_var_first(body, v, binder, &self.evaluated) {
-                        let v_expr = Core::Var(v.clone());
-                        let b_name = binder.clone();
-                        let Some(Alt::Default(mut body)) = alts.pop() else { unreachable!() };
-                        subst(&mut body, &b_name, &v_expr);
-                        *c = body;
-                        self.changed = true;
-                        return;
+                if let Core::Case(s, binder, alts) = c {
+                    if let (Core::Var(v), [Alt::Default(body)]) = (&**s, &alts[..]) {
+                        if forces_var_first(body, v, binder, &self.evaluated) {
+                            let v_expr = Core::Var(v.clone());
+                            let b_name = binder.clone();
+                            let Some(Alt::Default(mut body)) = alts.pop() else { unreachable!() };
+                            subst(&mut body, &b_name, &v_expr);
+                            *c = body;
+                            self.changed = true;
+                            return;
+                        }
                     }
                 }
             }
@@ -2473,6 +2528,51 @@ impl Simp<'_> {
                 }
                 Some(if binds.is_empty() { body } else { Core::Let(binds, Box::new(body)) })
             }
+            Core::Var(v) if self.known_enum_tags.contains_key(v.as_str()) => {
+                let tag = self.known_enum_tags[v.as_str()];
+                let mut has_con = false;
+                let mut all_bool = true;
+                let mut all_ord = true;
+                for a in alts.iter() {
+                    match a {
+                        Alt::Con(k, vars, _) => {
+                            if !vars.is_empty() {
+                                return None;
+                            }
+                            has_con = true;
+                            if k != TRUE && k != FALSE {
+                                all_bool = false;
+                            }
+                            if !matches!(k.as_str(), "GHC.Types.LT" | "GHC.Types.EQ" | "GHC.Types.GT") {
+                                all_ord = false;
+                            }
+                        }
+                        Alt::Default(_) => {}
+                        Alt::Lit(..) => return None,
+                    }
+                }
+                if !has_con {
+                    return None;
+                }
+                let con = if all_bool && (0..=1).contains(&tag) {
+                    if tag == 0 { FALSE } else { TRUE }
+                } else if all_ord && (0..=2).contains(&tag) {
+                    match tag {
+                        0 => "GHC.Types.LT",
+                        1 => "GHC.Types.EQ",
+                        _ => "GHC.Types.GT",
+                    }
+                } else {
+                    return None;
+                };
+                let i = alts
+                    .iter()
+                    .position(|a| matches!(a, Alt::Con(k, vars, _) if k == con && vars.is_empty()))
+                    .or_else(|| alts.iter().position(|a| matches!(a, Alt::Default(_))))?;
+                let mut body = alt_body(alts.swap_remove(i));
+                subst(&mut body, binder, &Core::Con(con.to_string(), Vec::new()));
+                Some(body)
+            }
             Core::Var(v) if self.literals.contains_key(v.as_str()) => {
                 let l = self.literals[v.as_str()].clone();
                 **s = Core::Lit(l);
@@ -2490,6 +2590,78 @@ impl Simp<'_> {
             }
             _ => None,
         }
+    }
+
+    /// Flattens a nested `case` in the default branch when it scrutinises the same value as the
+    /// enclosing `case` (`case s as b1 of { Con1 -> e1; _ -> case b1 as b2 of { Con2 -> e2; ... } }`
+    /// or `case e as a of { _ -> case a as b of alts }`). This collapses multi-constructor pattern
+    /// matches into a single `case` (one tag load in native codegen) and exposes `tagToEnum#` cases.
+    fn merge_same_scrutinee_case(&mut self, c: &mut Core) -> bool {
+        let Core::Case(s, b1, alts) = c else { return false };
+        // Preserve 1-alt default shells around raw primitives and calls (`case rawPrim as r of _ -> case r of ...`),
+        // which STG lowering relies on to keep `r` unboxed. Only merge 1-alt shells for `tagToEnum#`.
+        if alts.len() == 1 && !matches!(&**s, Core::Prim(p, _) if p == "tagToEnum#") {
+            return false;
+        }
+        let Some(Alt::Default(Core::Case(s2, _, inner_alts))) = alts.last() else {
+            return false;
+        };
+        let Core::Var(v) = &**s2 else { return false };
+        let same = v == b1 || matches!(&**s, Core::Var(sv) if sv == v);
+        if !same {
+            return false;
+        }
+        let outer_prefix = &alts[..alts.len() - 1];
+        let outer_has_con = outer_prefix.iter().any(|a| matches!(a, Alt::Con(..)));
+        let outer_has_lit = outer_prefix.iter().any(|a| matches!(a, Alt::Lit(..)));
+        let inner_has_con = inner_alts.iter().any(|a| matches!(a, Alt::Con(..)));
+        let inner_has_lit = inner_alts.iter().any(|a| matches!(a, Alt::Lit(..)));
+        if (outer_has_con && inner_has_lit) || (outer_has_lit && inner_has_con) {
+            return false;
+        }
+        let Some(Alt::Default(Core::Case(_, b2, inner_alts))) = alts.pop() else {
+            unreachable!()
+        };
+        let b1_var = Core::Var(b1.clone());
+        let mut seen_cons: HashSet<String> = alts
+            .iter()
+            .filter_map(|a| match a {
+                Alt::Con(k, _, _) => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut seen_lits: Vec<Lit> = alts
+            .iter()
+            .filter_map(|a| match a {
+                Alt::Lit(l, _) => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        for mut a in inner_alts {
+            match &mut a {
+                Alt::Con(_, _, body) | Alt::Lit(_, body) | Alt::Default(body) => {
+                    subst(body, &b2, &b1_var);
+                }
+            }
+            match a {
+                Alt::Con(k, vs, body) => {
+                    if seen_cons.insert(k.clone()) {
+                        alts.push(Alt::Con(k, vs, body));
+                    }
+                }
+                Alt::Lit(l, body) => {
+                    if !seen_lits.contains(&l) {
+                        seen_lits.push(l.clone());
+                        alts.push(Alt::Lit(l, body));
+                    }
+                }
+                Alt::Default(body) => {
+                    alts.push(Alt::Default(body));
+                    break;
+                }
+            }
+        }
+        true
     }
 
     /// `case tagToEnum# e as b of` with Bool alternatives, as a case on the `Int#` `e`; the binder
@@ -3575,7 +3747,8 @@ fn is_total_prim(p: &str, args: &[Core]) -> bool {
     ];
     let divides = matches!(p, "quotInt#" | "remInt#")
         && matches!(args.get(1), Some(Core::Lit(Lit::Int(d))) if *d != 0 && *d != -1);
-    (TOTAL.contains(&p) || divides) && args.iter().all(is_atom)
+    let tag_to_enum = p == "tagToEnum#" && matches!(args, [Core::Lit(Lit::Int(0 | 1))]);
+    (TOTAL.contains(&p) || divides || tag_to_enum) && args.iter().all(is_atom)
 }
 
 /// Primitives that unconditionally force all their arguments left-to-right before returning or
@@ -4485,7 +4658,7 @@ mod rule_tests {
         let no_strict_cons = HashMap::new();
         let no_bottom = HashMap::new();
         let mut s = Simp {
-            once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), local_templates: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates, bottom_fns: &no_bottom,
+            once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), known_enum_tags: HashMap::new(), local_templates: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates, bottom_fns: &no_bottom,
             this: "Test.x", rules: &rules, strict_cons: &no_strict_cons, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
             fresh: &mut fresh, budget: 0, changed: false, tune: O1,
         };
@@ -5423,5 +5596,120 @@ mod rule_tests {
         }
         find_go(&binds[1].body, &mut go_arity);
         assert_eq!(go_arity, Some(2), "expected inner `go` to eta-expand to arity 2: {:?}", binds[1].body);
+    }
+
+    #[test]
+    fn merges_nested_same_scrutinee_cases_and_default_wrappers() {
+        // case x as b1 of { A p -> p; _ -> case x as b2 of { B q -> q; _ -> case b2 as b3 of { C -> 0#; _ -> FAIL } } }
+        let body = Core::Lam(
+            "x".into(),
+            Box::new(Core::Case(
+                Box::new(v("x")),
+                "b1".into(),
+                vec![
+                    Alt::Con("T.A".into(), vec!["p".into()], v("p")),
+                    Alt::Default(Core::Case(
+                        Box::new(v("x")),
+                        "b2".into(),
+                        vec![
+                            Alt::Con("T.B".into(), vec!["q".into()], v("q")),
+                            Alt::Default(Core::Case(
+                                Box::new(v("b2")),
+                                "b3".into(),
+                                vec![
+                                    Alt::Con("T.C".into(), vec![], Core::Lit(Lit::Int(0))),
+                                    Alt::Default(Core::Fail("nope".into())),
+                                ],
+                            )),
+                        ],
+                    )),
+                ],
+            )),
+        );
+        let mut binds = vec![TopBind { name: "T.f".into(), body }];
+        simplify(&mut binds);
+        let Core::Lam(_, inner) = &binds[0].body else { panic!("expected lam") };
+        let Core::Case(_, _, alts) = &**inner else { panic!("expected single case: {:?}", inner) };
+        assert_eq!(alts.len(), 4, "expected A, B, C, Default in one case: {:?}", alts);
+        assert!(matches!(&alts[0], Alt::Con(k, _, _) if k == "T.A"));
+        assert!(matches!(&alts[1], Alt::Con(k, _, _) if k == "T.B"));
+        assert!(matches!(&alts[2], Alt::Con(k, _, _) if k == "T.C"));
+        assert!(matches!(&alts[3], Alt::Default(Core::Fail(_))));
+    }
+
+    #[test]
+    fn folds_known_tag_to_enum_literal_in_nested_bool_case() {
+        // Mirrors `div` overflow guard:
+        // case tagToEnum# 0# as a of _ -> case (case a of True -> f x; _ -> case a of False -> False; _ -> FAIL) as b of { True -> err; _ -> ok }
+        let inner_and = Core::Case(
+            Box::new(v("a")),
+            "cb1".into(),
+            vec![
+                Alt::Con(TRUE.into(), vec![], Core::App(Box::new(v("T.f")), Box::new(v("x")))),
+                Alt::Default(Core::Case(
+                    Box::new(v("a")),
+                    "cb2".into(),
+                    vec![
+                        Alt::Con(FALSE.into(), vec![], Core::Con(FALSE.into(), vec![])),
+                        Alt::Default(Core::Fail("and".into())),
+                    ],
+                )),
+            ],
+        );
+        let body = Core::Lam(
+            "x".into(),
+            Box::new(Core::Case(
+                Box::new(Core::Prim("tagToEnum#".into(), vec![Core::Lit(Lit::Int(0))])),
+                "a".into(),
+                vec![Alt::Default(Core::Case(
+                    Box::new(inner_and),
+                    "b".into(),
+                    vec![
+                        Alt::Con(TRUE.into(), vec![], Core::Fail("overflow".into())),
+                        Alt::Default(v("x")),
+                    ],
+                ))],
+            )),
+        );
+        let mut binds = vec![TopBind { name: "T.g".into(), body }];
+        simplify(&mut binds);
+        assert_eq!(binds[0].body, Core::Lam("x".into(), Box::new(v("x"))));
+    }
+
+    #[test]
+    fn eliminates_redundant_inner_case_inside_alt_con() {
+        // case x as b1 of { Pair p q -> case x as b2 of { Pair r s -> r +# s; _ -> 0# }; _ -> 1# }
+        let body = Core::Lam(
+            "x".into(),
+            Box::new(Core::Case(
+                Box::new(v("x")),
+                "b1".into(),
+                vec![
+                    Alt::Con(
+                        "T.Pair".into(),
+                        vec!["p".into(), "q".into()],
+                        Core::Case(
+                            Box::new(v("x")),
+                            "b2".into(),
+                            vec![
+                                Alt::Con(
+                                    "T.Pair".into(),
+                                    vec!["r".into(), "s".into()],
+                                    Core::Prim("+#".into(), vec![v("r"), v("s")]),
+                                ),
+                                Alt::Default(Core::Lit(Lit::Int(0))),
+                            ],
+                        ),
+                    ),
+                    Alt::Default(Core::Lit(Lit::Int(1))),
+                ],
+            )),
+        );
+        let mut binds = vec![TopBind { name: "T.h".into(), body }];
+        simplify(&mut binds);
+        let Core::Lam(_, inner) = &binds[0].body else { panic!("expected lam") };
+        let Core::Case(_, _, alts) = &**inner else { panic!("expected case") };
+        let Alt::Con(_, _, branch) = &alts[0] else { panic!("expected Con alt") };
+        assert_eq!(*branch, Core::Prim("+#".into(), vec![v("p"), v("q")]));
     }
 }
