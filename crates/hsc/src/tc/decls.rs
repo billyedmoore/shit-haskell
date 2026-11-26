@@ -1618,6 +1618,7 @@ impl Checker {
         // Methods.
         let mut fields: Vec<Core> = super_vars;
         let mut method_binds: Vec<(String, Core)> = Vec::new();
+        let mut method_inlines: Vec<(String, bool, crate::syntax::ast::Activation)> = Vec::new();
         // What the defaults need is solved here, while the instance context is given.
         let outer_wanted = std::mem::take(&mut self.wanted);
         for (mkey, mscheme) in &info.methods {
@@ -1642,6 +1643,9 @@ impl Checker {
                         self.check_method(clauses, &sch, &method_key, loc, 0)?
                     };
                     let name = self.fresh_name("mi");
+                    if let Some(p) = id.inlines.iter().find(|p| p.name.qual.is_none() && p.name.name == occ) {
+                        method_inlines.push((name.clone(), p.inline, p.activation));
+                    }
                     method_binds.push((name.clone(), core));
                     Core::Var(name)
                 }
@@ -1754,6 +1758,19 @@ impl Checker {
         self.scoped.truncate(scope_len);
         self.givens.truncate(givens_len);
 
+        let emit_inline_marker = |out: &mut Vec<TopBind>, module: &str, target: &str, inline: bool, act: crate::syntax::ast::Activation| {
+            use crate::syntax::ast::Activation;
+            let code = match act {
+                Activation::Always => "A".to_string(),
+                Activation::Never => "N".to_string(),
+                Activation::From(n) => format!("F{n}"),
+                Activation::Before(n) => format!("B{n}"),
+            };
+            let kind = if inline { "I" } else { "N" };
+            let name = format!("{module}.$rule%inli{}%{target}%{kind}%{code}", out.len());
+            out.push(TopBind { name, body: Core::Lit(crate::core::Lit::Char('i')) });
+        };
+
         if dparams.is_empty() {
             // A constant dictionary: its methods and superclass dictionaries are top-level
             // bindings, so that calls through the dictionary can be resolved statically.
@@ -1776,15 +1793,29 @@ impl Checker {
             for ((_, body), (_, new)) in binds.into_iter().zip(renames) {
                 self.out.push(TopBind { name: new, body });
             }
+            for (mi_name, inline, act) in method_inlines {
+                let target = format!("{}%{mi_name}", inst.dict);
+                emit_inline_marker(&mut self.out, &self.module, &target, inline, act);
+            }
             self.out.push(TopBind {
                 name: inst.dict.clone(),
                 body: Core::Con(info.dict_con.clone(), fields),
             });
             return Ok(());
         }
-        let dict_body = Core::Con(info.dict_con.clone(), fields);
+        let mut fields = fields;
         let mut bindings = super_binds;
         bindings.extend(method_binds);
+        // Bind non-atom dictionary fields (default methods) so the dictionary constructor
+        // holds atoms only and `local_known` cancels selectors after inlining the dictionary.
+        for f in fields.iter_mut() {
+            if !matches!(f, Core::Var(_)) {
+                let name = self.fresh_name("dm");
+                let rhs = std::mem::replace(f, Core::Var(name.clone()));
+                bindings.push((name, rhs));
+            }
+        }
+        let dict_body = Core::Con(info.dict_con.clone(), fields);
         bindings.push((this.clone(), dict_body));
         let dict_core = Core::Let(bindings, Box::new(Core::Var(this)));
         let core = dparams.into_iter().rev().fold(dict_core, |acc, d| Core::Lam(d, Box::new(acc)));
@@ -1792,6 +1823,13 @@ impl Checker {
             name: inst.dict.clone(),
             body: core,
         });
+        if method_inlines.iter().any(|(_, inl, _)| *inl) && method_inlines.iter().all(|(_, inl, _)| *inl) {
+            let act = method_inlines
+                .iter()
+                .find_map(|(_, inl, a)| (*inl).then_some(*a))
+                .unwrap_or(crate::syntax::ast::Activation::Always);
+            emit_inline_marker(&mut self.out, &self.module, &inst.dict, true, act);
+        }
         Ok(())
     }
 

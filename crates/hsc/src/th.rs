@@ -1000,7 +1000,7 @@ impl Conv<'_> {
                     let decls = self.decs(&a[3])?;
                     out.push(Decl::Instance(InstDecl {
                         overlap, binders: Vec::new(), context: self.cxt(&a[1])?, head: self.ty(&a[2])?,
-                        unboxed_head: false, decls, loc,
+                        unboxed_head: false, decls, inlines: Vec::new(), loc,
                     }));
                 }
                 "StandaloneDerivD" => {

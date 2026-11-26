@@ -134,10 +134,12 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
         }
     }
     let rule_pragmas: Vec<lexer::Pragma> = lexed.pragmas.iter().filter(|p| p.name == "RULES").cloned().collect();
-    // Top-level INLINE and NOINLINE pragmas (those in class, instance and local bodies are
-    // indented, and ignored).
+    // Top-level INLINE and NOINLINE pragmas go into `module.inlines`; indented ones inside
+    // an instance body are attached to that `InstDecl` below.
     let inline_pragmas: Vec<lexer::Pragma> =
         lexed.pragmas.iter().filter(|p| (p.name == "INLINE" || p.name == "NOINLINE") && p.col == 1).cloned().collect();
+    let inst_inline_pragmas: Vec<lexer::Pragma> =
+        lexed.pragmas.iter().filter(|p| (p.name == "INLINE" || p.name == "NOINLINE") && p.col > 1).cloned().collect();
     exts.unknown_pragmas = lexed.unknown_pragmas;
     let mut tokens = lexed.tokens;
     if th_quotes {
@@ -160,8 +162,8 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
             .collect();
         module.rules.extend(parser::parse_rules(tokens, &exts));
     }
-    for p in inline_pragmas {
-        let Ok(lexed) = lexer::lex_for_module(&p.body, &exts) else { continue };
+    let parse_inline_pragma = |p: &lexer::Pragma| -> Option<ast::InlinePragma> {
+        let lexed = lexer::lex_for_module(&p.body, &exts).ok()?;
         let tokens: Vec<token::Token> = lexed.tokens.into_iter().map(|mut t| {
             if t.line == 1 {
                 t.col += p.body_loc.col - 1;
@@ -173,7 +175,27 @@ pub fn parse_module_source(src: &str, flags: &[String]) -> Result<(ast::Module, 
             t.end_line += p.body_loc.line - 1;
             t
         }).collect();
-        module.inlines.extend(parser::parse_inline(&tokens, p.name == "INLINE"));
+        parser::parse_inline(&tokens, p.name == "INLINE")
+    };
+    for p in inline_pragmas {
+        module.inlines.extend(parse_inline_pragma(&p));
+    }
+    for p in inst_inline_pragmas {
+        let owner = module
+            .decls
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                let line = d.loc().line;
+                (line > 0 && line <= p.line).then_some((line, i))
+            })
+            .max_by_key(|&(line, i)| (line, i))
+            .map(|(_, i)| i);
+        if let Some(i) = owner {
+            if let ast::Decl::Instance(inst) = &mut module.decls[i] {
+                inst.inlines.extend(parse_inline_pragma(&p));
+            }
+        }
     }
     Ok((module, exts))
 }
@@ -445,5 +467,40 @@ f x = x
         assert!(fb.binders[2].1.is_some(), "g's rank-2 signature is kept");
         assert!(m.rules[3].binders.is_empty());
         assert_eq!(fb.loc.line, 3);
+    }
+
+    #[test]
+    fn instance_inline_pragmas_attach_to_instance() {
+        let src = r#"module M where
+class C a where
+  foo :: a -> a
+  (>>=) :: a -> a -> a
+
+{-# INLINE topFn #-}
+topFn x = x
+  where
+    {-# INLINE localHelper #-}
+    localHelper y = y
+
+instance C Int where
+  {-# INLINE foo #-}
+  foo x = x
+  {-# NOINLINE [1] (>>=) #-}
+  x >>= _ = x
+"#;
+        let (m, _) = super::parse_module_source(src, &[]).expect("parses");
+        assert_eq!(m.inlines.len(), 1);
+        assert_eq!(m.inlines[0].name.name, "topFn");
+        let inst = m.decls.iter().find_map(|d| match d {
+            super::ast::Decl::Instance(id) => Some(id),
+            _ => None,
+        }).expect("instance decl");
+        assert_eq!(inst.inlines.len(), 2);
+        assert_eq!(inst.inlines[0].name.name, "foo");
+        assert!(inst.inlines[0].inline);
+        assert_eq!(inst.inlines[0].activation, Activation::Always);
+        assert_eq!(inst.inlines[1].name.name, ">>=");
+        assert!(!inst.inlines[1].inline);
+        assert_eq!(inst.inlines[1].activation, Activation::From(1));
     }
 }

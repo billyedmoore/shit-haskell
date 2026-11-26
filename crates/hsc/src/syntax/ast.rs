@@ -261,6 +261,34 @@ pub enum Decl {
     },
 }
 
+impl Decl {
+    pub fn loc(&self) -> Loc {
+        match self {
+            Decl::Splice(_, loc)
+            | Decl::DefaultSig { loc, .. }
+            | Decl::IPBind { loc, .. }
+            | Decl::PatSyn { loc, .. }
+            | Decl::PatSynSig { loc, .. }
+            | Decl::Sig { loc, .. }
+            | Decl::Fixity { loc, .. }
+            | Decl::Fun { loc, .. }
+            | Decl::PatBind { loc, .. }
+            | Decl::TypeSyn { loc, .. }
+            | Decl::Default { loc, .. }
+            | Decl::Foreign { loc, .. }
+            | Decl::KindSig { loc, .. }
+            | Decl::RoleAnnotation { loc, .. }
+            | Decl::TypeFamily { loc, .. }
+            | Decl::TypeInstance { loc, .. } => *loc,
+            Decl::Many(ds) => ds.first().map(Decl::loc).unwrap_or_default(),
+            Decl::Data(dd) => dd.loc,
+            Decl::Class(cd) => cd.loc,
+            Decl::Instance(id) => id.loc,
+            Decl::Deriving(sd) => sd.loc,
+        }
+    }
+}
+
 /// One equation `F t1 .. tn = rhs` of a type family.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeEquation {
@@ -673,6 +701,7 @@ pub struct InstDecl {
     /// The parser erases the distinction between boxed and unboxed tuple types.
     pub unboxed_head: bool,
     pub decls: Vec<Decl>,
+    pub inlines: Vec<InlinePragma>,
     pub loc: Loc,
 }
 

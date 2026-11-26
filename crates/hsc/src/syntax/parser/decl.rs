@@ -1792,6 +1792,7 @@ impl Parser {
             head,
             unboxed_head,
             decls,
+            inlines: Vec::new(),
             loc,
         }))
     }
