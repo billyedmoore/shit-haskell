@@ -4822,22 +4822,28 @@ fn is_pat_error_call(f: &str) -> bool {
     )
 }
 
+/// Minimum argument count at which calling `f` unconditionally diverges (error/pattern-failure),
+/// or `None` if `f` is not a known diverging error function.
+pub(crate) fn diverging_error_arity(f: &str) -> Option<usize> {
+    if is_pat_error_call(f) {
+        return Some(1);
+    }
+    let (mod_name, base) = f.rsplit_once('.')?;
+    match (mod_name, base) {
+        ("GHC.Internal.Err" | "GHC.Err" | "Prelude", "error") => Some(2),
+        ("GHC.Internal.Err" | "GHC.Err" | "Prelude", "errorWithoutStackTrace" | "undefined") => {
+            Some(1)
+        }
+        ("GHC.Internal.Err" | "GHC.Err", "absentErr") => Some(0),
+        ("GHC.Internal.Ix" | "GHC.Ix", "indexError") => Some(4),
+        ("GHC.Prim", "raise#") => Some(1),
+        _ => None,
+    }
+}
+
 /// Whether `f` applied to `nargs` arguments is a saturated call to a diverging error function.
 fn is_diverging_error_call(f: &str, nargs: usize) -> bool {
-    if is_pat_error_call(f) {
-        return nargs >= 1;
-    }
-    let Some((mod_name, base)) = f.rsplit_once('.') else { return false };
-    match (mod_name, base) {
-        ("GHC.Internal.Err" | "GHC.Err" | "Prelude", "error") => nargs >= 2,
-        ("GHC.Internal.Err" | "GHC.Err" | "Prelude", "errorWithoutStackTrace" | "undefined") => {
-            nargs >= 1
-        }
-        ("GHC.Internal.Err" | "GHC.Err", "absentErr") => true,
-        ("GHC.Internal.Ix" | "GHC.Ix", "indexError") => nargs >= 4,
-        ("GHC.Prim", "raise#") => nargs >= 1,
-        _ => false,
-    }
+    diverging_error_arity(f).is_some_and(|min| nargs >= min)
 }
 
 /// Whether `name` is a cold exception/backtrace helper that should not be inlined into hot code.
