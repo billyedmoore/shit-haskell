@@ -807,6 +807,18 @@ fn is_dict_con(name: &str) -> bool {
     name.rsplit('.').next().is_some_and(|c| c.starts_with("D:"))
 }
 
+/// Whether a dictionary field is a pure value (no work to duplicate if projected out of a
+/// local dictionary constructor).
+fn is_safe_dict_field(e: &Core) -> bool {
+    match e {
+        Core::Var(_) | Core::Lit(_) | Core::Lam(..) => true,
+        Core::App(..) if one_shot_lambda(e).is_some() => true,
+        Core::Con(_, args) => args.iter().all(is_safe_dict_field),
+        Core::Let(bs, body) => bs.iter().all(|(_, r)| is_safe_dict_field(r)) && is_safe_dict_field(body),
+        _ => false,
+    }
+}
+
 /// Whether `e` mentions any of `names`.
 fn mentions_any(e: &Core, names: &HashSet<String>) -> bool {
     match e {
@@ -1238,12 +1250,20 @@ impl Simp<'_> {
                         kept.push((name, rhs));
                     }
                 }
-                for (_, rhs) in kept.iter_mut() {
+                for (name, rhs) in kept.iter_mut() {
                     self.expr(rhs);
+                    if let Core::Let(inner, inner_body) = rhs {
+                        if inner.len() == 1 && matches!(&**inner_body, Core::Var(v) if v == &inner[0].0) {
+                            let (this, mut body) = inner.pop().unwrap();
+                            rename_free(&mut body, &this, name);
+                            *rhs = body;
+                            self.changed = true;
+                        }
+                    }
                 }
                 for (name, rhs) in &kept {
                     if let Core::Con(con, args) = rhs {
-                        if args.iter().all(is_atom) {
+                        if args.iter().all(is_atom) || is_dict_con(con) {
                             self.local_known.insert(name.clone(), (con.clone(), args.clone()));
                         }
                     }
@@ -2065,16 +2085,38 @@ impl Simp<'_> {
                     .iter()
                     .position(|a| matches!(a, Alt::Con(k, vars, _) if k == &con && vars.len() == fields.len()))
                     .or_else(|| alts.iter().position(|a| matches!(a, Alt::Default(_))))?;
+                if let Alt::Con(_, vars, body) = &alts[i] {
+                    let limit = tuning().inline_pragma_size;
+                    for (x, f) in vars.iter().zip(&fields) {
+                        if !is_atom(f) && mentions(body, x) {
+                            if !is_safe_dict_field(f) || size(f, limit + 1) > limit {
+                                return None;
+                            }
+                        }
+                    }
+                }
                 let v = Core::Var(v.clone());
                 let (vars, mut body) = match alts.swap_remove(i) {
                     Alt::Con(_, vars, body) => (vars, body),
                     other => (Vec::new(), alt_body(other)),
                 };
+                let mut let_binds = Vec::new();
                 for (x, f) in vars.iter().zip(&fields) {
-                    subst(&mut body, x, f);
+                    if is_atom(f) {
+                        subst(&mut body, x, f);
+                    } else if mentions(&body, x) {
+                        *self.fresh += 1;
+                        let mut copy = f.clone();
+                        freshen(&mut copy, &format!("~d{}", self.fresh), &mut HashMap::new());
+                        if occurrences_of(&body, x) == 1 {
+                            subst(&mut body, x, &copy);
+                        } else {
+                            let_binds.push((x.clone(), copy));
+                        }
+                    }
                 }
                 subst(&mut body, binder, &v);
-                Some(body)
+                Some(if let_binds.is_empty() { body } else { Core::Let(let_binds, Box::new(body)) })
             }
             Core::Con(con, args) => {
                 let i = alts
@@ -4386,6 +4428,65 @@ mod rule_tests {
         assert!(
             !has_let(&binds[0].body),
             "expected multi-binding where-block lets to split and turn into strict cases: {:?}",
+            binds[0].body
+        );
+    }
+
+    #[test]
+    fn local_dict_with_lambda_methods_cancels_case_selection() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // let d = (let this = D:Cls (\x -> x) (T.dm this) in this)
+        // in \a -> (case d of D:Cls f _ -> f a) +# (case d of D:Cls f _ -> f a)
+        let dict_rhs = Core::Let(
+            vec![(
+                "this".into(),
+                Core::Con(
+                    "T.D:Cls".into(),
+                    vec![
+                        Core::Lam("x".into(), Box::new(v("x"))),
+                        app(v("T.dm"), v("this")),
+                    ],
+                ),
+            )],
+            Box::new(v("this")),
+        );
+        let sel = |f_name: &str, cb: &str| {
+            Core::Case(
+                Box::new(v("d")),
+                cb.into(),
+                vec![Alt::Con(
+                    "T.D:Cls".into(),
+                    vec![f_name.into(), format!("{f_name}_u")],
+                    app(v(f_name), v("a")),
+                )],
+            )
+        };
+        let bind = TopBind {
+            name: "T.useDict".into(),
+            body: Core::Let(
+                vec![("d".into(), dict_rhs)],
+                Box::new(Core::Lam(
+                    "a".into(),
+                    Box::new(Core::Prim("+#".into(), vec![sel("f1", "cb1"), sel("f2", "cb2")])),
+                )),
+            ),
+        };
+        let mut binds = vec![bind];
+        simplify(&mut binds);
+        fn has_case(e: &Core) -> bool {
+            match e {
+                Core::Case(..) => true,
+                Core::App(f, a) => has_case(f) || has_case(a),
+                Core::Lam(_, b) => has_case(b),
+                Core::Let(bs, b) => bs.iter().any(|(_, r)| has_case(r)) || has_case(b),
+                Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(has_case),
+                _ => false,
+            }
+        }
+        assert!(
+            !has_case(&binds[0].body),
+            "expected local dictionary selectors to cancel completely: {:?}",
             binds[0].body
         );
     }
