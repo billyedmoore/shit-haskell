@@ -2343,11 +2343,27 @@ impl Simp<'_> {
             return false;
         }
         let Core::Case(s, b, alts) = c else { return false };
-        if !matches!(**s, Core::Case(..)) || results(s, PUSH_RESULTS) > PUSH_RESULTS {
+        let Core::Case(_, _, inner_alts) = s.as_ref() else { return false };
+        let deep_ok = results(s, PUSH_RESULTS) <= PUSH_RESULTS;
+        let one_level = !deep_ok && {
+            let mut non_bottom = 0usize;
+            let mut has_direct_known = false;
+            for a in inner_alts {
+                let (Alt::Con(_, _, body) | Alt::Lit(_, body) | Alt::Default(body)) = a;
+                if !is_bottom_expr(body) {
+                    non_bottom += 1;
+                    if self.is_known_result(body) {
+                        has_direct_known = true;
+                    }
+                }
+            }
+            non_bottom <= PUSH_RESULTS && has_direct_known
+        };
+        if !deep_ok && !one_level {
             return false;
         }
         if let [Alt::Default(body)] = &alts[..] {
-            let limit = if results(s, 3) <= 2 && app_head_mentions(body, b) {
+            let limit = if deep_ok && results(s, 3) <= 2 && app_head_mentions(body, b) {
                 self.tune.push_call_size
             } else {
                 self.tune.push_size
@@ -2356,7 +2372,7 @@ impl Simp<'_> {
                 return false;
             }
         } else {
-            if !self.any_result_known(s) {
+            if !one_level && !self.any_result_known(s) {
                 return false;
             }
             let limit = self.tune.push_size;
@@ -2381,7 +2397,7 @@ impl Simp<'_> {
         let Core::Case(inner, b, alts) = take(c) else { unreachable!() };
         let mut inner = *inner;
         let fresh = &mut *self.fresh;
-        at_results(&mut inner, &mut |r: &mut Core| {
+        let mut wrap = |r: &mut Core| {
             *fresh += 1;
             let tag = format!("~p{fresh}");
             let mut copy = Core::Case(Box::new(Core::Lit(Lit::Int(0))), b.clone(), alts.clone());
@@ -2390,7 +2406,19 @@ impl Simp<'_> {
                 **scrut = take(r);
             }
             *r = copy;
-        });
+        };
+        if one_level {
+            if let Core::Case(_, _, inner_alts) = &mut inner {
+                for a in inner_alts {
+                    let (Alt::Con(_, _, body) | Alt::Lit(_, body) | Alt::Default(body)) = a;
+                    if !is_bottom_expr(body) {
+                        wrap(body);
+                    }
+                }
+            }
+        } else {
+            at_results(&mut inner, &mut wrap);
+        }
         *c = inner;
         true
     }
@@ -3773,6 +3801,9 @@ fn app_head_mentions(e: &Core, var: &str) -> bool {
 
 /// The results of an expression (the ends of its cases and lets), counted until past `limit`.
 fn results(e: &Core, limit: usize) -> usize {
+    if is_bottom_expr(e) {
+        return 0;
+    }
     match e {
         Core::Case(_, _, alts) => {
             let mut n = 0;
@@ -3791,8 +3822,11 @@ fn results(e: &Core, limit: usize) -> usize {
     }
 }
 
-/// Applies `f` at each result of an expression (failures are left).
+/// Applies `f` at each result of an expression (diverging expressions are left untouched).
 fn at_results(e: &mut Core, f: &mut dyn FnMut(&mut Core)) {
+    if is_bottom_expr(e) {
+        return;
+    }
     match e {
         Core::Case(_, _, alts) => {
             for a in alts {
@@ -6428,5 +6462,74 @@ mod rule_tests {
         let eq_alt = alts.iter().find(|a| matches!(a, Alt::Lit(Lit::Int(1), _))).expect("1# alt");
         let Alt::Lit(_, eq_body) = eq_alt else { unreachable!() };
         assert_eq!(*eq_body, app(app(v("T.rec"), v("xs")), v("ys")));
+    }
+
+    #[test]
+    fn push_small_case_skips_bottom_and_pushes_one_level_for_when() {
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // Simulates `when cond bigAction >> next` in an ST/IO loop:
+        // case (case cond of
+        //   True -> <inner case with 5 non-bottom leaves + bottom error arms>
+        //   False -> [Builtin.(,) s ()]) of
+        //   Builtin.(,) s' _ -> T.next s'
+        // Even though the True branch has > PUSH_RESULTS leaves, pushing one level cancels the
+        // False-branch tuple allocation `[Builtin.(,) s ()]` directly into `T.next s`.
+        let err = app(app(v("GHC.Internal.Err.error"), v("cs")), Core::Lit(Lit::Str("oob".into())));
+        let mk_branch = |tag: i64| app(v("T.step"), Core::Lit(Lit::Int(tag)));
+        let big_arm = Core::Case(
+            Box::new(v("k")),
+            "bk".into(),
+            vec![
+                Alt::Lit(Lit::Int(1), mk_branch(1)),
+                Alt::Lit(Lit::Int(2), mk_branch(2)),
+                Alt::Lit(Lit::Int(3), mk_branch(3)),
+                Alt::Lit(Lit::Int(4), mk_branch(4)),
+                Alt::Lit(Lit::Int(5), mk_branch(5)),
+                Alt::Default(err.clone()),
+            ],
+        );
+        let when_expr = Core::Case(
+            Box::new(v("cond")),
+            "bc".into(),
+            vec![
+                Alt::Con("GHC.Types.True".into(), vec![], big_arm),
+                Alt::Con(
+                    "GHC.Types.False".into(),
+                    vec![],
+                    Core::Con("Builtin.(,)".into(), vec![v("s"), Core::Con("Builtin.()".into(), vec![])]),
+                ),
+            ],
+        );
+        let outer = Core::Case(
+            Box::new(when_expr),
+            "cb".into(),
+            vec![Alt::Con("Builtin.(,)".into(), vec!["s'".into(), "u".into()], app(v("T.next"), v("s'")))],
+        );
+        let body = Core::Lam(
+            "cond".into(),
+            Box::new(Core::Lam(
+                "k".into(),
+                Box::new(Core::Lam("s".into(), Box::new(outer))),
+            )),
+        );
+        let mut binds = vec![
+            TopBind { name: "T.loop".into(), body },
+            TopBind { name: "T.next".into(), body: Core::Lam("x".into(), Box::new(app(v("T.ext"), v("x")))) },
+            TopBind { name: "T.step".into(), body: Core::Lam("x".into(), Box::new(app(v("T.ext"), v("x")))) },
+        ];
+        simplify(&mut binds);
+        let (_, inner_res) = params(&binds[0].body);
+        let Core::Case(s, _, alts) = inner_res else { panic!("expected outer Case on cond: {:?}", inner_res) };
+        assert_eq!(**s, v("cond"));
+        let false_alt = alts
+            .iter()
+            .find(|a| matches!(a, Alt::Con(c, _, _) if c == "GHC.Types.False"))
+            .expect("False alt");
+        let Alt::Con(_, _, false_body) = false_alt else { unreachable!() };
+        assert_eq!(
+            *false_body,
+            app(v("T.ext"), v("s")),
+            "False branch must cancel Builtin.(,) allocation directly into T.next s"
+        );
     }
 }
