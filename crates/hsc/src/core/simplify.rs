@@ -1080,6 +1080,9 @@ fn pass(
             Some((_, act)) if !act.active(phase) => 0,
             _ => tune.inline_size,
         };
+        if is_cold_error_fn(&b.name) || is_bottom_expr(inner) {
+            continue;
+        }
         // A partial application of a known function to atoms (`mconcat = foldr mappend mempty`)
         // inlines where it is applied, so that the call it makes is seen (and fuses).
         if arity == 0 && limit > 0 && !is_rule_binding(&b.name) && !rules.protected.contains(&b.name) {
@@ -1253,15 +1256,31 @@ impl Simp<'_> {
                 }
             }
             Core::Lit(_) | Core::Fail(_) => {}
-            Core::App(f, a) => {
+            Core::App(..) => {
+                let cold = is_bottom_expr(c);
+                let (saved_budget, saved_rule_budget) = if cold {
+                    (
+                        std::mem::replace(&mut self.budget, 0),
+                        std::mem::replace(&mut self.rule_budget, 0),
+                    )
+                } else {
+                    (0, 0)
+                };
+                let Core::App(f, a) = c else { unreachable!() };
                 self.expr(f);
                 self.expr(a);
+                if cold {
+                    self.budget = saved_budget;
+                    self.rule_budget = saved_rule_budget;
+                }
                 if self.rewrite(c) || self.app_of_case(c) {
                     self.changed = true;
                     self.expr(c);
                     return;
                 }
-                self.inline_call(c);
+                if !cold {
+                    self.inline_call(c);
+                }
                 self.reduce(c);
             }
             Core::Lam(_, b) => self.expr(b),
@@ -1345,6 +1364,13 @@ impl Simp<'_> {
             }
             Core::Case(s, binder, alts) => {
                 self.expr(s);
+                // A scrutinee that unconditionally diverges (`Fail`, `raise#`, saturated error
+                // call): the enclosing `case` is unreachable.
+                if is_bottom_expr(s) {
+                    *c = take(s);
+                    self.changed = true;
+                    return;
+                }
                 // A case of a variable already evaluated (a case binder), with one default
                 // alternative, is that alternative.
                 if let (Core::Var(v), [Alt::Default(_)]) = (&**s, &alts[..]) {
@@ -1385,18 +1411,21 @@ impl Simp<'_> {
                     *c = Core::Let(bs, Box::new(case));
                     return;
                 }
-                // Case of a case with one alternative: the outer case moves into it.
-                // Alternatives that fail do not count: the outer case of a failure fails too.
+                // Case of a case with one live alternative: the outer case moves into it.
+                // Alternatives that unconditionally diverge do not count: the outer case of a
+                // diverging branch diverges too.
                 if let Core::Case(_, _, inner) = &mut **s {
-                    fn alt_fails(a: &Alt) -> bool {
-                        let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
-                        let mut e = b;
-                        while let Core::App(f, _) = e {
-                            e = f;
-                        }
-                        matches!(e, Core::Fail(_))
+                    let live: Vec<usize> = (0..inner.len())
+                        .filter(|&i| {
+                            let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = &inner[i];
+                            !is_bottom_expr(b)
+                        })
+                        .collect();
+                    if live.is_empty() {
+                        *c = take(s);
+                        self.changed = true;
+                        return;
                     }
-                    let live: Vec<usize> = (0..inner.len()).filter(|&i| !alt_fails(&inner[i])).collect();
                     if let [one] = live[..] {
                         let Core::Case(s, binder, alts) = take(c) else { unreachable!() };
                         let Core::Case(s2, b2, mut inner) = *s else { unreachable!() };
@@ -1630,7 +1659,18 @@ impl Simp<'_> {
                 self.changed = true;
                 self.expr(c);
             }
-            Core::Con(_, args) | Core::Prim(_, args) => args.iter_mut().for_each(|a| self.expr(a)),
+            Core::Con(_, args) => args.iter_mut().for_each(|a| self.expr(a)),
+            Core::Prim(p, args) => {
+                if p == "raise#" {
+                    let saved_budget = std::mem::replace(&mut self.budget, 0);
+                    let saved_rule_budget = std::mem::replace(&mut self.rule_budget, 0);
+                    args.iter_mut().for_each(|a| self.expr(a));
+                    self.budget = saved_budget;
+                    self.rule_budget = saved_rule_budget;
+                } else {
+                    args.iter_mut().for_each(|a| self.expr(a));
+                }
+            }
         }
     }
 
@@ -2128,8 +2168,9 @@ impl Simp<'_> {
                 *c = Core::Let(bs, Box::new(app));
                 self.changed = true;
             }
-            Core::Fail(..) => {
-                // Applying a pattern-match failure to an argument fails immediately when forced.
+            f if is_bottom_expr(f) => {
+                // Applying a diverging expression (`Fail`, `raise#`, saturated error call) to an
+                // argument diverges immediately when forced.
                 let Core::App(f, _) = take(c) else { unreachable!() };
                 *c = *f;
                 self.changed = true;
@@ -3920,6 +3961,70 @@ fn is_pat_error_call(f: &str) -> bool {
     )
 }
 
+/// Whether `f` applied to `nargs` arguments is a saturated call to a diverging error function.
+fn is_diverging_error_call(f: &str, nargs: usize) -> bool {
+    if is_pat_error_call(f) {
+        return nargs >= 1;
+    }
+    let Some((mod_name, base)) = f.rsplit_once('.') else { return false };
+    match (mod_name, base) {
+        ("GHC.Internal.Err" | "GHC.Err" | "Prelude", "error") => nargs >= 2,
+        ("GHC.Internal.Err" | "GHC.Err" | "Prelude", "errorWithoutStackTrace" | "undefined") => {
+            nargs >= 1
+        }
+        ("GHC.Internal.Err" | "GHC.Err", "absentErr") => true,
+        ("GHC.Internal.Ix" | "GHC.Ix", "indexError") => nargs >= 4,
+        ("GHC.Prim", "raise#") => nargs >= 1,
+        _ => false,
+    }
+}
+
+/// Whether `name` is a cold exception/backtrace helper that should not be inlined into hot code.
+fn is_cold_error_fn(name: &str) -> bool {
+    let Some((mod_name, base)) = name.rsplit_once('.') else { return false };
+    matches!(
+        (mod_name, base),
+        (
+            "GHC.Internal.Exception" | "GHC.Exception",
+            "errorCallWithCallStackException" | "errorCallException"
+        ) | (
+            "GHC.Internal.Exception.Backtrace" | "GHC.Exception.Backtrace",
+            "collectBacktraces" | "collectBacktraces'"
+        ) | (
+            "GHC.Internal.Exception.Type" | "GHC.Exception.Type",
+            "toExceptionWithBacktrace"
+        )
+    )
+}
+
+/// Whether evaluating `e` unconditionally diverges (pattern failure, `raise#`, or saturated
+/// diverging error call), peeling enclosing `Let`s and `App`s.
+fn is_bottom_expr(mut e: &Core) -> bool {
+    loop {
+        match e {
+            Core::Let(_, b) => e = b,
+            Core::Fail(_) => return true,
+            Core::Prim(p, args) if p == "raise#" && args.len() == 1 => return true,
+            Core::App(..) => {
+                let mut nargs = 0usize;
+                let mut head = e;
+                while let Core::App(f, _) = head {
+                    nargs += 1;
+                    head = f;
+                }
+                return match head {
+                    Core::Fail(_) => true,
+                    Core::Prim(p, args) if p == "raise#" && args.len() == 1 => true,
+                    Core::Var(v) => is_diverging_error_call(v, nargs),
+                    _ => false,
+                };
+            }
+            Core::Var(v) => return is_diverging_error_call(v, 0),
+            _ => return false,
+        }
+    }
+}
+
 /// What `forced` answers, and whether the expression certainly fails (a pattern-match failure
 /// is bottom, as GHC takes it: a failing alternative constrains nothing). Calls of functions that
 /// raise are not counted as failing.
@@ -4660,6 +4765,120 @@ mod rule_tests {
             binds.iter().any(|b| b.name.starts_with("T.f%dict")),
             "expected floated dict TopBind for T.f: {:?}",
             binds
+        );
+    }
+
+    #[test]
+    fn cold_error_not_inlined_and_args_not_bloated() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // error = \cs msg -> <raise# (errorCallWithCallStackException msg cs)>
+        // T.fmt = \x -> T.work x x
+        // T.caller = \cs x -> GHC.Internal.Err.error cs (T.fmt x)
+        let err_bind = TopBind {
+            name: "GHC.Internal.Err.error".into(),
+            body: Core::Lam(
+                "cs".into(),
+                Box::new(Core::Lam(
+                    "msg".into(),
+                    Box::new(Core::Prim(
+                        "raise#".into(),
+                        vec![app(
+                            app(v("GHC.Internal.Exception.errorCallWithCallStackException"), v("msg")),
+                            v("cs"),
+                        )],
+                    )),
+                )),
+            ),
+        };
+        let fmt_bind = TopBind {
+            name: "T.fmt".into(),
+            body: Core::Lam("x".into(), Box::new(app(app(v("T.work"), v("x")), v("x")))),
+        };
+        let caller = TopBind {
+            name: "T.caller".into(),
+            body: Core::Lam(
+                "cs".into(),
+                Box::new(Core::Lam(
+                    "x".into(),
+                    Box::new(app(app(v("GHC.Internal.Err.error"), v("cs")), app(v("T.fmt"), v("x")))),
+                )),
+            ),
+        };
+        let mut binds = vec![err_bind, fmt_bind, caller];
+        simplify(&mut binds);
+        let body = &binds[2].body;
+        assert!(
+            mentions(body, "GHC.Internal.Err.error"),
+            "expected GHC.Internal.Err.error not to be inlined: {:?}",
+            body
+        );
+        assert!(
+            mentions(body, "T.fmt"),
+            "expected T.fmt inside cold error argument not to be inlined: {:?}",
+            body
+        );
+    }
+
+    #[test]
+    fn case_of_case_with_error_and_app_of_raise_collapse() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // T.f = \c y cs -> case (case c of GHC.Types.True -> y; _ -> GHC.Internal.Err.error cs "oob") as i of _ -> T.use i
+        let f_bind = TopBind {
+            name: "T.f".into(),
+            body: Core::Lam(
+                "c".into(),
+                Box::new(Core::Lam(
+                    "y".into(),
+                    Box::new(Core::Lam(
+                        "cs".into(),
+                        Box::new(Core::Case(
+                            Box::new(Core::Case(
+                                Box::new(v("c")),
+                                "cb".into(),
+                                vec![
+                                    Alt::Con("GHC.Types.True".into(), vec![], v("y")),
+                                    Alt::Default(app(
+                                        app(v("GHC.Internal.Err.error"), v("cs")),
+                                        Core::Lit(Lit::Str("oob".into())),
+                                    )),
+                                ],
+                            )),
+                            "i".into(),
+                            vec![Alt::Default(app(v("T.use"), v("i")))],
+                        )),
+                    )),
+                )),
+            ),
+        };
+        // T.g = \e x -> (<raise# e>) x
+        let g_bind = TopBind {
+            name: "T.g".into(),
+            body: Core::Lam(
+                "e".into(),
+                Box::new(Core::Lam(
+                    "x".into(),
+                    Box::new(app(Core::Prim("raise#".into(), vec![v("e")]), v("x"))),
+                )),
+            ),
+        };
+        let mut binds = vec![f_bind, g_bind];
+        simplify(&mut binds);
+        // Outer case pushed only into the True branch; T.use appears once.
+        assert_eq!(
+            occurrences_of(&binds[0].body, "T.use"),
+            1,
+            "expected outer case pushed only into live branch: {:?}",
+            binds[0].body
+        );
+        // (<raise# e>) x collapses to <raise# e>.
+        let Core::Lam(_, inner) = &binds[1].body else { panic!() };
+        let Core::Lam(_, body) = inner.as_ref() else { panic!() };
+        assert!(
+            matches!(body.as_ref(), Core::Prim(p, args) if p == "raise#" && args.len() == 1),
+            "expected (<raise# e>) x to collapse to <raise# e>: {:?}",
+            body
         );
     }
 }
