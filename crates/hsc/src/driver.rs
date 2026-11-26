@@ -1928,7 +1928,7 @@ pub fn compile_with(d: &mut Driver, main_file: &Path, flags: &[String]) -> Resul
         crate::core::opt::specialise_literals(&mut binds);
         crate::core::opt::resolve_known_methods(&mut binds);
         if crate::core::opt_level() > 0 {
-            crate::core::simplify::simplify(&mut binds);
+            crate::core::simplify::simplify_whole_program(&mut binds);
         } else {
             // -O0 is GHC's: the program's own modules are compiled as written, and the packages
             // are as optimised as ever (GHC's come compiled with -O). Package modules do not

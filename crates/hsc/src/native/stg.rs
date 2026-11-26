@@ -271,21 +271,63 @@ fn is_whnf_expr(e: &Core, whnf: &std::collections::HashSet<String>) -> bool {
     }
 }
 
-/// Records the variables guaranteed to be in WHNF inside the alternatives of `case scrut as binder of ...`.
-fn add_case_whnf(scrut: &Core, binder: &str, whnf: &mut std::collections::HashSet<String>) {
-    whnf.insert(binder.to_string());
+/// Temporarily records the variables guaranteed to be in WHNF inside the alternatives of
+/// `case scrut as binder of ...` and returns the newly-inserted names to remove on exit.
+fn push_case_whnf(
+    scrut: &Core,
+    binder: &str,
+    whnf: &mut std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut added = Vec::new();
+    if !whnf.contains(binder) {
+        whnf.insert(binder.to_string());
+        added.push(binder.to_string());
+    }
     match scrut {
         Core::Var(v) => {
-            whnf.insert(v.clone());
+            if !whnf.contains(v.as_str()) {
+                whnf.insert(v.clone());
+                added.push(v.clone());
+            }
         }
         Core::Prim(p, args) if RAW_RESULT_PRIMS.contains(&p.as_str()) => {
             for a in args {
                 if let Core::Var(v) = a {
-                    whnf.insert(v.clone());
+                    if !whnf.contains(v.as_str()) {
+                        whnf.insert(v.clone());
+                        added.push(v.clone());
+                    }
                 }
             }
         }
         _ => {}
+    }
+    added
+}
+
+/// Temporarily removes shadowed names from `whnf` and returns the entries that were present.
+fn push_shadow_whnf<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    whnf: &mut std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    for n in names {
+        if let Some(old) = whnf.take(n) {
+            removed.push(old);
+        }
+    }
+    removed
+}
+
+fn pop_added_whnf(added: Vec<String>, whnf: &mut std::collections::HashSet<String>) {
+    for n in added {
+        whnf.remove(&n);
+    }
+}
+
+fn pop_removed_whnf(removed: Vec<String>, whnf: &mut std::collections::HashSet<String>) {
+    for n in removed {
+        whnf.insert(n);
     }
 }
 
@@ -315,7 +357,7 @@ fn raw_uses(
     x: &str,
     w: &Workers,
     strict_map: &Workers,
-    whnf: &std::collections::HashSet<String>,
+    whnf: &mut std::collections::HashSet<String>,
 ) -> bool {
     raw_uses_in(e, x, w, strict_map, whnf, true)
 }
@@ -328,7 +370,7 @@ fn raw_uses_in(
     x: &str,
     w: &Workers,
     strict_map: &Workers,
-    whnf: &std::collections::HashSet<String>,
+    whnf: &mut std::collections::HashSet<String>,
     result: bool,
 ) -> bool {
     match e {
@@ -345,9 +387,12 @@ fn raw_uses_in(
                 return false;
             }
             if let Core::Var(v) = &args[0] {
-                let mut next = whnf.clone();
-                next.insert(v.clone());
-                raw_uses_in(&args[1], x, w, strict_map, &next, result)
+                let inserted = !whnf.contains(v.as_str()) && whnf.insert(v.clone());
+                let ok = raw_uses_in(&args[1], x, w, strict_map, whnf, result);
+                if inserted {
+                    whnf.remove(v.as_str());
+                }
+                ok
             } else {
                 raw_uses_in(&args[1], x, w, strict_map, whnf, result)
             }
@@ -356,14 +401,15 @@ fn raw_uses_in(
             raw_uses_in(&args[0], x, w, strict_map, whnf, result)
         }
         Core::Case(s, b, alts) if matches!(&**s, Core::Var(v) if v == x) => {
-            let mut base_whnf = whnf.clone();
-            add_case_whnf(s, b, &mut base_whnf);
-            alts.iter().all(|a| match a {
+            let added = push_case_whnf(s, b, whnf);
+            let ok = alts.iter().all(|a| match a {
                 Alt::Lit(Lit::Int(_) | Lit::Char(_), body) | Alt::Default(body) => {
-                    !mentions(body, b) && raw_uses_in(body, x, w, strict_map, &base_whnf, result)
+                    !mentions(body, b) && raw_uses_in(body, x, w, strict_map, whnf, result)
                 }
                 _ => false,
-            })
+            });
+            pop_added_whnf(added, whnf);
+            ok
         }
         Core::App(..) => {
             let (f, args) = spine(e);
@@ -389,27 +435,47 @@ fn raw_uses_in(
         }
         Core::Lam(_, b) => !mentions(b, x),
         Core::Let(binds, body) => {
-            let mut next = whnf.clone();
-            for (n, _) in binds {
-                next.remove(n);
-            }
             let body_shadowed = binds.iter().any(|(n, _)| n == x);
             if result && is_join(binds, body) {
-                let mut code_whnf = whnf.clone();
                 let mut cur = &binds[0].1;
                 let mut shadowed = false;
+                let mut params = Vec::new();
                 while let Core::Lam(p, inner) = cur {
                     if p == x {
                         shadowed = true;
                     }
-                    code_whnf.remove(p);
+                    params.push(p.as_str());
                     cur = inner;
                 }
-                (shadowed || raw_uses_in(cur, x, w, strict_map, &code_whnf, result))
-                    && (body_shadowed || raw_uses_in(body, x, w, strict_map, &next, result))
+                let code_ok = if shadowed {
+                    true
+                } else {
+                    let removed = push_shadow_whnf(params, whnf);
+                    let ok = raw_uses_in(cur, x, w, strict_map, whnf, result);
+                    pop_removed_whnf(removed, whnf);
+                    ok
+                };
+                if !code_ok {
+                    return false;
+                }
+                if body_shadowed {
+                    return true;
+                }
+                let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
+                let ok = raw_uses_in(body, x, w, strict_map, whnf, result);
+                pop_removed_whnf(removed, whnf);
+                ok
             } else {
-                binds.iter().all(|(_, r)| !mentions(r, x))
-                    && (body_shadowed || raw_uses_in(body, x, w, strict_map, &next, result))
+                if !binds.iter().all(|(_, r)| !mentions(r, x)) {
+                    return false;
+                }
+                if body_shadowed {
+                    return true;
+                }
+                let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
+                let ok = raw_uses_in(body, x, w, strict_map, whnf, result);
+                pop_removed_whnf(removed, whnf);
+                ok
             }
         }
         Core::Case(s, b, alts) => {
@@ -419,23 +485,23 @@ fn raw_uses_in(
             if b == x {
                 return true;
             }
-            let mut base_whnf = whnf.clone();
-            add_case_whnf(s, b, &mut base_whnf);
-            alts.iter().all(|a| match a {
+            let added = push_case_whnf(s, b, whnf);
+            let ok = alts.iter().all(|a| match a {
                 Alt::Con(_, vars, body) => {
                     if vars.iter().any(|v| v == x) {
                         return true;
                     }
-                    let mut alt_whnf = base_whnf.clone();
-                    for v in vars {
-                        alt_whnf.remove(v);
-                    }
-                    raw_uses_in(body, x, w, strict_map, &alt_whnf, result)
+                    let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
+                    let ok = raw_uses_in(body, x, w, strict_map, whnf, result);
+                    pop_removed_whnf(removed, whnf);
+                    ok
                 }
                 Alt::Lit(_, body) | Alt::Default(body) => {
-                    raw_uses_in(body, x, w, strict_map, &base_whnf, result)
+                    raw_uses_in(body, x, w, strict_map, whnf, result)
                 }
-            })
+            });
+            pop_added_whnf(added, whnf);
+            ok
         }
         Core::Prim(p, _) if p == "raise#" => no_bad_raw_case(e, x),
         Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, x)),
@@ -491,7 +557,7 @@ fn raw_returns(
         out: &HashMap<String, u8>,
         w_all: &Workers,
         strict_map: &Workers,
-        whnf: &std::collections::HashSet<String>,
+        whnf: &mut std::collections::HashSet<String>,
     ) -> bool {
         match e {
             Core::Con(..) | Core::Lam(..) => false,
@@ -509,9 +575,12 @@ fn raw_returns(
             }
             Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
                 if let Core::Var(v) = &args[0] {
-                    let mut next = whnf.clone();
-                    next.insert(v.clone());
-                    numeric_results(&args[1], out, w_all, strict_map, &next)
+                    let inserted = !whnf.contains(v.as_str()) && whnf.insert(v.clone());
+                    let ok = numeric_results(&args[1], out, w_all, strict_map, whnf);
+                    if inserted {
+                        whnf.remove(v.as_str());
+                    }
+                    ok
                 } else {
                     numeric_results(&args[1], out, w_all, strict_map, whnf)
                 }
@@ -521,38 +590,43 @@ fn raw_returns(
             }
             Core::Prim(..) => true,
             Core::Let(binds, body) => {
-                let mut body_whnf = whnf.clone();
-                for (n, _) in binds {
-                    body_whnf.remove(n);
-                }
                 let join_ok = if is_join(binds, body) {
-                    let mut code_whnf = whnf.clone();
                     let mut cur = &binds[0].1;
+                    let mut params = Vec::new();
                     while let Core::Lam(p, inner) = cur {
-                        code_whnf.remove(p);
+                        params.push(p.as_str());
                         cur = inner;
                     }
-                    numeric_results(cur, out, w_all, strict_map, &code_whnf)
+                    let removed = push_shadow_whnf(params, whnf);
+                    let ok = numeric_results(cur, out, w_all, strict_map, whnf);
+                    pop_removed_whnf(removed, whnf);
+                    ok
                 } else {
                     true
                 };
-                join_ok && numeric_results(body, out, w_all, strict_map, &body_whnf)
+                if !join_ok {
+                    return false;
+                }
+                let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
+                let ok = numeric_results(body, out, w_all, strict_map, whnf);
+                pop_removed_whnf(removed, whnf);
+                ok
             }
             Core::Case(s, b, alts) => {
-                let mut base_whnf = whnf.clone();
-                add_case_whnf(s, b, &mut base_whnf);
-                alts.iter().all(|a| match a {
+                let added = push_case_whnf(s, b, whnf);
+                let ok = alts.iter().all(|a| match a {
                     Alt::Con(_, vars, body) => {
-                        let mut alt_whnf = base_whnf.clone();
-                        for v in vars {
-                            alt_whnf.remove(v);
-                        }
-                        numeric_results(body, out, w_all, strict_map, &alt_whnf)
+                        let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
+                        let ok = numeric_results(body, out, w_all, strict_map, whnf);
+                        pop_removed_whnf(removed, whnf);
+                        ok
                     }
                     Alt::Lit(_, body) | Alt::Default(body) => {
-                        numeric_results(body, out, w_all, strict_map, &base_whnf)
+                        numeric_results(body, out, w_all, strict_map, whnf)
                     }
-                })
+                });
+                pop_added_whnf(added, whnf);
+                ok
             }
         }
     }
@@ -587,11 +661,12 @@ fn raw_returns(
     // From every candidate, weakened until each claim holds.
     loop {
         let failing: Vec<&str> = bodies
-            .iter()
-            .filter(|(name, inner, init_whnf)| {
-                out.contains_key(*name) && !numeric_results(inner, &out, &w_all, strict_map, init_whnf)
+            .iter_mut()
+            .filter_map(|(name, inner, init_whnf)| {
+                (out.contains_key(*name)
+                    && !numeric_results(inner, &out, &w_all, strict_map, init_whnf))
+                .then_some(*name)
             })
-            .map(|(name, _, _)| *name)
             .collect();
         if failing.is_empty() {
             return out;
@@ -675,10 +750,10 @@ fn workers_with_strict(binds: &[TopBind], numeric: &NumericParams) -> (Workers, 
             }
             for (i, p) in params.iter().enumerate() {
                 if raw[i]
-                    && !raw_uses(body, p, &w, &strict_map, &init_whnf)
+                    && !raw_uses(body, p, &w, &strict_map, &mut init_whnf)
                     && !(mentions(body, &name)
                         && no_bad_raw_case(body, p)
-                        && has_unboxed_recursive_path(body, p, &name, &w, &strict_map, &init_whnf))
+                        && has_unboxed_recursive_path(body, p, &name, &w, &strict_map, &mut init_whnf))
                 {
                     raw[i] = false;
                     changed = true;
@@ -745,7 +820,7 @@ fn has_self_raw_call(
     target: &str,
     w: &Workers,
     strict_map: &Workers,
-    whnf: &std::collections::HashSet<String>,
+    whnf: &mut std::collections::HashSet<String>,
 ) -> bool {
     match e {
         Core::App(..) => {
@@ -754,9 +829,12 @@ fn has_self_raw_call(
         }
         Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
             if let Core::Var(v) = &args[0] {
-                let mut next = whnf.clone();
-                next.insert(v.clone());
-                has_self_raw_call(&args[1], target, w, strict_map, &next)
+                let inserted = !whnf.contains(v.as_str()) && whnf.insert(v.clone());
+                let ok = has_self_raw_call(&args[1], target, w, strict_map, whnf);
+                if inserted {
+                    whnf.remove(v.as_str());
+                }
+                ok
             } else {
                 has_self_raw_call(&args[1], target, w, strict_map, whnf)
             }
@@ -765,28 +843,27 @@ fn has_self_raw_call(
             has_self_raw_call(&args[0], target, w, strict_map, whnf)
         }
         Core::Let(binds, body) => {
-            let mut next = whnf.clone();
-            for (n, _) in binds {
-                next.remove(n);
-            }
-            has_self_raw_call(body, target, w, strict_map, &next)
+            let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
+            let ok = has_self_raw_call(body, target, w, strict_map, whnf);
+            pop_removed_whnf(removed, whnf);
+            ok
         }
         Core::Case(s, b, alts) => {
             if has_self_raw_call(s, target, w, strict_map, whnf) {
                 return true;
             }
-            let mut base_whnf = whnf.clone();
-            add_case_whnf(s, b, &mut base_whnf);
-            alts.iter().any(|a| match a {
+            let added = push_case_whnf(s, b, whnf);
+            let ok = alts.iter().any(|a| match a {
                 Alt::Con(_, vars, body) => {
-                    let mut alt_whnf = base_whnf.clone();
-                    for v in vars {
-                        alt_whnf.remove(v);
-                    }
-                    has_self_raw_call(body, target, w, strict_map, &alt_whnf)
+                    let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
+                    let ok = has_self_raw_call(body, target, w, strict_map, whnf);
+                    pop_removed_whnf(removed, whnf);
+                    ok
                 }
-                Alt::Lit(_, body) | Alt::Default(body) => has_self_raw_call(body, target, w, strict_map, &base_whnf),
-            })
+                Alt::Lit(_, body) | Alt::Default(body) => has_self_raw_call(body, target, w, strict_map, whnf),
+            });
+            pop_added_whnf(added, whnf);
+            ok
         }
         _ => false,
     }
@@ -801,7 +878,7 @@ fn has_unboxed_recursive_path(
     target: &str,
     w: &Workers,
     strict_map: &Workers,
-    whnf: &std::collections::HashSet<String>,
+    whnf: &mut std::collections::HashSet<String>,
 ) -> bool {
     match e {
         Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
@@ -809,9 +886,12 @@ fn has_unboxed_recursive_path(
                 return false;
             }
             if let Core::Var(v) = &args[0] {
-                let mut next = whnf.clone();
-                next.insert(v.clone());
-                has_unboxed_recursive_path(&args[1], x, target, w, strict_map, &next)
+                let inserted = !whnf.contains(v.as_str()) && whnf.insert(v.clone());
+                let ok = has_unboxed_recursive_path(&args[1], x, target, w, strict_map, whnf);
+                if inserted {
+                    whnf.remove(v.as_str());
+                }
+                ok
             } else {
                 has_unboxed_recursive_path(&args[1], x, target, w, strict_map, whnf)
             }
@@ -823,26 +903,40 @@ fn has_unboxed_recursive_path(
             if binds.iter().any(|(n, _)| n == x) {
                 return false;
             }
-            let mut next = whnf.clone();
-            for (n, _) in binds {
-                next.remove(n);
-            }
             if is_join(binds, body) {
-                let mut code_whnf = whnf.clone();
                 let mut cur = &binds[0].1;
                 let mut shadowed = false;
+                let mut params = Vec::new();
                 while let Core::Lam(p, inner) = cur {
                     if p == x {
                         shadowed = true;
                     }
-                    code_whnf.remove(p);
+                    params.push(p.as_str());
                     cur = inner;
                 }
-                (shadowed || raw_uses_in(cur, x, w, strict_map, &code_whnf, true))
-                    && has_unboxed_recursive_path(body, x, target, w, strict_map, &next)
+                let code_ok = if shadowed {
+                    true
+                } else {
+                    let removed = push_shadow_whnf(params, whnf);
+                    let ok = raw_uses_in(cur, x, w, strict_map, whnf, true);
+                    pop_removed_whnf(removed, whnf);
+                    ok
+                };
+                if !code_ok {
+                    return false;
+                }
+                let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
+                let ok = has_unboxed_recursive_path(body, x, target, w, strict_map, whnf);
+                pop_removed_whnf(removed, whnf);
+                ok
             } else {
-                binds.iter().all(|(_, r)| !mentions(r, x))
-                    && has_unboxed_recursive_path(body, x, target, w, strict_map, &next)
+                if !binds.iter().all(|(_, r)| !mentions(r, x)) {
+                    return false;
+                }
+                let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
+                let ok = has_unboxed_recursive_path(body, x, target, w, strict_map, whnf);
+                pop_removed_whnf(removed, whnf);
+                ok
             }
         }
         Core::Case(s, b, alts) => {
@@ -853,38 +947,38 @@ fn has_unboxed_recursive_path(
             if b == x {
                 return false;
             }
-            let mut base_whnf = whnf.clone();
-            add_case_whnf(s, b, &mut base_whnf);
-            alts.iter().any(|a| match a {
+            let added = push_case_whnf(s, b, whnf);
+            let ok = alts.iter().any(|a| match a {
                 Alt::Con(_, vars, body) => {
                     if scrut_is_x || vars.iter().any(|v| v == x) {
                         return false;
                     }
-                    let mut alt_whnf = base_whnf.clone();
-                    for v in vars {
-                        alt_whnf.remove(v);
-                    }
-                    (raw_uses_in(body, x, w, strict_map, &alt_whnf, true)
-                        && has_self_raw_call(body, target, w, strict_map, &alt_whnf))
-                        || has_unboxed_recursive_path(body, x, target, w, strict_map, &alt_whnf)
+                    let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
+                    let ok = (raw_uses_in(body, x, w, strict_map, whnf, true)
+                        && has_self_raw_call(body, target, w, strict_map, whnf))
+                        || has_unboxed_recursive_path(body, x, target, w, strict_map, whnf);
+                    pop_removed_whnf(removed, whnf);
+                    ok
                 }
                 Alt::Lit(l, body) => {
                     if scrut_is_x && (!matches!(l, Lit::Int(_) | Lit::Char(_)) || mentions(body, b)) {
                         return false;
                     }
-                    (raw_uses_in(body, x, w, strict_map, &base_whnf, true)
-                        && has_self_raw_call(body, target, w, strict_map, &base_whnf))
-                        || has_unboxed_recursive_path(body, x, target, w, strict_map, &base_whnf)
+                    (raw_uses_in(body, x, w, strict_map, whnf, true)
+                        && has_self_raw_call(body, target, w, strict_map, whnf))
+                        || has_unboxed_recursive_path(body, x, target, w, strict_map, whnf)
                 }
                 Alt::Default(body) => {
                     if scrut_is_x && mentions(body, b) {
                         return false;
                     }
-                    (raw_uses_in(body, x, w, strict_map, &base_whnf, true)
-                        && has_self_raw_call(body, target, w, strict_map, &base_whnf))
-                        || has_unboxed_recursive_path(body, x, target, w, strict_map, &base_whnf)
+                    (raw_uses_in(body, x, w, strict_map, whnf, true)
+                        && has_self_raw_call(body, target, w, strict_map, whnf))
+                        || has_unboxed_recursive_path(body, x, target, w, strict_map, whnf)
                 }
-            })
+            });
+            pop_added_whnf(added, whnf);
+            ok
         }
         _ => false,
     }
@@ -1255,26 +1349,30 @@ impl Lowering {
             }
             Core::Let(binds, body) if is_join(binds, body) => {
                 let (name, rhs) = &binds[0];
-                let saved_whnf = self.bodies.last().expect("body").whnf.clone();
+                let mut removed_params = Vec::new();
                 let mut params = Vec::new();
                 let mut code = rhs;
                 while let Core::Lam(x, b) = code {
-                    self.bodies.last_mut().expect("body").whnf.remove(x);
+                    if let Some(old) = self.bodies.last_mut().expect("body").whnf.take(x) {
+                        removed_params.push(old);
+                    }
                     params.push(self.bind_local(x));
                     code = b;
                 }
                 let code = self.strict(code);
                 let id = self.next_join;
                 self.next_join += 1;
-                {
+                let removed_name = {
                     let top = self.bodies.last_mut().expect("body");
-                    top.whnf = saved_whnf.clone();
-                    top.whnf.remove(name);
-                }
+                    pop_removed_whnf(removed_params, &mut top.whnf);
+                    top.whnf.take(name)
+                };
                 let prev = self.bodies.last_mut().expect("body").joins.insert(name.clone(), (id, params.len()));
                 let body = self.strict(body);
                 let top = self.bodies.last_mut().expect("body");
-                top.whnf = saved_whnf;
+                if let Some(n) = removed_name {
+                    top.whnf.insert(n);
+                }
                 match prev {
                     Some(p) => top.joins.insert(name.clone(), p),
                     None => top.joins.remove(name),
@@ -1283,15 +1381,12 @@ impl Lowering {
             }
             Core::Let(binds, body) => {
                 let bound = self.let_binds(binds);
-                let saved_whnf = self.bodies.last().expect("body").whnf.clone();
-                {
-                    let top = self.bodies.last_mut().expect("body");
-                    for (n, _) in binds {
-                        top.whnf.remove(n);
-                    }
-                }
+                let removed = push_shadow_whnf(
+                    binds.iter().map(|(n, _)| n.as_str()),
+                    &mut self.bodies.last_mut().expect("body").whnf,
+                );
                 let body = self.strict(body);
-                self.bodies.last_mut().expect("body").whnf = saved_whnf;
+                pop_removed_whnf(removed, &mut self.bodies.last_mut().expect("body").whnf);
                 SExpr::Let(bound, Box::new(body))
             }
             Core::Case(scrut, binder, alts) => {
@@ -1313,32 +1408,40 @@ impl Lowering {
                     _ => {}
                 }
                 // The result of an inline primitive that is only used raw is kept unboxed.
-                let raw_call = self.raw_call(scrut);
-                let saved_whnf = self.bodies.last().expect("body").whnf.clone();
-                let mut alt_base_whnf = saved_whnf.clone();
-                add_case_whnf(scrut, binder, &mut alt_base_whnf);
-                let raw = (matches!(
-                    scrut.as_ref(),
+                let scrut_core = scrut;
+                let raw_call = self.raw_call(scrut_core);
+                let raw_eligible = matches!(
+                    scrut_core.as_ref(),
                     Core::Prim(p, args)
                         if RAW_RESULT_PRIMS.contains(&p.as_str())
                             || (is_bytes_index_prim(p)
                                 && args.len() == 2
                                 && !matches!(args[0], Core::Lit(_))
                                 && !matches!(&args[1], Core::Lit(l) if !matches!(l, Lit::Int(_))))
-                ) || raw_call.is_some())
-                    && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder, &self.workers, &self.worker_strict, &alt_base_whnf));
-                let raw_kind = match scrut.as_ref() {
+                ) || raw_call.is_some();
+                let raw = raw_eligible
+                    && match &alts[..] {
+                        [Alt::Default(body)] => {
+                            let whnf = &mut self.bodies.last_mut().expect("body").whnf;
+                            let added = push_case_whnf(scrut_core, binder, whnf);
+                            let ok = raw_uses(body, binder, &self.workers, &self.worker_strict, whnf);
+                            pop_added_whnf(added, whnf);
+                            ok
+                        }
+                        _ => false,
+                    };
+                let raw_kind = match scrut_core.as_ref() {
                     Core::Prim(p, _) => raw_prim_result_kind(p).unwrap_or(NUM_INT),
                     _ => raw_call.unwrap_or(NUM_INT),
                 };
-                let flat_alts = if !raw { flatten_case_alts(scrut, binder, alts) } else { None };
+                let flat_alts = if !raw { flatten_case_alts(scrut_core, binder, alts) } else { None };
                 let alts: &[Alt] = flat_alts.as_deref().unwrap_or(alts);
                 // Temporaries allocated only to evaluate the scrutinee are dead once it returns.
                 let (scrut_base, scrut_raw_base) = {
                     let b = self.bodies.last().expect("body");
                     (b.nslots, b.nraw)
                 };
-                let scrut = self.strict_in(scrut, if raw { Ctx::RawScrut } else { Ctx::Scrut });
+                let scrut = self.strict_in(scrut_core, if raw { Ctx::RawScrut } else { Ctx::Scrut });
                 let (scrut_top, scrut_raw_top) = {
                     let b = self.bodies.last_mut().expect("body");
                     let t = (b.nslots, b.nraw);
@@ -1390,25 +1493,40 @@ impl Lowering {
                     (b.nslots, b.nraw)
                 };
                 let (mut top, mut raw_top) = (scrut_top.max(base), scrut_raw_top.max(raw_base));
+                let added_case_whnf = push_case_whnf(
+                    scrut_core,
+                    binder,
+                    &mut self.bodies.last_mut().expect("body").whnf,
+                );
                 let mut lowered = Vec::with_capacity(alts.len());
                 for (alt_idx, a) in alts.iter().enumerate() {
-                    let b = self.bodies.last_mut().expect("body");
-                    b.nslots = base;
-                    b.nraw = raw_base;
-                    b.whnf = alt_base_whnf.clone();
-                    if let Alt::Con(_, vars, _) = a {
-                        for v in vars {
-                            b.whnf.remove(v);
+                    let removed_alt_whnf = {
+                        let b = self.bodies.last_mut().expect("body");
+                        b.nslots = base;
+                        b.nraw = raw_base;
+                        if let Alt::Con(_, vars, _) = a {
+                            push_shadow_whnf(vars.iter().map(|v| v.as_str()), &mut b.whnf)
+                        } else {
+                            Vec::new()
                         }
-                    }
+                    };
                     let lowered_alt = if can_fuse_bytes_read && alt_idx == 0 {
                         if let Alt::Con(name, vars, body) = a {
                             if name == "Builtin.(,)" && vars.len() == 2 && vars[0] != vars[1] {
-                                let mut read_whnf = self.bodies.last().expect("body").whnf.clone();
-                                read_whnf.insert(vars[1].clone());
+                                let inserted_v1 = self
+                                    .bodies
+                                    .last_mut()
+                                    .expect("body")
+                                    .whnf
+                                    .insert(vars[1].clone());
                                 let val_raw = free_mentions(body, &vars[1])
-                                    && raw_uses(body, &vars[1], &self.workers, &self.worker_strict, &read_whnf);
-                                self.bodies.last_mut().expect("body").whnf = read_whnf;
+                                    && raw_uses(
+                                        body,
+                                        &vars[1],
+                                        &self.workers,
+                                        &self.worker_strict,
+                                        &mut self.bodies.last_mut().expect("body").whnf,
+                                    );
                                 let s0 = if free_mentions(body, &vars[0]) {
                                     self.bind_local(&vars[0])
                                 } else {
@@ -1421,7 +1539,11 @@ impl Lowering {
                                 } else {
                                     UNUSED_SLOT
                                 };
-                                SAlt::Con(name.clone(), vec![s0, s1], self.strict(body))
+                                let alt_res = SAlt::Con(name.clone(), vec![s0, s1], self.strict(body));
+                                if inserted_v1 {
+                                    self.bodies.last_mut().expect("body").whnf.remove(&vars[1]);
+                                }
+                                alt_res
                             } else {
                                 self.alt(a)
                             }
@@ -1432,11 +1554,13 @@ impl Lowering {
                         self.alt(a)
                     };
                     lowered.push(lowered_alt);
-                    let b = self.bodies.last().expect("body");
+                    let b = self.bodies.last_mut().expect("body");
+                    pop_removed_whnf(removed_alt_whnf, &mut b.whnf);
                     top = top.max(b.nslots);
                     raw_top = raw_top.max(b.nraw);
                 }
                 let b = self.bodies.last_mut().expect("body");
+                pop_added_whnf(added_case_whnf, &mut b.whnf);
                 if let Some(prev) = saved_binder_local {
                     match prev {
                         Some(s) => {
@@ -1449,7 +1573,6 @@ impl Lowering {
                 }
                 b.nslots = top;
                 b.nraw = raw_top;
-                b.whnf = saved_whnf;
                 SExpr::Case(Box::new(scrut), bslot, lowered)
             }
             Core::Con(name, args) => {
@@ -1471,15 +1594,20 @@ impl Lowering {
                     b.nraw = raw_base;
                     t
                 };
-                let saved_whnf = self.bodies.last().expect("body").whnf.clone();
-                if let Core::Var(v) = &args[0] {
-                    self.bodies.last_mut().expect("body").whnf.insert(v.clone());
-                }
+                let inserted_seq_whnf = if let Core::Var(v) = &args[0] {
+                    self.bodies.last_mut().expect("body").whnf.insert(v.clone())
+                } else {
+                    false
+                };
                 let body = self.strict(&args[1]);
                 let b = self.bodies.last_mut().expect("body");
+                if inserted_seq_whnf {
+                    if let Core::Var(v) = &args[0] {
+                        b.whnf.remove(v);
+                    }
+                }
                 b.nslots = b.nslots.max(scrut_top);
                 b.nraw = b.nraw.max(scrut_raw_top);
-                b.whnf = saved_whnf;
                 SExpr::Case(Box::new(scrut), UNUSED_SLOT, vec![SAlt::Default(body)])
             }
             Core::Prim(name, args) if IDENTITY_PRIMS.contains(&name.as_str()) && args.len() == 1 => {
