@@ -2548,12 +2548,13 @@ pub fn write_native(out: &str, binds: &[crate::core::TopBind]) -> Result<(), Str
 /// workers; see `native::stg::NumericParams`): the dictionaries of its predicates come first,
 /// then the arguments of its arrows. A rank-N or otherwise qualified inner type says nothing.
 pub fn numeric_params(values: &crate::tc::env::EnvMap<crate::tc::types::Scheme>) -> crate::native::stg::NumericParams {
-    use crate::native::stg::{NUM_CHAR, NUM_INT};
+    use crate::native::stg::{NUM_CHAR, NUM_DOUBLE, NUM_INT};
     use crate::tc::types::{Ty, ARROW};
     let kind = |t: &Ty| match t {
         Ty::Con(c) => match c.as_str() {
             "GHC.Types.Int" | "GHC.Prim.Int#" | "GHC.Types.Word" | "GHC.Prim.Word#" => NUM_INT,
             "GHC.Types.Char" | "GHC.Prim.Char#" => NUM_CHAR,
+            "GHC.Types.Double" | "GHC.Prim.Double#" => NUM_DOUBLE,
             _ => 0,
         },
         _ => 0,

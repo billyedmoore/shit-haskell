@@ -17,7 +17,7 @@ use std::fmt::Write;
 
 use super::stg::{
     Atom, SAlt, SBind, SClosure, SExpr, SLit, SProgram, MAX_REG_RAW_ARGS, MAX_STATIC_STR_LEN, RAW,
-    RAW_CHAR, UNUSED_SLOT,
+    RAW_CHAR, RAW_DOUBLE, RAW_MASK, UNUSED_SLOT,
 };
 use crate::core::Lit;
 
@@ -112,7 +112,7 @@ impl Frame {
     /// then the locals, the optional closure (slot 0) and the stack arguments (slots 1..=a).
     fn off(&self, k: u32) -> i64 {
         if k & RAW != 0 {
-            return 8 * (k & !(RAW | RAW_CHAR)) as i64;
+            return 8 * raw_idx(k) as i64;
         }
         let (s, a, r, k) = (self.s as i64, self.a as i64, self.r as i64, k as i64);
         if k == 0 {
@@ -341,6 +341,17 @@ fn magic_divisor(a: &Atom) -> Option<i64> {
 /// Whether `name args` with a raw binder is computed inline from raw numbers and literals alone,
 /// with no slow path (no cell checks, no faulting division): see `Gen::raw_op`.
 fn total_raw_op(name: &str, args: &[Atom]) -> bool {
+    if let Some(d) = double_op(name) {
+        let arity = if matches!(d, D::Bin(_) | D::Cmp(_)) { 2 } else { 1 };
+        let in_int = d == D::IntToDouble;
+        let num = |a: &Atom| match a {
+            Atom::Slot(k) => k & RAW != 0,
+            Atom::Lit(SLit::Double(_)) => !in_int,
+            Atom::Lit(SLit::Int(_)) => in_int,
+            _ => false,
+        };
+        return args.len() == arity && args.iter().all(num);
+    }
     let Some(k) = int_op(name) else { return false };
     let arity = if matches!(k, K::Un(_) | K::Ord | K::Id | K::Chr | K::TagToEnum) { 1 } else { 2 };
     let in_char = matches!(k, K::CharCmp(_) | K::Ord);
@@ -404,7 +415,7 @@ fn bytes_elem_ops(elem: &str) -> Option<(&'static str, &'static str, usize)> {
 
 /// The inline `Double#` operations (see `Gen::double_fast_path`).
 #[derive(PartialEq, Clone, Copy)]
-enum D { Bin(&'static str), Cmp(DCmp), Sqrt, Negate, Abs }
+enum D { Bin(&'static str), Cmp(DCmp), Sqrt, Negate, Abs, IntToDouble, DoubleToInt }
 
 #[derive(PartialEq, Clone, Copy)]
 enum DCmp { Eq, Ne, Lt, Le, Gt, Ge }
@@ -415,6 +426,7 @@ fn double_op(name: &str) -> Option<D> {
         "==##" => D::Cmp(DCmp::Eq), "/=##" => D::Cmp(DCmp::Ne), "<##" => D::Cmp(DCmp::Lt),
         "<=##" => D::Cmp(DCmp::Le), ">##" => D::Cmp(DCmp::Gt), ">=##" => D::Cmp(DCmp::Ge),
         "sqrtDouble#" => D::Sqrt, "negateDouble#" => D::Negate, "fabsDouble#" => D::Abs,
+        "int2Double#" => D::IntToDouble, "double2Int#" => D::DoubleToInt,
         _ => return None,
     })
 }
@@ -439,9 +451,20 @@ fn bind_words(b: &SBind) -> usize {
     }
 }
 
-/// Physical raw slot index (ignoring the `RAW` and `RAW_CHAR` tag bits).
+/// Physical raw slot index (ignoring the `RAW`, `RAW_CHAR`, and `RAW_DOUBLE` tag bits).
 fn raw_idx(k: u32) -> u32 {
-    k & !(RAW | RAW_CHAR)
+    k & !RAW_MASK
+}
+
+/// Boxed heap cell kind corresponding to a raw slot's tag bits.
+fn raw_slot_kind(k: u32) -> u8 {
+    if k & RAW_CHAR != 0 {
+        CHAR
+    } else if k & RAW_DOUBLE != 0 {
+        DOUBLE
+    } else {
+        INT
+    }
 }
 
 /// Whether an atom is a raw slot (an unboxed number).
@@ -450,8 +473,10 @@ fn is_raw(a: &Atom) -> bool {
 }
 
 /// The cell kind of a primitive's raw operands, when they are boxed for the runtime.
-fn operand_kind(prim: &str) -> u8 {
-    if prim.ends_with("Char#") || prim == "ord#" {
+fn operand_kind(prim: &str, slot: u32) -> u8 {
+    if slot & RAW_DOUBLE != 0 {
+        DOUBLE
+    } else if slot & RAW_CHAR != 0 || prim.ends_with("Char#") || prim == "ord#" {
         CHAR
     } else {
         INT
@@ -1092,6 +1117,7 @@ impl Gen {
                         let v = match a {
                             Atom::Lit(SLit::Int(v)) => *v,
                             Atom::Lit(SLit::Char(ch)) => crate::syntax::lexer::char_code(*ch) as i64,
+                            Atom::Lit(SLit::Double(d)) => d.to_bits() as i64,
                             _ => return false,
                         };
                         if reg_raw.len() < MAX_REG_RAW_ARGS {
@@ -1115,6 +1141,7 @@ impl Gen {
                         let v = match a {
                             Atom::Lit(SLit::Int(v)) => *v,
                             Atom::Lit(SLit::Char(ch)) => crate::syntax::lexer::char_code(*ch) as i64,
+                            Atom::Lit(SLit::Double(d)) => d.to_bits() as i64,
                             _ => unreachable!(),
                         };
                         if i32::try_from(v).is_ok() {
@@ -1356,7 +1383,7 @@ impl Gen {
             if c.ret_raw {
                 match e {
                     SExpr::Atom(Atom::Slot(s)) if *s & RAW != 0 => reg_of(*s).is_some(),
-                    SExpr::Atom(Atom::Lit(SLit::Int(_) | SLit::Char(_))) => true,
+                    SExpr::Atom(Atom::Lit(SLit::Int(_) | SLit::Char(_) | SLit::Double(_))) => true,
                     _ => false,
                 }
             } else {
@@ -1412,6 +1439,7 @@ impl Gen {
                     SExpr::Atom(Atom::Lit(SLit::Char(ch))) => {
                         g.mov_src(Src::Imm(crate::syntax::lexer::char_code(*ch) as i64), "%r14")
                     }
+                    SExpr::Atom(Atom::Lit(SLit::Double(d))) => g.mov_src(Src::Imm(d.to_bits() as i64), "%r14"),
                     _ => unreachable!(),
                 }
             } else {
@@ -1837,7 +1865,7 @@ impl Gen {
                 _ => false,
             },
             SExpr::Atom(Atom::Slot(k)) => k & RAW != 0,
-            SExpr::Atom(Atom::Lit(SLit::Int(_) | SLit::Char(_))) => tail && self.ret_raw,
+            SExpr::Atom(Atom::Lit(SLit::Int(_) | SLit::Char(_) | SLit::Double(_))) => tail && self.ret_raw,
             SExpr::App(f, args) => tail && plain(f) && args.iter().all(plain),
             SExpr::CallWorker(_, args) => args.iter().all(plain),
             SExpr::Let(binds, _) => binds.iter().all(|(_, b)| b.atoms().iter().all(plain)),
@@ -1913,6 +1941,7 @@ impl Gen {
             }
             Atom::Lit(SLit::Int(v)) => Src::Imm(*v),
             Atom::Lit(SLit::Char(c)) => Src::Imm(crate::syntax::lexer::char_code(*c) as i64),
+            Atom::Lit(SLit::Double(d)) => Src::Imm(d.to_bits() as i64),
             other => panic!("internal: raw operand {other:?}"),
         }
     }
@@ -1939,9 +1968,122 @@ impl Gen {
         }
     }
 
+    fn load_raw_xmm(&mut self, a: &Atom, p: Pos, xmm: &str) {
+        match a {
+            Atom::Slot(k) if *k & RAW != 0 => {
+                if let Some(r) = self.cached(*k) {
+                    self.emit(&format!("movq {r}, {xmm}"));
+                } else {
+                    self.emit(&format!("movsd {}, {xmm}", p.slot(*k)));
+                }
+            }
+            Atom::Lit(SLit::Double(v)) => {
+                let bits = v.to_bits();
+                if bits == 0 {
+                    self.emit(&format!("xorpd {xmm}, {xmm}"));
+                } else {
+                    self.emit(&format!("movabsq ${}, %rdx", bits as i64));
+                    self.emit(&format!("movq %rdx, {xmm}"));
+                }
+            }
+            other => panic!("internal: raw double operand {other:?}"),
+        }
+    }
+
+    /// Emits `ucomisd` (with IEEE-754 NaN handling for `==`/`/=`) comparing `%xmm0` against `%xmm1`,
+    /// returning the x86 condition code suffix (`"a"`, `"ae"`, or `"ne"`) that holds when true.
+    fn emit_dcmp_flags(&mut self, c: DCmp) -> &'static str {
+        match c {
+            DCmp::Lt => { self.emit("ucomisd %xmm0, %xmm1"); "a" }
+            DCmp::Le => { self.emit("ucomisd %xmm0, %xmm1"); "ae" }
+            DCmp::Gt => { self.emit("ucomisd %xmm1, %xmm0"); "a" }
+            DCmp::Ge => { self.emit("ucomisd %xmm1, %xmm0"); "ae" }
+            DCmp::Eq | DCmp::Ne => {
+                self.emit("ucomisd %xmm1, %xmm0");
+                if c == DCmp::Eq {
+                    self.emit("sete %cl");
+                    self.emit("setnp %dl");
+                    self.emit("andb %dl, %cl");
+                } else {
+                    self.emit("setne %cl");
+                    self.emit("setp %dl");
+                    self.emit("orb %dl, %cl");
+                }
+                self.emit("testb %cl, %cl");
+                "ne"
+            }
+        }
+    }
+
     /// A total inline operation on raw numbers (`total_raw_op`) whose result goes to raw slot
     /// `dest`, kept in a cache register. Reuses a dead source register in place when possible.
     fn raw_op(&mut self, name: &str, args: &[Atom], dest: u32, after: &SExpr, p: Pos) {
+        if let Some(dk) = double_op(name) {
+            let same_args = args.len() == 2 && args[0] == args[1];
+            if dk == D::IntToDouble {
+                let s0 = self.raw_src(&args[0], p, &[]);
+                match s0 {
+                    Src::Reg(r) => self.emit(&format!("cvtsi2sdq {r}, %xmm0")),
+                    Src::Imm(v) => {
+                        self.mov_src(Src::Imm(v), "%rcx");
+                        self.emit("cvtsi2sdq %rcx, %xmm0");
+                    }
+                }
+            } else {
+                self.load_raw_xmm(&args[0], p, "%xmm0");
+                if let Some(a1) = args.get(1) {
+                    if !same_args {
+                        self.load_raw_xmm(a1, p, "%xmm1");
+                    } else if matches!(dk, D::Cmp(_)) {
+                        self.emit("movapd %xmm0, %xmm1");
+                    }
+                }
+            }
+            let mut avoid: Vec<&str> = Vec::new();
+            let mut dead_reg: Option<&'static str> = None;
+            for a in args {
+                if let Atom::Slot(sk) = a {
+                    if let Some(r) = self.cached(*sk) {
+                        if raw_idx(*sk) == raw_idx(dest) || !self.raw_live(*sk, after, p) {
+                            if dead_reg.is_none() {
+                                dead_reg = Some(r);
+                            }
+                        } else if !avoid.contains(&r) {
+                            avoid.push(r);
+                        }
+                    }
+                }
+            }
+            let d = dead_reg.unwrap_or_else(|| self.fresh_reg(p, &avoid));
+            match dk {
+                D::Bin(op) => {
+                    let rhs = if same_args { "%xmm0" } else { "%xmm1" };
+                    self.emit(&format!("{op} {rhs}, %xmm0"));
+                    self.emit(&format!("movq %xmm0, {d}"));
+                }
+                D::Sqrt => {
+                    self.emit("sqrtsd %xmm0, %xmm0");
+                    self.emit(&format!("movq %xmm0, {d}"));
+                }
+                D::Negate | D::Abs => {
+                    self.emit(&format!("movq %xmm0, {d}"));
+                    self.emit(&format!("{} $63, {d}", if dk == D::Negate { "btcq" } else { "btrq" }));
+                }
+                D::IntToDouble => {
+                    self.emit(&format!("movq %xmm0, {d}"));
+                }
+                D::DoubleToInt => {
+                    self.emit(&format!("cvttsd2siq %xmm0, {d}"));
+                }
+                D::Cmp(c) => {
+                    let cc = self.emit_dcmp_flags(c);
+                    self.emit(&format!("set{cc} {}", byte_reg(d)));
+                    self.emit(&format!("movzbl {}, {}", byte_reg(d), low32(d)));
+                }
+            }
+            self.cache_put(dest, d, true);
+            return;
+        }
         let k = int_op(name).expect("internal: not an inline operation");
         let s0 = self.raw_src(&args[0], p, &[]);
         let r0 = match s0 { Src::Reg(r) => Some(r), Src::Imm(_) => None };
@@ -2249,8 +2391,58 @@ impl Gen {
     /// optionally wrapped in `SExpr::Join` bindings: a compare and conditional jumps, without the
     /// 0 or 1. Answers whether it applied.
     fn compare_and_branch(&mut self, name: &str, args: &[Atom], b: u32, body: &SExpr, p: Pos) -> bool {
-        let Some(k @ (K::Cmp(set) | K::CharCmp(set))) = int_op(name) else { return false };
-        let is_char = matches!(k, K::CharCmp(_));
+        enum CmpKind {
+            Int(&'static str, bool),
+            Double(DCmp),
+        }
+        let cmp_kind = match int_op(name) {
+            Some(K::Cmp(set)) => CmpKind::Int(set, false),
+            Some(K::CharCmp(set)) => CmpKind::Int(set, true),
+            _ => match double_op(name) {
+                Some(D::Cmp(dc)) => CmpKind::Double(dc),
+                _ => return false,
+            },
+        };
+        let is_double = matches!(cmp_kind, CmpKind::Double(_));
+        let emit_cmp = |g: &mut Self| -> &'static str {
+            match cmp_kind {
+                CmpKind::Double(dc) => {
+                    g.load_raw_xmm(&args[0], p, "%xmm0");
+                    if args[0] == args[1] {
+                        g.emit("movapd %xmm0, %xmm1");
+                    } else {
+                        g.load_raw_xmm(&args[1], p, "%xmm1");
+                    }
+                    g.emit_dcmp_flags(dc)
+                }
+                CmpKind::Int(set, is_char) => {
+                    let s0 = g.raw_src(&args[0], p, &[]);
+                    let avoid: Vec<&str> = match s0 { Src::Reg(r) => vec![r], Src::Imm(_) => vec![] };
+                    let s1 = g.raw_src(&args[1], p, &avoid);
+                    let lhs = match s0 {
+                        Src::Reg(r) => r.to_string(),
+                        Src::Imm(_) => {
+                            g.mov_src(s0, "%rcx");
+                            "%rcx".to_string()
+                        }
+                    };
+                    if is_char {
+                        let t = match s1 {
+                            Src::Reg(r) => low32(r).to_string(),
+                            Src::Imm(v) => format!("${}", v as u32 as i32),
+                        };
+                        let l = if lhs == "%rcx" { "%ecx" } else { low32(&lhs) };
+                        g.emit(&format!("cmpl {t}, {l}"));
+                    } else if matches!(s1, Src::Imm(0)) {
+                        g.emit(&format!("testq {lhs}, {lhs}"));
+                    } else {
+                        let t = g.src_text(s1, "%rdx");
+                        g.emit(&format!("cmpq {t}, {lhs}"));
+                    }
+                    &set[3..]
+                }
+            }
+        };
         // Direct fusion for `case (a cmp b) as r of _ -> tagToEnum# r`: emit `cmp` + `cmov` into
         // True/False without materializing 0/1 or spilling to the frame.
         if let SExpr::Prim(tn, targs) = body {
@@ -2263,33 +2455,10 @@ impl Gen {
                 if p.mode == Mode::Scrut && !self.cache.is_empty() {
                     self.flush_live_raws(p);
                 }
-                let s0 = self.raw_src(&args[0], p, &[]);
-                let avoid: Vec<&str> = match s0 { Src::Reg(r) => vec![r], Src::Imm(_) => vec![] };
-                let s1 = self.raw_src(&args[1], p, &avoid);
-                let lhs = match s0 {
-                    Src::Reg(r) => r.to_string(),
-                    Src::Imm(_) => {
-                        self.mov_src(s0, "%rcx");
-                        "%rcx".to_string()
-                    }
-                };
-                if is_char {
-                    let t = match s1 {
-                        Src::Reg(r) => low32(r).to_string(),
-                        Src::Imm(v) => format!("${}", v as u32 as i32),
-                    };
-                    let l = if lhs == "%rcx" { "%ecx" } else { low32(&lhs) };
-                    self.emit(&format!("cmpl {t}, {l}"));
-                } else if matches!(s1, Src::Imm(0)) {
-                    self.emit(&format!("testq {lhs}, {lhs}"));
-                } else {
-                    let t = self.src_text(s1, "%rdx");
-                    self.emit(&format!("cmpq {t}, {lhs}"));
-                }
+                let cc = emit_cmp(self);
                 let t_id = self.con_id("GHC.Types.True");
                 let f_id = self.con_id("GHC.Types.False");
                 let (t_lbl, f_lbl) = (self.nullary_con(t_id), self.nullary_con(f_id));
-                let cc = &set[3..];
                 self.emit(&format!("leaq {f_lbl}(%rip), %r14"));
                 self.emit(&format!("leaq {t_lbl}(%rip), %rax"));
                 self.emit(&format!("cmov{cc}q %rax, %r14"));
@@ -2324,30 +2493,7 @@ impl Gen {
         if alts.iter().any(|a| matches!(a, SAlt::Lit(l, _) if !matches!(l, Lit::Int(_)))) || alts.iter().any(|a| matches!(a, SAlt::Con(..))) {
             return false;
         }
-        let s0 = self.raw_src(&args[0], p, &[]);
-        let avoid: Vec<&str> = match s0 { Src::Reg(r) => vec![r], Src::Imm(_) => vec![] };
-        let s1 = self.raw_src(&args[1], p, &avoid);
-        let lhs = match s0 {
-            Src::Reg(r) => r.to_string(),
-            Src::Imm(_) => {
-                self.mov_src(s0, "%rcx");
-                "%rcx".to_string()
-            }
-        };
-        if is_char {
-            let t = match s1 {
-                Src::Reg(r) => low32(r).to_string(),
-                Src::Imm(v) => format!("${}", v as u32 as i32),
-            };
-            let l = if lhs == "%rcx" { "%ecx" } else { low32(&lhs) };
-            self.emit(&format!("cmpl {t}, {l}"));
-        } else if matches!(s1, Src::Imm(0)) {
-            self.emit(&format!("testq {lhs}, {lhs}"));
-        } else {
-            let t = self.src_text(s1, "%rdx");
-            self.emit(&format!("cmpq {t}, {lhs}"));
-        }
-        let cc = &set[3..];
+        let cc = emit_cmp(self);
         let negated = Self::negate_cc(cc);
         let mut join_defs: Vec<(String, &[u32], &SExpr)> = Vec::new();
         for (idx, &(id, params, code)) in peeled_joins.iter().enumerate() {
@@ -2380,35 +2526,38 @@ impl Gen {
             | [SAlt::Lit(Lit::Int(1), t_body), SAlt::Lit(Lit::Int(0), f_body), ..] => Some((t_body, f_body)),
             _ => None,
         };
-        if let Some((t1, f1)) = two_way {
-            let fused = self
-                .nested_same_cmp(f1, args, is_char, p)
-                .map(|(cc2, t2, f2)| (cc, t1, cc2, t2, f2))
-                .or_else(|| {
-                    self.nested_same_cmp(t1, args, is_char, p)
-                        .map(|(cc2, t2, f2)| (negated, f1, cc2, t2, f2))
-                });
-            if let Some((j1, b1, j2, b2, b3)) = fused {
-                let l1 = self.label("alt");
-                let l2 = self.label("alt");
-                self.emit(&format!("j{j1} {l1}"));
-                self.emit(&format!("j{j2} {l2}"));
-                let snapshot = self.cache.clone();
-                let safe_snap = self.safe_slots;
-                let kind_snap = self.known_kind.clone();
-                self.expr(b3, p);
-                self.put_label(&l1);
-                self.cache = snapshot.clone();
-                self.safe_slots = safe_snap;
-                self.known_kind = kind_snap.clone();
-                self.expr(b1, p);
-                self.put_label(&l2);
-                self.cache = snapshot;
-                self.safe_slots = safe_snap;
-                self.known_kind = kind_snap;
-                self.expr(b2, p);
-                emit_joins(self, safe_snap);
-                return true;
+        if !is_double {
+            let is_char = matches!(cmp_kind, CmpKind::Int(_, true));
+            if let Some((t1, f1)) = two_way {
+                let fused = self
+                    .nested_same_cmp(f1, args, is_char, p)
+                    .map(|(cc2, t2, f2)| (cc, t1, cc2, t2, f2))
+                    .or_else(|| {
+                        self.nested_same_cmp(t1, args, is_char, p)
+                            .map(|(cc2, t2, f2)| (negated, f1, cc2, t2, f2))
+                    });
+                if let Some((j1, b1, j2, b2, b3)) = fused {
+                    let l1 = self.label("alt");
+                    let l2 = self.label("alt");
+                    self.emit(&format!("j{j1} {l1}"));
+                    self.emit(&format!("j{j2} {l2}"));
+                    let snapshot = self.cache.clone();
+                    let safe_snap = self.safe_slots;
+                    let kind_snap = self.known_kind.clone();
+                    self.expr(b3, p);
+                    self.put_label(&l1);
+                    self.cache = snapshot.clone();
+                    self.safe_slots = safe_snap;
+                    self.known_kind = kind_snap.clone();
+                    self.expr(b1, p);
+                    self.put_label(&l2);
+                    self.cache = snapshot;
+                    self.safe_slots = safe_snap;
+                    self.known_kind = kind_snap;
+                    self.expr(b2, p);
+                    emit_joins(self, safe_snap);
+                    return true;
+                }
             }
         }
         if let Some((t_body, f_body)) = two_way {
@@ -2893,10 +3042,11 @@ impl Gen {
                 self.emit(&format!("movq {src}, %r14"));
                 self.ret(p);
             }
-            SExpr::Atom(Atom::Lit(l @ (SLit::Int(_) | SLit::Char(_)))) if p.mode == Mode::Tail && self.ret_raw => {
+            SExpr::Atom(Atom::Lit(l @ (SLit::Int(_) | SLit::Char(_) | SLit::Double(_)))) if p.mode == Mode::Tail && self.ret_raw => {
                 let v = match l {
                     SLit::Int(i) => *i,
                     SLit::Char(c) => crate::syntax::lexer::char_code(*c) as i64,
+                    SLit::Double(d) => d.to_bits() as i64,
                     _ => unreachable!(),
                 };
                 if v == 0 {
@@ -2934,7 +3084,7 @@ impl Gen {
                 } else {
                     self.alloc(2, p);
                     let src = self.cached(*k).map(str::to_owned).unwrap_or_else(|| p.slot(*k));
-                    let _ = writeln!(self.out, "    movq ${}, (%rax)", header(INT, 1, 0));
+                    let _ = writeln!(self.out, "    movq ${}, (%rax)", header(raw_slot_kind(*k), 1, 0));
                     let _ = writeln!(self.out, "    movq {src}, %rcx");
                     self.emit("movq %rcx, 8(%rax)");
                     self.emit("movq %rax, %r14");
@@ -3095,8 +3245,7 @@ impl Gen {
                         self.mark_slot_safe(*slot);
                         match b {
                             SBind::BoxRaw(r) => {
-                                let kind = if *r & RAW_CHAR != 0 { CHAR } else { INT };
-                                self.known_kind.insert(*slot, KnownVal::Kind(kind));
+                                self.known_kind.insert(*slot, KnownVal::Kind(raw_slot_kind(*r)));
                             }
                             _ => {
                                 self.known_kind.remove(slot);
@@ -3122,8 +3271,7 @@ impl Gen {
                             }
                         }
                         SBind::BoxRaw(r) => {
-                            let kind = if *r & RAW_CHAR != 0 { CHAR } else { INT };
-                            let hdr = header(kind, 1, 0);
+                            let hdr = header(raw_slot_kind(*r), 1, 0);
                             let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
                             let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * base);
                             if let Some(reg) = self.cached(*r) {
@@ -3801,11 +3949,17 @@ impl Gen {
                         self.fast_done = None;
                         if fast {
                             let prim_out_kind = if !raw_binder {
-                                int_op(name).and_then(|k| match k {
-                                    K::TagToEnum => None,
-                                    K::Chr => Some(CHAR),
-                                    _ => Some(INT),
-                                })
+                                int_op(name)
+                                    .and_then(|k| match k {
+                                        K::TagToEnum => None,
+                                        K::Chr => Some(CHAR),
+                                        _ => Some(INT),
+                                    })
+                                    .or_else(|| {
+                                        double_op(name).map(|d| {
+                                            if matches!(d, D::Cmp(_) | D::DoubleToInt) { INT } else { DOUBLE }
+                                        })
+                                    })
                             } else {
                                 None
                             };
@@ -4778,7 +4932,7 @@ impl Gen {
                     // A raw operand is boxed for the runtime (the arguments in the record are roots,
                     // so a collection here keeps those already stored).
                     self.alloc(2, p);
-                    let _ = writeln!(self.out, "    movq ${}, (%rax)", header(operand_kind(name), 1, 0));
+                    let _ = writeln!(self.out, "    movq ${}, (%rax)", header(operand_kind(name, *k), 1, 0));
                     let _ = writeln!(self.out, "    movq {}(%rbp), %rcx", p.slot_off(*k));
                     self.emit("movq %rcx, 8(%rax)");
                     let _ = writeln!(self.out, "    movq %rax, {}(%rbx)", mach::ARGS + 8 * i as i64);
@@ -4794,35 +4948,39 @@ impl Gen {
         self.ret(p);
     }
 
-    /// A `Double#` operation on arguments that are already DOUBLE cells (or literals), computed
-    /// inline with SSE2; THUNK/IND operands are evaluated natively out-of-line via `hsc_eval`,
-    /// falling back to `slow` only on unexpected tags. The result is a new DOUBLE cell, or for a
-    /// comparison one of the shared INT cells 0 and 1.
+    /// A `Double#` operation on arguments that are already DOUBLE/INT cells, raw slots, or
+    /// literals, computed inline with SSE2; THUNK/IND operands are evaluated natively out-of-line
+    /// via `hsc_eval`, falling back to `slow` only on unexpected tags. When `self.raw_dest` is set,
+    /// stores the raw unboxed result directly with zero allocation.
     fn double_fast_path(&mut self, k: D, args: &[Atom], p: Pos, slow: &str) -> bool {
         let arity = if matches!(k, D::Bin(_) | D::Cmp(_)) { 2 } else { 1 };
-        if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !matches!(l, SLit::Double(_)))) {
+        let in_kind = if k == D::IntToDouble { INT } else { DOUBLE };
+        let lit_ok = |l: &SLit| matches!((l, in_kind), (SLit::Double(_), DOUBLE) | (SLit::Int(_), INT));
+        if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
             return false;
         }
-        if args.iter().any(is_raw) {
+        if args.iter().any(|a| matches!(a, Atom::Slot(s) if *s & RAW != 0 && raw_slot_kind(*s) != in_kind)) {
             return false;
         }
+        let dest = self.raw_dest;
         let same_args = arity == 2 && args[0] == args[1];
         let needs_check = |idx: usize| -> bool {
             if idx == 1 && same_args {
                 return false;
             }
             let a = &args[idx];
-            !matches!(a, Atom::Lit(_))
-                && !matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(DOUBLE)))
+            !is_raw(a)
+                && !matches!(a, Atom::Lit(_))
+                && !matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(in_kind)))
         };
         let store_slots = [
             match &args[0] {
-                Atom::Slot(s) if *s != 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) => Some(*s),
+                Atom::Slot(s) if *s != 0 && *s & RAW == 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) => Some(*s),
                 _ => None,
             },
             if arity == 2 {
                 match &args[1] {
-                    Atom::Slot(s) if *s != 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) => Some(*s),
+                    Atom::Slot(s) if *s != 0 && *s & RAW == 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) => Some(*s),
                     _ => None,
                 }
             } else {
@@ -4843,7 +5001,7 @@ impl Gen {
             let a = &args[idx];
             let store_slot = store_slots[idx];
             self.load(a, p, "%rax");
-            self.emit(&format!("cmpb ${DOUBLE}, (%rax)"));
+            self.emit(&format!("cmpb ${in_kind}, (%rax)"));
             self.fast_slow_used = true;
             if idx == 0 && have_xmm_lbl.is_some() {
                 let eval0 = self.label("opev");
@@ -4854,14 +5012,14 @@ impl Gen {
                 let store1 = store_slots[1];
                 let _ = writeln!(self.out, "    jne {eval0}");
                 self.emit_cold_eval_operand(
-                    &eval0, &got0_cold, slow, "%rax", DOUBLE, None, false, &cached, safe_snap, p,
+                    &eval0, &got0_cold, slow, "%rax", in_kind, None, false, &cached, safe_snap, p,
                 );
                 self.emit_cold(|g| {
                     g.safe_slots = safe_snap;
                     g.put_label(&got0_cold);
                     g.emit("movq 8(%rax), %rcx");
                     g.load(&args[1], p, "%rax");
-                    let _ = writeln!(g.out, "    cmpb ${DOUBLE}, (%rax)");
+                    let _ = writeln!(g.out, "    cmpb ${in_kind}, (%rax)");
                     let _ = writeln!(g.out, "    jne {eval01}");
                     g.put_label(&got01_cold);
                     g.emit("movq %rcx, %xmm0");
@@ -4869,7 +5027,7 @@ impl Gen {
                     let _ = writeln!(g.out, "    jmp {have_lbl}");
                 });
                 self.emit_cold_eval_operand(
-                    &eval01, &got01_cold, slow, "%rax", DOUBLE, store1, true, &cached, safe_snap, p,
+                    &eval01, &got01_cold, slow, "%rax", in_kind, store1, true, &cached, safe_snap, p,
                 );
             } else {
                 let eval_lbl = self.label("opev");
@@ -4877,7 +5035,7 @@ impl Gen {
                 let _ = writeln!(self.out, "    jne {eval_lbl}");
                 self.put_label(&got_lbl);
                 self.emit_cold_eval_operand(
-                    &eval_lbl, &got_lbl, slow, "%rax", DOUBLE, store_slot, false, &cached, safe_snap, p,
+                    &eval_lbl, &got_lbl, slow, "%rax", in_kind, store_slot, false, &cached, safe_snap, p,
                 );
             }
             rax_arg = Some(idx);
@@ -4886,17 +5044,40 @@ impl Gen {
         let rax_holds_arg1 = rax_arg == Some(1) || (rax_arg == Some(0) && same_args);
         // Load operands into %xmm0 (and %xmm1).
         let load_operands = |g: &mut Self, use_rax0: bool, use_rax1: bool| {
+            if k == D::IntToDouble {
+                if use_rax0 {
+                    g.emit("cvtsi2sdq 8(%rax), %xmm0");
+                } else {
+                    match &args[0] {
+                        Atom::Slot(s) if *s & RAW != 0 => {
+                            let src = g.cached(*s).map(str::to_owned).unwrap_or_else(|| p.slot(*s));
+                            g.emit(&format!("cvtsi2sdq {src}, %xmm0"));
+                        }
+                        Atom::Lit(SLit::Int(v)) => {
+                            g.mov_src(Src::Imm(*v), "%rcx");
+                            g.emit("cvtsi2sdq %rcx, %xmm0");
+                        }
+                        a => {
+                            g.load(a, p, "%rdx");
+                            g.emit("cvtsi2sdq 8(%rdx), %xmm0");
+                        }
+                    }
+                }
+                return;
+            }
             for (i, a) in args.iter().enumerate() {
                 let x = if i == 0 { "%xmm0" } else { "%xmm1" };
+                if i == 1 && same_args {
+                    g.emit("movapd %xmm0, %xmm1");
+                    continue;
+                }
                 let use_rax = if i == 0 { use_rax0 } else { use_rax1 };
                 if use_rax {
                     g.emit(&format!("movsd 8(%rax), {x}"));
                 } else {
                     match a {
-                        Atom::Lit(SLit::Double(v)) => {
-                            g.emit(&format!("movabsq ${}, %rdx", v.to_bits() as i64));
-                            g.emit(&format!("movq %rdx, {x}"));
-                        }
+                        Atom::Slot(s) if *s & RAW != 0 => g.load_raw_xmm(a, p, x),
+                        Atom::Lit(SLit::Double(_)) => g.load_raw_xmm(a, p, x),
                         a => {
                             g.load(a, p, "%rdx");
                             g.emit(&format!("movsd 8(%rdx), {x}"));
@@ -4913,7 +5094,7 @@ impl Gen {
                 g.emit(if k == D::Negate { "btcq $63, %rcx" } else { "btrq $63, %rcx" });
                 g.emit("movq %rcx, %xmm0");
             }
-            D::Cmp(_) => {}
+            D::Cmp(_) | D::IntToDouble | D::DoubleToInt => {}
         };
         load_operands(self, rax_holds_arg0, rax_holds_arg1);
         if let Some(ref lbl) = have_xmm_lbl {
@@ -4921,35 +5102,54 @@ impl Gen {
         }
         apply_op(self);
         if let D::Cmp(c) = k {
-            let (zero, one) = self.bool_cells();
-            // `ucomisd b, a` sets the flags as for an unsigned comparison of a with b; an unordered
-            // (NaN) pair sets ZF, PF and CF, which makes every test but `/=` false.
-            let cond = match c {
-                DCmp::Lt => { self.emit("ucomisd %xmm0, %xmm1"); "a" }
-                DCmp::Le => { self.emit("ucomisd %xmm0, %xmm1"); "ae" }
-                DCmp::Gt => { self.emit("ucomisd %xmm1, %xmm0"); "a" }
-                DCmp::Ge => { self.emit("ucomisd %xmm1, %xmm0"); "ae" }
-                DCmp::Eq | DCmp::Ne => {
-                    self.emit("ucomisd %xmm1, %xmm0");
-                    if c == DCmp::Eq {
-                        self.emit("sete %cl");
-                        self.emit("setnp %dl");
-                        self.emit("andb %dl, %cl");
-                    } else {
-                        self.emit("setne %cl");
-                        self.emit("setp %dl");
-                        self.emit("orb %dl, %cl");
-                    }
-                    self.emit("testb %cl, %cl");
-                    "ne"
+            let cond = self.emit_dcmp_flags(c);
+            if let Some(d) = dest {
+                let direct_reg = if !self.fast_slow_used {
+                    Some(self.fresh_reg(p, &[]))
+                } else {
+                    CACHE_REGS.iter().copied().find(|r| !self.cache.iter().any(|c| c.reg == *r))
+                };
+                if let Some(reg) = direct_reg {
+                    self.emit(&format!("set{cond} {}", byte_reg(reg)));
+                    self.emit(&format!("movzbl {}, {}", byte_reg(reg), low32(reg)));
+                    self.fast_raw_reg = Some(reg);
+                } else {
+                    self.emit(&format!("set{cond} %cl"));
+                    self.emit("movzbl %cl, %ecx");
+                    self.emit(&format!("movq %rcx, {}", p.slot(d)));
                 }
-            };
-            self.emit(&format!("leaq {zero}(%rip), %r14"));
-            self.emit(&format!("leaq {one}(%rip), %rax"));
-            self.emit(&format!("cmov{cond}q %rax, %r14"));
+            } else {
+                let (zero, one) = self.bool_cells();
+                self.emit(&format!("leaq {zero}(%rip), %r14"));
+                self.emit(&format!("leaq {one}(%rip), %rax"));
+                self.emit(&format!("cmov{cond}q %rax, %r14"));
+            }
             self.fast_ret(p);
             return true;
         }
+        if let Some(d) = dest {
+            let direct_reg = if !self.fast_slow_used {
+                Some(self.fresh_reg(p, &[]))
+            } else {
+                CACHE_REGS.iter().copied().find(|r| !self.cache.iter().any(|c| c.reg == *r))
+            };
+            if let Some(reg) = direct_reg {
+                if k == D::DoubleToInt {
+                    self.emit(&format!("cvttsd2siq %xmm0, {reg}"));
+                } else {
+                    self.emit(&format!("movq %xmm0, {reg}"));
+                }
+                self.fast_raw_reg = Some(reg);
+            } else if k == D::DoubleToInt {
+                self.emit("cvttsd2siq %xmm0, %rcx");
+                self.emit(&format!("movq %rcx, {}", p.slot(d)));
+            } else {
+                self.emit(&format!("movsd %xmm0, {}", p.slot(d)));
+            }
+            self.fast_ret(p);
+            return true;
+        }
+        let out_kind = if k == D::DoubleToInt { INT } else { DOUBLE };
         let gc_lbl = self.label("gc");
         let done_lbl = self.label("gc_done");
         self.emit("leaq 16(%r12), %rax");
@@ -4958,8 +5158,13 @@ impl Gen {
         self.put_label(&done_lbl);
         self.emit("movq %r12, %r14");
         self.emit("leaq 16(%r12), %r12");
-        self.emit(&format!("movq ${}, (%r14)", header(DOUBLE, 1, 0)));
-        self.emit("movsd %xmm0, 8(%r14)");
+        self.emit(&format!("movq ${}, (%r14)", header(out_kind, 1, 0)));
+        if k == D::DoubleToInt {
+            self.emit("cvttsd2siq %xmm0, %rcx");
+            self.emit("movq %rcx, 8(%r14)");
+        } else {
+            self.emit("movsd %xmm0, 8(%r14)");
+        }
         let cached = self.cache.clone();
         let base_top = if p.pushed == 0 { p.f.size_word() } else { 0 };
         let saved_top = (frame::words(base_top) + 1) | ((frame::raw(base_top) + 1) << 32);
@@ -4997,7 +5202,7 @@ impl Gen {
             return true;
         }
         if let Some(k) = double_op(name) {
-            return self.raw_dest.is_none() && self.double_fast_path(k, args, p, slow);
+            return self.double_fast_path(k, args, p, slow);
         }
         let Some(k) = int_op(name) else { return false };
         let arity = if matches!(k, K::Un(_) | K::Ord | K::Id | K::Chr | K::TagToEnum) { 1 } else { 2 };
@@ -5517,10 +5722,11 @@ impl Gen {
                     Atom::Slot(k)
                         if p.slot(*k) == dst
                             && !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) => {}
-                    Atom::Lit(l @ (SLit::Int(_) | SLit::Char(_))) if *is_raw_arg => {
+                    Atom::Lit(l @ (SLit::Int(_) | SLit::Char(_) | SLit::Double(_))) if *is_raw_arg => {
                         let v = match l {
                             SLit::Int(v) => *v,
                             SLit::Char(c) => crate::syntax::lexer::char_code(*c) as i64,
+                            SLit::Double(d) => d.to_bits() as i64,
                             _ => unreachable!(),
                         };
                         if i32::try_from(v).is_ok() {
@@ -5581,6 +5787,14 @@ impl Gen {
                     Atom::Lit(SLit::Char(c)) => {
                         let _ = writeln!(self.out, "    movq ${}, %rcx", crate::syntax::lexer::char_code(*c));
                     }
+                    Atom::Lit(SLit::Double(d)) => {
+                        let v = d.to_bits() as i64;
+                        if i32::try_from(v).is_ok() {
+                            let _ = writeln!(self.out, "    movq ${v}, %rcx");
+                        } else {
+                            let _ = writeln!(self.out, "    movabsq ${v}, %rcx");
+                        }
+                    }
                     other => panic!("internal: worker argument {other:?} is not raw"),
                 }
             } else {
@@ -5639,6 +5853,7 @@ impl Gen {
                 },
                 Atom::Lit(SLit::Int(v)) => non_reg.push((i, NonReg::Imm(*v))),
                 Atom::Lit(SLit::Char(c)) => non_reg.push((i, NonReg::Imm(crate::syntax::lexer::char_code(*c) as i64))),
+                Atom::Lit(SLit::Double(d)) => non_reg.push((i, NonReg::Imm(d.to_bits() as i64))),
                 other => panic!("internal: worker raw argument {other:?} is not raw"),
             }
         }
@@ -8491,6 +8706,97 @@ mod sprint6_codegen_tests {
             // Second operand thunk eval preserves unboxed lhs in %rcx across hsc_eval.
             assert!(body.contains("movq %rcx, 8(%rbp)"), "{name}: expected %rcx raw stack save:\n{body}");
         }
+    }
+
+    #[test]
+    fn raw_double_inline_sse2_and_zero_alloc_chain() {
+        // Global 0: raw-double worker computing `if x <## 1.0 then x else sqrtDouble# (x *## x +## 1.0)`
+        // returning raw Double# in %r14 with zero heap allocation or runtime calls.
+        let r0 = RAW | RAW_DOUBLE | 0;
+        let r1 = RAW | RAW_DOUBLE | 1;
+        let r2 = RAW | RAW_DOUBLE | 2;
+        let r_cmp = RAW | 3;
+        let mut worker_c = simple_closure(
+            0,
+            1,
+            4,
+            SExpr::Case(
+                Box::new(SExpr::Prim("<##".into(), vec![Atom::Slot(r0), Atom::Lit(SLit::Double(1.0))])),
+                r_cmp,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Atom(Atom::Slot(r_cmp))),
+                    UNUSED_SLOT,
+                    vec![
+                        SAlt::Lit(Lit::Int(1), SExpr::Atom(Atom::Slot(r0))),
+                        SAlt::Default(SExpr::Case(
+                            Box::new(SExpr::Prim("*##".into(), vec![Atom::Slot(r0), Atom::Slot(r0)])),
+                            r1,
+                            vec![SAlt::Default(SExpr::Case(
+                                Box::new(SExpr::Prim("+##".into(), vec![Atom::Slot(r1), Atom::Lit(SLit::Double(1.0))])),
+                                r2,
+                                vec![SAlt::Default(SExpr::Case(
+                                    Box::new(SExpr::Prim("sqrtDouble#".into(), vec![Atom::Slot(r2)])),
+                                    r1,
+                                    vec![SAlt::Default(SExpr::Atom(Atom::Slot(r1)))],
+                                ))],
+                            ))],
+                        )),
+                    ],
+                ))],
+            ),
+        );
+        worker_c.raw_args = vec![(0, r0)];
+        worker_c.ret_raw = true;
+        // Global 1: boxed Double input -> raw_dest double_fast_path -> BoxRaw into DOUBLE cell.
+        let mut boxed_c = simple_closure(
+            1,
+            2,
+            1,
+            SExpr::Case(
+                Box::new(SExpr::Prim("+##".into(), vec![Atom::Slot(1), Atom::Lit(SLit::Double(2.5))])),
+                r0,
+                vec![SAlt::Default(SExpr::Atom(Atom::Slot(r0)))],
+            ),
+        );
+        boxed_c.nraw = 1;
+        let g0 = SGlobal { name: "Test.raw_dbl".into(), closure: worker_c, worker: None };
+        let g1 = SGlobal { name: "Test.box_dbl".into(), closure: boxed_c, worker: None };
+        let prog = make_prog(vec![g0, g1]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbls: Vec<&str> = table
+            .lines()
+            .take(2)
+            .map(|l| l.rsplit_once(',').unwrap().1.split_whitespace().next().unwrap())
+            .collect();
+        let slice_fn = |lbl: &str| {
+            let start = asm.find(&format!("{lbl}:\n")).expect("label");
+            let end = lbls
+                .iter()
+                .filter_map(|other| {
+                    if *other == lbl {
+                        None
+                    } else {
+                        asm[start + 1..].find(&format!("\n{other}:\n")).map(|i| start + 1 + i)
+                    }
+                })
+                .chain(asm[start + 1..].find("\n    .section").map(|i| start + 1 + i))
+                .min()
+                .unwrap_or(asm.len());
+            &asm[start..end]
+        };
+        let body0 = slice_fn(lbls[0]);
+        let body1 = slice_fn(lbls[1]);
+        // Worker uses fused ucomisd + mulsd %xmm0, %xmm0 + addsd + sqrtsd, with zero GC/prim calls.
+        assert!(body0.contains("ucomisd"), "missing fused ucomisd:\n{body0}");
+        assert!(body0.contains("mulsd %xmm0, %xmm0"), "missing same-arg square mulsd:\n{body0}");
+        assert!(body0.contains("addsd"), "missing addsd:\n{body0}");
+        assert!(body0.contains("sqrtsd %xmm0, %xmm0"), "missing sqrtsd:\n{body0}");
+        assert!(!body0.contains("hsc_gc_rt"), "unexpected GC in raw double worker:\n{body0}");
+        assert!(!body0.contains("hsc_prim"), "unexpected hsc_prim in raw double worker:\n{body0}");
+        // Boxed-to-raw-to-boxed emits DOUBLE cell header tag, not INT.
+        let double_hdr = format!("movq ${}, (%rax)", header(DOUBLE, 1, 0));
+        assert!(body1.contains(&double_hdr), "expected DOUBLE header when boxing RAW_DOUBLE:\n{body1}");
     }
 }
 

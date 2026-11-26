@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::core::{Alt, Core, Lit, TopBind};
 
-use super::stg::{NumericParams, NUM_CHAR, NUM_INT, RAW_RESULT_PRIMS};
+use super::stg::{raw_prim_result_kind, NumericParams, NUM_CHAR, NUM_DOUBLE, NUM_INT};
 
 /// Maximum number of free variables captured by a lifted local function.
 const MAX_LIFT_FV: usize = 6;
@@ -696,19 +696,18 @@ fn subst_lifted(e: &mut Core, from: &str, to: &str, fvs: &[String]) {
     }
 }
 
-/// Soundly determines whether `e` is guaranteed to evaluate to an `INT`/`WORD` (`NUM_INT`) or
-/// `CHAR` (`NUM_CHAR`) value, or `0` if unknown.
+/// Soundly determines whether `e` is guaranteed to evaluate to an `INT`/`WORD` (`NUM_INT`),
+/// `CHAR` (`NUM_CHAR`), or `DOUBLE` (`NUM_DOUBLE`) value, or `0` if unknown.
 fn expr_kind(e: &Core, env: &HashMap<String, u8>, numeric: &NumericParams) -> u8 {
     match e {
         Core::Lit(Lit::Int(_)) => NUM_INT,
         Core::Lit(Lit::Char(_)) => NUM_CHAR,
+        Core::Lit(Lit::Double(_)) => NUM_DOUBLE,
         Core::Lit(_) | Core::Fail(_) | Core::Con(..) | Core::Lam(..) => 0,
         Core::Var(v) => env.get(v).copied().unwrap_or(0),
         Core::Prim(p, args) => {
-            if p == "chr#" {
-                NUM_CHAR
-            } else if RAW_RESULT_PRIMS.contains(&p.as_str()) {
-                NUM_INT
+            if let Some(k) = raw_prim_result_kind(p) {
+                k
             } else if p == "seq" && args.len() == 2 {
                 expr_kind(&args[1], env, numeric)
             } else if SAFE_IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 {
