@@ -1206,6 +1206,11 @@ impl Simp<'_> {
                     self.expr(c);
                     return;
                 }
+                if split_let_groups(c) {
+                    self.changed = true;
+                    self.expr(c);
+                    return;
+                }
                 let Core::Let(bindings, body) = c else { unreachable!() };
                 let mut kept = Vec::with_capacity(bindings.len());
                 let group: HashSet<String> = bindings.iter().map(|(n, _)| n.clone()).collect();
@@ -2169,6 +2174,133 @@ impl Simp<'_> {
         *alts = new_alts;
         self.changed = true;
     }
+}
+
+/// Splits a multi-binding `Core::Let` group into nested `Core::Let`s in topological SCC order
+/// (dependencies outer, dependents inner), enabling `strict_let` and `float_let_into_case` on
+/// non-recursive bindings inside `let`/`where` blocks.
+fn split_let_groups(c: &mut Core) -> bool {
+    let Core::Let(binds, _) = c else { return false };
+    let n = binds.len();
+    if n <= 1 {
+        return false;
+    }
+    let mut idx_of: HashMap<&str, usize> = HashMap::with_capacity(n);
+    for (i, (name, _)) in binds.iter().enumerate() {
+        if idx_of.insert(name.as_str(), i).is_some() {
+            return false;
+        }
+    }
+    fn collect_deps(e: &Core, idx_of: &HashMap<&str, usize>, out: &mut Vec<usize>) {
+        match e {
+            Core::Var(v) => {
+                if let Some(&j) = idx_of.get(v.as_str()) {
+                    out.push(j);
+                }
+            }
+            Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(f, a) => {
+                collect_deps(f, idx_of, out);
+                collect_deps(a, idx_of, out);
+            }
+            Core::Lam(_, b) => collect_deps(b, idx_of, out),
+            Core::Let(bs, b) => {
+                for (_, r) in bs {
+                    collect_deps(r, idx_of, out);
+                }
+                collect_deps(b, idx_of, out);
+            }
+            Core::Case(s, _, alts) => {
+                collect_deps(s, idx_of, out);
+                for a in alts {
+                    match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => collect_deps(b, idx_of, out),
+                    }
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    collect_deps(a, idx_of, out);
+                }
+            }
+        }
+    }
+    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for (_, rhs) in binds.iter() {
+        let mut d = Vec::new();
+        collect_deps(rhs, &idx_of, &mut d);
+        d.sort_unstable();
+        d.dedup();
+        deps.push(d);
+    }
+    // Tarjan's SCC: components are emitted in reverse topological order (dependencies first).
+    struct Tarjan<'a> {
+        deps: &'a [Vec<usize>],
+        next: usize,
+        index: Vec<usize>,
+        low: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        sccs: Vec<Vec<usize>>,
+    }
+    impl Tarjan<'_> {
+        fn visit(&mut self, v: usize) {
+            self.next += 1;
+            self.index[v] = self.next;
+            self.low[v] = self.next;
+            self.stack.push(v);
+            self.on_stack[v] = true;
+            for &w in &self.deps[v] {
+                if self.index[w] == 0 {
+                    self.visit(w);
+                    self.low[v] = self.low[v].min(self.low[w]);
+                } else if self.on_stack[w] {
+                    self.low[v] = self.low[v].min(self.index[w]);
+                }
+            }
+            if self.low[v] == self.index[v] {
+                let mut comp = Vec::new();
+                while let Some(w) = self.stack.pop() {
+                    self.on_stack[w] = false;
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                comp.sort_unstable();
+                self.sccs.push(comp);
+            }
+        }
+    }
+    let mut t = Tarjan {
+        deps: &deps,
+        next: 0,
+        index: vec![0; n],
+        low: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::with_capacity(n),
+        sccs: Vec::new(),
+    };
+    for v in 0..n {
+        if t.index[v] == 0 {
+            t.visit(v);
+        }
+    }
+    if t.sccs.len() <= 1 {
+        return false;
+    }
+    let Core::Let(binds, body) = take(c) else { unreachable!() };
+    let mut slots: Vec<Option<(String, Core)>> = binds.into_iter().map(Some).collect();
+    let mut cur = *body;
+    for comp in t.sccs.into_iter().rev() {
+        let group: Vec<(String, Core)> = comp
+            .into_iter()
+            .map(|i| slots[i].take().expect("binding in one SCC"))
+            .collect();
+        cur = Core::Let(group, Box::new(cur));
+    }
+    *c = cur;
+    true
 }
 
 /// A let group with banged bindings, `let x = e; strict%x = x; .. in case strict%x of _ -> ..
@@ -4202,5 +4334,59 @@ mod rule_tests {
             }
         }
         assert!(!has_let(&binds[0].body), "expected demanded Double# let to become a strict case: {:?}", binds[0].body);
+    }
+
+    #[test]
+    fn split_let_groups_enables_strict_let_on_where_block() {
+        let v = |s: &str| Core::Var(s.into());
+        // \x y -> let { d2 = dx *## dx +## dy *## dy; dx = x -## y; dy = x +## y } in d2
+        let bind = TopBind {
+            name: "T.whereBlock".into(),
+            body: Core::Lam(
+                "x".into(),
+                Box::new(Core::Lam(
+                    "y".into(),
+                    Box::new(Core::Let(
+                        vec![
+                            (
+                                "d2".into(),
+                                Core::Prim(
+                                    "+##".into(),
+                                    vec![
+                                        Core::Prim("*##".into(), vec![v("dx"), v("dx")]),
+                                        Core::Prim("*##".into(), vec![v("dy"), v("dy")]),
+                                    ],
+                                ),
+                            ),
+                            ("dx".into(), Core::Prim("-##".into(), vec![v("x"), v("y")])),
+                            ("dy".into(), Core::Prim("+##".into(), vec![v("x"), v("y")])),
+                        ],
+                        Box::new(v("d2")),
+                    )),
+                )),
+            ),
+        };
+        let mut binds = vec![bind];
+        simplify(&mut binds);
+        fn has_let(e: &Core) -> bool {
+            match e {
+                Core::Let(..) => true,
+                Core::App(f, a) => has_let(f) || has_let(a),
+                Core::Lam(_, b) => has_let(b),
+                Core::Case(s, _, alts) => {
+                    has_let(s)
+                        || alts.iter().any(|a| match a {
+                            Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => has_let(b),
+                        })
+                }
+                Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(has_let),
+                _ => false,
+            }
+        }
+        assert!(
+            !has_let(&binds[0].body),
+            "expected multi-binding where-block lets to split and turn into strict cases: {:?}",
+            binds[0].body
+        );
     }
 }
