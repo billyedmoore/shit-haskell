@@ -1168,6 +1168,7 @@ fn pass(
                 pending: HashMap::new(),
                 known: &known,
                 local_known: HashMap::new(),
+                local_templates: HashMap::new(),
                 literals: &literals,
                 aliases: &aliases,
                 templates: &templates,
@@ -1214,6 +1215,10 @@ struct Simp<'a> {
     known: &'a HashMap<String, (String, Vec<Core>)>,
     /// Local let-bound constructors with atomic fields (`let r = STRef mv`), for known-case elimination.
     local_known: HashMap<String, (String, Vec<Core>)>,
+    /// Small or higher-order non-recursive local lambdas eligible for saturated call-site inlining.
+    /// `(arity, body, ho_params)`: when `ho_params` is `Some(idxs)`, inline only when at least one
+    /// argument at an index in `idxs` is a known function/lambda/PAP.
+    local_templates: HashMap<String, (usize, Core, Option<Vec<usize>>)>,
     /// Globals that are literals.
     literals: &'a HashMap<String, Lit>,
     aliases: &'a HashMap<String, String>,
@@ -1351,7 +1356,36 @@ impl Simp<'_> {
                         }
                     }
                 }
+                let mut local_template_added: Option<String> = None;
+                if kept.len() == 1 {
+                    let (name, rhs) = &kept[0];
+                    if !mentions(rhs, name) && !self.pending.keys().any(|k| mentions(rhs, k)) {
+                        let (ps, inner) = params(rhs);
+                        let arity = ps.len();
+                        if arity > 0 && !is_bottom_expr(inner) {
+                            const TINY_LOCAL_SIZE: usize = 15;
+                            let ho_params: Vec<usize> = ps
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, p)| app_head_mentions(inner, p).then_some(i))
+                                .collect();
+                            if hot_size(inner, TINY_LOCAL_SIZE + 1) <= TINY_LOCAL_SIZE {
+                                self.local_templates.insert(name.clone(), (arity, rhs.clone(), None));
+                                local_template_added = Some(name.clone());
+                            } else if !ho_params.is_empty()
+                                && hot_size(inner, self.tune.push_call_size + 1) <= self.tune.push_call_size
+                            {
+                                self.local_templates
+                                    .insert(name.clone(), (arity, rhs.clone(), Some(ho_params)));
+                                local_template_added = Some(name.clone());
+                            }
+                        }
+                    }
+                }
                 self.expr(body);
+                if let Some(name) = local_template_added {
+                    self.local_templates.remove(&name);
+                }
                 if kept.is_empty() {
                     *c = take(body);
                 } else {
@@ -2083,18 +2117,69 @@ impl Simp<'_> {
         false
     }
 
-    /// Replaces the head of a saturated call of a small global function by a fresh copy of it.
+    /// Whether an argument expression is a known function, lambda, PAP, or case returning one
+    /// (so inlining a higher-order local function called with it avoids indirect calls/PAPs).
+    fn is_interesting_fn_arg(&self, e: &Core) -> bool {
+        match e {
+            Core::Lam(..) => true,
+            Core::Var(v) => self.arity(v) > 0 || self.local_templates.contains_key(v.as_str()),
+            Core::App(..) => {
+                let mut n = 0;
+                let mut h = e;
+                while let Core::App(f, _) = h {
+                    n += 1;
+                    h = f;
+                }
+                matches!(h, Core::Var(v) if self.arity(v) > n)
+            }
+            Core::Let(_, b) => self.is_interesting_fn_arg(b),
+            Core::Case(_, _, alts) => alts.iter().any(|a| {
+                let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                !is_bottom_expr(b) && self.is_interesting_fn_arg(b)
+            }),
+            _ => false,
+        }
+    }
+
+    /// Replaces the head of a saturated call of a small global or local function by a fresh copy of it.
     fn inline_call(&mut self, c: &mut Core) {
         if self.budget == 0 {
             return;
         }
-        let mut n = 0;
-        let mut head = &mut *c;
-        while let Core::App(f, _) = head {
-            n += 1;
-            head = f;
+        let mut args: Vec<&Core> = Vec::new();
+        let mut head_ref: &Core = c;
+        while let Core::App(f, a) = head_ref {
+            args.push(a);
+            head_ref = f;
         }
-        let Core::Var(name) = head else { return };
+        let Core::Var(name) = head_ref else { return };
+        let n = args.len();
+        args.reverse();
+        if let Some((arity, body, ho_params)) = self.local_templates.get(name.as_str()) {
+            if n < *arity {
+                return;
+            }
+            if let Some(positions) = ho_params {
+                if !positions
+                    .iter()
+                    .any(|&i| args.get(i).is_some_and(|a| self.is_interesting_fn_arg(a)))
+                {
+                    return;
+                }
+            }
+            let mut copy = body.clone();
+            *self.fresh += 1;
+            let mut map = HashMap::new();
+            freshen(&mut copy, &format!("~{}", self.fresh), &mut map);
+            let mut head = &mut *c;
+            while let Core::App(f, _) = head {
+                head = f;
+            }
+            *head = copy;
+            self.budget -= 1;
+            self.changed = true;
+            return;
+        }
         let mut target = name.as_str();
         for _ in 0..8 {
             match self.aliases.get(target) {
@@ -2116,6 +2201,10 @@ impl Simp<'_> {
         *self.fresh += 1;
         let mut map = HashMap::new();
         freshen(&mut copy, &format!("~{}", self.fresh), &mut map);
+        let mut head = &mut *c;
+        while let Core::App(f, _) = head {
+            head = f;
+        }
         *head = copy;
         self.budget -= 1;
         self.changed = true;
@@ -3555,6 +3644,39 @@ fn size(e: &Core, limit: usize) -> usize {
     n
 }
 
+/// Like `size`, but counts cold unconditionally diverging subtrees (`error`, `raise#`, `Fail`)
+/// as a single node so bounds-check error messages do not prevent inlining small hot loops.
+fn hot_size(e: &Core, limit: usize) -> usize {
+    fn go(e: &Core, n: &mut usize, limit: usize) {
+        *n += 1;
+        if *n > limit || is_bottom_expr(e) {
+            return;
+        }
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(f, a) => {
+                go(f, n, limit);
+                go(a, n, limit);
+            }
+            Core::Lam(_, b) => go(b, n, limit),
+            Core::Let(binds, body) => {
+                binds.iter().for_each(|(_, r)| go(r, n, limit));
+                go(body, n, limit);
+            }
+            Core::Case(s, _, alts) => {
+                go(s, n, limit);
+                alts.iter().for_each(|a| match a {
+                    Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => go(b, n, limit),
+                });
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => args.iter().for_each(|a| go(a, n, limit)),
+        }
+    }
+    let mut n = 0;
+    go(e, &mut n, limit);
+    n
+}
+
 /// Whether a variable occurs in an expression (shadowing ignored: a conservative answer).
 fn mentions(e: &Core, x: &str) -> bool {
     match e {
@@ -4207,7 +4329,7 @@ mod rule_tests {
         let no_arities = HashMap::new();
         let no_strict_cons = HashMap::new();
         let mut s = Simp {
-            once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates,
+            once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), local_templates: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates,
             this: "Test.x", rules: &rules, strict_cons: &no_strict_cons, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
             fresh: &mut fresh, budget: 0, changed: false, tune: O1,
         };
@@ -4879,6 +5001,88 @@ mod rule_tests {
             matches!(body.as_ref(), Core::Prim(p, args) if p == "raise#" && args.len() == 1),
             "expected (<raise# e>) x to collapse to <raise# e>: {:?}",
             body
+        );
+    }
+
+    #[test]
+    fn inline_higher_order_local_lambda_into_loop() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // T.f = \n s0 ->
+        //   let step = \j k s -> case <write# j s> as s' of _ -> k s'
+        //   in let done = \s -> s
+        //   in let go = \i s -> case <==# i n> as b of
+        //        1# -> step i done s
+        //        _  -> step i (go <+# i 1#>) s
+        //   in go 0# s0
+        let step_rhs = Core::Lam(
+            "j".into(),
+            Box::new(Core::Lam(
+                "k".into(),
+                Box::new(Core::Lam(
+                    "s".into(),
+                    Box::new(Core::Case(
+                        Box::new(Core::Prim("write#".into(), vec![v("j"), v("s")])),
+                        "s'".into(),
+                        vec![Alt::Default(app(v("k"), v("s'")))],
+                    )),
+                )),
+            )),
+        );
+        let done_rhs = Core::Lam("sd".into(), Box::new(v("sd")));
+        let go_rhs = Core::Lam(
+            "i".into(),
+            Box::new(Core::Lam(
+                "sg".into(),
+                Box::new(Core::Case(
+                    Box::new(Core::Prim("==#".into(), vec![v("i"), v("n")])),
+                    "b".into(),
+                    vec![
+                        Alt::Lit(
+                            Lit::Int(1),
+                            app(app(app(v("step"), v("i")), v("done")), v("sg")),
+                        ),
+                        Alt::Default(app(
+                            app(
+                                app(v("step"), v("i")),
+                                app(v("go"), Core::Prim("+#".into(), vec![v("i"), Core::Lit(Lit::Int(1))])),
+                            ),
+                            v("sg"),
+                        )),
+                    ],
+                )),
+            )),
+        );
+        let bind = TopBind {
+            name: "T.f".into(),
+            body: Core::Lam(
+                "n".into(),
+                Box::new(Core::Lam(
+                    "s0".into(),
+                    Box::new(Core::Let(
+                        vec![("step".into(), step_rhs)],
+                        Box::new(Core::Let(
+                            vec![("done".into(), done_rhs)],
+                            Box::new(Core::Let(
+                                vec![("go".into(), go_rhs)],
+                                Box::new(app(app(v("go"), Core::Lit(Lit::Int(0))), v("s0"))),
+                            )),
+                        )),
+                    )),
+                )),
+            ),
+        };
+        let mut binds = vec![bind];
+        simplify(&mut binds);
+        assert!(
+            !mentions(&binds[0].body, "step"),
+            "expected local higher-order lambda `step` to be inlined and dropped: {:?}",
+            binds[0].body
+        );
+        assert!(
+            !mentions(&binds[0].body, "done"),
+            "expected tiny local lambda `done` to be inlined and dropped: {:?}",
+            binds[0].body
         );
     }
 }
