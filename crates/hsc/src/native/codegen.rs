@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use super::stg::{
-    Atom, SAlt, SBind, SClosure, SExpr, SLit, SProgram, MAX_REG_RAW_ARGS, RAW, RAW_CHAR,
-    UNUSED_SLOT,
+    Atom, SAlt, SBind, SClosure, SExpr, SLit, SProgram, MAX_REG_RAW_ARGS, MAX_STATIC_STR_LEN, RAW,
+    RAW_CHAR, UNUSED_SLOT,
 };
 use crate::core::Lit;
 
@@ -32,10 +32,6 @@ pub const THUNK: u8 = 8;
 pub const IND: u8 = 9;
 pub const REF: u8 = 11;
 pub const BYTES: u8 = 13;
-
-/// Maximum byte length of a string literal emitted as static `Builtin.:`/`Builtin.[]` cells in
-/// `.data.rel.ro` rather than constructed dynamically via `hsc_mk_literal`.
-const MAX_STATIC_STR_LEN: usize = 128;
 
 /// Whether `l` is lowered to a static label (`leaq ...(%rip)`) with zero allocation and no GC.
 fn is_static_slit(l: &SLit) -> bool {
@@ -2708,10 +2704,7 @@ impl Gen {
                 let _ = writeln!(self.out, "    leaq {lbl}(%rip), %r14");
                 self.ret(p);
             }
-            SExpr::Atom(Atom::Lit(l))
-                if matches!(l, SLit::Int(_) | SLit::Char(_) | SLit::Double(_))
-                    || matches!(l, SLit::Integer(s) if s.parse::<i64>().is_ok()) =>
-            {
+            SExpr::Atom(Atom::Lit(l)) if is_static_slit(l) => {
                 self.literal(l, p, "%r14");
                 self.ret(p);
             }
@@ -2729,8 +2722,16 @@ impl Gen {
             SExpr::App(func, args) => self.call(func, args, None, p),
             SExpr::Con(name, args) => {
                 let id = self.con_id(name);
+                let empty_static = HashMap::new();
                 if args.is_empty() {
                     let label = self.nullary_con(id);
+                    self.emit(&format!("leaq {label}(%rip), %r14"));
+                } else if args.iter().all(|a| self.is_static_atom(a, &empty_static)) {
+                    let fields: Vec<String> = args
+                        .iter()
+                        .map(|a| self.static_atom_label(a, &empty_static).expect("checked static"))
+                        .collect();
+                    let label = self.static_con(id, fields);
                     self.emit(&format!("leaq {label}(%rip), %r14"));
                 } else {
                     self.alloc(1 + args.len(), p);
@@ -2750,52 +2751,121 @@ impl Gen {
                     Atom::Lit(l) => is_static_slit(l),
                     _ => true,
                 };
-                let fuse_con = match body.as_ref() {
-                    SExpr::Con(name, args)
-                        if !args.is_empty()
-                            && binds.iter().all(|(_, b)| b.atoms().iter().all(non_alloc))
-                            && args.iter().all(non_alloc) =>
-                    {
-                        Some((name, args))
+                // Resolve acyclic constant constructors in this batch to static `.data.rel.ro`
+                // objects so constant lists/records allocate zero heap words.
+                let mut local_static: HashMap<u32, String> = HashMap::new();
+                let mut static_binds: Vec<Option<String>> = Vec::with_capacity(binds.len());
+                for (slot, b) in binds {
+                    if let SBind::Con(name, args) = b {
+                        if args.iter().all(|a| self.is_static_atom(a, &local_static)) {
+                            let id = self.con_id(name);
+                            let lbl = if args.is_empty() {
+                                self.nullary_con(id)
+                            } else {
+                                let fields: Vec<String> = args
+                                    .iter()
+                                    .map(|a| self.static_atom_label(a, &local_static).expect("checked static"))
+                                    .collect();
+                                self.static_con(id, fields)
+                            };
+                            local_static.insert(*slot, lbl.clone());
+                            static_binds.push(Some(lbl));
+                            continue;
+                        }
                     }
+                    static_binds.push(None);
+                }
+                let static_body_con = match body.as_ref() {
+                    SExpr::Con(name, args) if args.iter().all(|a| self.is_static_atom(a, &local_static)) => {
+                        let id = self.con_id(name);
+                        let lbl = if args.is_empty() {
+                            self.nullary_con(id)
+                        } else {
+                            let fields: Vec<String> = args
+                                .iter()
+                                .map(|a| self.static_atom_label(a, &local_static).expect("checked static"))
+                                .collect();
+                            self.static_con(id, fields)
+                        };
+                        Some(lbl)
+                    }
+                    SExpr::Atom(Atom::Slot(s)) => local_static.get(s).cloned(),
                     _ => None,
                 };
-                let total: usize = binds.iter().map(|(_, b)| bind_words(b)).sum();
+                let fuse_con = if static_body_con.is_some() {
+                    None
+                } else {
+                    match body.as_ref() {
+                        SExpr::Con(name, args)
+                            if !args.is_empty()
+                                && binds.iter().zip(&static_binds).all(|((_, b), sb)| {
+                                    sb.is_some() || b.atoms().iter().all(non_alloc)
+                                })
+                                && args.iter().all(non_alloc) =>
+                        {
+                            Some((name, args))
+                        }
+                        _ => None,
+                    }
+                };
+                let total: usize = binds
+                    .iter()
+                    .zip(&static_binds)
+                    .filter(|(_, sb)| sb.is_none())
+                    .map(|((_, b), _)| bind_words(b))
+                    .sum();
                 let con_words = fuse_con.map_or(0, |(_, args)| (1 + args.len()).max(2));
                 if total + con_words > 0 {
                     self.alloc(total + con_words, p);
                 }
-                // Every binding's address is in its slot before any object is filled (letrec).
-                let mut off = 0usize;
-                let mut offs = Vec::with_capacity(binds.len());
-                for (slot, b) in binds {
-                    match b {
-                        SBind::Con(name, args) if args.is_empty() => {
-                            let id = self.con_id(name);
-                            let lbl = self.nullary_con(id);
-                            let _ = writeln!(self.out, "    leaq {lbl}(%rip), %rcx");
-                            let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(*slot));
-                            offs.push(0);
-                        }
-                        _ => {
-                            self.emit(&format!("leaq {}(%rax), %rcx", 8 * off));
-                            self.emit(&format!("movq %rcx, {}", p.slot(*slot)));
-                            offs.push(off);
-                            off += bind_words(b);
-                        }
-                    }
-                    self.mark_slot_safe(*slot);
-                    match b {
-                        SBind::BoxRaw(r) => {
-                            let kind = if *r & RAW_CHAR != 0 { CHAR } else { INT };
-                            self.known_kind.insert(*slot, KnownVal::Kind(kind));
-                        }
-                        _ => {
-                            self.known_kind.remove(slot);
+                // Static bindings only referenced by other static bindings in this batch need not
+                // be stored into the stack frame.
+                let mut needed = std::collections::HashSet::new();
+                if static_body_con.is_none() {
+                    self.slot_uses(body, &mut needed);
+                }
+                for ((_, b), sb) in binds.iter().zip(&static_binds) {
+                    if sb.is_none() {
+                        for a in b.atoms() {
+                            if let Atom::Slot(s) = a {
+                                needed.insert(*s);
+                            }
                         }
                     }
                 }
-                for ((_, b), base) in binds.iter().zip(offs) {
+                // Every binding's address is in its slot before any object is filled (letrec).
+                let mut off = 0usize;
+                let mut offs = Vec::with_capacity(binds.len());
+                for ((slot, b), sb) in binds.iter().zip(&static_binds) {
+                    if let Some(lbl) = sb {
+                        if needed.contains(slot) || needed.contains(&ALL_LIVE) {
+                            let _ = writeln!(self.out, "    leaq {lbl}(%rip), %rcx");
+                            let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(*slot));
+                            self.mark_slot_safe(*slot);
+                        }
+                        self.known_kind.remove(slot);
+                        offs.push(0);
+                    } else {
+                        self.emit(&format!("leaq {}(%rax), %rcx", 8 * off));
+                        self.emit(&format!("movq %rcx, {}", p.slot(*slot)));
+                        offs.push(off);
+                        off += bind_words(b);
+                        self.mark_slot_safe(*slot);
+                        match b {
+                            SBind::BoxRaw(r) => {
+                                let kind = if *r & RAW_CHAR != 0 { CHAR } else { INT };
+                                self.known_kind.insert(*slot, KnownVal::Kind(kind));
+                            }
+                            _ => {
+                                self.known_kind.remove(slot);
+                            }
+                        }
+                    }
+                }
+                for (((_, b), sb), base) in binds.iter().zip(&static_binds).zip(offs) {
+                    if sb.is_some() {
+                        continue;
+                    }
                     match b {
                         SBind::Closure(c) => self.fill_closure(c, base, p),
                         SBind::Con(_, args) if args.is_empty() => {}
@@ -2823,7 +2893,10 @@ impl Gen {
                         }
                     }
                 }
-                if let Some((name, args)) = fuse_con {
+                if let Some(lbl) = static_body_con {
+                    let _ = writeln!(self.out, "    leaq {lbl}(%rip), %r14");
+                    self.ret(p);
+                } else if let Some((name, args)) = fuse_con {
                     let id = self.con_id(name);
                     let hdr = header(CON, args.len() as u64, id as u64);
                     let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
@@ -4304,6 +4377,24 @@ impl Gen {
         self.rel_cons.push((lbl.clone(), hdr, fields));
         self.static_cons.insert(key, lbl.clone());
         lbl
+    }
+
+    fn is_static_atom(&self, a: &Atom, local_static: &HashMap<u32, String>) -> bool {
+        match a {
+            Atom::Lit(l) => is_static_slit(l),
+            Atom::Global(g) => self.nullary_globals.contains_key(g),
+            Atom::Slot(s) => local_static.contains_key(s),
+            Atom::Free(_) => false,
+        }
+    }
+
+    fn static_atom_label(&mut self, a: &Atom, local_static: &HashMap<u32, String>) -> Option<String> {
+        match a {
+            Atom::Lit(l) => self.static_literal_label(l),
+            Atom::Global(g) => self.nullary_globals.get(g).cloned(),
+            Atom::Slot(s) => local_static.get(s).cloned(),
+            Atom::Free(_) => None,
+        }
     }
 
     fn string_label(&mut self, bytes: &[u8]) -> String {
@@ -6673,13 +6764,34 @@ mod nullary_constructor_tests {
     }
 
     #[test]
-    fn constructors_with_fields_keep_heap_allocation() {
+    fn constructors_with_dynamic_fields_keep_heap_allocation() {
         let mut gen = Gen::new();
-        gen.expr(&SExpr::Con("Test.Box".into(), vec![Atom::Lit(SLit::Int(42))]), position(Mode::Tail));
+        gen.expr(&SExpr::Con("Test.Box".into(), vec![Atom::Slot(0)]), position(Mode::Tail));
         assert!(gen.nullary_cons.is_empty());
         assert!(gen.out.contains("ja .Lgc"));
         assert!(gen.cold_out.contains("hsc_gc"));
         assert!(gen.out.contains("movq %rcx, 8(%rax)"));
+    }
+
+    #[test]
+    fn constant_constructors_emit_static_cells_without_heap_allocation() {
+        let mut gen = Gen::new();
+        // let s1 = [] ; s2 = "lo" : s1 in "ka" : s2
+        let expr = SExpr::Let(
+            vec![
+                (1, SBind::Con("Builtin.[]".into(), Vec::new())),
+                (2, SBind::Con("Builtin.:".into(), vec![Atom::Lit(SLit::Str("lo".into())), Atom::Slot(1)])),
+            ],
+            Box::new(SExpr::Con(
+                "Builtin.:".into(),
+                vec![Atom::Lit(SLit::Str("ka".into())), Atom::Slot(2)],
+            )),
+        );
+        let pos = Pos { f: Frame { s: 3, a: 0, r: 0, has_closure: true }, mode: Mode::Tail, pushed: 0 };
+        gen.expr(&expr, pos);
+        assert!(!gen.out.contains("ja .Lgc"), "constant list should not allocate:\n{}", gen.out);
+        assert!(!gen.out.contains("%r12"), "constant list should not touch heap pointer:\n{}", gen.out);
+        assert!(gen.out.contains("leaq .Lscon"), "should load static cons label:\n{}", gen.out);
     }
 }
 
