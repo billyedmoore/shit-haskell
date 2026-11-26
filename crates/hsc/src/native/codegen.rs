@@ -173,8 +173,12 @@ pub struct Gen {
     /// Self-tail-loop metadata for the body being generated: `(entry_label, loop_label, stack_arity)`.
     current_self: Option<(String, String, u32)>,
     /// Bitmask of stack parameter slots (`1 << k`, `1 <= k <= arity`) in a self-looping function
-    /// that are only ever passed as the ignored state argument of `readMutVar#`/`writeMutVar#`.
+    /// that are only ever passed as the ignored state argument of `readMutVar#`/`writeMutVar#`
+    /// or `read*Array#`/`write*Array#`.
     self_dead_state_params: u64,
+    /// Loop-invariant stack parameter slots whose heap tag (`BYTES` or `REF`) was verified/forced
+    /// once in the self-loop pre-header so the loop body can omit per-iteration tag checks.
+    loop_known_kinds: Vec<(u32, u8)>,
     /// Static objects (label, header, payload: a number or a label).
     statics: Vec<(String, u64, String)>,
     /// Multi-field static constructor objects emitted in `.data.rel.ro`: `(label, header, fields)`.
@@ -502,6 +506,7 @@ impl Gen {
             current_name: String::new(),
             current_self: None,
             self_dead_state_params: 0,
+            loop_known_kinds: Vec::new(),
             statics: Vec::new(),
             rel_cons: Vec::new(),
             static_cons: HashMap::new(),
@@ -1280,6 +1285,8 @@ impl Gen {
                     let ignored_idx = match (name.as_str(), args.len()) {
                         ("readMutVar#", 2) => Some(1),
                         ("writeMutVar#", 3) => Some(2),
+                        (n, 3) if n.strip_prefix("read").and_then(bytes_elem_ops).is_some() => Some(2),
+                        (n, 4) if n.strip_prefix("write").and_then(bytes_elem_ops).is_some() => Some(3),
                         _ => None,
                     };
                     for (i, a) in args.iter().enumerate() {
@@ -1320,6 +1327,173 @@ impl Gen {
         walk(body, cap, &mut non_state);
         let all = ((1u64 << cap) - 1) << 1;
         all & !non_state
+    }
+
+    /// Finds loop-invariant stack parameter slots in a self-looping closure that are strictly
+    /// demanded as `BYTES` (`read*Array#`/`write*Array#`/`index*Array#`) or `REF`
+    /// (`readMutVar#`/`writeMutVar#`) on every non-error path from entry, so their heap-tag
+    /// check can be hoisted once into the pre-header before `.Lloop`.
+    fn find_hoistable_loop_kinds(&self, entry_label: &str, c: &SClosure) -> Vec<(u32, u8)> {
+        if c.arity == 0 || c.nslots > 64 {
+            return Vec::new();
+        }
+        let cap = c.arity.min(63);
+        let mut written = 0u64;
+        fn collect_writes(e: &SExpr, cap: u32, written: &mut u64) {
+            fn mark(s: u32, cap: u32, written: &mut u64) {
+                if s != UNUSED_SLOT && s & RAW == 0 && s >= 1 && s <= cap {
+                    *written |= 1u64 << s;
+                }
+            }
+            match e {
+                SExpr::Let(binds, body) => {
+                    for (s, _) in binds {
+                        mark(*s, cap, written);
+                    }
+                    collect_writes(body, cap, written);
+                }
+                SExpr::Join(_, params, code, body) => {
+                    for p in params {
+                        mark(*p, cap, written);
+                    }
+                    collect_writes(code, cap, written);
+                    collect_writes(body, cap, written);
+                }
+                SExpr::Case(scrut, bslot, alts) => {
+                    mark(*bslot, cap, written);
+                    collect_writes(scrut, cap, written);
+                    for a in alts {
+                        match a {
+                            SAlt::Con(_, slots, b) => {
+                                for s in slots {
+                                    mark(*s, cap, written);
+                                }
+                                collect_writes(b, cap, written);
+                            }
+                            SAlt::Lit(_, b) | SAlt::Default(b) => collect_writes(b, cap, written),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect_writes(&c.body, cap, &mut written);
+        let mut invariant = (((1u64 << cap) - 1) << 1) & !written;
+        if invariant == 0 {
+            return Vec::new();
+        }
+        fn check_self_calls(g: &Gen, entry_label: &str, self_arity: u32, cap: u32, e: &SExpr, inv: &mut u64) {
+            match e {
+                SExpr::App(func, args) => {
+                    if g.known_global_entry(func, args.len()).is_some_and(|(l, _)| l == entry_label)
+                        && args.len() == self_arity as usize
+                    {
+                        for k in 1..=cap {
+                            if !matches!(args[(k - 1) as usize], Atom::Slot(s) if s == k) {
+                                *inv &= !(1u64 << k);
+                            }
+                        }
+                    }
+                }
+                SExpr::CallWorker(w, args) => {
+                    if let Some(Some((l, raw_pos, _, _))) = g.workers.get(*w as usize) {
+                        let mut reg_raw = 0usize;
+                        let mut stack_args = Vec::new();
+                        for (i, a) in args.iter().enumerate() {
+                            if raw_pos.get(i).copied().unwrap_or(false) && reg_raw < MAX_REG_RAW_ARGS {
+                                reg_raw += 1;
+                            } else {
+                                stack_args.push(a);
+                            }
+                        }
+                        if l == entry_label && stack_args.len() == self_arity as usize {
+                            for k in 1..=cap {
+                                if !matches!(stack_args[(k - 1) as usize], Atom::Slot(s) if *s == k) {
+                                    *inv &= !(1u64 << k);
+                                }
+                            }
+                        }
+                    }
+                }
+                SExpr::Let(_, body) => check_self_calls(g, entry_label, self_arity, cap, body, inv),
+                SExpr::Join(_, _, code, body) => {
+                    check_self_calls(g, entry_label, self_arity, cap, code, inv);
+                    check_self_calls(g, entry_label, self_arity, cap, body, inv);
+                }
+                SExpr::Case(scrut, _, alts) => {
+                    check_self_calls(g, entry_label, self_arity, cap, scrut, inv);
+                    for a in alts {
+                        match a {
+                            SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => {
+                                check_self_calls(g, entry_label, self_arity, cap, b, inv);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        check_self_calls(self, entry_label, c.arity, cap, &c.body, &mut invariant);
+        if invariant == 0 {
+            return Vec::new();
+        }
+        fn strictly_demands(g: &Gen, e: &SExpr, slot: u32, kind: u8) -> bool {
+            match e {
+                SExpr::Case(scrut, bslot, alts) => {
+                    if let SExpr::Prim(name, args) = scrut.as_ref() {
+                        if matches!(args.first(), Some(Atom::Slot(s)) if *s == slot) {
+                            let is_bytes = kind == BYTES
+                                && ((name.strip_prefix("read").and_then(bytes_elem_ops).is_some() && args.len() == 3)
+                                    || (name.strip_prefix("write").and_then(bytes_elem_ops).is_some() && args.len() == 4)
+                                    || (name.strip_prefix("index").and_then(bytes_elem_ops).is_some() && args.len() == 2));
+                            let is_ref = kind == REF
+                                && ((name == "readMutVar#" && args.len() == 2)
+                                    || (name == "writeMutVar#" && args.len() == 3));
+                            if is_bytes || is_ref {
+                                return true;
+                            }
+                        }
+                    }
+                    if *bslot == slot
+                        || !matches!(scrut.as_ref(), SExpr::Prim(..) | SExpr::Atom(_) | SExpr::Con(..))
+                    {
+                        return false;
+                    }
+                    let mut saw_non_error = false;
+                    for a in alts {
+                        let (shadowed, body) = match a {
+                            SAlt::Con(_, slots, b) => (slots.contains(&slot), b),
+                            SAlt::Lit(_, b) | SAlt::Default(b) => (false, b),
+                        };
+                        if g.is_cold_error(body) {
+                            continue;
+                        }
+                        saw_non_error = true;
+                        if shadowed || !strictly_demands(g, body, slot, kind) {
+                            return false;
+                        }
+                    }
+                    saw_non_error
+                }
+                SExpr::Let(binds, body) => {
+                    !binds.iter().any(|(s, _)| *s == slot) && strictly_demands(g, body, slot, kind)
+                }
+                SExpr::Join(_, _, _, body) => strictly_demands(g, body, slot, kind),
+                _ => false,
+            }
+        }
+        let mut out = Vec::new();
+        for k in 1..=cap {
+            if invariant & (1u64 << k) == 0 {
+                continue;
+            }
+            if strictly_demands(self, &c.body, k, BYTES) {
+                out.push((k, BYTES));
+            } else if strictly_demands(self, &c.body, k, REF) {
+                out.push((k, REF));
+            }
+        }
+        out
     }
 
     /// Emits a frameless fast-exit before frame allocation and preemption check when a closure
@@ -1571,6 +1745,7 @@ impl Gen {
         self.rax_slot = None;
         self.cold_out.clear();
         self.self_dead_state_params = 0;
+        self.loop_known_kinds.clear();
         let sel_info = self.selector_info(c);
         if let Some((con_id, field_word)) = sel_info {
             self.selectors.push((label.to_string(), con_id, field_word));
@@ -1594,6 +1769,7 @@ impl Gen {
             let ll = self.label("loop");
             self.current_self = Some((label.to_string(), ll.clone(), c.arity));
             self.self_dead_state_params = Self::find_dead_state_params(&c.body, c.arity);
+            self.loop_known_kinds = self.find_hoistable_loop_kinds(label, c);
             Some(ll)
         } else {
             self.current_self = None;
@@ -1643,6 +1819,7 @@ impl Gen {
             let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", f.off(0));
         }
         let mut pre_safe = 0u64;
+        let hoisted = self.loop_known_kinds.clone();
         if let Some(ll) = &loop_lbl {
             // Hoist zeroing of cold local pointer slots never written on any path back to `.Lloop`
             // so loops with hot calls/GC points don't re-zero them on every iteration.
@@ -1655,8 +1832,50 @@ impl Gen {
                     }
                 }
             }
+            for &(slot, kind) in &hoisted {
+                let pre_eval = self.label("pre_eval");
+                let pre_ok = self.label("pre_ok");
+                let pre_k = self.label("pre_k");
+                let off = f.off(slot);
+                let _ = writeln!(self.out, "    movq {off}(%rbp), %rax");
+                self.emit("testq %rax, %rax");
+                let _ = writeln!(self.out, "    je {pre_eval}");
+                let _ = writeln!(self.out, "    cmpb ${kind}, (%rax)");
+                let _ = writeln!(self.out, "    jne {pre_eval}");
+                self.put_label(&pre_ok);
+                let raw_args = &c.raw_args;
+                let nslots = c.nslots;
+                let size = f.size_word();
+                self.emit_cold(|g| {
+                    g.put_label(&pre_eval);
+                    for (i, &(_, raw)) in raw_args.iter().enumerate() {
+                        let _ = writeln!(g.out, "    movq {}, {}(%rbp)", CACHE_REGS[i], f.off(raw));
+                    }
+                    for k in (f.a + 1)..nslots {
+                        if pre_safe & (1u64 << k) == 0 {
+                            let _ = writeln!(g.out, "    movq $0, {}(%rbp)", f.off(k));
+                        }
+                    }
+                    let _ = writeln!(g.out, "    movq {off}(%rbp), %r14");
+                    g.emit("subq $8, %rbp");
+                    let _ = writeln!(g.out, "    leaq {pre_k}(%rip), %rax");
+                    g.emit("movq %rax, (%rbp)");
+                    g.emit("jmp hsc_eval");
+                    let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                    g.put_label(&pre_k);
+                    g.emit("addq $8, %rbp");
+                    let _ = writeln!(g.out, "    movq %r14, {off}(%rbp)");
+                    for (i, &(_, raw)) in raw_args.iter().enumerate() {
+                        let _ = writeln!(g.out, "    movq {}(%rbp), {}", f.off(raw), CACHE_REGS[i]);
+                    }
+                    let _ = writeln!(g.out, "    jmp {pre_ok}");
+                });
+            }
             self.emit(".p2align 4");
             self.put_label(ll);
+            for &(slot, kind) in &hoisted {
+                self.known_kind.insert(slot, KnownVal::Kind(kind));
+            }
         }
         // For frames with <= 64 pointer slots, local pointer slots are zeroed lazily right before
         // GC-capable points (and on cold slow paths) instead of eagerly on every function entry.
@@ -1721,6 +1940,7 @@ impl Gen {
         }
         self.current_self = None;
         self.self_dead_state_params = 0;
+        self.loop_known_kinds.clear();
     }
 
     /// Leaves a WHNF value in R1 as the result of the expression.
@@ -1808,9 +2028,19 @@ impl Gen {
             }
             SExpr::Closure(c) => c.captures.iter().for_each(|a| atom(a, &mut out)),
             SExpr::Fail(_) => {}
-            SExpr::Join(id, _, code, body) => {
-                let uses = self.find_raw_uses(code, joins);
+            SExpr::Join(id, params, code, body) => {
+                joins.insert(*id, Vec::new());
+                let mut uses = self.find_raw_uses(code, joins);
+                if !params.is_empty() {
+                    uses.retain(|&s| {
+                        s == ALL_LIVE
+                            || !params.iter().any(|&p| p & RAW != 0 && raw_idx(p) == raw_idx(s))
+                    });
+                }
                 joins.insert(*id, uses.clone());
+                if !uses.is_empty() && count_jumps(code, *id) > 0 {
+                    let _ = self.find_raw_uses(code, joins);
+                }
                 out.extend(uses);
                 out.extend(self.find_raw_uses(body, joins));
             }
@@ -2377,7 +2607,17 @@ impl Gen {
     /// parameterized joins receive an out-of-line label `Some(lbl)`.
     fn register_join(&mut self, id: u32, params: &[u32], code: &SExpr, jump_count: usize) -> Option<String> {
         let mut uses = std::collections::HashSet::new();
-        self.slot_uses(code, &mut uses);
+        let mut local = HashMap::new();
+        local.insert(id, std::collections::HashSet::new());
+        self.slot_uses_in(code, &mut uses, &mut local);
+        for &p in params {
+            if p & RAW != 0 {
+                let pi = raw_idx(p);
+                uses.retain(|&k| k == ALL_LIVE || k & RAW == 0 || raw_idx(k) != pi);
+            } else {
+                uses.remove(&p);
+            }
+        }
         self.join_uses.insert(id, uses);
         if params.is_empty() && jump_count <= 2 && sexpr_size(code) <= 32 && !has_join_jump_or_closure(code) {
             let rc = std::rc::Rc::new(code.clone());
@@ -2389,6 +2629,362 @@ impl Gen {
         let l = self.label("join");
         self.joins.insert(id, (l.clone(), params.to_vec()));
         Some(l)
+    }
+
+    /// Fuses single-bit mask chains (`(1 << (i & 63))` followed by bit-clear `w & ~m`, bit-set
+    /// `w | m`, or bit-test `(w & m) /= 0`) into single x86-64 `btrq`/`btsq`/`btq` instructions.
+    /// Register-destination `btq`/`btrq`/`btsq` mask the bit offset modulo 64 in hardware, so
+    /// the explicit `andI# i 63#` and shift mask disappear along with their temporary registers.
+    fn try_bit_op(&mut self, name: &str, args: &[Atom], b: u32, body: &SExpr, p: Pos) -> bool {
+        fn slot_matches(a: &Atom, s: u32) -> bool {
+            matches!(a, Atom::Slot(x) if *x & RAW != 0 && raw_idx(*x) == raw_idx(s))
+        }
+        fn other_operand<'a>(args: &'a [Atom], s: u32) -> Option<&'a Atom> {
+            if args.len() != 2 {
+                return None;
+            }
+            if slot_matches(&args[0], s) && !slot_matches(&args[1], s) {
+                Some(&args[1])
+            } else if slot_matches(&args[1], s) && !slot_matches(&args[0], s) {
+                Some(&args[0])
+            } else {
+                None
+            }
+        }
+        fn const_val(a: &Atom, consts: &[(u32, i64)]) -> Option<i64> {
+            match a {
+                Atom::Lit(SLit::Int(v)) => Some(*v),
+                Atom::Slot(s) if *s & RAW != 0 => {
+                    consts.iter().rev().find(|&&(cs, _)| raw_idx(cs) == raw_idx(*s)).map(|&(_, v)| v)
+                }
+                _ => None,
+            }
+        }
+        fn skip_id_casts<'a>(
+            mut cur: u32,
+            mut e: &'a SExpr,
+            dead: &mut Vec<u32>,
+            consts: &mut Vec<(u32, i64)>,
+        ) -> (u32, &'a SExpr) {
+            while let SExpr::Case(scrut, next_b, alts) = e {
+                let (SExpr::Prim(pname, pargs), [SAlt::Default(next)]) = (scrut.as_ref(), &alts[..]) else {
+                    break;
+                };
+                if *next_b & RAW != 0
+                    && matches!(pname.as_str(), "int2Word#" | "word2Int#")
+                    && pargs.len() == 1
+                {
+                    if slot_matches(&pargs[0], cur) {
+                        dead.push(cur);
+                        cur = *next_b;
+                        e = next;
+                        continue;
+                    }
+                    if let Atom::Lit(SLit::Int(v)) = pargs[0] {
+                        if raw_idx(*next_b) != raw_idx(cur) {
+                            consts.push((*next_b, v));
+                            dead.push(*next_b);
+                            e = next;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            (cur, e)
+        }
+        let mut dead = Vec::new();
+        let mut consts = Vec::new();
+        let (bit_atom, mask_b, after_mask) = if matches!(name, "andI#" | "and#") && args.len() == 2 {
+            let bit_a = if matches!(args[1], Atom::Lit(SLit::Int(63))) {
+                &args[0]
+            } else if matches!(args[0], Atom::Lit(SLit::Int(63))) {
+                &args[1]
+            } else {
+                return false;
+            };
+            if !is_raw(bit_a) && !matches!(bit_a, Atom::Lit(SLit::Int(_))) {
+                return false;
+            }
+            let (rem_slot, after_rem) = skip_id_casts(b, body, &mut dead, &mut consts);
+            dead.push(rem_slot);
+            let SExpr::Case(sh_scrut, b_mask, sh_alts) = after_rem else {
+                return false;
+            };
+            let (SExpr::Prim(sh_name, sh_args), [SAlt::Default(next)]) = (sh_scrut.as_ref(), &sh_alts[..]) else {
+                return false;
+            };
+            if *b_mask & RAW == 0
+                || !matches!(sh_name.as_str(), "uncheckedShiftL#" | "uncheckedIShiftL#")
+                || sh_args.len() != 2
+                || const_val(&sh_args[0], &consts) != Some(1)
+                || !slot_matches(&sh_args[1], rem_slot)
+            {
+                return false;
+            }
+            (bit_a, *b_mask, next)
+        } else if matches!(name, "uncheckedShiftL#" | "uncheckedIShiftL#")
+            && args.len() == 2
+            && matches!(args[0], Atom::Lit(SLit::Int(1)))
+        {
+            match &args[1] {
+                Atom::Slot(s) if *s & RAW != 0 => {}
+                Atom::Lit(SLit::Int(v)) if (0..64).contains(v) => {}
+                _ => return false,
+            }
+            (&args[1], b, body)
+        } else {
+            return false;
+        };
+        let (mask_slot, after_mask) = skip_id_casts(mask_b, after_mask, &mut dead, &mut consts);
+        dead.push(mask_slot);
+        let SExpr::Case(scrut1, b1, alts1) = after_mask else {
+            return false;
+        };
+        let (SExpr::Prim(name1, args1), [SAlt::Default(next1)]) = (scrut1.as_ref(), &alts1[..]) else {
+            return false;
+        };
+        if *b1 & RAW == 0 {
+            return false;
+        }
+        let not_in_dead = |a: &Atom, dead: &[u32]| -> bool {
+            matches!(a, Atom::Slot(s) if *s & RAW != 0 && !dead.iter().any(|d| raw_idx(*d) == raw_idx(*s)))
+        };
+        // Helper to emit `btrq` / `btsq` into a register for `word_atom`, reusing it if dead in `cont`.
+        let emit_bit_mod = |g: &mut Self, op: &str, word_atom: &Atom, res_slot: u32, cont: &SExpr| {
+            let bit_src = g.raw_src(bit_atom, p, &[]);
+            let avoid_bit: &[&str] = match bit_src {
+                Src::Reg(r) => &[r],
+                Src::Imm(_) => &[],
+            };
+            let Src::Reg(word_reg) = g.raw_src(word_atom, p, avoid_bit) else {
+                unreachable!()
+            };
+            let reuse = matches!(
+                word_atom,
+                Atom::Slot(ws) if raw_idx(*ws) == raw_idx(res_slot) || !g.raw_live(*ws, cont, p)
+            );
+            let dst = if reuse {
+                word_reg
+            } else {
+                let avoid: Vec<&str> = match bit_src {
+                    Src::Reg(br) if br != word_reg => vec![br, word_reg],
+                    _ => vec![word_reg],
+                };
+                let d = g.fresh_reg(p, &avoid);
+                g.emit(&format!("movq {word_reg}, {d}"));
+                d
+            };
+            match bit_src {
+                Src::Reg(br) => g.emit(&format!("{op} {br}, {dst}")),
+                Src::Imm(v) => g.emit(&format!("{op} ${}, {dst}", v & 63)),
+            }
+            g.cache_put(res_slot, dst, true);
+            g.expr(cont, p);
+        };
+        // 1. Bit clear: `not# mask` (or `xor# mask -1`) followed by `and# w not_mask` -> `btrq`.
+        let is_not = (name1 == "not#" && args1.len() == 1 && slot_matches(&args1[0], mask_slot))
+            || (matches!(name1.as_str(), "xor#" | "xorI#")
+                && other_operand(args1, mask_slot).and_then(|a| const_val(a, &consts)) == Some(-1));
+        if is_not {
+            let (not_slot, after_not) = skip_id_casts(*b1, next1, &mut dead, &mut consts);
+            dead.push(not_slot);
+            if let SExpr::Case(scrut2, b_res, alts2) = after_not {
+                if let (SExpr::Prim(name2, args2), [SAlt::Default(cont)]) = (scrut2.as_ref(), &alts2[..]) {
+                    if *b_res & RAW != 0 && matches!(name2.as_str(), "and#" | "andI#") {
+                        if let Some(word_atom) = other_operand(args2, not_slot) {
+                            if not_in_dead(word_atom, &dead)
+                                && dead
+                                    .iter()
+                                    .all(|&t| raw_idx(t) == raw_idx(*b_res) || !self.raw_live(t, cont, p))
+                            {
+                                emit_bit_mod(self, "btrq", word_atom, *b_res, cont);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        // 2. Bit set: `or# w mask` -> `btsq`.
+        if matches!(name1.as_str(), "or#" | "orI#") {
+            if let Some(word_atom) = other_operand(args1, mask_slot) {
+                if not_in_dead(word_atom, &dead)
+                    && dead
+                        .iter()
+                        .all(|&t| raw_idx(t) == raw_idx(*b1) || !self.raw_live(t, next1, p))
+                {
+                    emit_bit_mod(self, "btsq", word_atom, *b1, next1);
+                    return true;
+                }
+            }
+            return false;
+        }
+        // 3. Bit test + branch: `and# w mask` followed by comparison against 0 -> `btq` + `jc`/`jnc`.
+        if matches!(name1.as_str(), "and#" | "andI#") {
+            if let Some(word_atom) = other_operand(args1, mask_slot) {
+                if !not_in_dead(word_atom, &dead) {
+                    return false;
+                }
+                let (and_slot, mut cmp_expr) = skip_id_casts(*b1, next1, &mut dead, &mut consts);
+                dead.push(and_slot);
+                let mut peeled_joins: Vec<(u32, &[u32], &SExpr)> = Vec::new();
+                while let SExpr::Join(id, params, code, next) = cmp_expr {
+                    peeled_joins.push((*id, params.as_slice(), code.as_ref()));
+                    cmp_expr = next.as_ref();
+                }
+                let branch = match cmp_expr {
+                    SExpr::Case(c_scrut, b_cmp, c_alts) => {
+                        match (c_scrut.as_ref(), &c_alts[..]) {
+                            (SExpr::Prim(cname, cargs), [SAlt::Default(cmp_body)])
+                                if *b_cmp & RAW != 0
+                                    && matches!(cname.as_str(), "eqWord#" | "neWord#" | "==#" | "/=#")
+                                    && other_operand(cargs, and_slot)
+                                        .and_then(|a| const_val(a, &consts))
+                                        == Some(0) =>
+                            {
+                                let mut inner = cmp_body;
+                                while let SExpr::Join(id, params, code, next) = inner {
+                                    peeled_joins.push((*id, params.as_slice(), code.as_ref()));
+                                    inner = next.as_ref();
+                                }
+                                if let SExpr::Case(in_scrut, _, in_alts) = inner {
+                                    if matches!(in_scrut.as_ref(), SExpr::Atom(a) if slot_matches(a, *b_cmp))
+                                    {
+                                        let end = in_alts
+                                            .iter()
+                                            .position(|a| matches!(a, SAlt::Default(_)))
+                                            .map_or(in_alts.len(), |i| i + 1);
+                                        let two = match &in_alts[..end] {
+                                            [SAlt::Lit(Lit::Int(1), t), SAlt::Default(f)]
+                                            | [SAlt::Lit(Lit::Int(1), t), SAlt::Lit(Lit::Int(0), f), ..] => {
+                                                Some((t, f))
+                                            }
+                                            [SAlt::Lit(Lit::Int(0), f), SAlt::Default(t)]
+                                            | [SAlt::Lit(Lit::Int(0), f), SAlt::Lit(Lit::Int(1), t), ..] => {
+                                                Some((t, f))
+                                            }
+                                            _ => None,
+                                        };
+                                        two.map(|(t, f)| {
+                                            let is_eq = matches!(cname.as_str(), "eqWord#" | "==#");
+                                            let (nz, z) = if is_eq { (f, t) } else { (t, f) };
+                                            (nz, z, inner, Some(*b_cmp))
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            (SExpr::Atom(a), _) if slot_matches(a, and_slot) => {
+                                let end = c_alts
+                                    .iter()
+                                    .position(|a| matches!(a, SAlt::Default(_)))
+                                    .map_or(c_alts.len(), |i| i + 1);
+                                match &c_alts[..end] {
+                                    [SAlt::Lit(Lit::Int(0), z), SAlt::Default(nz)] => {
+                                        Some((nz, z, cmp_expr, None))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((nz_body, z_body, dispatch_expr, extra_dead)) = branch {
+                    if let Some(eb) = extra_dead {
+                        dead.push(eb);
+                    }
+                    let all_dead = dead.iter().all(|&t| {
+                        !self.raw_live(t, nz_body, p)
+                            && !self.raw_live(t, z_body, p)
+                            && peeled_joins.iter().all(|(_, _, code)| !self.raw_live(t, code, p))
+                    });
+                    if !all_dead {
+                        return false;
+                    }
+                    let bit_src = self.raw_src(bit_atom, p, &[]);
+                    let avoid_bit: &[&str] = match bit_src {
+                        Src::Reg(r) => &[r],
+                        Src::Imm(_) => &[],
+                    };
+                    let Src::Reg(word_reg) = self.raw_src(word_atom, p, avoid_bit) else {
+                        return false;
+                    };
+                    match bit_src {
+                        Src::Reg(br) => self.emit(&format!("btq {br}, {word_reg}")),
+                        Src::Imm(v) => self.emit(&format!("btq ${}, {word_reg}", v & 63)),
+                    }
+                    let mut join_defs: Vec<(String, &[u32], &SExpr)> = Vec::new();
+                    for (idx, &(id, params, code)) in peeled_joins.iter().enumerate() {
+                        let mut jcount = count_jumps(dispatch_expr, id);
+                        for &(_, _, later) in &peeled_joins[idx + 1..] {
+                            jcount += count_jumps(later, id);
+                        }
+                        if let Some(l) = self.register_join(id, params, code, jcount) {
+                            join_defs.push((l, params, code));
+                        }
+                    }
+                    let cold_hot = if self.is_cold_error(nz_body) && !self.is_cold_error(z_body) {
+                        Some(("c", nz_body, z_body))
+                    } else if self.is_cold_error(z_body) && !self.is_cold_error(nz_body) {
+                        Some(("nc", z_body, nz_body))
+                    } else {
+                        None
+                    };
+                    let snapshot = self.cache.clone();
+                    let safe_snap = self.safe_slots;
+                    let kind_snap = self.known_kind.clone();
+                    if let Some((cold_cc, cold_body, hot_body)) = cold_hot {
+                        let cold_lbl = self.label("cold");
+                        self.emit(&format!("j{cold_cc} {cold_lbl}"));
+                        self.expr(hot_body, p);
+                        self.emit_cold(|g| {
+                            g.put_label(&cold_lbl);
+                            g.cache = snapshot;
+                            g.safe_slots = safe_snap;
+                            g.known_kind = kind_snap;
+                            g.expr(cold_body, p);
+                        });
+                    } else {
+                        let nz_lbl = self.label("alt");
+                        self.emit(&format!("jc {nz_lbl}"));
+                        self.expr(z_body, p);
+                        self.put_label(&nz_lbl);
+                        self.cache = snapshot;
+                        self.safe_slots = safe_snap;
+                        self.known_kind = kind_snap;
+                        self.expr(nz_body, p);
+                    }
+                    for (l, params, code) in join_defs.into_iter().rev() {
+                        self.put_label(&l);
+                        self.cache.clear();
+                        self.safe_slots = safe_snap;
+                        for &s in params {
+                            self.mark_slot_safe(s);
+                        }
+                        self.known_kind.clear();
+                        if !self.loop_known_kinds.is_empty() {
+                            let mut c_uses = std::collections::HashSet::new();
+                            self.slot_uses(code, &mut c_uses);
+                            for &(s, k) in &self.loop_known_kinds {
+                                if c_uses.contains(&s) || c_uses.contains(&ALL_LIVE) {
+                                    self.known_kind.insert(s, KnownVal::Kind(k));
+                                }
+                            }
+                        }
+                        self.expr(code, p);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// A comparison whose result only a case on it then uses (`case a <# b of 1# -> x; _ -> y`),
@@ -2522,6 +3118,15 @@ impl Gen {
                     g.mark_slot_safe(s);
                 }
                 g.known_kind.clear();
+                if !g.loop_known_kinds.is_empty() {
+                    let mut c_uses = std::collections::HashSet::new();
+                    g.slot_uses(code, &mut c_uses);
+                    for &(s, k) in &g.loop_known_kinds {
+                        if c_uses.contains(&s) || c_uses.contains(&ALL_LIVE) {
+                            g.known_kind.insert(s, KnownVal::Kind(k));
+                        }
+                    }
+                }
                 g.expr(code, p);
             }
         };
@@ -3325,6 +3930,9 @@ impl Gen {
                 if self.compare_and_branch(name, args, *b, body, p) {
                     return;
                 }
+                if self.try_bit_op(name, args, *b, body, p) {
+                    return;
+                }
                 self.raw_op(name, args, *b, body, p);
                 self.expr(body, p);
             }
@@ -3474,7 +4082,7 @@ impl Gen {
                                         self.slot_uses(body, &mut uses);
                                         if !uses.contains(bslot) {
                                             let skip_state = slots[0] == UNUSED_SLOT
-                                                || self.state_slot_unused(slots[0], body, Some(mv_slot), p);
+                                                || self.state_slot_unused(slots[0], body, Some((mv_slot, REF)), p);
                                             self.load(&args[0], p, "%rax");
                                             if !skip_state {
                                                 let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
@@ -3648,7 +4256,7 @@ impl Gen {
                                                 _ => None,
                                             };
                                             let skip_state = slots[0] == UNUSED_SLOT
-                                                || self.state_slot_unused(slots[0], body, mv_ref_slot, p);
+                                                || self.state_slot_unused(slots[0], body, mv_ref_slot.map(|s| (s, REF)), p);
                                             self.load(&args[0], p, "%rax");
                                             let _ = writeln!(self.out, "    cmpb ${REF}, (%rax)");
                                             let _ = writeln!(self.out, "    jne {slow}");
@@ -3824,17 +4432,26 @@ impl Gen {
                                                 };
                                                 let body_lbl = if slow_used { Some(self.label("ba_body")) } else { None };
                                                 let slow = if slow_used { Some(self.label("slow")) } else { None };
+                                                let mut rax_has_arr = false;
                                                 if !arr_known {
                                                     self.load(&args[0], p, "%rax");
                                                     let _ = writeln!(self.out, "    cmpb ${BYTES}, (%rax)");
                                                     let _ = writeln!(self.out, "    jne {}", slow.as_ref().unwrap());
+                                                    rax_has_arr = true;
                                                 }
                                                 if !idx_known {
                                                     self.load(&args[1], p, "%rax");
                                                     let _ = writeln!(self.out, "    cmpb ${INT}, (%rax)");
                                                     let _ = writeln!(self.out, "    jne {}", slow.as_ref().unwrap());
+                                                    rax_has_arr = false;
                                                 }
-                                                let skip_state = slots[0] == UNUSED_SLOT;
+                                                let skip_state = slots[0] == UNUSED_SLOT
+                                                    || self.state_slot_unused(
+                                                        slots[0],
+                                                        body,
+                                                        arr_slot.map(|s| (s, BYTES)),
+                                                        p,
+                                                    );
                                                 let val_slot = slots[1];
                                                 let val_is_raw = val_slot != UNUSED_SLOT && val_slot & RAW != 0;
                                                 let mut read_post_cache = saved_cache.clone();
@@ -3842,16 +4459,36 @@ impl Gen {
                                                     let vidx = raw_idx(val_slot);
                                                     read_post_cache.retain(|c| raw_idx(c.slot) != vidx);
                                                 }
+                                                let idx_cached = match &args[1] {
+                                                    Atom::Slot(s) if *s & RAW != 0 => self.cached(*s),
+                                                    _ => None,
+                                                };
                                                 let direct_reg = if val_is_raw {
                                                     if !slow_used {
                                                         if !skip_state {
                                                             let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
                                                         }
-                                                        self.operand(&args[1], p, "%rdx");
+                                                        let idx_str = if let Some(r) = idx_cached {
+                                                            r
+                                                        } else {
+                                                            self.operand(&args[1], p, "%rdx");
+                                                            "%rdx"
+                                                        };
                                                         self.cache.retain(|c| raw_idx(c.slot) != raw_idx(val_slot));
-                                                        let reg = self.fresh_reg(p, &[]);
-                                                        self.load(&args[0], p, "%rax");
-                                                        self.emit(&format!("{load} 8(%rax,%rdx,{scale}), {reg}"));
+                                                        let reg = if let (Atom::Slot(is), Some(r)) = (&args[1], idx_cached) {
+                                                            if !self.raw_live(*is, body, p) {
+                                                                self.cache.retain(|c| raw_idx(c.slot) != raw_idx(*is));
+                                                                r
+                                                            } else {
+                                                                self.fresh_reg(p, &[r])
+                                                            }
+                                                        } else {
+                                                            self.fresh_reg(p, &[])
+                                                        };
+                                                        if !rax_has_arr {
+                                                            self.load(&args[0], p, "%rax");
+                                                        }
+                                                        self.emit(&format!("{load} 8(%rax,{idx_str},{scale}), {reg}"));
                                                         self.cache_put(val_slot, reg, true);
                                                         self.known_kind = fast_kind;
                                                         if !skip_state {
@@ -3868,12 +4505,19 @@ impl Gen {
                                                         if !skip_state {
                                                             let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
                                                         }
-                                                        self.operand(&args[1], p, "%rdx");
-                                                        self.load(&args[0], p, "%rax");
-                                                        if let Some(reg) = reg {
-                                                            self.emit(&format!("{load} 8(%rax,%rdx,{scale}), {reg}"));
+                                                        let idx_str = if let Some(r) = idx_cached {
+                                                            r
                                                         } else {
-                                                            self.emit(&format!("{load} 8(%rax,%rdx,{scale}), %rcx"));
+                                                            self.operand(&args[1], p, "%rdx");
+                                                            "%rdx"
+                                                        };
+                                                        if !rax_has_arr {
+                                                            self.load(&args[0], p, "%rax");
+                                                        }
+                                                        if let Some(reg) = reg {
+                                                            self.emit(&format!("{load} 8(%rax,{idx_str},{scale}), {reg}"));
+                                                        } else {
+                                                            self.emit(&format!("{load} 8(%rax,{idx_str},{scale}), %rcx"));
                                                             let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(val_slot));
                                                         }
                                                         reg
@@ -3882,9 +4526,14 @@ impl Gen {
                                                     // Boxed result: allocate only the 2-word INT cell, skipping the 3-word pair.
                                                     self.alloc(2, p);
                                                     self.emit("movq %rax, %r14");
-                                                    self.operand(&args[1], p, "%rdx");
+                                                    let idx_str = if let Some(r) = idx_cached {
+                                                        r
+                                                    } else {
+                                                        self.operand(&args[1], p, "%rdx");
+                                                        "%rdx"
+                                                    };
                                                     self.load(&args[0], p, "%rax");
-                                                    self.emit(&format!("{load} 8(%rax,%rdx,{scale}), %rcx"));
+                                                    self.emit(&format!("{load} 8(%rax,{idx_str},{scale}), %rcx"));
                                                     self.emit(&format!("movq ${}, (%r14)", header(INT, 1, 0)));
                                                     self.emit("movq %rcx, 8(%r14)");
                                                     if !skip_state {
@@ -3968,6 +4617,176 @@ impl Gen {
                                                 self.expr(body, p);
                                                 return;
                                             }
+                                        }
+                                    }
+                                }
+                            } else if let Some((_, store, scale)) = name.strip_prefix("write").and_then(bytes_elem_ops) {
+                                if args.len() == 4
+                                    && !matches!(&args[1], Atom::Lit(l) if !matches!(l, SLit::Int(_)))
+                                    && !matches!(&args[2], Atom::Lit(l) if !matches!(l, SLit::Int(_)))
+                                {
+                                    if let [SAlt::Default(body)] = &alts[..] {
+                                        if !matches!(body, SExpr::Fail(_)) {
+                                            let mut uses = std::collections::HashSet::new();
+                                            self.slot_uses(body, &mut uses);
+                                            let write_bslot = *bslot != UNUSED_SLOT && uses.contains(bslot);
+                                            let defer_unit =
+                                                write_bslot && p.mode == Mode::Tail && !expr_contains_jump(body);
+                                            let unit_lbl = if write_bslot {
+                                                let unit_id = self.con_id("Builtin.()");
+                                                Some(self.nullary_con(unit_id))
+                                            } else {
+                                                None
+                                            };
+                                            let arr_known = matches!(
+                                                &args[0],
+                                                Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(BYTES))
+                                            );
+                                            let idx_known = is_raw(&args[1])
+                                                || matches!(args[1], Atom::Lit(_))
+                                                || matches!(
+                                                    &args[1],
+                                                    Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(INT))
+                                                );
+                                            let val_known = is_raw(&args[2])
+                                                || matches!(args[2], Atom::Lit(_))
+                                                || matches!(
+                                                    &args[2],
+                                                    Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(INT))
+                                                );
+                                            let slow_used = !arr_known || !idx_known || !val_known;
+                                            let mut fast_kind = saved_kind.clone();
+                                            let arr_slot = match args[0] {
+                                                Atom::Slot(s) => {
+                                                    fast_kind.insert(s, KnownVal::Kind(BYTES));
+                                                    Some(s)
+                                                }
+                                                _ => None,
+                                            };
+                                            let idx_slot = match args[1] {
+                                                Atom::Slot(s) if s & RAW == 0 && Some(s) != arr_slot => {
+                                                    fast_kind.insert(s, KnownVal::Kind(INT));
+                                                    Some(s)
+                                                }
+                                                _ => None,
+                                            };
+                                            let val_slot_k = match args[2] {
+                                                Atom::Slot(s)
+                                                    if s & RAW == 0 && Some(s) != arr_slot && Some(s) != idx_slot =>
+                                                {
+                                                    fast_kind.insert(s, KnownVal::Kind(INT));
+                                                    Some(s)
+                                                }
+                                                _ => None,
+                                            };
+                                            let body_lbl = if slow_used { Some(self.label("ba_body")) } else { None };
+                                            let slow = if slow_used { Some(self.label("slow")) } else { None };
+                                            let mut rax_has_arr = false;
+                                            if !arr_known {
+                                                self.load(&args[0], p, "%rax");
+                                                let _ = writeln!(self.out, "    cmpb ${BYTES}, (%rax)");
+                                                let _ = writeln!(self.out, "    jne {}", slow.as_ref().unwrap());
+                                                rax_has_arr = true;
+                                            }
+                                            if !idx_known {
+                                                self.load(&args[1], p, "%rax");
+                                                let _ = writeln!(self.out, "    cmpb ${INT}, (%rax)");
+                                                let _ = writeln!(self.out, "    jne {}", slow.as_ref().unwrap());
+                                                rax_has_arr = false;
+                                            }
+                                            if !val_known {
+                                                self.load(&args[2], p, "%rax");
+                                                let _ = writeln!(self.out, "    cmpb ${INT}, (%rax)");
+                                                let _ = writeln!(self.out, "    jne {}", slow.as_ref().unwrap());
+                                                rax_has_arr = false;
+                                            }
+                                            let idx_str = match &args[1] {
+                                                Atom::Slot(s) if *s & RAW != 0 => match self.cached(*s) {
+                                                    Some(r) => r,
+                                                    None => {
+                                                        self.operand(&args[1], p, "%rdx");
+                                                        "%rdx"
+                                                    }
+                                                },
+                                                _ => {
+                                                    self.operand(&args[1], p, "%rdx");
+                                                    "%rdx"
+                                                }
+                                            };
+                                            let direct_val = if store == "movq %rcx" {
+                                                match &args[2] {
+                                                    Atom::Slot(s) if *s & RAW != 0 => self.cached(*s),
+                                                    _ => None,
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            if direct_val.is_none() {
+                                                self.operand(&args[2], p, "%rcx");
+                                            }
+                                            if !rax_has_arr {
+                                                self.load(&args[0], p, "%rax");
+                                            }
+                                            if let Some(vr) = direct_val {
+                                                self.emit(&format!("movq {vr}, 8(%rax,{idx_str},{scale})"));
+                                            } else {
+                                                self.emit(&format!("{store}, 8(%rax,{idx_str},{scale})"));
+                                            }
+                                            if write_bslot && !defer_unit {
+                                                let ul = unit_lbl.as_ref().unwrap();
+                                                let _ = writeln!(self.out, "    leaq {ul}(%rip), %rcx");
+                                                let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*bslot));
+                                            }
+                                            if slow_used {
+                                                let slow = slow.unwrap();
+                                                let body_lbl = body_lbl.unwrap();
+                                                let cont = self.label("k");
+                                                let live = self.case_live(alts, *bslot, p);
+                                                self.emit_cold(|g| {
+                                                    g.put_label(&slow);
+                                                    g.save_cache(&saved_cache, p);
+                                                    g.cache.clear();
+                                                    g.safe_slots = saved_safe;
+                                                    g.known_kind = saved_kind;
+                                                    g.zero_unsafe_slots(p, true);
+                                                    g.emit("subq $8, %rbp");
+                                                    let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                                                    g.emit("movq %rax, (%rbp)");
+                                                    g.live.push(live.clone());
+                                                    g.slow_only = true;
+                                                    g.expr(scrut, sp);
+                                                    g.live.pop();
+                                                    let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                                                    g.put_label(&cont);
+                                                    g.emit("addq $8, %rbp");
+                                                    for slot_opt in [arr_slot, idx_slot, val_slot_k] {
+                                                        if let Some(sl) = slot_opt {
+                                                            if live.contains(&sl) || live.contains(&ALL_LIVE) {
+                                                                g.chase_ind_slot(sl, p);
+                                                            }
+                                                        }
+                                                    }
+                                                    g.reload_cache(&saved_cache, p);
+                                                    if write_bslot && !defer_unit {
+                                                        let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                                                    }
+                                                    let _ = writeln!(g.out, "    jmp {body_lbl}");
+                                                });
+                                                self.put_label(&body_lbl);
+                                                self.cache = saved_cache;
+                                            }
+                                            self.safe_slots = saved_safe;
+                                            self.known_kind = fast_kind;
+                                            if write_bslot {
+                                                if defer_unit {
+                                                    self.known_kind.insert(*bslot, KnownVal::StaticCon(unit_lbl.unwrap()));
+                                                } else {
+                                                    self.mark_slot_safe(*bslot);
+                                                    self.known_kind.remove(bslot);
+                                                }
+                                            }
+                                            self.expr(body, p);
+                                            return;
                                         }
                                     }
                                 }
@@ -4300,6 +5119,15 @@ impl Gen {
                         self.mark_slot_safe(s);
                     }
                     self.known_kind.clear();
+                    if !self.loop_known_kinds.is_empty() {
+                        let mut c_uses = std::collections::HashSet::new();
+                        self.slot_uses(code, &mut c_uses);
+                        for &(s, k) in &self.loop_known_kinds {
+                            if c_uses.contains(&s) || c_uses.contains(&ALL_LIVE) {
+                                self.known_kind.insert(s, KnownVal::Kind(k));
+                            }
+                        }
+                    }
                     self.expr(code, p);
                 }
             }
@@ -6529,20 +7357,38 @@ impl Gen {
             SExpr::CallWorker(_, args) => args.iter().for_each(|a| atom(a, out)),
             SExpr::Con(_, args) | SExpr::Prim(_, args) => args.iter().for_each(|a| atom(a, out)),
             SExpr::Let(binds, body) => {
+                let mut let_uses = std::collections::HashSet::new();
                 for (_, b) in binds {
                     if let SBind::BoxRaw(r) = b {
-                        out.insert(*r);
+                        let_uses.insert(*r);
                     } else {
-                        b.atoms().iter().for_each(|a| atom(a, out));
+                        b.atoms().iter().for_each(|a| atom(a, &mut let_uses));
                     }
                 }
-                self.slot_uses_in(body, out, local);
+                self.slot_uses_in(body, &mut let_uses, local);
+                for (s, _) in binds {
+                    let_uses.remove(s);
+                }
+                out.extend(let_uses);
             }
             SExpr::Case(s, bslot, alts) => {
                 let mut alt_uses = std::collections::HashSet::new();
                 for a in alts {
                     match a {
-                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => {
+                        SAlt::Con(_, slots, b) => {
+                            let mut a_uses = std::collections::HashSet::new();
+                            self.slot_uses_in(b, &mut a_uses, local);
+                            for &sl in slots {
+                                if sl & RAW != 0 {
+                                    let si = raw_idx(sl);
+                                    a_uses.retain(|&k| k == ALL_LIVE || k & RAW == 0 || raw_idx(k) != si);
+                                } else {
+                                    a_uses.remove(&sl);
+                                }
+                            }
+                            alt_uses.extend(a_uses);
+                        }
+                        SAlt::Lit(_, b) | SAlt::Default(b) => {
                             self.slot_uses_in(b, &mut alt_uses, local);
                         }
                     }
@@ -6550,16 +7396,27 @@ impl Gen {
                 if *bslot & RAW != 0 {
                     let b_idx = raw_idx(*bslot);
                     alt_uses.retain(|&k| k == ALL_LIVE || k & RAW == 0 || raw_idx(k) != b_idx);
+                } else if *bslot != UNUSED_SLOT {
+                    alt_uses.remove(bslot);
                 }
                 out.extend(alt_uses);
                 self.slot_uses_in(s, out, local);
             }
             SExpr::Closure(c) => c.captures.iter().for_each(|a| atom(a, out)),
             SExpr::Fail(_) => {}
-            SExpr::Join(id, _, code, body) => {
-                // The code first: jumps in the body (and code) to this join point use its slots.
+            SExpr::Join(id, params, code, body) => {
+                // Pre-seed empty uses so self-jumps inside `code` don't poison `ALL_LIVE`.
+                local.insert(*id, std::collections::HashSet::new());
                 let mut uses = std::collections::HashSet::new();
                 self.slot_uses_in(code, &mut uses, local);
+                for &p in params {
+                    if p & RAW != 0 {
+                        let pi = raw_idx(p);
+                        uses.retain(|&k| k == ALL_LIVE || k & RAW == 0 || raw_idx(k) != pi);
+                    } else {
+                        uses.remove(&p);
+                    }
+                }
                 out.extend(uses.iter().copied());
                 local.insert(*id, uses);
                 self.slot_uses_in(body, out, local);
@@ -6791,10 +7648,11 @@ impl Gen {
         walk(self, entry_label, self_arity, body, &mut joins)
     }
 
-    /// Returns true if state-token slot `s0` bound by an inline `readMutVar#` is never actually
-    /// read at runtime in `body` (or outer scrutinee continuation): either unused, or only passed
-    /// as the ignored state argument to an inline known-`REF` `readMutVar#` / `writeMutVar#`.
-    fn state_slot_unused(&self, s0: u32, body: &SExpr, known_ref_slot: Option<u32>, p: Pos) -> bool {
+    /// Returns true if state-token slot `s0` bound by an inline `readMutVar#` or `read*Array#` is
+    /// never actually read at runtime in `body` (or outer scrutinee continuation): either unused,
+    /// or only passed as the ignored state argument to an inline known-`REF` `readMutVar#` /
+    /// `writeMutVar#` or known-`BYTES` `read*Array#` / `write*Array#`.
+    fn state_slot_unused(&self, s0: u32, body: &SExpr, known_slot: Option<(u32, u8)>, p: Pos) -> bool {
         if p.mode == Mode::Scrut
             && self.live.last().is_none_or(|l| l.contains(&s0) || l.contains(&ALL_LIVE))
         {
@@ -6807,19 +7665,27 @@ impl Gen {
                     _ => true,
                 }
         };
-        let is_known_ref = |g: &Gen, a: &Atom, kref: Option<u32>| -> bool {
+        let is_known_kind = |g: &Gen, a: &Atom, kslot: Option<(u32, u8)>, want: u8| -> bool {
             match a {
-                Atom::Slot(r) => Some(*r) == kref || g.known_kind.get(r) == Some(&KnownVal::Kind(REF)),
+                Atom::Slot(r) => {
+                    kslot == Some((*r, want)) || g.known_kind.get(r) == Some(&KnownVal::Kind(want))
+                }
                 _ => false,
             }
+        };
+        let is_known_int = |g: &Gen, a: &Atom| -> bool {
+            is_raw(a)
+                || matches!(a, Atom::Lit(SLit::Int(_)))
+                || matches!(a, Atom::Slot(r) if g.known_kind.get(r) == Some(&KnownVal::Kind(INT)))
         };
         fn check(
             g: &Gen,
             e: &SExpr,
             s0: u32,
-            kref: Option<u32>,
+            kslot: Option<(u32, u8)>,
             non_alloc: &dyn Fn(&Atom) -> bool,
-            is_known_ref: &dyn Fn(&Gen, &Atom, Option<u32>) -> bool,
+            is_known_kind: &dyn Fn(&Gen, &Atom, Option<(u32, u8)>, u8) -> bool,
+            is_known_int: &dyn Fn(&Gen, &Atom) -> bool,
         ) -> bool {
             let mut uses = std::collections::HashSet::new();
             g.slot_uses(e, &mut uses);
@@ -6832,38 +7698,56 @@ impl Gen {
                         if name == "writeMutVar#"
                             && args.len() == 3
                             && !matches!(inner, SExpr::Fail(_))
-                            && is_known_ref(g, &args[0], kref)
+                            && is_known_kind(g, &args[0], kslot, REF)
                             && non_alloc(&args[1])
                             && !matches!(args[1], Atom::Slot(k) if k == s0)
                         {
                             if *bslot == s0 {
                                 return true;
                             }
-                            let next_ref = if Some(*bslot) == kref { None } else { kref };
-                            return check(g, inner, s0, next_ref, non_alloc, is_known_ref);
+                            let next_k = if kslot.is_some_and(|(kr, _)| kr == *bslot) { None } else { kslot };
+                            return check(g, inner, s0, next_k, non_alloc, is_known_kind, is_known_int);
+                        }
+                        if name.strip_prefix("write").and_then(bytes_elem_ops).is_some()
+                            && args.len() == 4
+                            && !matches!(inner, SExpr::Fail(_))
+                            && is_known_kind(g, &args[0], kslot, BYTES)
+                            && is_known_int(g, &args[1])
+                            && is_known_int(g, &args[2])
+                            && !matches!(args[1], Atom::Slot(k) if k == s0)
+                            && !matches!(args[2], Atom::Slot(k) if k == s0)
+                        {
+                            if *bslot == s0 {
+                                return true;
+                            }
+                            let next_k = if kslot.is_some_and(|(kr, _)| kr == *bslot) { None } else { kslot };
+                            return check(g, inner, s0, next_k, non_alloc, is_known_kind, is_known_int);
                         }
                     }
                     if let (SExpr::Prim(name, args), Some(SAlt::Con(c, slots, inner))) =
                         (scrut.as_ref(), alts.first())
                     {
-                        if name == "readMutVar#"
+                        let is_read_mv = name == "readMutVar#"
                             && args.len() == 2
-                            && c == "Builtin.(,)"
-                            && slots.len() == 2
-                            && is_known_ref(g, &args[0], kref)
-                        {
+                            && is_known_kind(g, &args[0], kslot, REF);
+                        let is_read_ba = name.strip_prefix("read").and_then(bytes_elem_ops).is_some()
+                            && args.len() == 3
+                            && is_known_kind(g, &args[0], kslot, BYTES)
+                            && is_known_int(g, &args[1])
+                            && !matches!(args[1], Atom::Slot(k) if k == s0);
+                        if (is_read_mv || is_read_ba) && c == "Builtin.(,)" && slots.len() == 2 {
                             let mut inner_uses = std::collections::HashSet::new();
                             g.slot_uses(inner, &mut inner_uses);
                             if !inner_uses.contains(bslot) {
                                 if *bslot == s0 || slots.contains(&s0) {
                                     return true;
                                 }
-                                let next_ref = if kref.is_some_and(|kr| kr == *bslot || slots.contains(&kr)) {
+                                let next_k = if kslot.is_some_and(|(kr, _)| kr == *bslot || slots.contains(&kr)) {
                                     None
                                 } else {
-                                    kref
+                                    kslot
                                 };
-                                return check(g, inner, s0, next_ref, non_alloc, is_known_ref);
+                                return check(g, inner, s0, next_k, non_alloc, is_known_kind, is_known_int);
                             }
                         }
                     }
@@ -6880,7 +7764,7 @@ impl Gen {
                             | SExpr::CallWorker(..)
                             | SExpr::Con(..)
                     );
-                    let after_scrut_ref = if safe_scrut { kref } else { None };
+                    let after_scrut_k = if safe_scrut { kslot } else { None };
                     alts.iter().all(|a| {
                         if *bslot == s0 {
                             return true;
@@ -6890,36 +7774,40 @@ impl Gen {
                                 if slots.contains(&s0) {
                                     return true;
                                 }
-                                let nr = if after_scrut_ref
-                                    .is_some_and(|kr| kr == *bslot || slots.contains(&kr))
+                                let nr = if after_scrut_k
+                                    .is_some_and(|(kr, _)| kr == *bslot || slots.contains(&kr))
                                 {
                                     None
                                 } else {
-                                    after_scrut_ref
+                                    after_scrut_k
                                 };
-                                check(g, b, s0, nr, non_alloc, is_known_ref)
+                                check(g, b, s0, nr, non_alloc, is_known_kind, is_known_int)
                             }
                             SAlt::Lit(_, b) | SAlt::Default(b) => {
-                                let nr = if Some(*bslot) == after_scrut_ref { None } else { after_scrut_ref };
-                                check(g, b, s0, nr, non_alloc, is_known_ref)
+                                let nr = if after_scrut_k.is_some_and(|(kr, _)| kr == *bslot) {
+                                    None
+                                } else {
+                                    after_scrut_k
+                                };
+                                check(g, b, s0, nr, non_alloc, is_known_kind, is_known_int)
                             }
                         }
                     })
                 }
                 SExpr::Let(binds, inner) => {
-                    let mut next_ref = kref;
+                    let mut next_k = kslot;
                     for (s, b) in binds {
                         if b.atoms().iter().any(|a| matches!(a, Atom::Slot(k) if *k == s0)) {
                             return false;
                         }
-                        if Some(*s) == next_ref {
-                            next_ref = None;
+                        if next_k.is_some_and(|(kr, _)| kr == *s) {
+                            next_k = None;
                         }
                     }
                     if binds.iter().any(|(s, _)| *s == s0) {
                         return true;
                     }
-                    check(g, inner, s0, next_ref, non_alloc, is_known_ref)
+                    check(g, inner, s0, next_k, non_alloc, is_known_kind, is_known_int)
                 }
                 SExpr::Join(_, _, code, inner) => {
                     let mut c_uses = std::collections::HashSet::new();
@@ -6927,12 +7815,12 @@ impl Gen {
                     if c_uses.contains(&s0) || c_uses.contains(&ALL_LIVE) {
                         return false;
                     }
-                    check(g, inner, s0, kref, non_alloc, is_known_ref)
+                    check(g, inner, s0, kslot, non_alloc, is_known_kind, is_known_int)
                 }
                 _ => false,
             }
         }
-        check(self, body, s0, known_ref_slot, &non_alloc, &is_known_ref)
+        check(self, body, s0, known_slot, &non_alloc, &is_known_kind, &is_known_int)
     }
 }
 
@@ -9036,6 +9924,328 @@ mod sprint6_codegen_tests {
         assert!(!cmp_asm.contains("movq $0, %rcx"), "expected flipped testq reg, reg:\n{cmp_asm}");
         assert!(cmp_asm.contains("cmpq $2, %rsi"), "missing cmpq $2, %rsi:\n{cmp_asm}");
         assert!(cmp_asm.contains("testq %rsi, %rsi"), "missing testq %rsi, %rsi:\n{cmp_asm}");
+    }
+
+    #[test]
+    fn loop_hoist_bytes_and_bit_ops() {
+        // Worker loop: clear_loop(arr, s, i#, lim#)
+        //   case readWordArray# arr (i# >> 6) s of (s1, w#) ->
+        //     let w'# = w# `and#` ((1# `uncheckedShiftL#` (i# `andI#` 63#)) `xor#` -1#)
+        //     case writeWordArray# arr (i# >> 6) w'# s1 of s2 ->
+        //       case (i# <# lim#) of 1# -> clear_loop(arr, s2, i# + 1#, lim#); _ -> ()
+        let r_i = RAW | 0;
+        let r_lim = RAW | 1;
+        let r_widx = RAW | 2;
+        let r_w = RAW | 3;
+        let r_rem = RAW | 4;
+        let r_mask = RAW | 5;
+        let r_not = RAW | 6;
+        let r_w2 = RAW | 7;
+        let r_cmp = RAW | 8;
+        let r_next = RAW | 9;
+        let mut clear_loop = simple_closure(
+            2,
+            5,
+            10,
+            SExpr::Case(
+                Box::new(SExpr::Prim("uncheckedIShiftRA#".into(), vec![Atom::Slot(r_i), Atom::Lit(SLit::Int(6))])),
+                r_widx,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Prim(
+                        "readWordArray#".into(),
+                        vec![Atom::Slot(1), Atom::Slot(r_widx), Atom::Slot(2)],
+                    )),
+                    UNUSED_SLOT,
+                    vec![SAlt::Con(
+                        "Builtin.(,)".into(),
+                        vec![3, r_w],
+                        SExpr::Case(
+                            Box::new(SExpr::Prim("andI#".into(), vec![Atom::Slot(r_i), Atom::Lit(SLit::Int(63))])),
+                            r_rem,
+                            vec![SAlt::Default(SExpr::Case(
+                                Box::new(SExpr::Prim(
+                                    "uncheckedShiftL#".into(),
+                                    vec![Atom::Lit(SLit::Int(1)), Atom::Slot(r_rem)],
+                                )),
+                                r_mask,
+                                vec![SAlt::Default(SExpr::Case(
+                                    Box::new(SExpr::Prim(
+                                        "xor#".into(),
+                                        vec![Atom::Slot(r_mask), Atom::Lit(SLit::Int(-1))],
+                                    )),
+                                    r_not,
+                                    vec![SAlt::Default(SExpr::Case(
+                                        Box::new(SExpr::Prim("and#".into(), vec![Atom::Slot(r_w), Atom::Slot(r_not)])),
+                                        r_w2,
+                                        vec![SAlt::Default(SExpr::Case(
+                                            Box::new(SExpr::Prim(
+                                                "writeWordArray#".into(),
+                                                vec![Atom::Slot(1), Atom::Slot(r_widx), Atom::Slot(r_w2), Atom::Slot(3)],
+                                            )),
+                                            4,
+                                            vec![SAlt::Default(SExpr::Case(
+                                                Box::new(SExpr::Prim("<#".into(), vec![Atom::Slot(r_i), Atom::Slot(r_lim)])),
+                                                r_cmp,
+                                                vec![SAlt::Default(SExpr::Case(
+                                                    Box::new(SExpr::Atom(Atom::Slot(r_cmp))),
+                                                    UNUSED_SLOT,
+                                                    vec![
+                                                        SAlt::Lit(
+                                                            Lit::Int(1),
+                                                            SExpr::Case(
+                                                                Box::new(SExpr::Prim(
+                                                                    "+#".into(),
+                                                                    vec![Atom::Slot(r_i), Atom::Lit(SLit::Int(1))],
+                                                                )),
+                                                                r_next,
+                                                                vec![SAlt::Default(SExpr::CallWorker(
+                                                                    0,
+                                                                    vec![
+                                                                        Atom::Slot(1),
+                                                                        Atom::Slot(4),
+                                                                        Atom::Slot(r_next),
+                                                                        Atom::Slot(r_lim),
+                                                                    ],
+                                                                ))],
+                                                            ),
+                                                        ),
+                                                        SAlt::Default(SExpr::Con("Builtin.()".into(), vec![])),
+                                                    ],
+                                                ))],
+                                            ))],
+                                        ))],
+                                    ))],
+                                ))],
+                            ))],
+                        ),
+                    )],
+                ))],
+            ),
+        );
+        clear_loop.raw_args = vec![(0, r_i), (0, r_lim)];
+
+        // Bit-test loop: test_bit(arr, s, i#) -> 1# if bit set else 0#
+        let mut test_bit = simple_closure(
+            2,
+            4,
+            7,
+            SExpr::Case(
+                Box::new(SExpr::Prim("uncheckedIShiftRA#".into(), vec![Atom::Slot(r_i), Atom::Lit(SLit::Int(6))])),
+                r_widx,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Prim(
+                        "readWordArray#".into(),
+                        vec![Atom::Slot(1), Atom::Slot(r_widx), Atom::Slot(2)],
+                    )),
+                    UNUSED_SLOT,
+                    vec![SAlt::Con(
+                        "Builtin.(,)".into(),
+                        vec![3, r_w],
+                        SExpr::Case(
+                            Box::new(SExpr::Prim("andI#".into(), vec![Atom::Slot(r_i), Atom::Lit(SLit::Int(63))])),
+                            r_rem,
+                            vec![SAlt::Default(SExpr::Case(
+                                Box::new(SExpr::Prim(
+                                    "uncheckedShiftL#".into(),
+                                    vec![Atom::Lit(SLit::Int(1)), Atom::Slot(r_rem)],
+                                )),
+                                r_mask,
+                                vec![SAlt::Default(SExpr::Case(
+                                    Box::new(SExpr::Prim("and#".into(), vec![Atom::Slot(r_w), Atom::Slot(r_mask)])),
+                                    r_not,
+                                    vec![SAlt::Default(SExpr::Case(
+                                        Box::new(SExpr::Prim(
+                                            "neWord#".into(),
+                                            vec![Atom::Slot(r_not), Atom::Lit(SLit::Int(0))],
+                                        )),
+                                        r_w2,
+                                        vec![SAlt::Default(SExpr::Case(
+                                            Box::new(SExpr::Atom(Atom::Slot(r_w2))),
+                                            UNUSED_SLOT,
+                                            vec![
+                                                SAlt::Lit(Lit::Int(1), SExpr::Atom(Atom::Lit(SLit::Int(1)))),
+                                                SAlt::Default(SExpr::Atom(Atom::Lit(SLit::Int(0)))),
+                                            ],
+                                        ))],
+                                    ))],
+                                ))],
+                            ))],
+                        ),
+                    )],
+                ))],
+            ),
+        );
+        test_bit.raw_args = vec![(0, r_i)];
+        test_bit.ret_raw = true;
+
+        let wrapper = simple_closure(
+            2,
+            3,
+            0,
+            SExpr::CallWorker(
+                0,
+                vec![
+                    Atom::Slot(1),
+                    Atom::Slot(2),
+                    Atom::Lit(SLit::Int(0)),
+                    Atom::Lit(SLit::Int(100)),
+                ],
+            ),
+        );
+        let prog = make_prog(vec![
+            SGlobal {
+                name: "Test.clearLoop".into(),
+                closure: wrapper,
+                worker: Some((clear_loop, vec![false, false, true, true])),
+            },
+            SGlobal { name: "Test.testBit".into(), closure: test_bit, worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let w_start = asm.find(".Lw").expect("worker label");
+        let w_end = asm[w_start + 1..].find("\n.Lg").or_else(|| asm[w_start + 1..].find("\n    .section")).map(|i| w_start + 1 + i).unwrap_or(asm.len());
+        let w_asm = &asm[w_start..w_end];
+        let (pre_hdr, after_loop) = w_asm.split_once("\n.Lloop").expect("expected .Lloop");
+        let loop_body = after_loop.split("\n.Lpre_eval").next().unwrap_or(after_loop).split("\n.Lyield").next().unwrap_or(after_loop);
+        assert!(pre_hdr.contains("cmpb $13, (%rax)"), "expected hoisted BYTES check in pre-header:\n{pre_hdr}");
+        assert!(!loop_body.contains("cmpb $13"), "unexpected per-iteration BYTES check inside loop:\n{loop_body}");
+        assert!(loop_body.contains("btrq "), "expected fused btrq in clear_loop:\n{loop_body}");
+        assert!(!loop_body.contains("shlq "), "unexpected shlq when btrq fused:\n{loop_body}");
+        assert!(!loop_body.contains("movq $0,"), "unexpected dead state store inside loop:\n{loop_body}");
+
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbls: Vec<&str> = table
+            .lines()
+            .take(2)
+            .map(|l| l.rsplit_once(',').unwrap().1.split_whitespace().next().unwrap())
+            .collect();
+        let tb_lbl = lbls[1];
+        let tb_start = asm.find(&format!("{tb_lbl}:\n")).expect("testBit label");
+        let tb_end = asm[tb_start + 1..]
+            .find("\n.Lg")
+            .into_iter()
+            .chain(asm[tb_start + 1..].find("\n.Lw"))
+            .chain(asm[tb_start + 1..].find("\n    .section"))
+            .map(|i| tb_start + 1 + i)
+            .min()
+            .unwrap_or(asm.len());
+        let tb_asm = &asm[tb_start..tb_end];
+        assert!(tb_asm.contains("btq "), "expected fused btq in testBit:\n{tb_asm}");
+        assert!(tb_asm.contains("jc "), "expected jc branch after btq:\n{tb_asm}");
+        assert!(!tb_asm.contains("shlq "), "unexpected shlq when btq fused:\n{tb_asm}");
+    }
+
+    #[test]
+    fn bit_ops_const_casts_and_recursive_join() {
+        // Recursive SExpr::Join whose body performs `Data.Array.Base.bOOL_NOT_BIT` with explicit
+        // `word2Int#` / `int2Word# 1#` / `int2Word# -1#` casts and compacted raw slot reuse
+        // (`r_rem == r_mask == r_not == r_res`): self-jumps must not poison `ALL_LIVE`, and
+        // `try_bit_op` must fuse the chain into a single `btrq`.
+        let r_i = RAW | 0;
+        let r_w = RAW | 1;
+        let r_rem = RAW | 2;
+        let r_rem_i = RAW | 2;
+        let r_one = RAW | 3;
+        let r_mask = RAW | 2;
+        let r_m1 = RAW | 3;
+        let r_not = RAW | 2;
+        let r_res = RAW | 2;
+        let join_code = SExpr::Case(
+            Box::new(SExpr::Prim("and#".into(), vec![Atom::Slot(r_i), Atom::Lit(SLit::Int(63))])),
+            r_rem,
+            vec![SAlt::Default(SExpr::Case(
+                Box::new(SExpr::Prim("word2Int#".into(), vec![Atom::Slot(r_rem)])),
+                r_rem_i,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Prim("int2Word#".into(), vec![Atom::Lit(SLit::Int(1))])),
+                    r_one,
+                    vec![SAlt::Default(SExpr::Case(
+                        Box::new(SExpr::Prim(
+                            "uncheckedShiftL#".into(),
+                            vec![Atom::Slot(r_one), Atom::Slot(r_rem_i)],
+                        )),
+                        r_mask,
+                        vec![SAlt::Default(SExpr::Case(
+                            Box::new(SExpr::Prim("int2Word#".into(), vec![Atom::Lit(SLit::Int(-1))])),
+                            r_m1,
+                            vec![SAlt::Default(SExpr::Case(
+                                Box::new(SExpr::Prim("xor#".into(), vec![Atom::Slot(r_mask), Atom::Slot(r_m1)])),
+                                r_not,
+                                vec![SAlt::Default(SExpr::Case(
+                                    Box::new(SExpr::Prim("and#".into(), vec![Atom::Slot(r_w), Atom::Slot(r_not)])),
+                                    r_res,
+                                    vec![SAlt::Default(SExpr::Case(
+                                        Box::new(SExpr::Atom(Atom::Slot(r_res))),
+                                        UNUSED_SLOT,
+                                        vec![
+                                            SAlt::Lit(Lit::Int(0), SExpr::Jump(1, vec![Atom::Slot(1)])),
+                                            SAlt::Default(SExpr::Atom(Atom::Slot(r_res))),
+                                        ],
+                                    ))],
+                                ))],
+                            ))],
+                        ))],
+                    ))],
+                ))],
+            ))],
+        );
+        let mut c = simple_closure(
+            3,
+            4,
+            4,
+            SExpr::Join(1, vec![2], Box::new(join_code), Box::new(SExpr::Jump(1, vec![Atom::Slot(1)]))),
+        );
+        c.raw_args = vec![(0, r_i), (1, r_w)];
+        c.ret_raw = true;
+
+        // `btq` with a `SExpr::Join` between `neWord#` and the 1#/0# case (as in `when (p && ...)`).
+        let bt_body = SExpr::Case(
+            Box::new(SExpr::Prim("and#".into(), vec![Atom::Slot(r_i), Atom::Lit(SLit::Int(63))])),
+            r_rem,
+            vec![SAlt::Default(SExpr::Case(
+                Box::new(SExpr::Prim(
+                    "uncheckedShiftL#".into(),
+                    vec![Atom::Lit(SLit::Int(1)), Atom::Slot(r_rem)],
+                )),
+                r_mask,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Prim("and#".into(), vec![Atom::Slot(r_w), Atom::Slot(r_mask)])),
+                    r_not,
+                    vec![SAlt::Default(SExpr::Case(
+                        Box::new(SExpr::Prim(
+                            "neWord#".into(),
+                            vec![Atom::Slot(r_not), Atom::Lit(SLit::Int(0))],
+                        )),
+                        r_res,
+                        vec![SAlt::Default(SExpr::Join(
+                            9,
+                            vec![2],
+                            Box::new(SExpr::Atom(Atom::Lit(SLit::Int(7)))),
+                            Box::new(SExpr::Case(
+                                Box::new(SExpr::Atom(Atom::Slot(r_res))),
+                                UNUSED_SLOT,
+                                vec![
+                                    SAlt::Lit(Lit::Int(1), SExpr::Atom(Atom::Lit(SLit::Int(42)))),
+                                    SAlt::Default(SExpr::Jump(9, vec![Atom::Slot(1)])),
+                                ],
+                            )),
+                        ))],
+                    ))],
+                ))],
+            ))],
+        );
+        let mut c_bt = simple_closure(3, 4, 4, bt_body);
+        c_bt.raw_args = vec![(0, r_i), (1, r_w)];
+        c_bt.ret_raw = true;
+
+        let prog = make_prog(vec![
+            SGlobal { name: "Test.joinBtr".into(), closure: c, worker: None },
+            SGlobal { name: "Test.joinBt".into(), closure: c_bt, worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let body = asm.split_once("\n.Lg").expect("body label").1;
+        assert!(body.contains("btrq "), "expected fused btrq inside recursive Join:\n{body}");
+        assert!(body.contains("btq "), "expected fused btq with peeled Join:\n{body}");
+        assert!(!body.contains("shlq "), "unexpected shlq when btrq/btq fused:\n{body}");
     }
 }
 
