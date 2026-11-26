@@ -1070,6 +1070,7 @@ fn pass(
         .collect();
     let tune = tuning();
     let mut templates: HashMap<String, (usize, Core)> = HashMap::new();
+    let mut bottom_fns: HashMap<String, usize> = HashMap::new();
     let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
     for b in binds.iter() {
         let (arity, inner) = lambdas(&b.body);
@@ -1080,7 +1081,11 @@ fn pass(
             Some((_, act)) if !act.active(phase) => 0,
             _ => tune.inline_size,
         };
-        if is_cold_error_fn(&b.name) || is_bottom_expr(inner) {
+        if is_bottom_expr(inner) {
+            bottom_fns.insert(b.name.clone(), arity);
+            continue;
+        }
+        if is_cold_error_fn(&b.name) {
             continue;
         }
         // A partial application of a known function to atoms (`mconcat = foldr mappend mempty`)
@@ -1172,6 +1177,7 @@ fn pass(
                 literals: &literals,
                 aliases: &aliases,
                 templates: &templates,
+                bottom_fns: &bottom_fns,
                 this: &bind.name,
                 rules,
                 strict_cons,
@@ -1223,6 +1229,8 @@ struct Simp<'a> {
     literals: &'a HashMap<String, Lit>,
     aliases: &'a HashMap<String, String>,
     templates: &'a HashMap<String, (usize, Core)>,
+    /// Top-level functions whose saturated calls unconditionally diverge `(name -> min_arity)`.
+    bottom_fns: &'a HashMap<String, usize>,
     /// The binding being simplified (never inlined into itself).
     this: &'a str,
     /// The rewrite rules, and the phase (2, 1, 0) of this pass.
@@ -1391,7 +1399,7 @@ impl Simp<'_> {
                 } else {
                     *bindings = kept;
                     self.strict_let(c);
-                    if self.float_let_into_case(c) {
+                    if self.float_let_into_case(c) || self.float_cold_let_inward(c) {
                         self.changed = true;
                     }
                 }
@@ -1836,6 +1844,110 @@ impl Simp<'_> {
             *abody1 = Core::Let(vec![(x2, rhs2)], Box::new(take(abody1)));
         }
         true
+    }
+
+    /// Whether every free occurrence of `x` in `e` lies inside a diverging/bottoming subexpression
+    /// (including lambdas whose bodies unconditionally diverge, e.g. `\_ -> error d ...`).
+    fn used_only_in_bottom(&self, e: &Core, x: &str) -> bool {
+        let (_, inner) = lambdas(e);
+        if is_bottom_expr_with(inner, self.bottom_fns) {
+            return true;
+        }
+        match e {
+            Core::Var(v) => v != x,
+            Core::Lit(_) | Core::Fail(_) => true,
+            Core::App(f, a) => self.used_only_in_bottom(f, x) && self.used_only_in_bottom(a, x),
+            Core::Lam(p, b) => p == x || self.used_only_in_bottom(b, x),
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                args.iter().all(|a| self.used_only_in_bottom(a, x))
+            }
+            Core::Case(s, b, alts) => {
+                self.used_only_in_bottom(s, x)
+                    && (b == x
+                        || alts.iter().all(|a| match a {
+                            Alt::Con(_, vs, body) => {
+                                vs.iter().any(|v| v == x) || self.used_only_in_bottom(body, x)
+                            }
+                            Alt::Lit(_, body) | Alt::Default(body) => {
+                                self.used_only_in_bottom(body, x)
+                            }
+                        }))
+            }
+            Core::Let(bs, body) => {
+                if bs.iter().any(|(n, _)| n == x) {
+                    return true;
+                }
+                if !self.used_only_in_bottom(body, x) {
+                    return false;
+                }
+                bs.iter().all(|(n, r)| {
+                    self.used_only_in_bottom(r, x)
+                        || (!mentions(r, n)
+                            && bs.iter().all(|(m, mr)| m == n || !mentions(mr, n))
+                            && self.used_only_in_bottom(body, n))
+                })
+            }
+        }
+    }
+
+    /// Floats a non-recursive binding `let x = rhs in ...` inward when every use of `x` lies in
+    /// diverging/bottoming paths (e.g. `HasCallStack` `PushCallStack` dictionaries in `!!`):
+    /// - `let x = rhs in \p1 -> ... -> inner` => `\p1 -> ... -> let x = rhs in inner`
+    /// - `let x = rhs in let y = yrhs in body` (when `x` is only used in `yrhs`)
+    ///   => `let y = (let x = rhs in yrhs) in body`
+    ///
+    /// This exposes outer lambdas for full arity / direct calls and avoids allocating cold error
+    /// thunks on the hot path, while never duplicating work on any non-diverging path.
+    fn float_cold_let_inward(&mut self, c: &mut Core) -> bool {
+        let Core::Let(bs, body) = c else { return false };
+        let [(x, rhs)] = &bs[..] else { return false };
+        if mentions(rhs, x)
+            || self.pending.keys().any(|k| mentions(rhs, k))
+            || !mentions(body, x)
+            || !self.used_only_in_bottom(body, x)
+        {
+            return false;
+        }
+        // Case A: float inward across leading lambdas that do not capture/shadow `x` or `rhs`.
+        let mut lam_depth = 0usize;
+        let mut cur: &Core = body;
+        while let Core::Lam(p, inner) = cur {
+            if p == x || mentions(rhs, p) {
+                break;
+            }
+            lam_depth += 1;
+            cur = inner;
+        }
+        if lam_depth > 0 {
+            let Core::Let(mut bs, mut inner) = take(c) else { unreachable!() };
+            let (x, rhs) = bs.pop().expect("one binding");
+            let mut params_out = Vec::with_capacity(lam_depth);
+            for _ in 0..lam_depth {
+                let Core::Lam(p, next) = *inner else { unreachable!() };
+                params_out.push(p);
+                inner = next;
+            }
+            let mut rebuilt = Core::Let(vec![(x, rhs)], inner);
+            for p in params_out.into_iter().rev() {
+                rebuilt = Core::Lam(p, Box::new(rebuilt));
+            }
+            *c = rebuilt;
+            return true;
+        }
+        // Case B: float into a single sibling `Let` RHS when the outer `Let` body does not use `x`.
+        if let Core::Let(ibs, ibody) = &**body {
+            if let [(y, _)] = &ibs[..] {
+                if y != x && !mentions(rhs, y) && !mentions(ibody, x) {
+                    let Core::Let(mut bs, inner) = take(c) else { unreachable!() };
+                    let (x, rhs) = bs.pop().expect("one binding");
+                    let Core::Let(mut ibs, ibody) = *inner else { unreachable!() };
+                    let (y, yrhs) = ibs.pop().expect("one inner binding");
+                    *c = Core::Let(vec![(y, Core::Let(vec![(x, rhs)], Box::new(yrhs)))], ibody);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// `case (case s of alts1) as b of _ -> body` with `body` small: `body` (a fresh copy) after
@@ -4148,7 +4260,15 @@ fn is_cold_error_fn(name: &str) -> bool {
 
 /// Whether evaluating `e` unconditionally diverges (pattern failure, `raise#`, or saturated
 /// diverging error call), peeling enclosing `Let`s and `App`s.
-fn is_bottom_expr(mut e: &Core) -> bool {
+fn is_bottom_expr(e: &Core) -> bool {
+    is_bottom_expr_with_opt(e, None)
+}
+
+fn is_bottom_expr_with(e: &Core, bottom_fns: &HashMap<String, usize>) -> bool {
+    is_bottom_expr_with_opt(e, Some(bottom_fns))
+}
+
+fn is_bottom_expr_with_opt(mut e: &Core, bottom_fns: Option<&HashMap<String, usize>>) -> bool {
     loop {
         match e {
             Core::Let(_, b) => e = b,
@@ -4164,11 +4284,19 @@ fn is_bottom_expr(mut e: &Core) -> bool {
                 return match head {
                     Core::Fail(_) => true,
                     Core::Prim(p, args) if p == "raise#" && args.len() == 1 => true,
-                    Core::Var(v) => is_diverging_error_call(v, nargs),
+                    Core::Var(v) => {
+                        is_diverging_error_call(v, nargs)
+                            || bottom_fns
+                                .and_then(|m| m.get(v.as_str()))
+                                .is_some_and(|&min| nargs >= min)
+                    }
                     _ => false,
                 };
             }
-            Core::Var(v) => return is_diverging_error_call(v, 0),
+            Core::Var(v) => {
+                return is_diverging_error_call(v, 0)
+                    || bottom_fns.and_then(|m| m.get(v.as_str())).is_some_and(|&min| min == 0);
+            }
             _ => return false,
         }
     }
@@ -4355,8 +4483,9 @@ mod rule_tests {
         let mut fresh = 0;
         let no_arities = HashMap::new();
         let no_strict_cons = HashMap::new();
+        let no_bottom = HashMap::new();
         let mut s = Simp {
-            once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), local_templates: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates,
+            once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), local_templates: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates, bottom_fns: &no_bottom,
             this: "Test.x", rules: &rules, strict_cons: &no_strict_cons, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
             fresh: &mut fresh, budget: 0, changed: false, tune: O1,
         };
@@ -5151,5 +5280,148 @@ mod rule_tests {
             "expected fold/build to fire after floating let out of foldr: {:?}",
             binds[0].body
         );
+    }
+
+    #[test]
+    fn float_cold_callstack_let_exposes_arity_and_eta_expansion() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // T.neg = \d -> error d "neg"
+        let neg = TopBind {
+            name: "T.neg".into(),
+            body: Core::Lam(
+                "d".into(),
+                Box::new(app(
+                    app(v("GHC.Internal.Err.error"), v("d")),
+                    Core::Lit(Lit::Str("neg".into())),
+                )),
+            ),
+        };
+        // T.index = \dg ->
+        //   let d1 = case dg as c1 of Freeze _ -> dg; _ -> Push "a" dg in
+        //   let d2 = case dg as c2 of Freeze _ -> dg; _ -> Push "b" dg in
+        //   \xs -> \n ->
+        //     case (<# n 0#) as b of
+        //       1# -> T.neg d2
+        //       _ -> let err = let d3 = case d1 as c3 of Freeze _ -> d1; _ -> Push "c" d1
+        //                      in \_ -> error d3 "oob" in
+        //            let go = \ys -> case ys as c4 of
+        //              [] -> err
+        //              (:) x xs' -> let r = go xs' in \m -> case (==# m 0#) as b2 of 1# -> x; _ -> r (-# m 1#)
+        //            in go xs n
+        let push_case = |src: &str, c: &str, tag: &str| {
+            Core::Case(
+                Box::new(v(src)),
+                c.into(),
+                vec![
+                    Alt::Con("Freeze".into(), vec!["p".into()], v(src)),
+                    Alt::Default(Core::Con("Push".into(), vec![Core::Lit(Lit::Str(tag.into())), v(src)])),
+                ],
+            )
+        };
+        let go_rhs = Core::Lam(
+            "ys".into(),
+            Box::new(Core::Case(
+                Box::new(v("ys")),
+                "c4".into(),
+                vec![
+                    Alt::Con("Builtin.[]".into(), vec![], v("err")),
+                    Alt::Con(
+                        "Builtin.:".into(),
+                        vec!["x".into(), "xs'".into()],
+                        Core::Let(
+                            vec![("r".into(), app(v("go"), v("xs'")))],
+                            Box::new(Core::Lam(
+                                "m".into(),
+                                Box::new(Core::Case(
+                                    Box::new(Core::Prim("==#".into(), vec![v("m"), Core::Lit(Lit::Int(0))])),
+                                    "b2".into(),
+                                    vec![
+                                        Alt::Lit(Lit::Int(1), v("x")),
+                                        Alt::Default(app(
+                                            v("r"),
+                                            Core::Prim("-#".into(), vec![v("m"), Core::Lit(Lit::Int(1))]),
+                                        )),
+                                    ],
+                                )),
+                            )),
+                        ),
+                    ),
+                ],
+            )),
+        );
+        let err_rhs = Core::Let(
+            vec![("d3".into(), push_case("d1", "c3", "c"))],
+            Box::new(Core::Lam(
+                "u".into(),
+                Box::new(app(
+                    app(v("GHC.Internal.Err.error"), v("d3")),
+                    Core::Lit(Lit::Str("oob".into())),
+                )),
+            )),
+        );
+        let index_body = Core::Lam(
+            "dg".into(),
+            Box::new(Core::Let(
+                vec![("d1".into(), push_case("dg", "c1", "a"))],
+                Box::new(Core::Let(
+                    vec![("d2".into(), push_case("dg", "c2", "b"))],
+                    Box::new(Core::Lam(
+                        "xs".into(),
+                        Box::new(Core::Lam(
+                            "n".into(),
+                            Box::new(Core::Case(
+                                Box::new(Core::Prim("<#".into(), vec![v("n"), Core::Lit(Lit::Int(0))])),
+                                "b".into(),
+                                vec![
+                                    Alt::Lit(Lit::Int(1), app(v("T.neg"), v("d2"))),
+                                    Alt::Default(Core::Let(
+                                        vec![("err".into(), err_rhs)],
+                                        Box::new(Core::Let(
+                                            vec![("go".into(), go_rhs)],
+                                            Box::new(app(app(v("go"), v("xs")), v("n"))),
+                                        )),
+                                    )),
+                                ],
+                            )),
+                        )),
+                    )),
+                )),
+            )),
+        );
+        let mut binds = vec![neg, TopBind { name: "T.index".into(), body: index_body }];
+        simplify(&mut binds);
+        let (arity, _) = lambdas(&binds[1].body);
+        assert_eq!(arity, 3, "expected T.index to float cold lets and expose arity 3: {:?}", binds[1].body);
+        // Check that `go` eta-expanded to arity 2.
+        let mut go_arity = None;
+        fn find_go(e: &Core, out: &mut Option<usize>) {
+            match e {
+                Core::Lam(_, b) => find_go(b, out),
+                Core::Let(bs, b) => {
+                    for (n, r) in bs {
+                        if n == "go" {
+                            *out = Some(lambdas(r).0);
+                        }
+                        find_go(r, out);
+                    }
+                    find_go(b, out);
+                }
+                Core::Case(s, _, alts) => {
+                    find_go(s, out);
+                    for a in alts {
+                        let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                        find_go(b, out);
+                    }
+                }
+                Core::App(f, a) => {
+                    find_go(f, out);
+                    find_go(a, out);
+                }
+                _ => {}
+            }
+        }
+        find_go(&binds[1].body, &mut go_arity);
+        assert_eq!(go_arity, Some(2), "expected inner `go` to eta-expand to arity 2: {:?}", binds[1].body);
     }
 }
