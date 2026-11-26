@@ -1861,8 +1861,19 @@ fn redirect(e: &Core, j: &str) -> Core {
 /// Whether a let is lowered as a join point: one non-recursive binding all of whose uses in the
 /// body are calls with as many arguments as it has parameters, in tail position.
 fn is_join(binds: &[(String, Core)], body: &Core) -> bool {
+    let mut memo = HashMap::new();
+    is_join_memo(binds, body, &mut memo)
+}
+
+fn is_join_memo(binds: &[(String, Core)], body: &Core, memo: &mut HashMap<usize, bool>) -> bool {
     let [(name, rhs)] = binds else { return false };
-    !mentions(rhs, name) && tail_calls(body, name, lambdas(rhs).0)
+    let key = binds.as_ptr() as usize;
+    if let Some(&res) = memo.get(&key) {
+        return res;
+    }
+    let res = !mentions(rhs, name) && tail_calls_memo(body, name, lambdas(rhs).0, memo);
+    memo.insert(key, res);
+    res
 }
 
 /// The leading parameters of an expression, and what is under them.
@@ -1892,7 +1903,7 @@ fn strict_integer_arity(name: &str) -> Option<usize> {
 /// Whether every use of `j` in `e` is a call `j a1 .. an` in tail position (its arguments not
 /// mentioning `j`). Tail positions are those `strict` lowers in the frame and mode of `e`: case
 /// alternatives, let bodies, the code of join points, and the result of `seq` and identities.
-fn tail_calls(e: &Core, j: &str, n: usize) -> bool {
+fn tail_calls_memo(e: &Core, j: &str, n: usize, memo: &mut HashMap<usize, bool>) -> bool {
     match e {
         Core::Var(v) => v != j || n == 0,
         Core::Lit(_) | Core::Fail(_) => true,
@@ -1908,7 +1919,13 @@ fn tail_calls(e: &Core, j: &str, n: usize) -> bool {
             if binds.iter().any(|(x, _)| x == j) {
                 return true;
             }
-            if is_join(binds, body) {
+            if binds.iter().all(|(_, rhs)| !mentions(rhs, j)) {
+                return tail_calls_memo(body, j, n, memo);
+            }
+            if !tail_calls_memo(body, j, n, memo) {
+                return false;
+            }
+            if is_join_memo(binds, body, memo) {
                 let (_, code) = lambdas(&binds[0].1);
                 let shadowed = {
                     let mut cur = &binds[0].1;
@@ -1919,21 +1936,21 @@ fn tail_calls(e: &Core, j: &str, n: usize) -> bool {
                     }
                     hit
                 };
-                (shadowed || tail_calls(code, j, n)) && tail_calls(body, j, n)
+                shadowed || tail_calls_memo(code, j, n, memo)
             } else {
-                binds.iter().all(|(_, rhs)| !mentions(rhs, j)) && tail_calls(body, j, n)
+                false
             }
         }
         Core::Case(scrut, binder, alts) => {
             !mentions(scrut, j)
                 && (binder == j
                     || alts.iter().all(|a| match a {
-                        Alt::Con(_, vars, b) => vars.iter().any(|v| v == j) || tail_calls(b, j, n),
-                        Alt::Lit(_, b) | Alt::Default(b) => tail_calls(b, j, n),
+                        Alt::Con(_, vars, b) => vars.iter().any(|v| v == j) || tail_calls_memo(b, j, n, memo),
+                        Alt::Lit(_, b) | Alt::Default(b) => tail_calls_memo(b, j, n, memo),
                     }))
         }
-        Core::Prim(p, args) if p == "seq" && args.len() == 2 => !mentions(&args[0], j) && tail_calls(&args[1], j, n),
-        Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => tail_calls(&args[0], j, n),
+        Core::Prim(p, args) if p == "seq" && args.len() == 2 => !mentions(&args[0], j) && tail_calls_memo(&args[1], j, n, memo),
+        Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => tail_calls_memo(&args[0], j, n, memo),
         Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, j)),
     }
 }
@@ -3380,6 +3397,18 @@ mod raw_slot_tests {
             }
         }
         assert_eq!(count_box_raw(&worker.body), 1, "expected deduplicated single SBind::BoxRaw: {:?}", worker.body);
+    }
+
+    #[test]
+    fn is_join_handles_deeply_nested_lets_without_exponential_blowup() {
+        let mut body = Core::Var("x39".into());
+        for i in (1..40).rev() {
+            let name = format!("x{i}");
+            let prev = format!("x{}", i - 1);
+            body = Core::Let(vec![(name, Core::Var(prev))], Box::new(body));
+        }
+        let binds = vec![("x0".to_string(), Core::Lit(Lit::Int(1)))];
+        assert!(is_join(&binds, &body));
     }
 }
 
