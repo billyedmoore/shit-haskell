@@ -573,8 +573,8 @@ fn raw_returns(
 
 /// The global functions given workers: a parameter is passed raw when its type says it is a number,
 /// the body uses it as a number, every use takes it raw, and either the body certainly evaluates
-/// it (strict worker) or no strict numeric parameter exists (WHNF-guarded worker, invoked only at
-/// call sites passing a guaranteed-WHNF argument).
+/// it (strict parameter) or no strict numeric parameter exists / the function is self-recursive
+/// (WHNF-guarded parameter, invoked only at call sites passing a guaranteed-WHNF argument).
 pub fn workers(binds: &[TopBind], numeric: &NumericParams) -> Workers {
     workers_with_strict(binds, numeric).0
 }
@@ -606,20 +606,22 @@ fn workers_with_strict(binds: &[TopBind], numeric: &NumericParams) -> (Workers, 
                 types.and_then(|t| t.get(i)).is_some_and(|k| *k != 0) && evaluated.contains(*p) && numeric_use(cur, p)
             })
             .collect();
-        if strict_raw.iter().any(|r| *r) {
+        let has_strict = strict_raw.iter().any(|r| *r);
+        if has_strict && !mentions(cur, &b.name) {
             strict_map.insert(b.name.clone(), strict_raw.clone());
             w.insert(b.name.clone(), strict_raw);
             bodies.insert(b.name.as_str(), (params, cur));
         } else {
-            // No strict numeric parameter: allow WHNF-guarded raw parameters (e.g. `member`,
-            // `safe`, IO loops), invoked only at call sites passing guaranteed-WHNF values.
+            // Allow WHNF-guarded raw parameters (e.g. `member`, `safe`, IO/ST loops like sieve's
+            // bounds/step params that sit behind an earlier branch), invoked only at call sites
+            // passing guaranteed-WHNF values for non-strict parameters.
             let whnf_raw: Vec<bool> = params
                 .iter()
                 .enumerate()
                 .map(|(i, p)| types.and_then(|t| t.get(i)).is_some_and(|k| *k != 0) && numeric_use(cur, p))
                 .collect();
             if whnf_raw.iter().any(|r| *r) {
-                strict_map.insert(b.name.clone(), vec![false; params.len()]);
+                strict_map.insert(b.name.clone(), strict_raw);
                 w.insert(b.name.clone(), whnf_raw);
                 bodies.insert(b.name.as_str(), (params, cur));
             }
@@ -3622,6 +3624,82 @@ mod raw_slot_tests {
             panic!("expected Case binding i: {:?}", worker.body);
         };
         assert!(i_slot & RAW != 0, "i = j -# 2# should remain raw despite cold error use: {:?}", worker.body);
+    }
+
+    #[test]
+    fn mixed_strict_and_whnf_recursive_worker() {
+        // Test.loop = \i step -> case 0# <=# i as c of
+        //   1# -> Test.loop (i -# step) step
+        //   _  -> i
+        // `i` is certainly evaluated (strict), while `step` is behind the branch (WHNF-guarded).
+        // Both should become raw in the worker, while callers with a WHNF `step` invoke the worker
+        // and callers with an unforced thunk for `step` stay on the boxed entry.
+        let loop_body = Core::Lam(
+            "i".into(),
+            Box::new(Core::Lam(
+                "step".into(),
+                Box::new(Core::Case(
+                    Box::new(prim("<=#", vec![Core::Lit(Lit::Int(0)), var("i")])),
+                    "c".into(),
+                    vec![
+                        Alt::Lit(
+                            Lit::Int(1),
+                            case(
+                                prim("-#", vec![var("i"), var("step")]),
+                                "next",
+                                app(app(var("Test.loop"), var("next")), var("step")),
+                            ),
+                        ),
+                        Alt::Default(var("i")),
+                    ],
+                )),
+            )),
+        );
+        let caller_whnf = Core::Lam(
+            "x".into(),
+            Box::new(app(app(var("Test.loop"), var("x")), Core::Lit(Lit::Int(3)))),
+        );
+        let caller_lazy = Core::Lam(
+            "x".into(),
+            Box::new(Core::Lam(
+                "t".into(),
+                Box::new(app(app(var("Test.loop"), var("x")), var("t"))),
+            )),
+        );
+        let binds = vec![
+            TopBind { name: "Test.loop".into(), body: loop_body },
+            TopBind { name: "Test.whnfCall".into(), body: caller_whnf },
+            TopBind { name: "Test.lazyCall".into(), body: caller_lazy },
+        ];
+        let numeric = NumericParams {
+            params: [("Test.loop".to_string(), vec![NUM_INT, NUM_INT])].into_iter().collect(),
+            results: HashMap::new(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (_, raw) = prog.globals[0].worker.as_ref().expect("Test.loop should get worker");
+        assert_eq!(raw, &vec![true, true], "both strict i and WHNF-guarded step should be raw");
+        let has_worker_call = |e: &SExpr| -> bool {
+            fn walk(e: &SExpr) -> bool {
+                match e {
+                    SExpr::CallWorker(0, _) => true,
+                    SExpr::Case(s, _, alts) => walk(s) || alts.iter().any(|a| match a {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => walk(b),
+                    }),
+                    _ => false,
+                }
+            }
+            walk(e)
+        };
+        assert!(
+            has_worker_call(&prog.globals[1].closure.body),
+            "WHNF call should invoke worker: {:?}",
+            prog.globals[1].closure.body
+        );
+        assert!(
+            !has_worker_call(&prog.globals[2].closure.body),
+            "non-WHNF step must not invoke worker: {:?}",
+            prog.globals[2].closure.body
+        );
     }
 }
 
