@@ -1466,6 +1466,7 @@ fn pass(
                 fresh: &mut fresh,
                 budget: tune.inline_budget,
                 changed: false,
+                eval_pos: false,
                 tune,
             };
             s.expr(&mut bind.body);
@@ -1535,11 +1536,21 @@ struct Simp<'a> {
     fresh: &'a mut u64,
     budget: usize,
     changed: bool,
+    /// True when control is guaranteed to evaluate the current expression (lambda body, case
+    /// scrutinee/alt, strict prim arg, or `let` body in eval position), so floating speculable
+    /// arguments out of a `Core::Con` does not turn a value binding into a thunk.
+    eval_pos: bool,
     /// The thresholds of the optimisation level.
     tune: Tuning,
 }
 
 impl Simp<'_> {
+    fn expr_with_eval(&mut self, c: &mut Core, eval_pos: bool) {
+        let prev = std::mem::replace(&mut self.eval_pos, eval_pos);
+        self.expr(c);
+        self.eval_pos = prev;
+    }
+
     fn expr(&mut self, c: &mut Core) {
         match c {
             Core::Var(v) => {
@@ -1564,8 +1575,8 @@ impl Simp<'_> {
                     (0, 0)
                 };
                 let Core::App(f, a) = c else { unreachable!() };
-                self.expr(f);
-                self.expr(a);
+                self.expr_with_eval(f, true);
+                self.expr_with_eval(a, false);
                 if cold {
                     self.budget = saved_budget;
                     self.rule_budget = saved_rule_budget;
@@ -1580,7 +1591,7 @@ impl Simp<'_> {
                 }
                 self.reduce(c);
             }
-            Core::Lam(_, b) => self.expr(b),
+            Core::Lam(_, b) => self.expr_with_eval(b, true),
             Core::Let(bindings, _) => {
                 for (x, r) in bindings.iter() {
                     let n = value_arity(r);
@@ -1631,7 +1642,7 @@ impl Simp<'_> {
                     }
                 }
                 for (name, rhs) in kept.iter_mut() {
-                    self.expr(rhs);
+                    self.expr_with_eval(rhs, false);
                     if let Core::Let(inner, inner_body) = rhs {
                         if inner.len() == 1 && matches!(&**inner_body, Core::Var(v) if v == &inner[0].0) {
                             let (this, mut body) = inner.pop().unwrap();
@@ -1706,10 +1717,11 @@ impl Simp<'_> {
                     if self.float_let_into_case(c) || self.float_cold_let_inward(c) {
                         self.changed = true;
                     }
+                    self.speculate_let(c);
                 }
             }
             Core::Case(s, binder, alts) => {
-                self.expr(s);
+                self.expr_with_eval(s, true);
                 // A scrutinee that unconditionally diverges (`Fail`, `raise#`, saturated error
                 // call): the enclosing `case` is unreachable.
                 if is_bottom_expr(s) {
@@ -1725,6 +1737,19 @@ impl Simp<'_> {
                         let b = binder.clone();
                         let Some(Alt::Default(mut body)) = alts.pop() else { unreachable!() };
                         subst(&mut body, &b, &v);
+                        *c = body;
+                        self.changed = true;
+                        self.expr(c);
+                        return;
+                    }
+                }
+                // A case of an atomic literal with one default alternative is that alternative.
+                if let (Core::Lit(lit), [Alt::Default(_)]) = (&**s, &alts[..]) {
+                    if is_atom(s) {
+                        let lit = Core::Lit(lit.clone());
+                        let b = binder.clone();
+                        let Some(Alt::Default(mut body)) = alts.pop() else { unreachable!() };
+                        subst(&mut body, &b, &lit);
                         *c = body;
                         self.changed = true;
                         self.expr(c);
@@ -1940,7 +1965,7 @@ impl Simp<'_> {
                                 .as_ref()
                                 .filter(|sv| *sv != binder)
                                 .map(|sv| (sv.clone(), self.local_known.insert(sv.clone(), known_val)));
-                            self.expr(b);
+                            self.expr_with_eval(b, true);
                             if let Some(prev) = prev_binder {
                                 self.local_known.insert(binder.clone(), prev);
                             } else {
@@ -1957,7 +1982,7 @@ impl Simp<'_> {
                                 self.evaluated.remove(&v);
                             }
                         }
-                        Alt::Lit(_, b) | Alt::Default(b) => self.expr(b),
+                        Alt::Lit(_, b) | Alt::Default(b) => self.expr_with_eval(b, true),
                     }
                 }
                 if let Some((k, prev)) = added_enum_tag {
@@ -1997,7 +2022,7 @@ impl Simp<'_> {
                 if args.len() == 1
                     && matches!(p.as_str(), "int2Word#" | "word2Int#" | "integerToInt" | "integerToWord" | "unsafeCoerce" | "unsafeCoerce#" | "coerce") =>
             {
-                self.expr(&mut args[0]);
+                self.expr_with_eval(&mut args[0], true);
                 let integer = p.starts_with("integer");
                 if integer && matches!(&args[0], Core::Case(_, _, alts) if matches!(&alts[..], [Alt::Default(_)])) {
                     let Core::Prim(p, mut args) = take(c) else { unreachable!() };
@@ -2020,7 +2045,7 @@ impl Simp<'_> {
                 }
             }
             Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
-                args.iter_mut().for_each(|a| self.expr(a));
+                args.iter_mut().for_each(|a| self.expr_with_eval(a, true));
                 // Each argument that is not an atom is evaluated first, into a fresh variable.
                 let mut cases = Vec::new();
                 for a in args.iter_mut() {
@@ -2057,16 +2082,37 @@ impl Simp<'_> {
                 self.changed = true;
                 self.expr(c);
             }
-            Core::Con(_, args) => args.iter_mut().for_each(|a| self.expr(a)),
+            Core::Con(_, args) => {
+                args.iter_mut().for_each(|a| self.expr_with_eval(a, false));
+                if self.eval_pos {
+                    let mut cases = Vec::new();
+                    for a in args.iter_mut() {
+                        if !is_atom(a) && ok_for_speculation(a, &self.evaluated) {
+                            *self.fresh += 1;
+                            let v = format!("sp~{}", self.fresh);
+                            cases.push((v.clone(), std::mem::replace(a, Core::Var(v))));
+                        }
+                    }
+                    if !cases.is_empty() {
+                        self.changed = true;
+                        let mut e = take(c);
+                        for (v, a) in cases.into_iter().rev() {
+                            e = Core::Case(Box::new(a), v, vec![Alt::Default(e)]);
+                        }
+                        *c = e;
+                        self.expr(c);
+                    }
+                }
+            }
             Core::Prim(p, args) => {
                 if p == "raise#" {
                     let saved_budget = std::mem::replace(&mut self.budget, 0);
                     let saved_rule_budget = std::mem::replace(&mut self.rule_budget, 0);
-                    args.iter_mut().for_each(|a| self.expr(a));
+                    args.iter_mut().for_each(|a| self.expr_with_eval(a, false));
                     self.budget = saved_budget;
                     self.rule_budget = saved_rule_budget;
                 } else {
-                    args.iter_mut().for_each(|a| self.expr(a));
+                    args.iter_mut().for_each(|a| self.expr_with_eval(a, false));
                 }
             }
         }
@@ -2101,6 +2147,24 @@ impl Simp<'_> {
             }
         }
         *c = Core::Case(Box::new(e), x, alts);
+        self.changed = true;
+    }
+
+    /// Converts a non-recursive `let x = e in body` into `case e as x of _ -> body` when `e` is a
+    /// small total primitive computation on already-evaluated operands (`ok_for_speculation`),
+    /// avoiding thunk allocation even when `x` is only referenced inside lazy constructor fields.
+    fn speculate_let(&mut self, c: &mut Core) {
+        let Core::Let(bs, body) = c else { return };
+        let [(x, e)] = &bs[..] else { return };
+        if mentions(e, x) || self.is_value(e) || !mentions(body, x) {
+            return;
+        }
+        if !ok_for_speculation(e, &self.evaluated) {
+            return;
+        }
+        let Core::Let(mut bs, body) = take(c) else { unreachable!() };
+        let (x, e) = bs.pop().expect("one binding");
+        *c = Core::Case(Box::new(e), x, vec![Alt::Default(*body)]);
         self.changed = true;
     }
 
@@ -4163,19 +4227,63 @@ fn fold(p: &str, args: &[Core]) -> Option<i64> {
     })
 }
 
-/// A primitive without effects that cannot fail, on atoms: its result unused, it can go.
-fn is_total_prim(p: &str, args: &[Core]) -> bool {
+/// A pure, non-failing primitive operation (regardless of whether its arguments are atoms).
+fn is_total_prim_op(p: &str, args: &[Core]) -> bool {
     const TOTAL: &[&str] = &[
         "+#", "-#", "*#", "andI#", "orI#", "xorI#", "notI#", "negateInt#", "==#", "/=#", "<#", "<=#", ">#", ">=#",
         "plusWord#", "minusWord#", "timesWord#", "and#", "or#", "xor#", "not#", "eqWord#", "neWord#", "ltWord#",
         "leWord#", "gtWord#", "geWord#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#", "geChar#", "ord#",
         "int2Word#", "word2Int#", "uncheckedIShiftL#", "uncheckedIShiftRA#", "uncheckedIShiftRL#",
         "uncheckedShiftL#", "uncheckedShiftRL#",
+        "+##", "-##", "*##", "/##", "==##", "/=##", "<##", "<=##", ">##", ">=##",
+        "sqrtDouble#", "negateDouble#", "fabsDouble#", "int2Double#", "double2Int#", "word2Double#",
+        "plusFloat#", "minusFloat#", "timesFloat#", "divideFloat#", "eqFloat#", "neFloat#", "ltFloat#", "leFloat#",
+        "gtFloat#", "geFloat#", "sqrtFloat#", "negateFloat#", "fabsFloat#", "int2Float#", "float2Int#",
+        "word2Float#", "float2Double#", "double2Float#",
     ];
     let divides = matches!(p, "quotInt#" | "remInt#")
         && matches!(args.get(1), Some(Core::Lit(Lit::Int(d))) if *d != 0 && *d != -1);
     let tag_to_enum = p == "tagToEnum#" && matches!(args, [Core::Lit(Lit::Int(0 | 1))]);
-    (TOTAL.contains(&p) || divides || tag_to_enum) && args.iter().all(is_atom)
+    TOTAL.contains(&p) || divides || tag_to_enum
+}
+
+/// A primitive without effects that cannot fail, on atoms: its result unused, it can go.
+fn is_total_prim(p: &str, args: &[Core]) -> bool {
+    is_total_prim_op(p, args) && args.iter().all(is_atom)
+}
+
+/// Maximum Core node size of an expression eligible for speculation.
+const SPECULATE_SIZE: usize = 24;
+
+/// True when `e` is a small, pure, non-failing primitive computation whose free operands are all
+/// already in WHNF (`evaluated` or atomic literals), so evaluating it eagerly cannot change
+/// termination or exception semantics and avoids allocating a thunk.
+fn ok_for_speculation(e: &Core, evaluated: &HashSet<String>) -> bool {
+    fn go<'a>(e: &'a Core, evaluated: &HashSet<String>, extra: &mut Vec<&'a str>, depth: usize) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        match e {
+            Core::Lit(Lit::Int(_) | Lit::Char(_) | Lit::Double(_)) => true,
+            Core::Var(x) => evaluated.contains(x.as_str()) || extra.contains(&x.as_str()),
+            Core::Prim(p, args) => {
+                is_total_prim_op(p, args) && args.iter().all(|a| go(a, evaluated, extra, depth - 1))
+            }
+            Core::Case(s, b, alts) => {
+                let [Alt::Default(body)] = &alts[..] else { return false };
+                if !go(s, evaluated, extra, depth - 1) {
+                    return false;
+                }
+                extra.push(b.as_str());
+                let ok = go(body, evaluated, extra, depth - 1);
+                extra.pop();
+                ok
+            }
+            _ => false,
+        }
+    }
+    let mut extra = Vec::new();
+    size(e, SPECULATE_SIZE + 1) <= SPECULATE_SIZE && go(e, evaluated, &mut extra, 16)
 }
 
 /// Primitives that unconditionally force all their arguments left-to-right before returning or
@@ -5093,7 +5201,7 @@ mod rule_tests {
         let mut s = Simp {
             once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), known_enum_tags: HashMap::new(), local_templates: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates, bottom_fns: &no_bottom,
             this: "Test.x", rules: &rules, strict_cons: &no_strict_cons, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
-            fresh: &mut fresh, budget: 0, changed: false, tune: O1,
+            fresh: &mut fresh, budget: 0, changed: false, eval_pos: false, tune: O1,
         };
         s.rewrite(&mut e).then_some(e)
     }
@@ -6536,6 +6644,153 @@ mod rule_tests {
             *false_body,
             app(v("T.ext"), v("s")),
             "False branch must cancel Builtin.(,) allocation directly into T.next s"
+        );
+    }
+
+    #[test]
+    fn speculate_whnf_let_and_con_args_flattens_double_chain() {
+        // Inside a lambda, after forcing d2, dx, ax, ay, mass:
+        // let f = case <sqrtDouble# d2> as u1 of _ -> </## mass u1>
+        // in [Builtin.(,) (case <*## f dx> as u2 of _ -> <+## ax u2>) ay]
+        // Both `f` and the first pair field must be speculated into flat `Core::Case` chains
+        // with atomic arguments to `Builtin.(,)`.
+        let sqrt_e = Core::Case(
+            Box::new(Core::Prim("sqrtDouble#".into(), vec![v("d2")])),
+            "u1".into(),
+            vec![Alt::Default(Core::Prim("/##".into(), vec![v("mass"), v("u1")]))],
+        );
+        let field1 = Core::Case(
+            Box::new(Core::Prim("*##".into(), vec![v("f"), v("dx")])),
+            "u2".into(),
+            vec![Alt::Default(Core::Prim("+##".into(), vec![v("ax"), v("u2")]))],
+        );
+        let let_e = Core::Let(
+            vec![("f".into(), sqrt_e)],
+            Box::new(Core::Con("Builtin.(,)".into(), vec![field1, v("ay")])),
+        );
+        let wrap_force = |var: &str, inner: Core| {
+            Core::Case(Box::new(v(var)), format!("b_{var}"), vec![Alt::Default(inner)])
+        };
+        let body = Core::Lam(
+            "d2".into(),
+            Box::new(Core::Lam(
+                "dx".into(),
+                Box::new(Core::Lam(
+                    "ax".into(),
+                    Box::new(Core::Lam(
+                        "ay".into(),
+                        Box::new(Core::Lam(
+                            "mass".into(),
+                            Box::new(wrap_force(
+                                "d2",
+                                wrap_force(
+                                    "dx",
+                                    wrap_force("ax", wrap_force("ay", wrap_force("mass", let_e))),
+                                ),
+                            )),
+                        )),
+                    )),
+                )),
+            )),
+        );
+        let mut binds = vec![TopBind { name: "T.pull".into(), body }];
+        simplify(&mut binds);
+        fn assert_no_let_and_atomic_con(e: &Core) {
+            match e {
+                Core::Let(..) => panic!("unexpected Let remaining after speculation: {e:?}"),
+                Core::Con(k, args) => {
+                    assert_eq!(k, "Builtin.(,)");
+                    assert!(args.iter().all(is_atom), "expected atomic Con args, got: {args:?}");
+                }
+                Core::Case(_, _, alts) => {
+                    for a in alts {
+                        let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                        assert_no_let_and_atomic_con(b);
+                    }
+                }
+                Core::Lam(_, b) => assert_no_let_and_atomic_con(b),
+                _ => {}
+            }
+        }
+        assert_no_let_and_atomic_con(&binds[0].body);
+    }
+
+    #[test]
+    fn speculate_does_not_force_unevaluated_operands() {
+        // `a` is NOT evaluated: speculating `a +# 1#` inside a lazy pair would change semantics
+        // if `a` diverges and the first component is never demanded.
+        let pair = Core::Con(
+            "Builtin.(,)".into(),
+            vec![Core::Prim("+#".into(), vec![v("a"), Core::Lit(Lit::Int(1))]), v("b")],
+        );
+        let body = Core::Lam("a".into(), Box::new(Core::Lam("b".into(), Box::new(pair))));
+        let mut binds = vec![TopBind { name: "T.lazy_pair".into(), body }];
+        simplify(&mut binds);
+        let (_, inner) = params(&binds[0].body);
+        assert!(
+            matches!(inner, Core::Con(k, _) if k == "Builtin.(,)"),
+            "must not hoist primop on unevaluated operand out of Con: {inner:?}"
+        );
+    }
+
+    #[test]
+    fn speculate_does_not_turn_let_bound_con_into_thunk() {
+        // `let p = Just (x +# 1#) in T.use p p` where `x` is evaluated:
+        // `p` is a value (Core::Con) bound in a non-eval position; we must not wrap `p`'s RHS in
+        // a `Core::Case`, which would turn `p` from a WHNF constructor into a thunk.
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        let p_rhs = Core::Con(
+            "GHC.Maybe.Just".into(),
+            vec![Core::Prim("+#".into(), vec![v("x"), Core::Lit(Lit::Int(1))])],
+        );
+        let inner = Core::Let(
+            vec![("p".into(), p_rhs)],
+            Box::new(app(app(v("T.use"), v("p")), v("p"))),
+        );
+        let body = Core::Lam(
+            "x".into(),
+            Box::new(Core::Case(Box::new(v("x")), "bx".into(), vec![Alt::Default(inner)])),
+        );
+        let mut binds = vec![TopBind { name: "T.keep_con".into(), body }];
+        simplify(&mut binds);
+        fn find_p_rhs(e: &Core) -> Option<&Core> {
+            match e {
+                Core::Lam(_, b) => find_p_rhs(b),
+                Core::Case(_, _, alts) => alts.iter().find_map(|a| {
+                    let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                    find_p_rhs(b)
+                }),
+                Core::Let(bs, body) => bs
+                    .iter()
+                    .find(|(n, _)| n == "p")
+                    .map(|(_, r)| r)
+                    .or_else(|| find_p_rhs(body)),
+                _ => None,
+            }
+        }
+        let rhs = find_p_rhs(&binds[0].body).expect("let binding p should remain");
+        assert!(
+            matches!(rhs, Core::Con(k, _) if k == "GHC.Maybe.Just"),
+            "let-bound constructor must remain a Core::Con value, got: {rhs:?}"
+        );
+    }
+
+    #[test]
+    fn case_of_atomic_literal_default_eliminates() {
+        // `case 0.01## as bb of _ -> <+## x bb>` simplifies to `<+## x 0.01##>`.
+        let expr = Core::Case(
+            Box::new(Core::Lit(Lit::Double(0.01))),
+            "bb".into(),
+            vec![Alt::Default(Core::Prim("+##".into(), vec![v("x"), v("bb")]))],
+        );
+        let body = Core::Lam("x".into(), Box::new(expr));
+        let mut binds = vec![TopBind { name: "T.lit_case".into(), body }];
+        simplify(&mut binds);
+        let (_, inner) = params(&binds[0].body);
+        assert_eq!(
+            *inner,
+            Core::Prim("+##".into(), vec![v("x"), Core::Lit(Lit::Double(0.01))]),
+            "atomic literal default case must fold away"
         );
     }
 }
