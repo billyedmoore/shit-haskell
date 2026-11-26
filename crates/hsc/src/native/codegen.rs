@@ -162,6 +162,8 @@ pub struct Gen {
     prim_names: Vec<String>,
     /// Entry labels, fixed arities, and `uses_closure` in program-global index order.
     known_globals: Vec<(u32, String, bool)>,
+    /// Minimum argument count at which calling each global unconditionally diverges, if known.
+    global_error_arity: Vec<Option<usize>>,
     /// Closure bodies still to generate: (label, closure, name for debugging).
     pending: Vec<(String, SClosure, String)>,
     /// The bodies in the order they are emitted (their addresses increase): (label, name).
@@ -469,6 +471,7 @@ impl Gen {
             prim_ids: HashMap::new(),
             prim_names: Vec::new(),
             known_globals: Vec::new(),
+            global_error_arity: Vec::new(),
             pending: Vec::new(),
             body_names: Vec::new(),
             current_name: String::new(),
@@ -504,6 +507,34 @@ impl Gen {
             uses_charlike: false,
             rodata_tables: Vec::new(),
             cold_out: String::new(),
+        }
+    }
+
+    /// Whether `e` unconditionally diverges via a pattern failure, `raise#`, or saturated call to
+    /// a known error function (`error`, `indexError`, `patError`, etc.).
+    fn is_cold_error(&self, e: &SExpr) -> bool {
+        match e {
+            SExpr::Fail(_) => true,
+            SExpr::Prim(p, args) => p == "raise#" && args.len() == 1,
+            SExpr::Atom(Atom::Global(g)) => {
+                self.global_error_arity.get(*g as usize).and_then(|x| *x) == Some(0)
+            }
+            SExpr::App(Atom::Global(g), args) | SExpr::CallWorker(g, args) => self
+                .global_error_arity
+                .get(*g as usize)
+                .and_then(|x| *x)
+                .is_some_and(|min| args.len() >= min),
+            SExpr::Let(_, body) | SExpr::Join(_, _, _, body) => self.is_cold_error(body),
+            SExpr::Case(scrut, _, alts) => {
+                self.is_cold_error(scrut)
+                    || (!alts.is_empty()
+                        && alts.iter().all(|a| match a {
+                            SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => {
+                                self.is_cold_error(b)
+                            }
+                        }))
+            }
+            _ => false,
         }
     }
 
@@ -573,6 +604,7 @@ impl Gen {
             // Register every entry before emitting bodies, including forward/mutual calls.
             let arity = if gl.closure.captures.is_empty() { gl.closure.arity } else { 0 };
             g.known_globals.push((arity, l.clone(), gl.closure.uses_closure));
+            g.global_error_arity.push(crate::core::simplify::diverging_error_arity(&gl.name));
             if gl.closure.arity == 0 && gl.closure.captures.is_empty() {
                 match &gl.closure.body {
                     SExpr::Con(name, args) if args.is_empty() => {
@@ -618,6 +650,12 @@ impl Gen {
                             let info = g.known_globals[*target as usize].clone();
                             if info.0 > 0 && !info.2 {
                                 g.known_globals[gi] = info;
+                                changed = true;
+                            }
+                        }
+                        if g.global_error_arity[gi].is_none() {
+                            if let Some(min) = g.global_error_arity[*target as usize] {
+                                g.global_error_arity[gi] = Some(min);
                                 changed = true;
                             }
                         }
@@ -2289,6 +2327,32 @@ impl Gen {
                 return true;
             }
         }
+        if let Some((t_body, f_body)) = two_way {
+            let cold_hot = if self.is_cold_error(t_body) && !self.is_cold_error(f_body) {
+                Some((cc, t_body, f_body))
+            } else if self.is_cold_error(f_body) && !self.is_cold_error(t_body) {
+                Some((negated, f_body, t_body))
+            } else {
+                None
+            };
+            if let Some((cold_cc, cold_body, hot_body)) = cold_hot {
+                let cold_lbl = self.label("cold");
+                self.emit(&format!("j{cold_cc} {cold_lbl}"));
+                let snapshot = self.cache.clone();
+                let safe_snap = self.safe_slots;
+                let kind_snap = self.known_kind.clone();
+                self.expr(hot_body, p);
+                self.emit_cold(|g| {
+                    g.put_label(&cold_lbl);
+                    g.cache = snapshot;
+                    g.safe_slots = safe_snap;
+                    g.known_kind = kind_snap;
+                    g.expr(cold_body, p);
+                });
+                emit_joins(self, safe_snap);
+                return true;
+            }
+        }
         let labels: Vec<String> = alts.iter().map(|_| self.label("alt")).collect();
         for (a, l) in alts.iter().zip(&labels) {
             match a {
@@ -2564,6 +2628,67 @@ impl Gen {
                         g.emit(if is_char { "cmpl %edx, %ecx" } else { "cmpq %rdx, %rcx" });
                         let _ = writeln!(g.out, "    j{j2} {l2}");
                         let _ = writeln!(g.out, "    jmp {l3}");
+                    });
+                }
+                return true;
+            }
+        }
+
+        if let Some((t_body, f_body)) = two_way {
+            let cold_hot = if self.is_cold_error(t_body) && !self.is_cold_error(f_body) {
+                Some((cc, 1i64, t_body, f_body))
+            } else if self.is_cold_error(f_body) && !self.is_cold_error(t_body) {
+                Some((negated, 0i64, f_body, t_body))
+            } else {
+                None
+            };
+            if let Some((cold_cc, cold_val, cold_body, hot_body)) = cold_hot {
+                let cold_lbl = self.label("cold");
+                let hot_lbl = self.label("hot");
+                let _ = writeln!(self.out, "    j{cold_cc} {cold_lbl}");
+                self.put_label(&hot_lbl);
+                self.known_kind = post_kind.clone();
+                self.expr(hot_body, p);
+                self.emit_cold(|g| {
+                    g.put_label(&cold_lbl);
+                    g.cache = saved_cache.clone();
+                    g.safe_slots = saved_safe;
+                    g.known_kind = post_kind.clone();
+                    g.expr(cold_body, p);
+                });
+                emit_joins(self);
+                if emitted_slow {
+                    let cont = self.label("k");
+                    let live = self.case_live(alts, bslot, p);
+                    self.emit_cold(|g| {
+                        g.put_label(&slow);
+                        g.save_cache(&saved_cache, p);
+                        g.cache.clear();
+                        g.safe_slots = saved_safe;
+                        g.known_kind = saved_kind;
+                        g.zero_unsafe_slots(p, true);
+                        g.emit("subq $8, %rbp");
+                        let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                        g.emit("movq %rax, (%rbp)");
+                        let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
+                        g.live.push(live.clone());
+                        g.slow_only = true;
+                        g.prim(name, args, sp);
+                        g.live.pop();
+                        let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
+                        let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                        g.put_label(&cont);
+                        g.emit("addq $8, %rbp");
+                        for &s in &newly_checked {
+                            if live.contains(&s) || live.contains(&ALL_LIVE) {
+                                g.chase_ind_slot(s, p);
+                            }
+                        }
+                        g.reload_cache(&saved_cache, p);
+                        g.emit("movq 8(%r14), %rcx");
+                        let _ = writeln!(g.out, "    cmpq ${cold_val}, %rcx");
+                        let _ = writeln!(g.out, "    je {cold_lbl}");
+                        let _ = writeln!(g.out, "    jmp {hot_lbl}");
                     });
                 }
                 return true;
@@ -3955,6 +4080,7 @@ impl Gen {
         let end = alts.iter().position(|a| matches!(a, SAlt::Default(_))).unwrap_or(alts.len());
         let all_int = end >= 8 && alts[..end].iter().all(|a| matches!(a, SAlt::Lit(Lit::Int(_), _)));
         let all_char = !all_int && end >= 8 && alts[..end].iter().all(|a| matches!(a, SAlt::Lit(Lit::Char(_), _)));
+        let mut fallthrough_idx: Option<usize> = None;
         if all_int || all_char {
             let has_def = end < alts.len();
             let def_lbl = if has_def { labels[end].clone() } else { self.label("fail") };
@@ -4077,11 +4203,19 @@ impl Gen {
             let _ = writeln!(self.out, "    cmpl ${id}, 4(%r14)");
             let _ = writeln!(self.out, "    jne {fl}");
             fail_lbl = Some(fl);
-        } else if let [SAlt::Con(name, _, _), SAlt::Default(_)] = alts {
-            // Con + Default: invert to `jne default` so alt 0 falls straight through.
+            fallthrough_idx = Some(0);
+        } else if let [SAlt::Con(name, _, b0), SAlt::Default(b1)] = alts {
             let id = self.con_id(name);
             let _ = writeln!(self.out, "    cmpl ${id}, 4(%r14)");
-            let _ = writeln!(self.out, "    jne {}", labels[1]);
+            if fast_body.is_none() && self.is_cold_error(b0) && !self.is_cold_error(b1) {
+                // Alt 0 is a cold error: branch to it so the hot default falls straight through.
+                let _ = writeln!(self.out, "    je {}", labels[0]);
+                fallthrough_idx = Some(1);
+            } else {
+                // Con + Default: invert to `jne default` so alt 0 falls straight through.
+                let _ = writeln!(self.out, "    jne {}", labels[1]);
+                fallthrough_idx = Some(0);
+            }
         } else {
             let mut has_default = false;
             let con_count = alts.iter().filter(|a| matches!(a, SAlt::Con(..))).count();
@@ -4168,62 +4302,83 @@ impl Gen {
                 g.fail(&fail_msg, p);
             });
         }
-        for (idx, (a, l)) in alts.iter().zip(&labels).enumerate() {
+        let order: Vec<usize> = if fallthrough_idx == Some(1) {
+            vec![1, 0]
+        } else {
+            (0..alts.len()).collect()
+        };
+        for idx in order {
             if skipped_alts.contains(&idx) {
                 continue;
             }
-            self.cache = alt_cache.clone();
-            self.safe_slots = alt_safe;
-            self.known_kind = alt_kind.clone();
-            match a {
-                SAlt::Con(_, slots, body) => {
-                    self.put_label(l);
-                    for (i, s) in slots.iter().enumerate() {
-                        if *s == UNUSED_SLOT {
-                            continue;
-                        }
-                        if *s & RAW != 0 {
-                            let _ = writeln!(self.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
-                            self.emit("movq 8(%rcx), %rcx");
-                            let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(*s));
-                            self.cache.retain(|c| raw_idx(c.slot) != raw_idx(*s));
-                        } else {
-                            let _ = writeln!(self.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
-                            let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*s));
-                            self.mark_slot_safe(*s);
-                            self.known_kind.remove(s);
-                        }
+            let a = &alts[idx];
+            let l = &labels[idx];
+            if let SAlt::Default(SExpr::Fail(msg)) = a {
+                self.emit_cold(|g| {
+                    g.safe_slots = alt_safe;
+                    g.put_label(l);
+                    // Diagnostic: a pattern failure leaves the scrutinee in the record.
+                    if bslot != UNUSED_SLOT {
+                        let _ = writeln!(g.out, "    movq {}(%rbp), %rax", p.slot_off(bslot));
+                        let _ = writeln!(g.out, "    movq %rax, {}(%rbx)", mach::R1);
+                    } else {
+                        let _ = writeln!(g.out, "    movq %r14, {}(%rbx)", mach::R1);
                     }
-                    if idx == 0 {
-                        if let Some(fb) = fast_body {
-                            self.put_label(fb);
-                        }
-                    }
-                    self.expr(body, p);
-                }
-                SAlt::Default(SExpr::Fail(msg)) => {
-                    self.emit_cold(|g| {
-                        g.safe_slots = alt_safe;
+                    g.fail(msg, p);
+                });
+                continue;
+            }
+            let body = match a {
+                SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => b,
+            };
+            let cold = Some(idx) != fallthrough_idx
+                && !(idx == 0 && fast_body.is_some())
+                && self.is_cold_error(body);
+            let emit_alt = |g: &mut Self| {
+                g.cache = alt_cache.clone();
+                g.safe_slots = alt_safe;
+                g.known_kind = alt_kind.clone();
+                match a {
+                    SAlt::Con(_, slots, body) => {
                         g.put_label(l);
-                        // Diagnostic: a pattern failure leaves the scrutinee in the record.
-                        if bslot != UNUSED_SLOT {
-                            let _ = writeln!(g.out, "    movq {}(%rbp), %rax", p.slot_off(bslot));
-                            let _ = writeln!(g.out, "    movq %rax, {}(%rbx)", mach::R1);
-                        } else {
-                            let _ = writeln!(g.out, "    movq %r14, {}(%rbx)", mach::R1);
+                        for (i, s) in slots.iter().enumerate() {
+                            if *s == UNUSED_SLOT {
+                                continue;
+                            }
+                            if *s & RAW != 0 {
+                                let _ = writeln!(g.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
+                                g.emit("movq 8(%rcx), %rcx");
+                                let _ = writeln!(g.out, "    movq %rcx, {}", p.slot(*s));
+                                g.cache.retain(|c| raw_idx(c.slot) != raw_idx(*s));
+                            } else {
+                                let _ = writeln!(g.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
+                                let _ = writeln!(g.out, "    movq %rcx, {}(%rbp)", p.slot_off(*s));
+                                g.mark_slot_safe(*s);
+                                g.known_kind.remove(s);
+                            }
                         }
-                        g.fail(msg, p);
-                    });
-                }
-                SAlt::Lit(_, body) | SAlt::Default(body) => {
-                    self.put_label(l);
-                    if idx == 0 {
-                        if let Some(fb) = fast_body {
-                            self.put_label(fb);
+                        if idx == 0 {
+                            if let Some(fb) = fast_body {
+                                g.put_label(fb);
+                            }
                         }
+                        g.expr(body, p);
                     }
-                    self.expr(body, p);
+                    SAlt::Lit(_, body) | SAlt::Default(body) => {
+                        g.put_label(l);
+                        if idx == 0 {
+                            if let Some(fb) = fast_body {
+                                g.put_label(fb);
+                            }
+                        }
+                        g.expr(body, p);
+                    }
                 }
+            };
+            if cold {
+                self.emit_cold(emit_alt);
+            } else {
+                emit_alt(self);
             }
         }
     }
@@ -7903,6 +8058,134 @@ mod sprint6_codegen_tests {
             1,
             "only long string should call hsc_mk_literal_rt"
         );
+    }
+
+    #[test]
+    fn cold_error_arms_move_out_of_line() {
+        // Global 0: GHC.Internal.Err.error (arity 2, diverging).
+        let err_g = SGlobal {
+            name: "GHC.Internal.Err.error".into(),
+            closure: simple_closure(2, 3, 0, SExpr::Fail("err".into())),
+            worker: None,
+        };
+        // Global 1: raw compare_and_branch where False calls error and True returns raw0.
+        let mut raw_cmp = simple_closure(
+            0,
+            1,
+            2,
+            SExpr::Case(
+                Box::new(SExpr::Prim("<#".into(), vec![Atom::Slot(RAW | 0), Atom::Lit(SLit::Int(10))])),
+                RAW | 1,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Atom(Atom::Slot(RAW | 1))),
+                    UNUSED_SLOT,
+                    vec![
+                        SAlt::Lit(
+                            Lit::Int(0),
+                            SExpr::App(
+                                Atom::Global(0),
+                                vec![Atom::Lit(SLit::Int(0)), Atom::Lit(SLit::Int(1))],
+                            ),
+                        ),
+                        SAlt::Default(SExpr::Prim(
+                            "+#".into(),
+                            vec![Atom::Slot(RAW | 0), Atom::Lit(SLit::Int(1))],
+                        )),
+                    ],
+                ))],
+            ),
+        );
+        raw_cmp.raw_args = vec![(0, RAW | 0)];
+        raw_cmp.ret_raw = true;
+        let g1 = SGlobal { name: "Test.raw_bounds".into(), closure: raw_cmp, worker: None };
+        // Global 2: boxed_compare_and_branch where True calls error and False returns slot1.
+        let boxed_cmp = simple_closure(
+            1,
+            2,
+            1,
+            SExpr::Case(
+                Box::new(SExpr::Prim("<#".into(), vec![Atom::Slot(1), Atom::Lit(SLit::Int(0))])),
+                RAW | 0,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Atom(Atom::Slot(RAW | 0))),
+                    UNUSED_SLOT,
+                    vec![
+                        SAlt::Lit(
+                            Lit::Int(1),
+                            SExpr::App(
+                                Atom::Global(0),
+                                vec![Atom::Lit(SLit::Int(0)), Atom::Lit(SLit::Int(1))],
+                            ),
+                        ),
+                        SAlt::Default(SExpr::Atom(Atom::Slot(1))),
+                    ],
+                ))],
+            ),
+        );
+        let g2 = SGlobal { name: "Test.boxed_bounds".into(), closure: boxed_cmp, worker: None };
+        // Global 3: Con + Default where Con is cold error and Default is hot.
+        let con_case = simple_closure(
+            1,
+            2,
+            0,
+            SExpr::Case(
+                Box::new(SExpr::Atom(Atom::Slot(1))),
+                UNUSED_SLOT,
+                vec![
+                    SAlt::Con(
+                        "Builtin.[]".into(),
+                        vec![],
+                        SExpr::App(
+                            Atom::Global(0),
+                            vec![Atom::Lit(SLit::Int(0)), Atom::Lit(SLit::Int(1))],
+                        ),
+                    ),
+                    SAlt::Default(SExpr::Atom(Atom::Slot(1))),
+                ],
+            ),
+        );
+        let g3 = SGlobal { name: "Test.con_bounds".into(), closure: con_case, worker: None };
+        let prog = make_prog(vec![err_g, g1, g2, g3]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbls: Vec<&str> = table
+            .lines()
+            .take(4)
+            .map(|l| l.rsplit_once(',').unwrap().1.split_whitespace().next().unwrap())
+            .collect();
+        let slice_fn = |lbl: &str| {
+            let start = asm.find(&format!("{lbl}:\n")).expect("label");
+            let end = lbls
+                .iter()
+                .filter_map(|other| {
+                    if *other == lbl {
+                        None
+                    } else {
+                        asm[start + 1..].find(&format!("\n{other}:\n")).map(|i| start + 1 + i)
+                    }
+                })
+                .chain(asm[start + 1..].find("\n    .section").map(|i| start + 1 + i))
+                .min()
+                .unwrap_or(asm.len());
+            &asm[start..end]
+        };
+        let err_lbl = lbls[0];
+        for (name, lbl) in [("raw", lbls[1]), ("boxed", lbls[2]), ("con", lbls[3])] {
+            let body = slice_fn(lbl);
+            let ret_pos = body
+                .find("jmp *(%rbp)")
+                .into_iter()
+                .chain(body.find("jmp hsc_eval"))
+                .min()
+                .unwrap_or_else(|| panic!("{name}: missing ret:\n{body}"));
+            let err_pos = body
+                .find(&format!("jmp {err_lbl}"))
+                .unwrap_or_else(|| panic!("{name}: missing err call:\n{body}"));
+            assert!(
+                ret_pos < err_pos,
+                "{name}: expected hot path before cold error call:\n{body}"
+            );
+        }
     }
 }
 
