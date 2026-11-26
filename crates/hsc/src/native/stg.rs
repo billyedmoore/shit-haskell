@@ -31,6 +31,10 @@ pub enum SLit {
     Frac(String),
 }
 
+/// Maximum byte length of a string literal emitted as static `Builtin.:`/`Builtin.[]` cells in
+/// `.data.rel.ro` rather than constructed dynamically via `hsc_mk_literal`.
+pub const MAX_STATIC_STR_LEN: usize = 128;
+
 /// A heap object bound in `SExpr::Let`: a closure (function/thunk), a constructor allocated
 /// directly in weak head normal form, or a boxed cell materialized from a raw slot.
 #[derive(Clone, Debug)]
@@ -1637,9 +1641,10 @@ impl Lowering {
                 }
                 other => other,
             },
-            // Numbers, small Integers and characters are static objects; the others are built when they are used.
+            // Numbers, small Integers, characters and short strings are static objects; the others are built when they are used.
             Core::Lit(l @ (Lit::Int(_) | Lit::Double(_) | Lit::Char(_))) => Atom::Lit(slit(l)),
             Core::Lit(Lit::Integer(s)) if s.parse::<i64>().is_ok() => Atom::Lit(SLit::Integer(s.clone())),
+            Core::Lit(Lit::Str(s)) if s.len() <= MAX_STATIC_STR_LEN => Atom::Lit(SLit::Str(s.clone())),
             Core::Con(con, args) => {
                 let atoms: Vec<Atom> = args.iter().map(|a| self.atom(a)).collect();
                 let b = self.bodies.last_mut().expect("body");
