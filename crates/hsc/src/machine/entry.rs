@@ -168,11 +168,13 @@ impl Machine {
         self.top = outer_top;
         if status == 0 {
             let r = self.r1;
+            self.r1 = 0;
             if matches!(heap::kind_of(self.heap_get(r, 0)), kind::THUNK | kind::IND) {
                 return self.force(r);
             }
             Some(r)
         } else {
+            self.r1 = 0;
             self.prim_failed = true;
             None
         }
@@ -210,7 +212,11 @@ pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
     // meanwhile is raised in place of the primitive.
     if super::conc::safe_point(mp) {
         // SAFETY: machine is valid for the running thread.
-        unsafe { (*mp).prim_nargs = prev_nargs };
+        unsafe {
+            let m = &mut *mp;
+            m.args[..nargs].fill(0);
+            m.prim_nargs = prev_nargs;
+        }
         return 0;
     }
     // SAFETY: re-derive after safe_point (which may have switched coroutines and back).
@@ -223,7 +229,11 @@ pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
     if let super::PrimDispatch::Conc(op) = dispatch {
         let r = op.run_fast(mp);
         // SAFETY: re-derive after possible coroutine switch.
-        unsafe { (*mp).prim_nargs = prev_nargs };
+        unsafe {
+            let m = &mut *mp;
+            m.args[..nargs].fill(0);
+            m.prim_nargs = prev_nargs;
+        }
         return r;
     }
     // A primitive builds its result from several allocations, holding the earlier objects in Rust
@@ -239,6 +249,7 @@ pub extern "C" fn hsc_prim(mp: *mut Machine, id: u64, nargs: u64) -> Word {
     };
     // SAFETY: re-derive in case the primitive switched coroutines.
     let m = unsafe { &mut *mp };
+    m.args[..nargs].fill(0);
     m.prim_nargs = prev_nargs;
     // Generated code takes a primitive's result as a value: a thunk (a result that is a variable of
     // the program, not yet evaluated) is evaluated here first.
@@ -443,8 +454,11 @@ impl Machine {
         self.sp = outer_sp;
         self.top = outer_top;
         if status == 0 {
-            Some(self.r1)
+            let r = self.r1;
+            self.r1 = 0;
+            Some(r)
         } else {
+            self.r1 = 0;
             self.prim_failed = true;
             None
         }
