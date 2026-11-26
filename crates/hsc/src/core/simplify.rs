@@ -850,6 +850,20 @@ fn is_dict_con(name: &str) -> bool {
     name.rsplit('.').next().is_some_and(|c| c.starts_with("D:"))
 }
 
+fn is_dict_rhs(e: &Core) -> bool {
+    match e {
+        Core::Con(k, _) => is_dict_con(k),
+        Core::App(..) => {
+            let mut h = e;
+            while let Core::App(f, _) = h {
+                h = f;
+            }
+            matches!(h, Core::Var(f) if f.rsplit('.').next().is_some_and(|c| c.starts_with("$f") && !c.contains('%')))
+        }
+        _ => false,
+    }
+}
+
 /// Whether a dictionary field is a pure value (no work to duplicate if projected out of a
 /// local dictionary constructor).
 fn is_safe_dict_field(e: &Core) -> bool {
@@ -899,7 +913,7 @@ fn float_dicts_in(c: &mut Core, locals: &mut HashSet<String>, in_lam: bool, owne
                 loop {
                     let group: HashSet<String> = bs.iter().map(|(x, _)| x.clone()).collect();
                     let Some(i) = bs.iter().position(|(x, r)| {
-                        if !matches!(r, Core::Con(k, _) if is_dict_con(k)) || mentions_any(r, locals) {
+                        if !is_dict_rhs(r) || mentions_any(r, locals) {
                             return false;
                         }
                         let mut others = group.clone();
@@ -4620,6 +4634,32 @@ mod rule_tests {
             2,
             "expected T.f to eta-expand to arity 2 through patError and let-bound g: {:?}",
             binds[0].body
+        );
+    }
+
+    #[test]
+    fn float_closed_dict_app_exposes_outer_lambda() {
+        let v = |s: &str| Core::Var(s.into());
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // f = let d = GHC.Classes.$fOrd_10 GHC.Classes.$fOrdChar_11 in \x -> T.use d x
+        let bind = TopBind {
+            name: "T.f".into(),
+            body: Core::Let(
+                vec![("d".into(), app(v("GHC.Classes.$fOrd_10"), v("GHC.Classes.$fOrdChar_11")))],
+                Box::new(Core::Lam("x".into(), Box::new(app(app(v("T.use"), v("d")), v("x"))))),
+            ),
+        };
+        let mut binds = vec![bind];
+        simplify(&mut binds);
+        assert!(
+            matches!(binds[0].body, Core::Lam(..)),
+            "expected closed $f dict application to float out of T.f: {:?}",
+            binds[0].body
+        );
+        assert!(
+            binds.iter().any(|b| b.name.starts_with("T.f%dict")),
+            "expected floated dict TopBind for T.f: {:?}",
+            binds
         );
     }
 }
