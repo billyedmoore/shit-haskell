@@ -4320,23 +4320,104 @@ impl Gen {
             return false;
         }
         // Boxed operands must already be cells of the operand kind; raw ones are numbers.
-        let mut rax_holds_arg0 = false;
-        for (idx, a) in args.iter().enumerate() {
-            // Raw operands and literals are numbers already.
+        // When an operand is a THUNK or IND (common in unoptimised code and lazy data fields),
+        // evaluate it natively out-of-line via `hsc_eval` instead of falling back to `hsc_prim`
+        // (which enters Rust, reserves PRIM_SLACK, and runs a nested `hsc_enter_eval`).
+        let same_args = arity == 2 && args[0] == args[1];
+        let needs_check = |idx: usize| -> bool {
+            if idx == 1 && same_args {
+                return false;
+            }
+            let a = &args[idx];
             if is_raw(a) || matches!(a, Atom::Lit(_)) {
+                return false;
+            }
+            !matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(in_kind)))
+        };
+        let chk0 = needs_check(0);
+        let chk1 = arity == 2 && needs_check(1);
+        let has_free_cache_reg = CACHE_REGS.iter().any(|r| !self.cache.iter().any(|c| c.reg == *r));
+        let non_slot_eval_ok = matches!(k, K::Cmp(_) | K::CharCmp(_) | K::TagToEnum)
+            || (dest.is_none() && matches!(k, K::Bin(_)))
+            || (dest.is_some() && !matches!(k, K::Div(_)) && has_free_cache_reg);
+        let mut rax_arg: Option<usize> = None;
+        for idx in 0..arity {
+            if !(if idx == 0 { chk0 } else { chk1 }) {
                 continue;
             }
-            if matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(in_kind))) {
-                continue;
-            }
+            let a = &args[idx];
             if !(idx == 0 && matches!(a, Atom::Slot(s) if rax_slot == Some(*s))) {
                 self.load(a, p, "%rax");
             }
+            let store_slot = match a {
+                Atom::Slot(s)
+                    if *s != 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) =>
+                {
+                    Some(*s)
+                }
+                _ => None,
+            };
+            let is_last_check = idx == 1 || !chk1;
+            let native_eval = store_slot.is_some() || (is_last_check && non_slot_eval_ok);
             self.emit(&format!("cmpb ${in_kind}, (%rax)"));
-            self.emit(&format!("jne {slow}"));
             self.fast_slow_used = true;
-            rax_holds_arg0 = idx == 0;
+            if native_eval {
+                let eval_lbl = self.label("opev");
+                let ind_lbl = self.label("opind");
+                let chk_thk = self.label("opthk");
+                let ret_lbl = self.label("opret");
+                let got_lbl = self.label("opgot");
+                let _ = writeln!(self.out, "    jne {eval_lbl}");
+                self.put_label(&got_lbl);
+                let cached = self.cache.clone();
+                let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
+                self.emit_cold(|g| {
+                    g.put_label(&eval_lbl);
+                    g.emit("testq %rax, %rax");
+                    let _ = writeln!(g.out, "    je {slow}");
+                    g.put_label(&ind_lbl);
+                    let _ = writeln!(g.out, "    cmpb ${IND}, (%rax)");
+                    let _ = writeln!(g.out, "    jne {chk_thk}");
+                    g.emit("movq 8(%rax), %rax");
+                    g.emit("testq %rax, %rax");
+                    let _ = writeln!(g.out, "    je {slow}");
+                    let _ = writeln!(g.out, "    cmpb ${in_kind}, (%rax)");
+                    let _ = writeln!(g.out, "    jne {ind_lbl}");
+                    if let Some(s) = store_slot {
+                        let _ = writeln!(g.out, "    movq %rax, {}(%rbp)", p.slot_off(s));
+                    }
+                    let _ = writeln!(g.out, "    jmp {got_lbl}");
+                    g.put_label(&chk_thk);
+                    let _ = writeln!(g.out, "    cmpb ${THUNK}, (%rax)");
+                    let _ = writeln!(g.out, "    jne {slow}");
+                    g.save_cache(&cached, p);
+                    g.zero_unsafe_slots(p, false);
+                    g.emit("movq %rax, %r14");
+                    g.emit("subq $8, %rbp");
+                    let _ = writeln!(g.out, "    leaq {ret_lbl}(%rip), %rcx");
+                    g.emit("movq %rcx, (%rbp)");
+                    g.emit("jmp hsc_eval");
+                    let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                    g.put_label(&ret_lbl);
+                    g.emit("addq $8, %rbp");
+                    g.reload_cache(&cached, p);
+                    g.emit("testq %r14, %r14");
+                    let _ = writeln!(g.out, "    je {slow}");
+                    let _ = writeln!(g.out, "    cmpb ${in_kind}, (%r14)");
+                    let _ = writeln!(g.out, "    jne {slow}");
+                    if let Some(s) = store_slot {
+                        let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(s));
+                    }
+                    g.emit("movq %r14, %rax");
+                    let _ = writeln!(g.out, "    jmp {got_lbl}");
+                });
+            } else {
+                self.emit(&format!("jne {slow}"));
+            }
+            rax_arg = Some(idx);
         }
+        let rax_holds_arg0 = rax_arg == Some(0);
+        let rax_holds_arg1 = rax_arg == Some(1) || (rax_arg == Some(0) && same_args);
         if matches!(k, K::Div(_)) {
             // A divisor of 0 or -1 takes the runtime's path (x86 faults on minBound / -1).
             self.operand(&args[1], p, "%rax");
@@ -4349,7 +4430,11 @@ impl Gen {
             let t = self.con_id("GHC.Types.True");
             let f = self.con_id("GHC.Types.False");
             let (t, f) = (self.nullary_con(t), self.nullary_con(f));
-            self.operand(&args[0], p, "%rcx");
+            if rax_holds_arg0 {
+                self.emit("movq 8(%rax), %rcx");
+            } else {
+                self.operand(&args[0], p, "%rcx");
+            }
             self.emit("testq %rcx, %rcx");
             self.emit(&format!("leaq {f}(%rip), %r14"));
             self.emit(&format!("leaq {t}(%rip), %rax"));
@@ -4358,12 +4443,19 @@ impl Gen {
             return true;
         }
         if matches!(k, K::Cmp(_) | K::CharCmp(_)) {
-            if rax_holds_arg0 {
+            if rax_holds_arg0 && rax_holds_arg1 {
                 self.emit("movq 8(%rax), %rcx");
+                self.emit("movq %rcx, %rdx");
+            } else if rax_holds_arg0 {
+                self.emit("movq 8(%rax), %rcx");
+                self.operand(&args[1], p, "%rdx");
+            } else if rax_holds_arg1 {
+                self.emit("movq 8(%rax), %rdx");
+                self.operand(&args[0], p, "%rcx");
             } else {
                 self.operand(&args[0], p, "%rcx");
+                self.operand(&args[1], p, "%rdx");
             }
-            self.operand(&args[1], p, "%rdx");
             let (cmp, set) = match k {
                 K::Cmp(set) => ("cmpq %rdx, %rcx", set),
                 K::CharCmp(set) => ("cmpl %edx, %ecx", set),
@@ -4432,10 +4524,22 @@ impl Gen {
         }
         // Boxed binary arithmetic: compute payload in `%rcx` BEFORE the heap check so we can
         // reuse `%rax` from the tag check and direct register/immediate `args[1]` without a second
-        // reload; if GC triggers, recompute `%rcx` in the cold stub after GC moves boxed operands.
+        // reload; if GC triggers, recompute `%rcx` in the cold stub after GC moves boxed operands
+        // (GC also short-circuits any IND chains on Free/Global operands).
         if dest.is_none() {
             if let K::Bin(op) = k {
-                let emit_bin_rcx = |g: &mut Self, use_rax0: bool| {
+                let emit_bin_rcx = |g: &mut Self, use_rax0: bool, use_rax1: bool| {
+                    if use_rax0 && use_rax1 {
+                        g.emit("movq 8(%rax), %rcx");
+                        g.emit(&format!("{op} %rcx, %rcx"));
+                        return;
+                    }
+                    if use_rax1 {
+                        g.emit("movq 8(%rax), %rdx");
+                        g.operand(&args[0], p, "%rcx");
+                        g.emit(&format!("{op} %rdx, %rcx"));
+                        return;
+                    }
                     if use_rax0 {
                         g.emit("movq 8(%rax), %rcx");
                     } else {
@@ -4462,7 +4566,7 @@ impl Gen {
                         }
                     }
                 };
-                emit_bin_rcx(self, rax_holds_arg0);
+                emit_bin_rcx(self, rax_holds_arg0, rax_holds_arg1);
                 let gc_lbl = self.label("gc");
                 let done_lbl = self.label("gc_done");
                 self.emit("leaq 16(%r12), %rax");
@@ -4481,7 +4585,7 @@ impl Gen {
                     g.emit("movl $2, %esi");
                     g.rt_call("hsc_gc", p, 1);
                     g.reload_cache(&cached, p);
-                    emit_bin_rcx(g, false);
+                    emit_bin_rcx(g, false, false);
                     let _ = writeln!(g.out, "    jmp {done_lbl}");
                 });
                 self.fast_ret(p);
@@ -4508,43 +4612,66 @@ impl Gen {
                 CACHE_REGS.iter().copied().find(|r| !self.cache.iter().any(|c| c.reg == *r))
             };
             if let Some(reg) = direct_reg {
-                if rax_holds_arg0 {
+                if rax_holds_arg0 && rax_holds_arg1 {
                     self.emit(&format!("movq 8(%rax), {reg}"));
-                } else {
-                    self.operand(&args[0], p, reg);
-                }
-                match k {
-                    K::Bin(op) => match &args[1] {
-                        Atom::Slot(sk) if sk & RAW != 0 => {
-                            if let Some(r1) = self.cached(*sk) {
-                                self.emit(&format!("{op} {r1}, {reg}"));
-                            } else {
-                                self.emit(&format!("{op} {}, {reg}", p.slot(*sk)));
-                            }
-                        }
-                        Atom::Lit(SLit::Int(v)) if i32::try_from(*v).is_ok() => {
-                            self.emit(&format!("{op} ${v}, {reg}"));
-                        }
-                        Atom::Lit(SLit::Int(v)) => {
-                            self.emit(&format!("movabsq ${v}, %rdx"));
-                            self.emit(&format!("{op} %rdx, {reg}"));
-                        }
-                        a => {
-                            self.load(a, p, "%rdx");
-                            self.emit(&format!("{op} 8(%rdx), {reg}"));
-                        }
-                    },
-                    K::Shift(op) => match &args[1] {
-                        Atom::Lit(SLit::Int(v)) => self.emit(&format!("{op} ${}, {reg}", v & 63)),
-                        a => {
-                            self.operand(a, p, "%rcx");
+                    match k {
+                        K::Bin(op) => self.emit(&format!("{op} {reg}, {reg}")),
+                        K::Shift(op) => {
+                            self.emit(&format!("movq {reg}, %rcx"));
                             self.emit(&format!("{op} %cl, {reg}"));
                         }
-                    },
-                    K::Un(op) => self.emit(&format!("{op} {reg}")),
-                    K::Ord => {}
-                    K::Chr => self.emit(&format!("movl {}, {}", low32(reg), low32(reg))),
-                    K::Div(_) | K::Cmp(_) | K::CharCmp(_) | K::TagToEnum => unreachable!(),
+                        _ => unreachable!(),
+                    }
+                } else if rax_holds_arg1 {
+                    self.emit("movq 8(%rax), %rdx");
+                    self.operand(&args[0], p, reg);
+                    match k {
+                        K::Bin(op) => self.emit(&format!("{op} %rdx, {reg}")),
+                        K::Shift(op) => {
+                            self.emit("movq %rdx, %rcx");
+                            self.emit(&format!("{op} %cl, {reg}"));
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    if rax_holds_arg0 {
+                        self.emit(&format!("movq 8(%rax), {reg}"));
+                    } else {
+                        self.operand(&args[0], p, reg);
+                    }
+                    match k {
+                        K::Bin(op) => match &args[1] {
+                            Atom::Slot(sk) if sk & RAW != 0 => {
+                                if let Some(r1) = self.cached(*sk) {
+                                    self.emit(&format!("{op} {r1}, {reg}"));
+                                } else {
+                                    self.emit(&format!("{op} {}, {reg}", p.slot(*sk)));
+                                }
+                            }
+                            Atom::Lit(SLit::Int(v)) if i32::try_from(*v).is_ok() => {
+                                self.emit(&format!("{op} ${v}, {reg}"));
+                            }
+                            Atom::Lit(SLit::Int(v)) => {
+                                self.emit(&format!("movabsq ${v}, %rdx"));
+                                self.emit(&format!("{op} %rdx, {reg}"));
+                            }
+                            a => {
+                                self.load(a, p, "%rdx");
+                                self.emit(&format!("{op} 8(%rdx), {reg}"));
+                            }
+                        },
+                        K::Shift(op) => match &args[1] {
+                            Atom::Lit(SLit::Int(v)) => self.emit(&format!("{op} ${}, {reg}", v & 63)),
+                            a => {
+                                self.operand(a, p, "%rcx");
+                                self.emit(&format!("{op} %cl, {reg}"));
+                            }
+                        },
+                        K::Un(op) => self.emit(&format!("{op} {reg}")),
+                        K::Ord => {}
+                        K::Chr => self.emit(&format!("movl {}, {}", low32(reg), low32(reg))),
+                        K::Div(_) | K::Cmp(_) | K::CharCmp(_) | K::TagToEnum => unreachable!(),
+                    }
                 }
                 self.fast_raw_reg = Some(reg);
                 self.fast_ret(p);
@@ -7219,6 +7346,24 @@ mod sprint6_codegen_tests {
         // Self-tail-call back to .Lloop should not rewrite the dead state param slot with .Lcon.
         let back_edge = w2_hot.split("jmp .Lloop").next().unwrap_or(w2_hot);
         assert!(!back_edge.contains("leaq .Lcon"), "dead state param should not be rewritten in self-loop:\n{w2_hot}");
+    }
+
+    #[test]
+    fn int_fast_path_evaluates_thunk_operands_natively_out_of_line() {
+        let add_slots = SGlobal {
+            name: "Test.add".into(),
+            closure: simple_closure(2, 3, 0, SExpr::Prim("+#".into(), vec![Atom::Slot(1), Atom::Slot(2)])),
+            worker: None,
+        };
+        let prog = make_prog(vec![add_slots]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbl0 = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let start = asm.find(&format!("{lbl0}:\n")).expect("g0");
+        let body = &asm[start..];
+        assert!(body.contains(".Lopev"), "expected cold operand eval stub:\n{body}");
+        assert!(body.contains("jmp hsc_eval"), "expected native hsc_eval in operand stub:\n{body}");
+        assert!(body.contains(".Lopret"), "expected operand eval continuation:\n{body}");
     }
 }
 
