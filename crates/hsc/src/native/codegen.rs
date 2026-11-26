@@ -1403,6 +1403,10 @@ impl Gen {
         } else {
             return None;
         };
+        let (s0, s1, jump_cc) = match (s0, s1) {
+            (Src::Imm(v), Src::Reg(r)) => (Src::Reg(r), Src::Imm(v), Self::flip_cc(jump_cc)),
+            _ => (s0, s1, jump_cc),
+        };
         let lhs = match s0 {
             Src::Reg(r) => r.to_string(),
             Src::Imm(_) => {
@@ -2404,7 +2408,7 @@ impl Gen {
             },
         };
         let is_double = matches!(cmp_kind, CmpKind::Double(_));
-        let emit_cmp = |g: &mut Self| -> &'static str {
+        let emit_cmp = |g: &mut Self| -> (&'static str, bool) {
             match cmp_kind {
                 CmpKind::Double(dc) => {
                     g.load_raw_xmm(&args[0], p, "%xmm0");
@@ -2413,12 +2417,16 @@ impl Gen {
                     } else {
                         g.load_raw_xmm(&args[1], p, "%xmm1");
                     }
-                    g.emit_dcmp_flags(dc)
+                    (g.emit_dcmp_flags(dc), false)
                 }
                 CmpKind::Int(set, is_char) => {
                     let s0 = g.raw_src(&args[0], p, &[]);
                     let avoid: Vec<&str> = match s0 { Src::Reg(r) => vec![r], Src::Imm(_) => vec![] };
                     let s1 = g.raw_src(&args[1], p, &avoid);
+                    let (s0, s1, cc, flipped) = match (s0, s1) {
+                        (Src::Imm(v), Src::Reg(r)) => (Src::Reg(r), Src::Imm(v), Self::flip_cc(&set[3..]), true),
+                        _ => (s0, s1, &set[3..], false),
+                    };
                     let lhs = match s0 {
                         Src::Reg(r) => r.to_string(),
                         Src::Imm(_) => {
@@ -2439,7 +2447,7 @@ impl Gen {
                         let t = g.src_text(s1, "%rdx");
                         g.emit(&format!("cmpq {t}, {lhs}"));
                     }
-                    &set[3..]
+                    (cc, flipped)
                 }
             }
         };
@@ -2455,7 +2463,7 @@ impl Gen {
                 if p.mode == Mode::Scrut && !self.cache.is_empty() {
                     self.flush_live_raws(p);
                 }
-                let cc = emit_cmp(self);
+                let (cc, _) = emit_cmp(self);
                 let t_id = self.con_id("GHC.Types.True");
                 let f_id = self.con_id("GHC.Types.False");
                 let (t_lbl, f_lbl) = (self.nullary_con(t_id), self.nullary_con(f_id));
@@ -2493,7 +2501,7 @@ impl Gen {
         if alts.iter().any(|a| matches!(a, SAlt::Lit(l, _) if !matches!(l, Lit::Int(_)))) || alts.iter().any(|a| matches!(a, SAlt::Con(..))) {
             return false;
         }
-        let cc = emit_cmp(self);
+        let (cc, flipped) = emit_cmp(self);
         let negated = Self::negate_cc(cc);
         let mut join_defs: Vec<(String, &[u32], &SExpr)> = Vec::new();
         for (idx, &(id, params, code)) in peeled_joins.iter().enumerate() {
@@ -2528,13 +2536,14 @@ impl Gen {
         };
         if !is_double {
             let is_char = matches!(cmp_kind, CmpKind::Int(_, true));
+            let adjust = |c: &'static str| if flipped { Self::flip_cc(c) } else { c };
             if let Some((t1, f1)) = two_way {
                 let fused = self
                     .nested_same_cmp(f1, args, is_char, p)
-                    .map(|(cc2, t2, f2)| (cc, t1, cc2, t2, f2))
+                    .map(|(cc2, t2, f2)| (cc, t1, adjust(cc2), t2, f2))
                     .or_else(|| {
                         self.nested_same_cmp(t1, args, is_char, p)
-                            .map(|(cc2, t2, f2)| (negated, f1, cc2, t2, f2))
+                            .map(|(cc2, t2, f2)| (negated, f1, adjust(cc2), t2, f2))
                     });
                 if let Some((j1, b1, j2, b2, b3)) = fused {
                     let l1 = self.label("alt");
@@ -3414,10 +3423,19 @@ impl Gen {
                         if need_r14 {
                             self.load(a, p, "%r14");
                         }
-                        let live = self.case_live(alts, *bslot, p);
-                        self.live.push(live);
-                        self.clear_dead(std::slice::from_ref(a), Pos { mode: Mode::Scrut, ..p });
-                        self.live.pop();
+                        let need_fast_clear = p.mode == Mode::Scrut
+                            || !alts.iter().all(|alt| {
+                                let body = match alt {
+                                    SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => b,
+                                };
+                                self.expr_gc_free_tail(body)
+                            });
+                        if need_fast_clear {
+                            let live = self.case_live(alts, *bslot, p);
+                            self.live.push(live);
+                            self.clear_dead(std::slice::from_ref(a), Pos { mode: Mode::Scrut, ..p });
+                            self.live.pop();
+                        }
                         if raw_binder {
                             let r = self.fresh_reg(p, &[]);
                             let _ = writeln!(self.out, "    movq 8(%r14), {r}");
@@ -3519,17 +3537,35 @@ impl Gen {
                         let eval = self.label("eval");
                         let value = self.label("value");
                         let cont = self.label("k");
+                        let non_null_scrut = raw_binder
+                            || alts.iter().any(|alt| {
+                                matches!(
+                                    alt,
+                                    SAlt::Con(..) | SAlt::Lit(Lit::Int(_) | Lit::Char(_) | Lit::Double(_), _)
+                                )
+                            });
                         self.load(a, p, "%r14");
-                        self.emit("testq %r14, %r14");
-                        let _ = writeln!(self.out, "    je {value}");
+                        if !non_null_scrut {
+                            self.emit("testq %r14, %r14");
+                            let _ = writeln!(self.out, "    je {value}");
+                        }
                         // Kinds 1..7 (CON, INT, DOUBLE, CHAR, INTEGER, FUN, PAP) fall straight through.
                         let _ = writeln!(self.out, "    cmpb ${THUNK}, (%r14)");
                         let _ = writeln!(self.out, "    jae {slow_chk}");
                         self.put_label(&value);
                         let live = self.case_live(alts, *bslot, p);
-                        self.live.push(live.clone());
-                        self.clear_dead(std::slice::from_ref(a), Pos { mode: Mode::Scrut, ..p });
-                        self.live.pop();
+                        let need_fast_clear = p.mode == Mode::Scrut
+                            || !alts.iter().all(|alt| {
+                                let body = match alt {
+                                    SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => b,
+                                };
+                                self.expr_gc_free_tail(body)
+                            });
+                        if need_fast_clear {
+                            self.live.push(live.clone());
+                            self.clear_dead(std::slice::from_ref(a), Pos { mode: Mode::Scrut, ..p });
+                            self.live.pop();
+                        }
                         let fast_kind = self.known_kind.clone();
                         self.emit_cold(|g| {
                             g.put_label(&slow_chk);
@@ -3537,8 +3573,10 @@ impl Gen {
                             let _ = writeln!(g.out, "    cmpb ${IND}, (%r14)");
                             let _ = writeln!(g.out, "    jne {value}");
                             g.emit("movq 8(%r14), %r14");
-                            g.emit("testq %r14, %r14");
-                            let _ = writeln!(g.out, "    je {value}");
+                            if !non_null_scrut {
+                                g.emit("testq %r14, %r14");
+                                let _ = writeln!(g.out, "    je {value}");
+                            }
                             let _ = writeln!(g.out, "    cmpb ${THUNK}, (%r14)");
                             let _ = writeln!(g.out, "    jb {value}");
                             let _ = writeln!(g.out, "    jmp {slow_chk}");
@@ -4352,6 +4390,7 @@ impl Gen {
         let all_int = end >= 8 && alts[..end].iter().all(|a| matches!(a, SAlt::Lit(Lit::Int(_), _)));
         let all_char = !all_int && end >= 8 && alts[..end].iter().all(|a| matches!(a, SAlt::Lit(Lit::Char(_), _)));
         let mut fallthrough_idx: Option<usize> = None;
+        let mut other_con_guard: Option<(usize, String, u32, String)> = None;
         if all_int || all_char {
             let has_def = end < alts.len();
             let def_lbl = if has_def { labels[end].clone() } else { self.label("fail") };
@@ -4487,6 +4526,50 @@ impl Gen {
                 let _ = writeln!(self.out, "    jne {}", labels[1]);
                 fallthrough_idx = Some(0);
             }
+        } else if let [SAlt::Con(n0, s0, b0), SAlt::Con(n1, s1, b1)]
+            | [SAlt::Con(n0, s0, b0), SAlt::Con(n1, s1, b1), SAlt::Default(SExpr::Fail(_))] = alts
+        {
+            if n0 != n1 {
+                let hot_idx = if fast_body.is_some() {
+                    0
+                } else if self.is_cold_error(b0) && !self.is_cold_error(b1) {
+                    1
+                } else if self.is_cold_error(b1) && !self.is_cold_error(b0) {
+                    0
+                } else if s1.len() > s0.len() {
+                    1
+                } else {
+                    0
+                };
+                let other_idx = 1 - hot_idx;
+                let (hot_name, other_name) = if hot_idx == 0 { (n0, n1) } else { (n1, n0) };
+                let hot_id = self.con_id(hot_name);
+                let other_id = self.con_id(other_name);
+                let chk_other = self.label("conchk");
+                let fail_target = if alts.len() == 3 {
+                    labels[2].clone()
+                } else {
+                    let fl = self.label("fail");
+                    fail_lbl = Some(fl.clone());
+                    fl
+                };
+                let _ = writeln!(self.out, "    cmpl ${hot_id}, 4(%r14)");
+                let _ = writeln!(self.out, "    jne {chk_other}");
+                fallthrough_idx = Some(hot_idx);
+                other_con_guard = Some((other_idx, chk_other, other_id, fail_target));
+            } else {
+                let id = self.con_id(n0);
+                let fail_target = if alts.len() == 3 {
+                    labels[2].clone()
+                } else {
+                    let fl = self.label("fail");
+                    fail_lbl = Some(fl.clone());
+                    fl
+                };
+                let _ = writeln!(self.out, "    cmpl ${id}, 4(%r14)");
+                let _ = writeln!(self.out, "    jne {fail_target}");
+                fallthrough_idx = Some(0);
+            }
         } else {
             let mut has_default = false;
             let con_count = alts.iter().filter(|a| matches!(a, SAlt::Con(..))).count();
@@ -4574,7 +4657,9 @@ impl Gen {
             });
         }
         let order: Vec<usize> = if fallthrough_idx == Some(1) {
-            vec![1, 0]
+            let mut o = vec![1, 0];
+            o.extend(2..alts.len());
+            o
         } else {
             (0..alts.len()).collect()
         };
@@ -4609,6 +4694,13 @@ impl Gen {
                 g.cache = alt_cache.clone();
                 g.safe_slots = alt_safe;
                 g.known_kind = alt_kind.clone();
+                if let Some((oidx, ref chk_lbl, other_id, ref fail_target)) = other_con_guard {
+                    if idx == oidx {
+                        g.put_label(chk_lbl);
+                        let _ = writeln!(g.out, "    cmpl ${other_id}, 4(%r14)");
+                        let _ = writeln!(g.out, "    jne {fail_target}");
+                    }
+                }
                 match a {
                     SAlt::Con(_, slots, body) => {
                         g.put_label(l);
@@ -6355,6 +6447,52 @@ impl Gen {
         for k in dead {
             self.emit(&format!("movq $0, {}", p.slot(k)));
             self.known_kind.remove(&k);
+        }
+    }
+
+    /// Whether a tail-position expression neither allocates on the heap nor pushes a continuation
+    /// frame on its fast path before popping the current frame (returning or tail-calling).
+    fn expr_gc_free_tail(&self, e: &SExpr) -> bool {
+        let static_atom = |a: &Atom| !matches!(a, Atom::Lit(l) if !is_static_slit(l));
+        match e {
+            SExpr::Atom(a) => {
+                if is_raw(a) {
+                    self.ret_raw
+                } else if let Atom::Lit(l) = a {
+                    self.ret_raw || is_static_slit(l)
+                } else {
+                    true
+                }
+            }
+            SExpr::Con(_, args) => args.is_empty(),
+            SExpr::App(_, args) | SExpr::CallWorker(_, args) => args.iter().all(static_atom),
+            SExpr::Fail(_) => true,
+            SExpr::Prim(name, args) => {
+                name == "tagToEnum#" || (self.ret_raw && total_raw_op(name, args))
+            }
+            SExpr::Case(scrut, bslot, alts) => {
+                let scrut_ok = match scrut.as_ref() {
+                    SExpr::Atom(Atom::Slot(_) | Atom::Free(_) | Atom::Global(_)) => true,
+                    SExpr::Prim(name, args) => {
+                        *bslot & RAW != 0
+                            && (total_raw_op(name, args)
+                                || int_op(name).is_some()
+                                || double_op(name).is_some())
+                    }
+                    _ => false,
+                };
+                scrut_ok
+                    && alts.iter().all(|alt| match alt {
+                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => {
+                            self.expr_gc_free_tail(b)
+                        }
+                    })
+            }
+            SExpr::Join(_, _, code, body) => {
+                self.expr_gc_free_tail(code) && self.expr_gc_free_tail(body)
+            }
+            SExpr::Jump(_, args) => args.iter().all(static_atom),
+            SExpr::Let(..) | SExpr::Closure(_) => false,
         }
     }
 
@@ -8797,6 +8935,107 @@ mod sprint6_codegen_tests {
         // Boxed-to-raw-to-boxed emits DOUBLE cell header tag, not INT.
         let double_hdr = format!("movq ${}, (%rax)", header(DOUBLE, 1, 0));
         assert!(body1.contains(&double_hdr), "expected DOUBLE header when boxing RAW_DOUBLE:\n{body1}");
+    }
+
+    #[test]
+    fn case_fastpath_and_imm_cmp_flip_opts() {
+        // Global 0: tail-recursive list walker `case xs of [] -> 0; (h:t) -> walk t`
+        // Expects: no `testq %r14, %r14`, no `movq $0,` on hot path, and single `cmpl` falling through into `:`.
+        let list_walk = simple_closure(
+            1,
+            4,
+            0,
+            SExpr::Case(
+                Box::new(SExpr::Atom(Atom::Slot(1))),
+                UNUSED_SLOT,
+                vec![
+                    SAlt::Con("Builtin.[]".into(), vec![], SExpr::Atom(Atom::Lit(SLit::Int(0)))),
+                    SAlt::Con(
+                        "Builtin.:".into(),
+                        vec![2, 3],
+                        SExpr::App(Atom::Global(0), vec![Atom::Slot(3)]),
+                    ),
+                ],
+            ),
+        );
+        // Global 1: raw worker comparing `2 ># x` and `0 ># x` (Imm LHS, Reg RHS).
+        let r0 = RAW | 0;
+        let r1 = RAW | 1;
+        let mut imm_cmp = simple_closure(
+            0,
+            1,
+            2,
+            SExpr::Case(
+                Box::new(SExpr::Prim(">#".into(), vec![Atom::Lit(SLit::Int(2)), Atom::Slot(r0)])),
+                r1,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Atom(Atom::Slot(r1))),
+                    UNUSED_SLOT,
+                    vec![
+                        SAlt::Lit(Lit::Int(1), SExpr::Atom(Atom::Lit(SLit::Int(10)))),
+                        SAlt::Default(SExpr::Case(
+                            Box::new(SExpr::Prim(">#".into(), vec![Atom::Lit(SLit::Int(0)), Atom::Slot(r0)])),
+                            r1,
+                            vec![SAlt::Default(SExpr::Case(
+                                Box::new(SExpr::Atom(Atom::Slot(r1))),
+                                UNUSED_SLOT,
+                                vec![
+                                    SAlt::Lit(Lit::Int(1), SExpr::Atom(Atom::Lit(SLit::Int(20)))),
+                                    SAlt::Default(SExpr::Atom(Atom::Slot(r0))),
+                                ],
+                            ))],
+                        )),
+                    ],
+                ))],
+            ),
+        );
+        imm_cmp.raw_args = vec![(0, r0)];
+        imm_cmp.ret_raw = true;
+        let prog = make_prog(vec![
+            SGlobal { name: "Test.walk".into(), closure: list_walk, worker: None },
+            SGlobal { name: "Test.immcmp".into(), closure: imm_cmp, worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbls: Vec<&str> = table
+            .lines()
+            .take(2)
+            .map(|l| l.rsplit_once(',').unwrap().1.split_whitespace().next().unwrap())
+            .collect();
+        let slice_fn = |lbl: &str| {
+            let start = asm.find(&format!("{lbl}:\n")).expect("label");
+            let end = lbls
+                .iter()
+                .filter_map(|other| {
+                    if *other == lbl {
+                        None
+                    } else {
+                        asm[start + 1..].find(&format!("\n{other}:\n")).map(|i| start + 1 + i)
+                    }
+                })
+                .chain(asm[start + 1..].find("\n    .section").map(|i| start + 1 + i))
+                .min()
+                .unwrap_or(asm.len());
+            &asm[start..end]
+        };
+        let walk_asm = slice_fn(lbls[0]);
+        let walk_hot = walk_asm
+            .split("\n.Lchk")
+            .next()
+            .unwrap_or(walk_asm)
+            .split("\n.Lyield")
+            .next()
+            .unwrap_or(walk_asm);
+        assert!(!walk_hot.contains("testq %r14, %r14"), "unexpected NULL check on Con case:\n{walk_hot}");
+        assert!(!walk_hot.contains("movq $0,"), "unexpected clear_dead store on GC-free tail case:\n{walk_hot}");
+        assert!(!walk_hot.contains("movl 4(%r14), %ecx"), "expected single-compare 2-way Con fall-through:\n{walk_hot}");
+        assert!(walk_hot.contains("jne .Lconchk"), "expected fall-through to hot `:` branch:\n{walk_hot}");
+
+        let cmp_asm = slice_fn(lbls[1]);
+        assert!(!cmp_asm.contains("movq $2, %rcx"), "expected flipped cmpq $2, reg:\n{cmp_asm}");
+        assert!(!cmp_asm.contains("movq $0, %rcx"), "expected flipped testq reg, reg:\n{cmp_asm}");
+        assert!(cmp_asm.contains("cmpq $2, %rsi"), "missing cmpq $2, %rsi:\n{cmp_asm}");
+        assert!(cmp_asm.contains("testq %rsi, %rsi"), "missing testq %rsi, %rsi:\n{cmp_asm}");
     }
 }
 
