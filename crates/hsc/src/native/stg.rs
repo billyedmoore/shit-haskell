@@ -124,9 +124,32 @@ pub const RAW_RESULT_PRIMS: &[&str] = &[
     "ord#", "chr#",
 ];
 
-/// Primitives that can take raw operands (those, and `tagToEnum#`).
+/// Primitives that can take raw operands in every argument (those, and `tagToEnum#`).
 fn raw_operand_prim(p: &str) -> bool {
     p == "tagToEnum#" || RAW_RESULT_PRIMS.contains(&p)
+}
+
+fn is_bytes_index_prim(p: &str) -> bool {
+    matches!(p, "indexIntArray#" | "indexWordArray#" | "indexInt8Array#" | "indexWord8Array#")
+}
+
+fn is_bytes_read_prim(p: &str) -> bool {
+    matches!(p, "readIntArray#" | "readWordArray#" | "readInt8Array#" | "readWord8Array#")
+}
+
+fn is_bytes_write_prim(p: &str) -> bool {
+    matches!(p, "writeIntArray#" | "writeWordArray#" | "writeInt8Array#" | "writeWord8Array#")
+}
+
+/// Whether argument `idx` of primitive `p` can be passed in a raw slot.
+fn prim_arg_accepts_raw(p: &str, idx: usize) -> bool {
+    raw_operand_prim(p)
+        || ((is_bytes_index_prim(p) || is_bytes_read_prim(p)) && idx == 1)
+        || (is_bytes_write_prim(p) && (idx == 1 || idx == 2))
+}
+
+fn prim_accepts_any_raw(p: &str) -> bool {
+    raw_operand_prim(p) || is_bytes_index_prim(p) || is_bytes_read_prim(p) || is_bytes_write_prim(p)
 }
 
 /// A raw slot holding a `Char#` (its boxed form is a CHAR cell); others hold `Int#`/`Word#`.
@@ -268,8 +291,10 @@ fn raw_uses_in(
         Core::Var(v) => v != x || result,
         Core::Lit(_) | Core::Fail(_) => true,
         // An operand that is not an atom becomes a thunk: it must not mention the raw value.
-        Core::Prim(p, args) if raw_operand_prim(p) => {
-            args.iter().all(|a| matches!(a, Core::Var(v) if v == x) || !mentions(a, x))
+        Core::Prim(p, args) if prim_accepts_any_raw(p) => {
+            args.iter().enumerate().all(|(i, a)| {
+                (prim_arg_accepts_raw(p, i) && matches!(a, Core::Var(v) if v == x)) || !mentions(a, x)
+            })
         }
         Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
             if mentions(&args[0], x) {
@@ -373,7 +398,14 @@ fn raw_uses_in(
 /// case with number or character literal alternatives.
 fn numeric_use(e: &Core, x: &str) -> bool {
     match e {
-        Core::Prim(p, args) if raw_operand_prim(p) && args.iter().any(|a| matches!(a, Core::Var(v) if v == x)) => true,
+        Core::Prim(p, args)
+            if args
+                .iter()
+                .enumerate()
+                .any(|(i, a)| prim_arg_accepts_raw(p, i) && matches!(a, Core::Var(v) if v == x)) =>
+        {
+            true
+        }
         Core::Case(s, _, alts)
             if matches!(&**s, Core::Var(v) if v == x)
                 && alts.iter().any(|a| matches!(a, Alt::Lit(Lit::Int(_) | Lit::Char(_), _))) =>
@@ -1235,7 +1267,15 @@ impl Lowering {
                 let saved_whnf = self.bodies.last().expect("body").whnf.clone();
                 let mut alt_base_whnf = saved_whnf.clone();
                 add_case_whnf(scrut, binder, &mut alt_base_whnf);
-                let raw = (matches!(scrut.as_ref(), Core::Prim(p, _) if RAW_RESULT_PRIMS.contains(&p.as_str())) || raw_call.is_some())
+                let raw = (matches!(
+                    scrut.as_ref(),
+                    Core::Prim(p, args)
+                        if RAW_RESULT_PRIMS.contains(&p.as_str())
+                            || (is_bytes_index_prim(p)
+                                && args.len() == 2
+                                && !matches!(args[0], Core::Lit(_))
+                                && !matches!(&args[1], Core::Lit(l) if !matches!(l, Lit::Int(_))))
+                ) || raw_call.is_some())
                     && matches!(&alts[..], [Alt::Default(body)] if raw_uses(body, binder, &self.workers, &self.worker_strict, &alt_base_whnf));
                 let char = matches!(scrut.as_ref(), Core::Prim(p, _) if p == "chr#") || raw_call == Some(NUM_CHAR);
                 let flat_alts = if !raw { flatten_case_alts(scrut, binder, alts) } else { None };
@@ -1279,6 +1319,17 @@ impl Lowering {
                 } else {
                     UNUSED_SLOT
                 };
+                let can_fuse_bytes_read = !raw
+                    && bslot == UNUSED_SLOT
+                    && matches!(
+                        &scrut,
+                        SExpr::Prim(p, args)
+                            if is_bytes_read_prim(p)
+                                && args.len() == 3
+                                && !matches!(args[0], Atom::Lit(_))
+                                && !matches!(args[0], Atom::Slot(k) if k & RAW != 0)
+                                && !matches!(&args[1], Atom::Lit(l) if !matches!(l, SLit::Int(_)))
+                    );
                 // Only one alternative runs, so their locals share the slots after the binder: the
                 // frame needs the largest alternative's, not their sum.
                 let (base, raw_base) = {
@@ -1287,7 +1338,7 @@ impl Lowering {
                 };
                 let (mut top, mut raw_top) = (scrut_top.max(base), scrut_raw_top.max(raw_base));
                 let mut lowered = Vec::with_capacity(alts.len());
-                for a in alts {
+                for (alt_idx, a) in alts.iter().enumerate() {
                     let b = self.bodies.last_mut().expect("body");
                     b.nslots = base;
                     b.nraw = raw_base;
@@ -1297,7 +1348,37 @@ impl Lowering {
                             b.whnf.remove(v);
                         }
                     }
-                    lowered.push(self.alt(a));
+                    let lowered_alt = if can_fuse_bytes_read && alt_idx == 0 {
+                        if let Alt::Con(name, vars, body) = a {
+                            if name == "Builtin.(,)" && vars.len() == 2 && vars[0] != vars[1] {
+                                let mut read_whnf = self.bodies.last().expect("body").whnf.clone();
+                                read_whnf.insert(vars[1].clone());
+                                let val_raw = free_mentions(body, &vars[1])
+                                    && raw_uses(body, &vars[1], &self.workers, &self.worker_strict, &read_whnf);
+                                self.bodies.last_mut().expect("body").whnf = read_whnf;
+                                let s0 = if free_mentions(body, &vars[0]) {
+                                    self.bind_local(&vars[0])
+                                } else {
+                                    UNUSED_SLOT
+                                };
+                                let s1 = if val_raw {
+                                    self.bind_raw(&vars[1], false)
+                                } else if free_mentions(body, &vars[1]) {
+                                    self.bind_local(&vars[1])
+                                } else {
+                                    UNUSED_SLOT
+                                };
+                                SAlt::Con(name.clone(), vec![s0, s1], self.strict(body))
+                            } else {
+                                self.alt(a)
+                            }
+                        } else {
+                            self.alt(a)
+                        }
+                    } else {
+                        self.alt(a)
+                    };
+                    lowered.push(lowered_alt);
                     let b = self.bodies.last().expect("body");
                     top = top.max(b.nslots);
                     raw_top = raw_top.max(b.nraw);
@@ -1387,10 +1468,16 @@ impl Lowering {
             }
             Core::Prim(name, args) => {
                 let mark = self.pending_len();
-                let accepts_raw = raw_operand_prim(name);
                 let atoms = args
                     .iter()
-                    .map(|a| if accepts_raw { self.raw_or_boxed_atom(a) } else { self.atom(a) })
+                    .enumerate()
+                    .map(|(i, a)| {
+                        if prim_arg_accepts_raw(name, i) {
+                            self.raw_or_boxed_atom(a)
+                        } else {
+                            self.atom(a)
+                        }
+                    })
                     .collect();
                 let prim = self.allocating(mark, SExpr::Prim(name.clone(), atoms));
                 match self.raw_result() {
@@ -1642,10 +1729,20 @@ fn compact_raw_slots(c: &mut SClosure) {
             SExpr::Case(scrut, bslot, alts) => {
                 let mut alts_in = 0u64;
                 for a in alts {
-                    let b = match a {
-                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => b,
+                    let (con_slots, b) = match a {
+                        SAlt::Con(_, slots, b) => (slots.as_slice(), b),
+                        SAlt::Lit(_, b) | SAlt::Default(b) => (&[][..], b),
                     };
-                    alts_in |= liveness(b, live_after, all_mask, joins, adj, active, atom_bit, interfere);
+                    let mut branch_in = liveness(b, live_after, all_mask, joins, adj, active, atom_bit, interfere);
+                    for &s in con_slots {
+                        if s & RAW != 0 {
+                            let d = (s & !(RAW | RAW_CHAR)) as usize;
+                            *active |= 1u64 << d;
+                            interfere(adj, d, branch_in);
+                            branch_in &= !(1u64 << d);
+                        }
+                    }
+                    alts_in |= branch_in;
                 }
                 if *bslot & RAW != 0 {
                     let d = (*bslot & !(RAW | RAW_CHAR)) as usize;
@@ -1772,7 +1869,13 @@ fn compact_raw_slots(c: &mut SClosure) {
                 remap(bslot);
                 for a in alts {
                     match a {
-                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => rewrite_expr(b, remap, remap_atom),
+                        SAlt::Con(_, slots, b) => {
+                            for s in slots {
+                                remap(s);
+                            }
+                            rewrite_expr(b, remap, remap_atom);
+                        }
+                        SAlt::Lit(_, b) | SAlt::Default(b) => rewrite_expr(b, remap, remap_atom),
                     }
                 }
             }
@@ -3409,6 +3512,57 @@ mod raw_slot_tests {
         }
         let binds = vec![("x0".to_string(), Core::Lit(Lit::Int(1)))];
         assert!(is_join(&binds, &body));
+    }
+
+    #[test]
+    fn raw_bytearray_read_write_keeps_word_unboxed() {
+        // \arr i s -> case readWordArray# arr i s of (s', w) ->
+        //               case and# w 1# as w' of _ -> writeWordArray# arr i w' s'
+        let body = Core::Lam(
+            "arr".into(),
+            Box::new(Core::Lam(
+                "i".into(),
+                Box::new(Core::Lam(
+                    "s".into(),
+                    Box::new(Core::Case(
+                        Box::new(prim("readWordArray#", vec![var("arr"), var("i"), var("s")])),
+                        "pair".into(),
+                        vec![Alt::Con(
+                            "Builtin.(,)".into(),
+                            vec!["s1".into(), "w".into()],
+                            case(
+                                prim("and#", vec![var("w"), Core::Lit(Lit::Int(1))]),
+                                "w1",
+                                prim("writeWordArray#", vec![var("arr"), var("i"), var("w1"), var("s1")]),
+                            ),
+                        )],
+                    )),
+                )),
+            )),
+        );
+        let binds = vec![TopBind { name: "Test.clearBit".into(), body }];
+        let numeric = NumericParams {
+            params: [("Test.clearBit".to_string(), vec![0, NUM_INT, 0])].into_iter().collect(),
+            results: HashMap::new(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, _) = prog.globals[0].worker.as_ref().expect("clearBit should get raw-index worker");
+        let SExpr::Case(scrut, bslot, alts) = &worker.body else {
+            panic!("expected outer Case: {:?}", worker.body);
+        };
+        assert_eq!(*bslot, UNUSED_SLOT);
+        let SExpr::Prim(p, args) = scrut.as_ref() else { panic!("expected readWordArray#") };
+        assert_eq!(p, "readWordArray#");
+        assert!(matches!(args[1], Atom::Slot(k) if k & RAW != 0), "index arg should be raw: {:?}", args);
+        let SAlt::Con(c, slots, inner) = &alts[0] else { panic!("expected Builtin.(,) alt") };
+        assert_eq!(c, "Builtin.(,)");
+        assert!(slots[1] & RAW != 0, "readWordArray# value slot should be raw: {:?}", slots);
+        let SExpr::Case(_, w1_slot, inner_alts) = inner else { panic!("expected inner Case") };
+        assert!(w1_slot & RAW != 0, "and# result should stay raw");
+        let SAlt::Default(SExpr::Prim(wp, wargs)) = &inner_alts[0] else { panic!("expected writeWordArray#") };
+        assert_eq!(wp, "writeWordArray#");
+        assert!(matches!(wargs[1], Atom::Slot(k) if k & RAW != 0));
+        assert!(matches!(wargs[2], Atom::Slot(k) if k & RAW != 0));
     }
 }
 

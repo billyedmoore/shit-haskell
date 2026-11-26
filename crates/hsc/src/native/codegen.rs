@@ -376,6 +376,16 @@ fn g_write(g: &mut Gen, a: &Atom, p: Pos) {
     g.operand(a, p, "%rcx");
 }
 
+/// Element load instruction, store instruction+reg, and byte scale for byte-array primops.
+fn bytes_elem_ops(elem: &str) -> Option<(&'static str, &'static str, usize)> {
+    Some(match elem {
+        "IntArray#" | "WordArray#" => ("movq", "movq %rcx", 8),
+        "Int8Array#" => ("movsbq", "movb %cl", 1),
+        "Word8Array#" => ("movzbq", "movb %cl", 1),
+        _ => return None,
+    })
+}
+
 /// The inline `Double#` operations (see `Gen::double_fast_path`).
 #[derive(PartialEq, Clone, Copy)]
 enum D { Bin(&'static str), Cmp(DCmp), Sqrt, Negate, Abs }
@@ -3255,6 +3265,188 @@ impl Gen {
                                         return;
                                     }
                                 }
+                            } else if let Some((load, _, scale)) = name.strip_prefix("read").and_then(bytes_elem_ops) {
+                                if args.len() == 3 && !matches!(&args[1], Atom::Lit(l) if !matches!(l, SLit::Int(_))) {
+                                    if let Some(SAlt::Con(c, slots, body)) = alts.first() {
+                                        if c == "Builtin.(,)" && slots.len() == 2 {
+                                            let mut uses = std::collections::HashSet::new();
+                                            self.slot_uses(body, &mut uses);
+                                            if !uses.contains(bslot) {
+                                                let arr_known = matches!(
+                                                    &args[0],
+                                                    Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(BYTES))
+                                                );
+                                                let idx_known = is_raw(&args[1])
+                                                    || matches!(args[1], Atom::Lit(_))
+                                                    || matches!(
+                                                        &args[1],
+                                                        Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(INT))
+                                                    );
+                                                let slow_used = !arr_known || !idx_known;
+                                                let mut fast_kind = saved_kind.clone();
+                                                let arr_slot = match args[0] {
+                                                    Atom::Slot(s) => {
+                                                        fast_kind.insert(s, KnownVal::Kind(BYTES));
+                                                        Some(s)
+                                                    }
+                                                    _ => None,
+                                                };
+                                                let idx_slot = match args[1] {
+                                                    Atom::Slot(s) if s & RAW == 0 && Some(s) != arr_slot => {
+                                                        fast_kind.insert(s, KnownVal::Kind(INT));
+                                                        Some(s)
+                                                    }
+                                                    _ => None,
+                                                };
+                                                let body_lbl = if slow_used { Some(self.label("ba_body")) } else { None };
+                                                let slow = if slow_used { Some(self.label("slow")) } else { None };
+                                                if !arr_known {
+                                                    self.load(&args[0], p, "%rax");
+                                                    let _ = writeln!(self.out, "    cmpb ${BYTES}, (%rax)");
+                                                    let _ = writeln!(self.out, "    jne {}", slow.as_ref().unwrap());
+                                                }
+                                                if !idx_known {
+                                                    self.load(&args[1], p, "%rax");
+                                                    let _ = writeln!(self.out, "    cmpb ${INT}, (%rax)");
+                                                    let _ = writeln!(self.out, "    jne {}", slow.as_ref().unwrap());
+                                                }
+                                                let skip_state = slots[0] == UNUSED_SLOT;
+                                                let val_slot = slots[1];
+                                                let val_is_raw = val_slot != UNUSED_SLOT && val_slot & RAW != 0;
+                                                let mut read_post_cache = saved_cache.clone();
+                                                if val_is_raw {
+                                                    let vidx = raw_idx(val_slot);
+                                                    read_post_cache.retain(|c| raw_idx(c.slot) != vidx);
+                                                }
+                                                let direct_reg = if val_is_raw {
+                                                    if !slow_used {
+                                                        if !skip_state {
+                                                            let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
+                                                        }
+                                                        self.operand(&args[1], p, "%rdx");
+                                                        self.cache.retain(|c| raw_idx(c.slot) != raw_idx(val_slot));
+                                                        let reg = self.fresh_reg(p, &[]);
+                                                        self.load(&args[0], p, "%rax");
+                                                        self.emit(&format!("{load} 8(%rax,%rdx,{scale}), {reg}"));
+                                                        self.cache_put(val_slot, reg, true);
+                                                        self.known_kind = fast_kind;
+                                                        if !skip_state {
+                                                            self.mark_slot_safe(slots[0]);
+                                                            self.known_kind.remove(&slots[0]);
+                                                        }
+                                                        self.expr(body, p);
+                                                        return;
+                                                    } else {
+                                                        let reg = CACHE_REGS
+                                                            .iter()
+                                                            .copied()
+                                                            .find(|r| !read_post_cache.iter().any(|c| c.reg == *r));
+                                                        if !skip_state {
+                                                            let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
+                                                        }
+                                                        self.operand(&args[1], p, "%rdx");
+                                                        self.load(&args[0], p, "%rax");
+                                                        if let Some(reg) = reg {
+                                                            self.emit(&format!("{load} 8(%rax,%rdx,{scale}), {reg}"));
+                                                        } else {
+                                                            self.emit(&format!("{load} 8(%rax,%rdx,{scale}), %rcx"));
+                                                            let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(val_slot));
+                                                        }
+                                                        reg
+                                                    }
+                                                } else if val_slot != UNUSED_SLOT {
+                                                    // Boxed result: allocate only the 2-word INT cell, skipping the 3-word pair.
+                                                    self.alloc(2, p);
+                                                    self.emit("movq %rax, %r14");
+                                                    self.operand(&args[1], p, "%rdx");
+                                                    self.load(&args[0], p, "%rax");
+                                                    self.emit(&format!("{load} 8(%rax,%rdx,{scale}), %rcx"));
+                                                    self.emit(&format!("movq ${}, (%r14)", header(INT, 1, 0)));
+                                                    self.emit("movq %rcx, 8(%r14)");
+                                                    if !skip_state {
+                                                        let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
+                                                    }
+                                                    let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(val_slot));
+                                                    None
+                                                } else {
+                                                    if !skip_state {
+                                                        let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
+                                                    }
+                                                    None
+                                                };
+                                                if slow_used {
+                                                    let slow = slow.unwrap();
+                                                    let body_lbl = body_lbl.unwrap();
+                                                    let cont = self.label("k");
+                                                    let live = self.case_live(alts, *bslot, p);
+                                                    self.emit_cold(|g| {
+                                                        g.put_label(&slow);
+                                                        g.save_cache(&saved_cache, p);
+                                                        g.cache.clear();
+                                                        g.safe_slots = saved_safe;
+                                                        g.known_kind = saved_kind;
+                                                        g.zero_unsafe_slots(p, true);
+                                                        g.emit("subq $8, %rbp");
+                                                        let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
+                                                        g.emit("movq %rax, (%rbp)");
+                                                        g.live.push(live.clone());
+                                                        g.slow_only = true;
+                                                        g.expr(scrut, sp);
+                                                        g.live.pop();
+                                                        let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
+                                                        g.put_label(&cont);
+                                                        g.emit("addq $8, %rbp");
+                                                        if let Some(aslot) = arr_slot {
+                                                            if live.contains(&aslot) || live.contains(&ALL_LIVE) {
+                                                                g.chase_ind_slot(aslot, p);
+                                                            }
+                                                        }
+                                                        if let Some(islot) = idx_slot {
+                                                            if live.contains(&islot) || live.contains(&ALL_LIVE) {
+                                                                g.chase_ind_slot(islot, p);
+                                                            }
+                                                        }
+                                                        g.reload_cache(&read_post_cache, p);
+                                                        if !skip_state {
+                                                            g.emit("movq 8(%r14), %rcx");
+                                                            let _ = writeln!(g.out, "    movq %rcx, {}(%rbp)", p.slot_off(slots[0]));
+                                                        }
+                                                        if val_is_raw {
+                                                            g.emit("movq 16(%r14), %rax");
+                                                            if let Some(reg) = direct_reg {
+                                                                let _ = writeln!(g.out, "    movq 8(%rax), {reg}");
+                                                            } else {
+                                                                g.emit("movq 8(%rax), %rcx");
+                                                                let _ = writeln!(g.out, "    movq %rcx, {}", p.slot(val_slot));
+                                                            }
+                                                        } else if val_slot != UNUSED_SLOT {
+                                                            g.emit("movq 16(%r14), %rax");
+                                                            let _ = writeln!(g.out, "    movq %rax, {}(%rbp)", p.slot_off(val_slot));
+                                                        }
+                                                        let _ = writeln!(g.out, "    jmp {body_lbl}");
+                                                    });
+                                                    self.put_label(&body_lbl);
+                                                    self.cache = read_post_cache;
+                                                    if let Some(reg) = direct_reg {
+                                                        self.cache_put(val_slot, reg, true);
+                                                    }
+                                                }
+                                                self.safe_slots = saved_safe;
+                                                self.known_kind = fast_kind;
+                                                if !skip_state {
+                                                    self.mark_slot_safe(slots[0]);
+                                                    self.known_kind.remove(&slots[0]);
+                                                }
+                                                if val_slot != UNUSED_SLOT && !val_is_raw {
+                                                    self.mark_slot_safe(val_slot);
+                                                    self.known_kind.insert(val_slot, KnownVal::Kind(INT));
+                                                }
+                                                self.expr(body, p);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         let ready = self.label("ready");
@@ -3894,10 +4086,17 @@ impl Gen {
                         if *s == UNUSED_SLOT {
                             continue;
                         }
-                        let _ = writeln!(self.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
-                        let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*s));
-                        self.mark_slot_safe(*s);
-                        self.known_kind.remove(s);
+                        if *s & RAW != 0 {
+                            let _ = writeln!(self.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
+                            self.emit("movq 8(%rcx), %rcx");
+                            let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(*s));
+                            self.cache.retain(|c| raw_idx(c.slot) != raw_idx(*s));
+                        } else {
+                            let _ = writeln!(self.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
+                            let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*s));
+                            self.mark_slot_safe(*s);
+                            self.known_kind.remove(s);
+                        }
                     }
                     if idx == 0 {
                         if let Some(fb) = fast_body {
@@ -4294,7 +4493,7 @@ impl Gen {
         if self.raw_dest.is_none() && self.mutvar_fast_path(name, args, p, slow) {
             return true;
         }
-        if self.raw_dest.is_none() && self.bytes_fast_path(name, args, p, slow) {
+        if self.bytes_fast_path(name, args, p, slow) {
             return true;
         }
         if self.integer_fast_path(name, args, p, slow) {
@@ -5051,12 +5250,12 @@ impl Gen {
         let Some((access, elem)) = ["index", "read", "write"].iter().find_map(|a| name.strip_prefix(a).map(|r| (*a, r))) else {
             return false;
         };
+        if self.raw_dest.is_some() && access != "index" {
+            return false;
+        }
         // (load instruction, store instruction and register, scale)
-        let (load, store, scale) = match elem {
-            "IntArray#" | "WordArray#" => ("movq", "movq %rcx", 8),
-            "Int8Array#" => ("movsbq", "movb %cl", 1),
-            "Word8Array#" => ("movzbq", "movb %cl", 1),
-            _ => return false,
+        let Some((load, store, scale)) = bytes_elem_ops(elem) else {
+            return false;
         };
         let arity = match access {
             "index" => 2,
@@ -5070,10 +5269,12 @@ impl Gen {
         if numbers.iter().any(|a| matches!(a, Atom::Lit(l) if !matches!(l, SLit::Int(_)))) {
             return false;
         }
-        self.load(&args[0], p, "%rax");
-        self.emit(&format!("cmpb ${BYTES}, (%rax)"));
-        self.emit(&format!("jne {slow}"));
-        self.fast_slow_used = true;
+        if !matches!(&args[0], Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(BYTES))) {
+            self.load(&args[0], p, "%rax");
+            self.emit(&format!("cmpb ${BYTES}, (%rax)"));
+            self.emit(&format!("jne {slow}"));
+            self.fast_slow_used = true;
+        }
         for a in numbers {
             if is_raw(a) || matches!(a, Atom::Lit(_)) || matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(INT))) {
                 continue;
@@ -5081,6 +5282,7 @@ impl Gen {
             self.load(a, p, "%rax");
             self.emit(&format!("cmpb ${INT}, (%rax)"));
             self.emit(&format!("jne {slow}"));
+            self.fast_slow_used = true;
         }
         let element = |g: &mut Self| {
             g.operand(&args[1], p, "%rdx");
@@ -5093,6 +5295,30 @@ impl Gen {
             let unit = self.con_id("Builtin.()");
             let cell = self.nullary_con(unit);
             self.emit(&format!("leaq {cell}(%rip), %r14"));
+            self.fast_ret(p);
+            return true;
+        }
+        if let Some(dest) = self.raw_dest {
+            if !self.fast_slow_used {
+                element(self);
+                self.cache.retain(|c| raw_idx(c.slot) != raw_idx(dest));
+                let reg = self.fresh_reg(p, &[]);
+                self.emit(&format!("{load} 8(%rax,%rdx,{scale}), {reg}"));
+                self.fast_raw_reg = Some(reg);
+            } else {
+                let reg = CACHE_REGS
+                    .iter()
+                    .copied()
+                    .find(|r| !self.cache.iter().any(|c| c.reg == *r && raw_idx(c.slot) != raw_idx(dest)));
+                element(self);
+                if let Some(reg) = reg {
+                    self.emit(&format!("{load} 8(%rax,%rdx,{scale}), {reg}"));
+                    self.fast_raw_reg = Some(reg);
+                } else {
+                    self.emit(&format!("{load} 8(%rax,%rdx,{scale}), %rcx"));
+                    let _ = writeln!(self.out, "    movq %rcx, {}", p.slot(dest));
+                }
+            }
             self.fast_ret(p);
             return true;
         }
@@ -7437,6 +7663,50 @@ mod sprint6_codegen_tests {
         assert!(g1.contains("movq %rax, %r14"), "expected zero-alloc return for boxed int2Word#:\n{g1}");
         let g1_hot = g1.split("\n.Lyield").next().unwrap_or(g1);
         assert!(!g1_hot.contains("hsc_gc"), "expected no allocation on hot path of boxed int2Word#:\n{g1_hot}");
+    }
+
+    #[test]
+    fn fused_unboxed_read_write_word_array_avoids_allocation() {
+        // Case(readWordArray# slot1 raw0 slot2, UNUSED, [(,) [slot3, raw1] ->
+        //   Case(and# raw1 1#, raw2, [_ -> writeWordArray# slot1 raw0 raw2 slot3])])
+        let mut c = simple_closure(
+            2,
+            4,
+            3,
+            SExpr::Case(
+                Box::new(SExpr::Prim(
+                    "readWordArray#".into(),
+                    vec![Atom::Slot(1), Atom::Slot(RAW | 0), Atom::Slot(2)],
+                )),
+                UNUSED_SLOT,
+                vec![SAlt::Con(
+                    "Builtin.(,)".into(),
+                    vec![3, RAW | 1],
+                    SExpr::Case(
+                        Box::new(SExpr::Prim("and#".into(), vec![Atom::Slot(RAW | 1), Atom::Lit(SLit::Int(1))])),
+                        RAW | 2,
+                        vec![SAlt::Default(SExpr::Prim(
+                            "writeWordArray#".into(),
+                            vec![Atom::Slot(1), Atom::Slot(RAW | 0), Atom::Slot(RAW | 2), Atom::Slot(3)],
+                        ))],
+                    ),
+                )],
+            ),
+        );
+        c.raw_args = vec![(0, RAW | 0)];
+        let g = SGlobal { name: "Test.rw".into(), closure: c, worker: None };
+        let prog = make_prog(vec![g]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbl0 = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let start = asm.find(&format!("{lbl0}:\n")).expect("g0");
+        let end = asm[start + 1..].find("\n.section").map(|i| start + 1 + i).unwrap_or(asm.len());
+        let g0 = &asm[start..end];
+        let hot = g0.split("\n.Lslow").next().unwrap_or(g0);
+        // Hot path should perform a single BYTES tag check and zero heap allocations (no ja .Lgc).
+        assert_eq!(hot.matches(&format!("cmpb ${BYTES}")).count(), 1, "expected single BYTES check:\n{hot}");
+        assert!(!hot.contains("ja .Lgc"), "expected zero heap allocation on hot path:\n{hot}");
+        assert!(hot.contains("8(%rax,%rdx,8)"), "expected indexed word array load/store:\n{hot}");
     }
 }
 
