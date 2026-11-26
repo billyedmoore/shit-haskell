@@ -77,7 +77,7 @@ const STRICT_PRIMS: &[&str] = &[
     "uncheckedIShiftRL#", "tagToEnum#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#",
     "geChar#", "ord#", "chr#", "plusWord#", "minusWord#", "timesWord#", "and#", "or#", "xor#",
     "eqWord#", "neWord#", "ltWord#", "leWord#", "gtWord#", "geWord#", "uncheckedShiftL#",
-    "uncheckedShiftRL#", "+##", "-##", "*##", "/##", "==##", "/=##", "<##", "<=##", ">##", ">=##",
+    "uncheckedShiftRL#", "not#", "int2Word#", "word2Int#", "+##", "-##", "*##", "/##", "==##", "/=##", "<##", "<=##", ">##", ">=##",
     "sqrtDouble#", "negateDouble#", "fabsDouble#", "int2Double#", "double2Int#", "word2Double#",
     "plusFloat#", "minusFloat#", "timesFloat#", "divideFloat#", "eqFloat#", "neFloat#", "ltFloat#",
     "leFloat#", "gtFloat#", "geFloat#", "sqrtFloat#", "negateFloat#", "fabsFloat#", "int2Float#",

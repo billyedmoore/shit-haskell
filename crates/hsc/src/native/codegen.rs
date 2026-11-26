@@ -326,7 +326,7 @@ fn magic_divisor(a: &Atom) -> Option<i64> {
 /// with no slow path (no cell checks, no faulting division): see `Gen::raw_op`.
 fn total_raw_op(name: &str, args: &[Atom]) -> bool {
     let Some(k) = int_op(name) else { return false };
-    let arity = if matches!(k, K::Un(_) | K::Ord | K::Chr | K::TagToEnum) { 1 } else { 2 };
+    let arity = if matches!(k, K::Un(_) | K::Ord | K::Id | K::Chr | K::TagToEnum) { 1 } else { 2 };
     let in_char = matches!(k, K::CharCmp(_) | K::Ord);
     let num = |a: &Atom| match a {
         Atom::Slot(k) => k & RAW != 0,
@@ -342,7 +342,7 @@ fn total_raw_op(name: &str, args: &[Atom]) -> bool {
 
 /// The inline `Int#`/`Word#`/`Char#` operations (see `Gen::int_fast_path`).
 #[derive(PartialEq, Clone, Copy)]
-enum K { Bin(&'static str), Cmp(&'static str), Shift(&'static str), Div(bool), Un(&'static str), CharCmp(&'static str), Ord, Chr, TagToEnum }
+enum K { Bin(&'static str), Cmp(&'static str), Shift(&'static str), Div(bool), Un(&'static str), CharCmp(&'static str), Ord, Id, Chr, TagToEnum }
 
 fn int_op(name: &str) -> Option<K> {
     Some(match name {
@@ -366,6 +366,7 @@ fn int_op(name: &str) -> Option<K> {
         "eqWord#" => K::Cmp("sete"), "neWord#" => K::Cmp("setne"), "ltWord#" => K::Cmp("setb"),
         "leWord#" => K::Cmp("setbe"), "gtWord#" => K::Cmp("seta"), "geWord#" => K::Cmp("setae"),
         "uncheckedShiftL#" => K::Shift("shlq"), "uncheckedShiftRL#" => K::Shift("shrq"),
+        "not#" => K::Un("notq"), "int2Word#" | "word2Int#" => K::Id,
         _ => return None,
     })
 }
@@ -1954,7 +1955,7 @@ impl Gen {
                 };
                 self.emit(&format!("{op} {d}"));
             }
-            K::Ord => {
+            K::Ord | K::Id => {
                 d = if dead0 && r0.is_some() {
                     r0.unwrap()
                 } else {
@@ -4303,7 +4304,7 @@ impl Gen {
             return self.raw_dest.is_none() && self.double_fast_path(k, args, p, slow);
         }
         let Some(k) = int_op(name) else { return false };
-        let arity = if matches!(k, K::Un(_) | K::Ord | K::Chr | K::TagToEnum) { 1 } else { 2 };
+        let arity = if matches!(k, K::Un(_) | K::Ord | K::Id | K::Chr | K::TagToEnum) { 1 } else { 2 };
         let (in_kind, out_kind) = match k {
             K::CharCmp(_) => (CHAR, INT),
             K::Ord => (CHAR, INT),
@@ -4338,7 +4339,7 @@ impl Gen {
         let chk1 = arity == 2 && needs_check(1);
         let has_free_cache_reg = CACHE_REGS.iter().any(|r| !self.cache.iter().any(|c| c.reg == *r));
         let non_slot_eval_ok = matches!(k, K::Cmp(_) | K::CharCmp(_) | K::TagToEnum)
-            || (dest.is_none() && matches!(k, K::Bin(_)))
+            || (dest.is_none() && (matches!(k, K::Bin(_)) || k == K::Id))
             || (dest.is_some() && !matches!(k, K::Div(_)) && has_free_cache_reg);
         let mut rax_arg: Option<usize> = None;
         for idx in 0..arity {
@@ -4439,6 +4440,15 @@ impl Gen {
             self.emit(&format!("leaq {f}(%rip), %r14"));
             self.emit(&format!("leaq {t}(%rip), %rax"));
             self.emit("cmovneq %rax, %r14");
+            self.fast_ret(p);
+            return true;
+        }
+        if k == K::Id && dest.is_none() && !is_raw(&args[0]) && !matches!(args[0], Atom::Lit(_)) {
+            if rax_holds_arg0 {
+                self.emit("movq %rax, %r14");
+            } else {
+                self.load(&args[0], p, "%r14");
+            }
             self.fast_ret(p);
             return true;
         }
@@ -4668,7 +4678,7 @@ impl Gen {
                             }
                         },
                         K::Un(op) => self.emit(&format!("{op} {reg}")),
-                        K::Ord => {}
+                        K::Ord | K::Id => {}
                         K::Chr => self.emit(&format!("movl {}, {}", low32(reg), low32(reg))),
                         K::Div(_) | K::Cmp(_) | K::CharCmp(_) | K::TagToEnum => unreachable!(),
                     }
@@ -4703,7 +4713,7 @@ impl Gen {
                 self.emit(if quot { "movq %rax, %rcx" } else { "movq %rdx, %rcx" });
             }
             K::Un(op) => self.emit(&format!("{op} %rcx")),
-            K::Ord => {}
+            K::Ord | K::Id => {}
             // The code point is the low 32 bits (as the runtime takes it).
             K::Chr => self.emit("movl %ecx, %ecx"),
             K::Cmp(_) | K::CharCmp(_) | K::TagToEnum => unreachable!("answered without allocating"),
@@ -7364,6 +7374,40 @@ mod sprint6_codegen_tests {
         assert!(body.contains(".Lopev"), "expected cold operand eval stub:\n{body}");
         assert!(body.contains("jmp hsc_eval"), "expected native hsc_eval in operand stub:\n{body}");
         assert!(body.contains(".Lopret"), "expected operand eval continuation:\n{body}");
+    }
+
+    #[test]
+    fn word_not_and_conversions_compile_inline() {
+        let not_g = SGlobal {
+            name: "Test.wnot".into(),
+            closure: simple_closure(1, 2, 0, SExpr::Prim("not#".into(), vec![Atom::Slot(1)])),
+            worker: None,
+        };
+        let i2w_g = SGlobal {
+            name: "Test.i2w".into(),
+            closure: simple_closure(1, 2, 0, SExpr::Prim("int2Word#".into(), vec![Atom::Slot(1)])),
+            worker: None,
+        };
+        let prog = make_prog(vec![not_g, i2w_g]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let lbl0 = table.lines().next().unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let lbl1 = table.lines().nth(1).unwrap().rsplit_once(',').unwrap().1.split_whitespace().next().unwrap();
+        let slice_fn = |lbl: &str| {
+            let start = asm.find(&format!("{lbl}:\n")).expect("label");
+            let end = asm[start + 1..]
+                .find("\n    .p2align")
+                .or_else(|| asm[start + 1..].find("\n.section"))
+                .map(|i| start + 1 + i)
+                .unwrap_or(asm.len());
+            &asm[start..end]
+        };
+        let g0 = slice_fn(lbl0);
+        let g1 = slice_fn(lbl1);
+        assert!(g0.contains("notq"), "expected inline notq for not#:\n{g0}");
+        assert!(g1.contains("movq %rax, %r14"), "expected zero-alloc return for boxed int2Word#:\n{g1}");
+        let g1_hot = g1.split("\n.Lyield").next().unwrap_or(g1);
+        assert!(!g1_hot.contains("hsc_gc"), "expected no allocation on hot path of boxed int2Word#:\n{g1_hot}");
     }
 }
 

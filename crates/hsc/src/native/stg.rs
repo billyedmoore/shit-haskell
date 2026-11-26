@@ -120,7 +120,7 @@ pub const RAW_RESULT_PRIMS: &[&str] = &[
     "uncheckedIShiftL#", "uncheckedIShiftRA#", "uncheckedIShiftRL#", "==#", "/=#", "<#", "<=#",
     ">#", ">=#", "plusWord#", "minusWord#", "timesWord#", "and#", "or#", "xor#", "eqWord#",
     "neWord#", "ltWord#", "leWord#", "gtWord#", "geWord#", "uncheckedShiftL#",
-    "uncheckedShiftRL#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#", "geChar#",
+    "uncheckedShiftRL#", "not#", "int2Word#", "word2Int#", "eqChar#", "neChar#", "ltChar#", "leChar#", "gtChar#", "geChar#",
     "ord#", "chr#",
 ];
 
