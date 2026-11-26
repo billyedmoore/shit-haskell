@@ -91,6 +91,14 @@ const TRUE: &str = "GHC.Types.True";
 const FALSE: &str = "GHC.Types.False";
 
 pub fn simplify(binds: &mut Vec<TopBind>) {
+    simplify_with_mode(binds, false);
+}
+
+pub fn simplify_whole_program(binds: &mut Vec<TopBind>) {
+    simplify_with_mode(binds, true);
+}
+
+fn simplify_with_mode(binds: &mut Vec<TopBind>, whole_program: bool) {
     float_closed_dicts(binds, 0);
     tie_dict_builder_knots(binds);
     expand_closed_dict_apps(binds);
@@ -129,6 +137,31 @@ pub fn simplify(binds: &mut Vec<TopBind>) {
             break;
         }
         pass(binds, 0, &rules, &strict_cons, Some(&changed));
+    }
+    // Caller-WHNF parameter analysis and speculation of cheap total primitive arguments at call
+    // sites (whole-program mode analyzes non-escaping top-level functions too; package mode analyzes
+    // local `let`-bound functions only).
+    let (global_whnf, local_whnf, spec_changed) =
+        caller_whnf_speculate(binds, &strict_cons, whole_program);
+    if !spec_changed.is_empty() || !global_whnf.is_empty() || !local_whnf.is_empty() {
+        let mut to_clean = spec_changed;
+        to_clean.extend(global_whnf.keys().cloned());
+        to_clean.extend(local_whnf.keys().cloned());
+        let no_rules = Rules {
+            by_head: HashMap::new(),
+            protected: HashSet::new(),
+            inlines: rules.inlines.clone(),
+        };
+        pass_with_whnf(
+            binds,
+            0,
+            &no_rules,
+            &strict_cons,
+            Some(&to_clean),
+            &global_whnf,
+            &local_whnf,
+            false,
+        );
     }
     // `oneShot` was kept as a marker (see `into_one_shot`); it is the identity.
     for b in binds.iter_mut() {
@@ -1269,7 +1302,23 @@ fn pass(
     strict_cons: &HashMap<String, Vec<bool>>,
     only: Option<&HashSet<String>>,
 ) {
-    if std::env::var_os("HSC_NO_ETA").is_none() {
+    let empty_global = HashMap::new();
+    let empty_local = HashMap::new();
+    pass_with_whnf(binds, phase, rules, strict_cons, only, &empty_global, &empty_local, true);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pass_with_whnf(
+    binds: &mut [TopBind],
+    phase: u32,
+    rules: &Rules,
+    strict_cons: &HashMap<String, Vec<bool>>,
+    only: Option<&HashSet<String>>,
+    global_whnf: &HashMap<String, Vec<bool>>,
+    local_whnf_by_bind: &HashMap<String, HashMap<String, Vec<bool>>>,
+    run_eta: bool,
+) {
+    if run_eta && std::env::var_os("HSC_NO_ETA").is_none() {
         let _ = eta_expand(binds, only, rules);
     }
     let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
@@ -1438,6 +1487,22 @@ fn pass(
                     once.insert(n);
                 }
             }
+            let empty_local_whnf = HashMap::new();
+            let bind_local_whnf = local_whnf_by_bind.get(&bind.name).unwrap_or(&empty_local_whnf);
+            let mut caller_whnf = HashSet::new();
+            if let Some(flags) = global_whnf.get(&bind.name) {
+                let mut cur: &Core = &bind.body;
+                for &is_whnf in flags {
+                    if let Core::Lam(p, inner) = cur {
+                        if is_whnf {
+                            caller_whnf.insert(p.clone());
+                        }
+                        cur = inner;
+                    } else {
+                        break;
+                    }
+                }
+            }
             let mut s = Simp {
                 once: &once,
                 dead: &dead,
@@ -1457,6 +1522,8 @@ fn pass(
                 rule_budget: RULE_BUDGET,
                 atoms: HashMap::new(),
                 evaluated: HashSet::new(),
+                caller_whnf,
+                local_whnf: bind_local_whnf,
                 arities,
                 local_arities: {
                     let mut a = HashMap::new();
@@ -1467,6 +1534,7 @@ fn pass(
                 budget: tune.inline_budget,
                 changed: false,
                 eval_pos: false,
+                in_app_head: false,
                 tune,
             };
             s.expr(&mut bind.body);
@@ -1529,6 +1597,11 @@ struct Simp<'a> {
     atoms: HashMap<String, Core>,
     /// Case binders: variables known to be evaluated.
     evaluated: HashSet<String>,
+    /// Parameters guaranteed WHNF by all callers (used for speculation only so explicit `case`
+    /// forcing stays intact for downstream `certainly_evaluated` / raw-worker analysis).
+    caller_whnf: HashSet<String>,
+    /// Caller-WHNF parameter flags for local `let`-bound functions in the current top-level bind.
+    local_whnf: &'a HashMap<String, Vec<bool>>,
     /// The number of parameters of the global and let-bound functions in scope.
     arities: &'a HashMap<String, usize>,
     /// The same for the let-bound functions of the binding being simplified.
@@ -1540,15 +1613,24 @@ struct Simp<'a> {
     /// scrutinee/alt, strict prim arg, or `let` body in eval position), so floating speculable
     /// arguments out of a `Core::Con` does not turn a value binding into a thunk.
     eval_pos: bool,
+    /// True while descending down the left function spine of a `Core::App`, so `speculate_app_args`
+    /// runs once on the outermost application spine after inlining/beta-reduction.
+    in_app_head: bool,
     /// The thresholds of the optimisation level.
     tune: Tuning,
 }
 
 impl Simp<'_> {
+    fn ok_for_spec(&self, e: &Core) -> bool {
+        ok_for_speculation_with(e, &self.evaluated, Some(&self.caller_whnf))
+    }
+
     fn expr_with_eval(&mut self, c: &mut Core, eval_pos: bool) {
-        let prev = std::mem::replace(&mut self.eval_pos, eval_pos);
+        let prev_eval = std::mem::replace(&mut self.eval_pos, eval_pos);
+        let prev_head = std::mem::replace(&mut self.in_app_head, false);
         self.expr(c);
-        self.eval_pos = prev;
+        self.eval_pos = prev_eval;
+        self.in_app_head = prev_head;
     }
 
     fn expr(&mut self, c: &mut Core) {
@@ -1565,7 +1647,16 @@ impl Simp<'_> {
             }
             Core::Lit(_) | Core::Fail(_) => {}
             Core::App(..) => {
-                let cold = is_bottom_expr(c);
+                let cold = is_bottom_expr_with(c, self.bottom_fns);
+                let pap_non_eval = !self.eval_pos && {
+                    let mut n = 0usize;
+                    let mut h = &*c;
+                    while let Core::App(g, _) = h {
+                        n += 1;
+                        h = g;
+                    }
+                    matches!(h, Core::Var(v) if self.arity(v) > n)
+                };
                 let (saved_budget, saved_rule_budget) = if cold {
                     (
                         std::mem::replace(&mut self.budget, 0),
@@ -1575,7 +1666,11 @@ impl Simp<'_> {
                     (0, 0)
                 };
                 let Core::App(f, a) = c else { unreachable!() };
-                self.expr_with_eval(f, true);
+                let prev_eval = std::mem::replace(&mut self.eval_pos, !pap_non_eval);
+                let prev_head = std::mem::replace(&mut self.in_app_head, true);
+                self.expr(f);
+                self.eval_pos = prev_eval;
+                self.in_app_head = prev_head;
                 self.expr_with_eval(a, false);
                 if cold {
                     self.budget = saved_budget;
@@ -1590,6 +1685,9 @@ impl Simp<'_> {
                     self.inline_call(c);
                 }
                 self.reduce(c);
+                if !self.in_app_head && !cold && self.phase == 0 && !pap_non_eval {
+                    self.speculate_app_args(c);
+                }
             }
             Core::Lam(_, b) => self.expr_with_eval(b, true),
             Core::Let(bindings, _) => {
@@ -1642,7 +1740,24 @@ impl Simp<'_> {
                     }
                 }
                 for (name, rhs) in kept.iter_mut() {
+                    let mut added_whnf = Vec::new();
+                    if let Some(flags) = self.local_whnf.get(name.as_str()) {
+                        let mut cur: &Core = rhs;
+                        for &is_whnf in flags {
+                            if let Core::Lam(p, inner) = cur {
+                                if is_whnf && self.caller_whnf.insert(p.clone()) {
+                                    added_whnf.push(p.clone());
+                                }
+                                cur = inner;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
                     self.expr_with_eval(rhs, false);
+                    for p in added_whnf {
+                        self.caller_whnf.remove(&p);
+                    }
                     if let Core::Let(inner, inner_body) = rhs {
                         if inner.len() == 1 && matches!(&**inner_body, Core::Var(v) if v == &inner[0].0) {
                             let (this, mut body) = inner.pop().unwrap();
@@ -2087,7 +2202,7 @@ impl Simp<'_> {
                 if self.eval_pos {
                     let mut cases = Vec::new();
                     for a in args.iter_mut() {
-                        if !is_atom(a) && ok_for_speculation(a, &self.evaluated) {
+                        if !is_atom(a) && self.ok_for_spec(a) {
                             *self.fresh += 1;
                             let v = format!("sp~{}", self.fresh);
                             cases.push((v.clone(), std::mem::replace(a, Core::Var(v))));
@@ -2116,6 +2231,58 @@ impl Simp<'_> {
                 }
             }
         }
+    }
+
+    /// Evaluates small, total primitive arguments (`ok_for_spec`) before a non-PAP call instead
+    /// of allocating a thunk for them. Wrapping the call itself ensures the argument is only
+    /// computed when the call is entered (safe even inside a lazy constructor field).
+    fn speculate_app_args(&mut self, c: &mut Core) {
+        if !matches!(c, Core::App(..)) {
+            return;
+        }
+        // Inspect the full application spine without mutating first.
+        let mut nargs = 0usize;
+        let mut has_spec = false;
+        let mut cur: &Core = c;
+        while let Core::App(f, a) = cur {
+            nargs += 1;
+            if !is_atom(a) && self.ok_for_spec(a) {
+                has_spec = true;
+            }
+            cur = f;
+        }
+        if !has_spec {
+            return;
+        }
+        match cur {
+            Core::Lam(..) | Core::Case(..) | Core::Fail(_) => return,
+            Core::Var(v) if v == ONE_SHOT => return,
+            Core::Var(v) if !self.eval_pos && self.arity(v) > nargs => return,
+            _ => {}
+        }
+        // Replace each speculable argument in left-to-right order and wrap the call in `case`s.
+        let mut cases: Vec<(String, Core)> = Vec::new();
+        let mut cur_mut: &mut Core = c;
+        while let Core::App(f, a) = cur_mut {
+            if !is_atom(a) && self.ok_for_spec(a) {
+                *self.fresh += 1;
+                let v = format!("sp~{}", self.fresh);
+                cases.push((v.clone(), std::mem::replace(&mut **a, Core::Var(v))));
+            }
+            cur_mut = f;
+        }
+        if cases.is_empty() {
+            return;
+        }
+        // `cases` was collected right-to-left (outermost arg first), so iterating directly wraps
+        // the leftmost arg outermost.
+        let mut e = take(c);
+        for (v, a) in cases {
+            e = Core::Case(Box::new(a), v, vec![Alt::Default(e)]);
+        }
+        *c = e;
+        self.changed = true;
+        self.expr(c);
     }
 
     /// `let x = e in case x as b of alts` (x not in e) as `case e as x of alts`, with `b` as `x`.
@@ -2159,7 +2326,7 @@ impl Simp<'_> {
         if mentions(e, x) || self.is_value(e) || !mentions(body, x) {
             return;
         }
-        if !ok_for_speculation(e, &self.evaluated) {
+        if !self.ok_for_spec(e) {
             return;
         }
         let Core::Let(mut bs, body) = take(c) else { unreachable!() };
@@ -4256,26 +4423,44 @@ fn is_total_prim(p: &str, args: &[Core]) -> bool {
 const SPECULATE_SIZE: usize = 24;
 
 /// True when `e` is a small, pure, non-failing primitive computation whose free operands are all
-/// already in WHNF (`evaluated` or atomic literals), so evaluating it eagerly cannot change
-/// termination or exception semantics and avoids allocating a thunk.
+/// already in WHNF (`evaluated`, `extra_whnf`, or atomic literals), so evaluating it eagerly cannot
+/// change termination or exception semantics and avoids allocating a thunk.
 fn ok_for_speculation(e: &Core, evaluated: &HashSet<String>) -> bool {
-    fn go<'a>(e: &'a Core, evaluated: &HashSet<String>, extra: &mut Vec<&'a str>, depth: usize) -> bool {
+    ok_for_speculation_with(e, evaluated, None)
+}
+
+fn ok_for_speculation_with(
+    e: &Core,
+    evaluated: &HashSet<String>,
+    extra_whnf: Option<&HashSet<String>>,
+) -> bool {
+    fn go<'a>(
+        e: &'a Core,
+        evaluated: &HashSet<String>,
+        extra_whnf: Option<&HashSet<String>>,
+        extra: &mut Vec<&'a str>,
+        depth: usize,
+    ) -> bool {
         if depth == 0 {
             return false;
         }
         match e {
             Core::Lit(Lit::Int(_) | Lit::Char(_) | Lit::Double(_)) => true,
-            Core::Var(x) => evaluated.contains(x.as_str()) || extra.contains(&x.as_str()),
+            Core::Var(x) => {
+                evaluated.contains(x.as_str())
+                    || extra_whnf.is_some_and(|w| w.contains(x.as_str()))
+                    || extra.contains(&x.as_str())
+            }
             Core::Prim(p, args) => {
-                is_total_prim_op(p, args) && args.iter().all(|a| go(a, evaluated, extra, depth - 1))
+                is_total_prim_op(p, args) && args.iter().all(|a| go(a, evaluated, extra_whnf, extra, depth - 1))
             }
             Core::Case(s, b, alts) => {
                 let [Alt::Default(body)] = &alts[..] else { return false };
-                if !go(s, evaluated, extra, depth - 1) {
+                if !go(s, evaluated, extra_whnf, extra, depth - 1) {
                     return false;
                 }
                 extra.push(b.as_str());
-                let ok = go(body, evaluated, extra, depth - 1);
+                let ok = go(body, evaluated, extra_whnf, extra, depth - 1);
                 extra.pop();
                 ok
             }
@@ -4283,7 +4468,7 @@ fn ok_for_speculation(e: &Core, evaluated: &HashSet<String>) -> bool {
         }
     }
     let mut extra = Vec::new();
-    size(e, SPECULATE_SIZE + 1) <= SPECULATE_SIZE && go(e, evaluated, &mut extra, 16)
+    size(e, SPECULATE_SIZE + 1) <= SPECULATE_SIZE && go(e, evaluated, extra_whnf, &mut extra, 16)
 }
 
 /// Primitives that unconditionally force all their arguments left-to-right before returning or
@@ -4850,6 +5035,980 @@ fn call_by_value(binds: &mut [TopBind]) -> HashSet<String> {
     changed
 }
 
+/// Bindings referenced directly by the runtime or program entry (must not assume closed-world callers).
+fn is_external_entry(name: &str) -> bool {
+    name == "Main.main"
+        || name == crate::core::MAIN_ENTRY
+        || name == "hsc$main"
+        || name == "GHC.Internal.TopHandler.runMainIO"
+        || name == "GHC.Internal.TopHandler.flushStdHandles"
+        || name == "GHC.Internal.Base.thenIO"
+        || name == "GHC.Internal.Exception.Type.displayException"
+        || crate::native::RTS_GLOBALS.contains(&name)
+}
+
+/// Greatest-fixed-point caller-WHNF parameter analysis and call-site speculation.
+///
+/// Finds non-escaping functions (top-level when `whole_program`, plus local `let`-bound functions
+/// in uniquely-bound bodies) whose callers only ever pass WHNF values or `ok_for_speculation` total
+/// primitive expressions in parameter position `i`, then wraps every speculable call-site argument
+/// in `case arg as sp of _ -> f ... sp ...` so the WHNF invariant holds strictly before `pass`
+/// uses those parameters to enable further speculation inside the callee.
+fn caller_whnf_speculate(
+    binds: &mut [TopBind],
+    strict_cons: &HashMap<String, Vec<bool>>,
+    whole_program: bool,
+) -> (
+    HashMap<String, Vec<bool>>,
+    HashMap<String, HashMap<String, Vec<bool>>>,
+    HashSet<String>,
+) {
+    let globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
+    let direct: HashMap<&str, &Core> = binds.iter().map(|b| (b.name.as_str(), &b.body)).collect();
+    let global_arities: HashMap<String, usize> = binds
+        .iter()
+        .filter_map(|b| {
+            let (n, _) = lambdas(&b.body);
+            (n > 0).then(|| (b.name.clone(), n))
+        })
+        .collect();
+
+    // Top-level bindings guaranteed to already be in WHNF (literals, constructors, lambdas, or
+    // atomic-arg partial applications of known functions).
+    let mut whnf_globals: HashSet<String> = HashSet::new();
+    for b in binds.iter() {
+        let mut cur = &b.body;
+        for _ in 0..8 {
+            match cur {
+                Core::Var(v) => match direct.get(v.as_str()) {
+                    Some(next) if v != &b.name => cur = next,
+                    _ => break,
+                },
+                Core::Lit(_) | Core::Con(..) | Core::Lam(..) => {
+                    whnf_globals.insert(b.name.clone());
+                    break;
+                }
+                Core::App(..) => {
+                    let mut n = 0usize;
+                    let mut all_atom = true;
+                    let mut h = cur;
+                    while let Core::App(f, a) = h {
+                        if !is_atom(a) {
+                            all_atom = false;
+                            break;
+                        }
+                        n += 1;
+                        h = f;
+                    }
+                    if all_atom && matches!(h, Core::Var(g) if global_arities.get(g.as_str()).is_some_and(|&a| a > n)) {
+                        whnf_globals.insert(b.name.clone());
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    // Collect candidate top-level functions (whole-program only) and local functions (per binding).
+    let mut global_cands: HashMap<String, usize> = HashMap::new();
+    if whole_program {
+        for b in binds.iter() {
+            if is_rule_binding(&b.name) || is_external_entry(&b.name) {
+                continue;
+            }
+            let (n, _) = lambdas(&b.body);
+            if n > 0 {
+                global_cands.insert(b.name.clone(), n);
+            }
+        }
+    }
+
+    fn collect_local_lams<'a>(e: &'a Core, out: &mut HashMap<String, usize>) {
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(f, a) => {
+                collect_local_lams(f, out);
+                collect_local_lams(a, out);
+            }
+            Core::Lam(_, b) => collect_local_lams(b, out),
+            Core::Let(bs, body) => {
+                for (x, r) in bs {
+                    let (n, _) = lambdas(r);
+                    if n > 0 {
+                        out.insert(x.clone(), n);
+                    }
+                    collect_local_lams(r, out);
+                }
+                collect_local_lams(body, out);
+            }
+            Core::Case(s, _, alts) => {
+                collect_local_lams(s, out);
+                for a in alts {
+                    let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                    collect_local_lams(b, out);
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    collect_local_lams(a, out);
+                }
+            }
+        }
+    }
+
+    let mut local_cands: Vec<HashMap<String, usize>> = Vec::with_capacity(binds.len());
+    for b in binds.iter() {
+        let mut lc = HashMap::new();
+        if !is_rule_binding(&b.name) && unique_binders(&b.body, &globals, &mut HashSet::new()) {
+            collect_local_lams(&b.body, &mut lc);
+        }
+        local_cands.push(lc);
+    }
+
+    // Scan all bindings for escaped (non-saturated / higher-order) occurrences and call counts.
+    let mut global_escaped: HashSet<String> = HashSet::new();
+    let mut global_calls: HashMap<String, usize> = HashMap::new();
+    let mut local_escaped: Vec<HashSet<String>> = vec![HashSet::new(); binds.len()];
+    let mut local_calls: Vec<HashMap<String, usize>> = vec![HashMap::new(); binds.len()];
+
+    struct EscapeCtx<'a> {
+        global_cands: &'a HashMap<String, usize>,
+        local_cands: &'a HashMap<String, usize>,
+        global_escaped: &'a mut HashSet<String>,
+        global_calls: &'a mut HashMap<String, usize>,
+        local_escaped: &'a mut HashSet<String>,
+        local_calls: &'a mut HashMap<String, usize>,
+        shadowed: HashMap<String, usize>,
+    }
+
+    fn scan_escapes(e: &Core, ctx: &mut EscapeCtx<'_>) {
+        match e {
+            Core::Var(v) => {
+                if ctx.shadowed.get(v.as_str()).copied().unwrap_or(0) == 0 {
+                    if ctx.global_cands.contains_key(v.as_str()) {
+                        ctx.global_escaped.insert(v.clone());
+                    }
+                } else if ctx.local_cands.contains_key(v.as_str()) {
+                    ctx.local_escaped.insert(v.clone());
+                }
+            }
+            Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(..) => {
+                let mut args = Vec::new();
+                let mut head = e;
+                while let Core::App(f, a) = head {
+                    args.push(&**a);
+                    head = f;
+                }
+                match head {
+                    Core::Var(v) => {
+                        if ctx.shadowed.get(v.as_str()).copied().unwrap_or(0) == 0 {
+                            if let Some(&arity) = ctx.global_cands.get(v.as_str()) {
+                                if args.len() >= arity {
+                                    *ctx.global_calls.entry(v.clone()).or_default() += 1;
+                                } else {
+                                    ctx.global_escaped.insert(v.clone());
+                                }
+                            }
+                        } else if let Some(&arity) = ctx.local_cands.get(v.as_str()) {
+                            if args.len() >= arity {
+                                *ctx.local_calls.entry(v.clone()).or_default() += 1;
+                            } else {
+                                ctx.local_escaped.insert(v.clone());
+                            }
+                        }
+                    }
+                    other => scan_escapes(other, ctx),
+                }
+                for a in args {
+                    scan_escapes(a, ctx);
+                }
+            }
+            Core::Lam(p, b) => {
+                *ctx.shadowed.entry(p.clone()).or_default() += 1;
+                scan_escapes(b, ctx);
+                *ctx.shadowed.get_mut(p.as_str()).unwrap() -= 1;
+            }
+            Core::Let(bs, body) => {
+                for (n, _) in bs {
+                    *ctx.shadowed.entry(n.clone()).or_default() += 1;
+                }
+                for (_, r) in bs {
+                    scan_escapes(r, ctx);
+                }
+                scan_escapes(body, ctx);
+                for (n, _) in bs {
+                    *ctx.shadowed.get_mut(n.as_str()).unwrap() -= 1;
+                }
+            }
+            Core::Case(s, b, alts) => {
+                scan_escapes(s, ctx);
+                *ctx.shadowed.entry(b.clone()).or_default() += 1;
+                for alt in alts {
+                    match alt {
+                        Alt::Con(_, vars, rhs) => {
+                            for v in vars {
+                                *ctx.shadowed.entry(v.clone()).or_default() += 1;
+                            }
+                            scan_escapes(rhs, ctx);
+                            for v in vars {
+                                *ctx.shadowed.get_mut(v.as_str()).unwrap() -= 1;
+                            }
+                        }
+                        Alt::Lit(_, rhs) | Alt::Default(rhs) => scan_escapes(rhs, ctx),
+                    }
+                }
+                *ctx.shadowed.get_mut(b.as_str()).unwrap() -= 1;
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    scan_escapes(a, ctx);
+                }
+            }
+        }
+    }
+
+    for (idx, b) in binds.iter().enumerate() {
+        if is_rule_binding(&b.name) {
+            continue;
+        }
+        let mut ctx = EscapeCtx {
+            global_cands: &global_cands,
+            local_cands: &local_cands[idx],
+            global_escaped: &mut global_escaped,
+            global_calls: &mut global_calls,
+            local_escaped: &mut local_escaped[idx],
+            local_calls: &mut local_calls[idx],
+            shadowed: HashMap::new(),
+        };
+        scan_escapes(&b.body, &mut ctx);
+    }
+
+    let mut global_whnf: HashMap<String, Vec<bool>> = global_cands
+        .into_iter()
+        .filter(|(k, _)| !global_escaped.contains(k) && global_calls.get(k).copied().unwrap_or(0) > 0)
+        .map(|(k, n)| (k, vec![true; n]))
+        .collect();
+    let mut local_whnf: Vec<HashMap<String, Vec<bool>>> = local_cands
+        .into_iter()
+        .enumerate()
+        .map(|(idx, lc)| {
+            lc.into_iter()
+                .filter(|(k, _)| !local_escaped[idx].contains(k) && local_calls[idx].get(k).copied().unwrap_or(0) > 0)
+                .map(|(k, n)| (k, vec![true; n]))
+                .collect()
+        })
+        .collect();
+
+    if global_whnf.is_empty() && local_whnf.iter().all(|m| m.is_empty()) {
+        return (HashMap::new(), HashMap::new(), HashSet::new());
+    }
+
+    #[derive(Default)]
+    struct Scope {
+        evaluated: HashSet<String>,
+        shadowed: HashMap<String, usize>,
+        local_arities: HashMap<String, usize>,
+    }
+
+    impl Scope {
+        fn is_local(&self, v: &str) -> bool {
+            self.shadowed.get(v).copied().unwrap_or(0) > 0
+        }
+
+        fn push_binder(&mut self, name: &str, is_eval: bool, arity: Option<usize>) -> (bool, Option<usize>) {
+            let prev_eval = self.evaluated.contains(name);
+            if is_eval {
+                self.evaluated.insert(name.to_string());
+            } else {
+                self.evaluated.remove(name);
+            }
+            *self.shadowed.entry(name.to_string()).or_default() += 1;
+            let prev_arity = match arity {
+                Some(n) => self.local_arities.insert(name.to_string(), n),
+                None => self.local_arities.remove(name),
+            };
+            (prev_eval, prev_arity)
+        }
+
+        fn pop_binder(&mut self, name: &str, saved: (bool, Option<usize>)) {
+            if saved.0 {
+                self.evaluated.insert(name.to_string());
+            } else {
+                self.evaluated.remove(name);
+            }
+            *self.shadowed.get_mut(name).unwrap() -= 1;
+            match saved.1 {
+                Some(n) => {
+                    self.local_arities.insert(name.to_string(), n);
+                }
+                None => {
+                    self.local_arities.remove(name);
+                }
+            }
+        }
+    }
+
+    fn is_already_whnf(
+        e: &Core,
+        scope: &Scope,
+        whnf_globals: &HashSet<String>,
+        global_arities: &HashMap<String, usize>,
+    ) -> bool {
+        match e {
+            Core::Lit(_) | Core::Con(..) | Core::Lam(..) => true,
+            Core::Var(v) => {
+                if scope.is_local(v) {
+                    scope.evaluated.contains(v.as_str())
+                } else {
+                    whnf_globals.contains(v.as_str())
+                }
+            }
+            Core::App(..) => {
+                let mut n = 0usize;
+                let mut h = e;
+                while let Core::App(f, a) = h {
+                    if !is_atom(a) {
+                        return false;
+                    }
+                    n += 1;
+                    h = f;
+                }
+                match h {
+                    Core::Var(g) => {
+                        let arity = if scope.is_local(g) {
+                            scope.local_arities.get(g.as_str()).copied().unwrap_or(0)
+                        } else {
+                            global_arities.get(g.as_str()).copied().unwrap_or(0)
+                        };
+                        arity > n
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn arg_whnf_or_spec(
+        arg: &Core,
+        scope: &Scope,
+        whnf_globals: &HashSet<String>,
+        global_arities: &HashMap<String, usize>,
+    ) -> bool {
+        is_already_whnf(arg, scope, whnf_globals, global_arities)
+            || (!is_atom(arg) && ok_for_speculation(arg, &scope.evaluated))
+    }
+
+    fn refine_expr(
+        e: &Core,
+        scope: &mut Scope,
+        strict_cons: &HashMap<String, Vec<bool>>,
+        whnf_globals: &HashSet<String>,
+        global_arities: &HashMap<String, usize>,
+        global_whnf: &mut HashMap<String, Vec<bool>>,
+        local_whnf: &mut HashMap<String, Vec<bool>>,
+        changed: &mut bool,
+    ) {
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(..) => {
+                let mut args = Vec::new();
+                let mut head = e;
+                while let Core::App(f, a) = head {
+                    args.push(&**a);
+                    head = f;
+                }
+                args.reverse();
+                match head {
+                    Core::Var(v) => {
+                        let is_local = scope.is_local(v);
+                        let flags_opt = if is_local {
+                            local_whnf.get_mut(v.as_str())
+                        } else {
+                            global_whnf.get_mut(v.as_str())
+                        };
+                        if let Some(flags) = flags_opt {
+                            if args.len() >= flags.len() {
+                                for (i, flag) in flags.iter_mut().enumerate() {
+                                    if *flag
+                                        && !arg_whnf_or_spec(args[i], scope, whnf_globals, global_arities)
+                                    {
+                                        *flag = false;
+                                        *changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    other => refine_expr(
+                        other,
+                        scope,
+                        strict_cons,
+                        whnf_globals,
+                        global_arities,
+                        global_whnf,
+                        local_whnf,
+                        changed,
+                    ),
+                }
+                for a in args {
+                    refine_expr(
+                        a,
+                        scope,
+                        strict_cons,
+                        whnf_globals,
+                        global_arities,
+                        global_whnf,
+                        local_whnf,
+                        changed,
+                    );
+                }
+            }
+            Core::Lam(p, body) => {
+                let saved = scope.push_binder(p, false, None);
+                refine_expr(
+                    body,
+                    scope,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    global_whnf,
+                    local_whnf,
+                    changed,
+                );
+                scope.pop_binder(p, saved);
+            }
+            Core::Let(bs, body) => {
+                let group_whnf: Vec<bool> = bs
+                    .iter()
+                    .map(|(_, rhs)| match rhs {
+                        Core::Lam(..) | Core::Lit(_) => true,
+                        Core::Con(..) => !bs.iter().any(|(n, _)| mentions(rhs, n)),
+                        Core::Var(y) => {
+                            !bs.iter().any(|(n, _)| n == y)
+                                && is_already_whnf(rhs, scope, whnf_globals, global_arities)
+                        }
+                        _ => false,
+                    })
+                    .collect();
+                let mut saved = Vec::with_capacity(bs.len());
+                for (name, rhs) in bs {
+                    let ar = lambdas(rhs).0;
+                    let is_lam = matches!(rhs, Core::Lam(..));
+                    saved.push(scope.push_binder(name, is_lam, (ar > 0).then_some(ar)));
+                }
+                for (name, rhs) in bs {
+                    if let Some(flags) = local_whnf.get(name.as_str()).cloned() {
+                        let mut p_saved = Vec::with_capacity(flags.len());
+                        let mut cur = rhs;
+                        for &is_w in &flags {
+                            let Core::Lam(p, inner) = cur else { break };
+                            p_saved.push((p.as_str(), scope.push_binder(p, is_w, None)));
+                            cur = inner;
+                        }
+                        refine_expr(
+                            cur,
+                            scope,
+                            strict_cons,
+                            whnf_globals,
+                            global_arities,
+                            global_whnf,
+                            local_whnf,
+                            changed,
+                        );
+                        for (p, s) in p_saved.into_iter().rev() {
+                            scope.pop_binder(p, s);
+                        }
+                    } else {
+                        refine_expr(
+                            rhs,
+                            scope,
+                            strict_cons,
+                            whnf_globals,
+                            global_arities,
+                            global_whnf,
+                            local_whnf,
+                            changed,
+                        );
+                    }
+                }
+                for ((name, _), &is_w) in bs.iter().zip(&group_whnf) {
+                    if is_w {
+                        scope.evaluated.insert(name.clone());
+                    }
+                }
+                refine_expr(
+                    body,
+                    scope,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    global_whnf,
+                    local_whnf,
+                    changed,
+                );
+                for ((name, _), s) in bs.iter().zip(saved).rev() {
+                    scope.pop_binder(name, s);
+                }
+            }
+            Core::Case(s, binder, alts) => {
+                refine_expr(
+                    s,
+                    scope,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    global_whnf,
+                    local_whnf,
+                    changed,
+                );
+                let mut extra_eval: Vec<(&str, bool)> = Vec::new();
+                match s.as_ref() {
+                    Core::Var(v) if scope.is_local(v) => {
+                        let prev = scope.evaluated.contains(v.as_str());
+                        extra_eval.push((v.as_str(), prev));
+                    }
+                    Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
+                        for a in args {
+                            if let Core::Var(v) = a {
+                                if scope.is_local(v) && !extra_eval.iter().any(|(n, _)| *n == v.as_str()) {
+                                    let prev = scope.evaluated.contains(v.as_str());
+                                    extra_eval.push((v.as_str(), prev));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for (v, _) in &extra_eval {
+                    scope.evaluated.insert((*v).to_string());
+                }
+                let saved_b = scope.push_binder(binder, true, None);
+                for alt in alts {
+                    match alt {
+                        Alt::Con(con, vars, rhs) => {
+                            let flags = strict_cons.get(con.as_str());
+                            let mut v_saved = Vec::with_capacity(vars.len());
+                            for (i, v) in vars.iter().enumerate() {
+                                let is_strict = flags.and_then(|f| f.get(i)).copied().unwrap_or(false);
+                                v_saved.push(scope.push_binder(v, is_strict, None));
+                            }
+                            refine_expr(
+                                rhs,
+                                scope,
+                                strict_cons,
+                                whnf_globals,
+                                global_arities,
+                                global_whnf,
+                                local_whnf,
+                                changed,
+                            );
+                            for (v, s) in vars.iter().zip(v_saved).rev() {
+                                scope.pop_binder(v, s);
+                            }
+                        }
+                        Alt::Lit(_, rhs) | Alt::Default(rhs) => refine_expr(
+                            rhs,
+                            scope,
+                            strict_cons,
+                            whnf_globals,
+                            global_arities,
+                            global_whnf,
+                            local_whnf,
+                            changed,
+                        ),
+                    }
+                }
+                scope.pop_binder(binder, saved_b);
+                for (v, prev) in extra_eval.into_iter().rev() {
+                    if prev {
+                        scope.evaluated.insert(v.to_string());
+                    } else {
+                        scope.evaluated.remove(v);
+                    }
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    refine_expr(
+                        a,
+                        scope,
+                        strict_cons,
+                        whnf_globals,
+                        global_arities,
+                        global_whnf,
+                        local_whnf,
+                        changed,
+                    );
+                }
+            }
+        }
+    }
+
+    // Iterate to greatest fixed point (flags only flip true -> false, so guaranteed termination).
+    loop {
+        let mut changed = false;
+        for (idx, b) in binds.iter().enumerate() {
+            if is_rule_binding(&b.name) {
+                continue;
+            }
+            let mut scope = Scope::default();
+            let mut cur = &b.body;
+            let mut p_saved = Vec::new();
+            if let Some(flags) = global_whnf.get(&b.name).cloned() {
+                for &is_w in &flags {
+                    let Core::Lam(p, inner) = cur else { break };
+                    p_saved.push((p.as_str(), scope.push_binder(p, is_w, None)));
+                    cur = inner;
+                }
+            }
+            refine_expr(
+                cur,
+                &mut scope,
+                strict_cons,
+                &whnf_globals,
+                &global_arities,
+                &mut global_whnf,
+                &mut local_whnf[idx],
+                &mut changed,
+            );
+            for (p, s) in p_saved.into_iter().rev() {
+                scope.pop_binder(p, s);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    global_whnf.retain(|_, fs| fs.iter().any(|&f| f));
+    for m in &mut local_whnf {
+        m.retain(|_, fs| fs.iter().any(|&f| f));
+    }
+    if global_whnf.is_empty() && local_whnf.iter().all(|m| m.is_empty()) {
+        return (HashMap::new(), HashMap::new(), HashSet::new());
+    }
+
+    // Rewrite every speculable call-site argument of a proven caller-WHNF parameter into
+    // `case arg as sp~N of _ -> f ... sp~N ...` so the WHNF invariant holds strictly on entry.
+    #[allow(clippy::too_many_arguments)]
+    fn speculate_calls(
+        e: &mut Core,
+        scope: &mut Scope,
+        strict_cons: &HashMap<String, Vec<bool>>,
+        whnf_globals: &HashSet<String>,
+        global_arities: &HashMap<String, usize>,
+        global_whnf: &HashMap<String, Vec<bool>>,
+        local_whnf: &HashMap<String, Vec<bool>>,
+        fresh: &mut u64,
+    ) {
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(..) => {
+                // Unwind spine mutably to recurse post-order into arguments and (non-Var) head.
+                let mut nargs = 0usize;
+                let mut cur: &Core = e;
+                while let Core::App(f, _) = cur {
+                    nargs += 1;
+                    cur = f;
+                }
+                let target_flags: Option<Vec<bool>> = match cur {
+                    Core::Var(v) => {
+                        let map = if scope.is_local(v) { local_whnf } else { global_whnf };
+                        map.get(v.as_str()).filter(|fs| nargs >= fs.len()).cloned()
+                    }
+                    _ => None,
+                };
+                // Recurse into every argument (and non-Var head) first.
+                {
+                    let mut cur_mut: &mut Core = e;
+                    while let Core::App(f, a) = cur_mut {
+                        speculate_calls(
+                            a,
+                            scope,
+                            strict_cons,
+                            whnf_globals,
+                            global_arities,
+                            global_whnf,
+                            local_whnf,
+                            fresh,
+                        );
+                        cur_mut = f;
+                    }
+                    if !matches!(cur_mut, Core::Var(_)) {
+                        speculate_calls(
+                            cur_mut,
+                            scope,
+                            strict_cons,
+                            whnf_globals,
+                            global_arities,
+                            global_whnf,
+                            local_whnf,
+                            fresh,
+                        );
+                    }
+                }
+                let Some(flags) = target_flags else { return };
+                // Walk the spine right-to-left (outermost arg index = nargs - 1 down to 0) and
+                // replace any non-WHNF speculable argument for a `flags[i]` parameter.
+                let mut cases: Vec<(String, Core)> = Vec::new();
+                let mut idx = nargs;
+                let mut cur_mut: &mut Core = e;
+                while let Core::App(f, a) = cur_mut {
+                    idx -= 1;
+                    if idx < flags.len() && flags[idx] {
+                        if !is_already_whnf(a, scope, whnf_globals, global_arities) {
+                            debug_assert!(
+                                !is_atom(a) && ok_for_speculation(a, &scope.evaluated),
+                                "caller_whnf_speculate invariant violated for arg {idx}: {a:?}"
+                            );
+                            if !is_atom(a) && ok_for_speculation(a, &scope.evaluated) {
+                                *fresh += 1;
+                                let sp = format!("sp~{}", *fresh);
+                                cases.push((sp.clone(), std::mem::replace(&mut **a, Core::Var(sp))));
+                            }
+                        }
+                    }
+                    cur_mut = f;
+                }
+                if !cases.is_empty() {
+                    let mut wrapped = take(e);
+                    // `cases` is right-to-left, so iterating wraps leftmost arg outermost.
+                    for (sp, arg) in cases {
+                        wrapped = Core::Case(Box::new(arg), sp, vec![Alt::Default(wrapped)]);
+                    }
+                    *e = wrapped;
+                }
+            }
+            Core::Lam(p, body) => {
+                let p_name = p.clone();
+                let saved = scope.push_binder(&p_name, false, None);
+                speculate_calls(
+                    body,
+                    scope,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    global_whnf,
+                    local_whnf,
+                    fresh,
+                );
+                scope.pop_binder(&p_name, saved);
+            }
+            Core::Let(bs, body) => {
+                let group_whnf: Vec<bool> = bs
+                    .iter()
+                    .map(|(_, rhs)| match rhs {
+                        Core::Lam(..) | Core::Lit(_) => true,
+                        Core::Con(..) => !bs.iter().any(|(n, _)| mentions(rhs, n)),
+                        Core::Var(y) => {
+                            !bs.iter().any(|(n, _)| n == y)
+                                && is_already_whnf(rhs, scope, whnf_globals, global_arities)
+                        }
+                        _ => false,
+                    })
+                    .collect();
+                let mut saved = Vec::with_capacity(bs.len());
+                for (name, rhs) in bs.iter() {
+                    let ar = lambdas(rhs).0;
+                    let is_lam = matches!(rhs, Core::Lam(..));
+                    saved.push((name.clone(), scope.push_binder(name, is_lam, (ar > 0).then_some(ar))));
+                }
+                for (name, rhs) in bs.iter_mut() {
+                    if let Some(flags) = local_whnf.get(name.as_str()) {
+                        let mut p_saved = Vec::with_capacity(flags.len());
+                        let mut cur: &mut Core = rhs;
+                        for &is_w in flags {
+                            let Core::Lam(p, inner) = cur else { break };
+                            let p_name = p.clone();
+                            p_saved.push((p_name.clone(), scope.push_binder(&p_name, is_w, None)));
+                            cur = inner;
+                        }
+                        speculate_calls(
+                            cur,
+                            scope,
+                            strict_cons,
+                            whnf_globals,
+                            global_arities,
+                            global_whnf,
+                            local_whnf,
+                            fresh,
+                        );
+                        for (p, s) in p_saved.into_iter().rev() {
+                            scope.pop_binder(&p, s);
+                        }
+                    } else {
+                        speculate_calls(
+                            rhs,
+                            scope,
+                            strict_cons,
+                            whnf_globals,
+                            global_arities,
+                            global_whnf,
+                            local_whnf,
+                            fresh,
+                        );
+                    }
+                }
+                for ((name, _), &is_w) in bs.iter().zip(&group_whnf) {
+                    if is_w {
+                        scope.evaluated.insert(name.clone());
+                    }
+                }
+                speculate_calls(
+                    body,
+                    scope,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    global_whnf,
+                    local_whnf,
+                    fresh,
+                );
+                for (name, s) in saved.into_iter().rev() {
+                    scope.pop_binder(&name, s);
+                }
+            }
+            Core::Case(s, binder, alts) => {
+                speculate_calls(
+                    s,
+                    scope,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    global_whnf,
+                    local_whnf,
+                    fresh,
+                );
+                let mut extra_eval: Vec<(String, bool)> = Vec::new();
+                match s.as_ref() {
+                    Core::Var(v) if scope.is_local(v) => {
+                        let prev = scope.evaluated.contains(v.as_str());
+                        extra_eval.push((v.clone(), prev));
+                    }
+                    Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
+                        for a in args {
+                            if let Core::Var(v) = a {
+                                if scope.is_local(v) && !extra_eval.iter().any(|(n, _)| n == v) {
+                                    let prev = scope.evaluated.contains(v.as_str());
+                                    extra_eval.push((v.clone(), prev));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for (v, _) in &extra_eval {
+                    scope.evaluated.insert(v.clone());
+                }
+                let b_name = binder.clone();
+                let saved_b = scope.push_binder(&b_name, true, None);
+                for alt in alts.iter_mut() {
+                    match alt {
+                        Alt::Con(con, vars, rhs) => {
+                            let flags = strict_cons.get(con.as_str());
+                            let mut v_saved = Vec::with_capacity(vars.len());
+                            for (i, v) in vars.iter().enumerate() {
+                                let is_strict = flags.and_then(|f| f.get(i)).copied().unwrap_or(false);
+                                v_saved.push((v.clone(), scope.push_binder(v, is_strict, None)));
+                            }
+                            speculate_calls(
+                                rhs,
+                                scope,
+                                strict_cons,
+                                whnf_globals,
+                                global_arities,
+                                global_whnf,
+                                local_whnf,
+                                fresh,
+                            );
+                            for (v, s) in v_saved.into_iter().rev() {
+                                scope.pop_binder(&v, s);
+                            }
+                        }
+                        Alt::Lit(_, rhs) | Alt::Default(rhs) => speculate_calls(
+                            rhs,
+                            scope,
+                            strict_cons,
+                            whnf_globals,
+                            global_arities,
+                            global_whnf,
+                            local_whnf,
+                            fresh,
+                        ),
+                    }
+                }
+                scope.pop_binder(&b_name, saved_b);
+                for (v, prev) in extra_eval.into_iter().rev() {
+                    if prev {
+                        scope.evaluated.insert(v);
+                    } else {
+                        scope.evaluated.remove(&v);
+                    }
+                }
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args.iter_mut() {
+                    speculate_calls(
+                        a,
+                        scope,
+                        strict_cons,
+                        whnf_globals,
+                        global_arities,
+                        global_whnf,
+                        local_whnf,
+                        fresh,
+                    );
+                }
+            }
+        }
+    }
+
+    let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
+    let mut changed_binds = HashSet::new();
+    let mut local_whnf_by_name: HashMap<String, HashMap<String, Vec<bool>>> = HashMap::new();
+    for (idx, b) in binds.iter_mut().enumerate() {
+        if is_rule_binding(&b.name) {
+            continue;
+        }
+        let before = fresh;
+        let mut scope = Scope::default();
+        let mut cur: &mut Core = &mut b.body;
+        let mut p_saved = Vec::new();
+        if let Some(flags) = global_whnf.get(&b.name) {
+            for &is_w in flags {
+                let Core::Lam(p, inner) = cur else { break };
+                let p_name = p.clone();
+                p_saved.push((p_name.clone(), scope.push_binder(&p_name, is_w, None)));
+                cur = inner;
+            }
+        }
+        speculate_calls(
+            cur,
+            &mut scope,
+            strict_cons,
+            &whnf_globals,
+            &global_arities,
+            &global_whnf,
+            &local_whnf[idx],
+            &mut fresh,
+        );
+        for (p, s) in p_saved.into_iter().rev() {
+            scope.pop_binder(&p, s);
+        }
+        if fresh != before {
+            changed_binds.insert(b.name.clone());
+        }
+        if !local_whnf[idx].is_empty() {
+            local_whnf_by_name.insert(b.name.clone(), std::mem::take(&mut local_whnf[idx]));
+        }
+    }
+    FRESH.store(fresh, std::sync::atomic::Ordering::Relaxed);
+    (global_whnf, local_whnf_by_name, changed_binds)
+}
+
 /// The let-bound functions of an expression, with their right sides.
 fn local_functions<'a>(e: &'a Core, out: &mut Vec<(&'a str, &'a Core)>) {
     match e {
@@ -5198,10 +6357,11 @@ mod rule_tests {
         let no_arities = HashMap::new();
         let no_strict_cons = HashMap::new();
         let no_bottom = HashMap::new();
+        let no_local_whnf = HashMap::new();
         let mut s = Simp {
             once: &once, dead: &dead, pending: HashMap::new(), known: &known, local_known: HashMap::new(), known_enum_tags: HashMap::new(), local_templates: HashMap::new(), literals: &literals, aliases: &aliases, templates: &templates, bottom_fns: &no_bottom,
-            this: "Test.x", rules: &rules, strict_cons: &no_strict_cons, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), arities: &no_arities, local_arities: HashMap::new(),
-            fresh: &mut fresh, budget: 0, changed: false, eval_pos: false, tune: O1,
+            this: "Test.x", rules: &rules, strict_cons: &no_strict_cons, phase, rule_budget: RULE_BUDGET, atoms: HashMap::new(), evaluated: HashSet::new(), caller_whnf: HashSet::new(), local_whnf: &no_local_whnf, arities: &no_arities, local_arities: HashMap::new(),
+            fresh: &mut fresh, budget: 0, changed: false, eval_pos: false, in_app_head: false, tune: O1,
         };
         s.rewrite(&mut e).then_some(e)
     }
@@ -6791,6 +7951,385 @@ mod rule_tests {
             *inner,
             Core::Prim("+##".into(), vec![v("x"), Core::Lit(Lit::Double(0.01))]),
             "atomic literal default case must fold away"
+        );
+    }
+
+    #[test]
+    fn whole_program_caller_whnf_speculates_lazy_recursive_tree_args() {
+        // Recursive bintrees-style builder: `v` is never forced in `build`, only stored in
+        // `Tip v` / `Node v ...` and used in arithmetic inside lazy child thunks. Under
+        // whole-program simplification, `Main.main` passes literal `1#` and recursive calls pass
+        // `2*v` / `2*v+1`, so the arithmetic is speculated inside each child thunk while the
+        // `Node` children themselves remain lazy.
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        let build_body = Core::Lam(
+            "d".into(),
+            Box::new(Core::Lam(
+                "v".into(),
+                Box::new(Core::Case(
+                    Box::new(Core::Prim("<=#".into(), vec![v("d"), Core::Lit(Lit::Int(0))])),
+                    "c".into(),
+                    vec![
+                        Alt::Lit(Lit::Int(1), Core::Con("Main.Tip".into(), vec![v("v")])),
+                        Alt::Default(Core::Con(
+                            "Main.Node".into(),
+                            vec![
+                                v("v"),
+                                app(
+                                    app(
+                                        v("Main.build"),
+                                        Core::Prim("-#".into(), vec![v("d"), Core::Lit(Lit::Int(1))]),
+                                    ),
+                                    Core::Prim("*#".into(), vec![Core::Lit(Lit::Int(2)), v("v")]),
+                                ),
+                                app(
+                                    app(
+                                        v("Main.build"),
+                                        Core::Prim("-#".into(), vec![v("d"), Core::Lit(Lit::Int(1))]),
+                                    ),
+                                    Core::Prim(
+                                        "+#".into(),
+                                        vec![
+                                            Core::Prim("*#".into(), vec![Core::Lit(Lit::Int(2)), v("v")]),
+                                            Core::Lit(Lit::Int(1)),
+                                        ],
+                                    ),
+                                ),
+                            ],
+                        )),
+                    ],
+                )),
+            )),
+        );
+        let main_body = app(
+            app(v("Main.build"), Core::Lit(Lit::Int(10))),
+            Core::Lit(Lit::Int(1)),
+        );
+        let mut binds = vec![
+            TopBind { name: "Main.build".into(), body: build_body },
+            TopBind { name: "Main.main".into(), body: main_body },
+        ];
+        simplify_whole_program(&mut binds);
+
+        let build = binds
+            .iter()
+            .find(|b| b.name == "Main.build")
+            .expect("Main.build should remain");
+
+        fn find_node(e: &Core) -> Option<&[Core]> {
+            match e {
+                Core::Con(k, args) if k == "Main.Node" => Some(args),
+                Core::Lam(_, b) => find_node(b),
+                Core::Let(_, b) => find_node(b),
+                Core::Case(_, _, alts) => alts.iter().find_map(|a| {
+                    let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                    find_node(b)
+                }),
+                _ => None,
+            }
+        }
+        fn has_unspeculated_prim_arg_to(e: &Core, callee: &str) -> bool {
+            let mut head = e;
+            let mut args = Vec::new();
+            while let Core::App(f, a) = head {
+                args.push(a.as_ref());
+                head = f;
+            }
+            if matches!(head, Core::Var(n) if n == callee)
+                && args.iter().any(|a| matches!(a, Core::Prim(..)))
+            {
+                return true;
+            }
+            match e {
+                Core::App(f, a) => {
+                    has_unspeculated_prim_arg_to(f, callee) || has_unspeculated_prim_arg_to(a, callee)
+                }
+                Core::Lam(_, b) => has_unspeculated_prim_arg_to(b, callee),
+                Core::Let(bs, b) => {
+                    bs.iter().any(|(_, r)| has_unspeculated_prim_arg_to(r, callee))
+                        || has_unspeculated_prim_arg_to(b, callee)
+                }
+                Core::Case(s, _, alts) => {
+                    has_unspeculated_prim_arg_to(s, callee)
+                        || alts.iter().any(|a| {
+                            let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                            has_unspeculated_prim_arg_to(b, callee)
+                        })
+                }
+                Core::Con(_, xs) | Core::Prim(_, xs) => {
+                    xs.iter().any(|x| has_unspeculated_prim_arg_to(x, callee))
+                }
+                Core::Var(_) | Core::Lit(_) | Core::Fail(_) => false,
+            }
+        }
+
+        let node_args = find_node(&build.body).expect("Main.Node should remain in Main.build");
+        assert_eq!(node_args.len(), 3);
+        // Both child thunks stay inside Main.Node and speculate their arithmetic args.
+        assert!(
+            matches!(node_args[1], Core::Case(..)),
+            "left child thunk should speculate arithmetic before recursive call, got: {:?}",
+            node_args[1]
+        );
+        assert!(
+            matches!(node_args[2], Core::Case(..)),
+            "right child thunk should speculate arithmetic before recursive call, got: {:?}",
+            node_args[2]
+        );
+        assert!(
+            !has_unspeculated_prim_arg_to(&build.body, "Main.build"),
+            "no unspeculated primop args should remain in calls to Main.build: {:?}",
+            build.body
+        );
+    }
+
+    #[test]
+    fn whole_program_caller_whnf_skips_escaping_function() {
+        // `Main.f` escapes as a first-class value to `Main.higher`, so `v` is NOT guaranteed
+        // WHNF even though one call passes `1#`. Speculating `+# v 1#` would be unsound.
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        let f_body = Core::Lam(
+            "v".into(),
+            Box::new(Core::Con(
+                "Main.Wrap".into(),
+                vec![app(
+                    v("Main.f"),
+                    Core::Prim("+#".into(), vec![v("v"), Core::Lit(Lit::Int(1))]),
+                )],
+            )),
+        );
+        let main_body = Core::Con(
+            "Builtin.(,)".into(),
+            vec![
+                app(v("Main.f"), Core::Lit(Lit::Int(1))),
+                app(v("Main.higher"), v("Main.f")),
+            ],
+        );
+        let mut binds = vec![
+            TopBind { name: "Main.f".into(), body: f_body },
+            TopBind { name: "Main.main".into(), body: main_body },
+        ];
+        simplify_whole_program(&mut binds);
+        let f = binds.iter().find(|b| b.name == "Main.f").expect("Main.f should remain");
+        let (_, inner) = params(&f.body);
+        let Core::Con(k, args) = inner else {
+            panic!("expected Main.Wrap constructor, got: {inner:?}");
+        };
+        assert_eq!(k, "Main.Wrap");
+        assert!(
+            !matches!(args[0], Core::Case(..)),
+            "escaping function must not speculate arithmetic on unforced param: {:?}",
+            args[0]
+        );
+    }
+
+    #[test]
+    fn package_simplify_skips_top_level_caller_whnf_but_analyzes_local_let() {
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        // 1) Top-level T.build in package-only simplify: external callers are unknown, so `v`
+        //    cannot be assumed WHNF.
+        let build_body = Core::Lam(
+            "d".into(),
+            Box::new(Core::Lam(
+                "v".into(),
+                Box::new(Core::Case(
+                    Box::new(Core::Prim("<=#".into(), vec![v("d"), Core::Lit(Lit::Int(0))])),
+                    "c".into(),
+                    vec![
+                        Alt::Lit(Lit::Int(1), Core::Con("T.Tip".into(), vec![v("v")])),
+                        Alt::Default(Core::Con(
+                            "T.Node".into(),
+                            vec![
+                                v("v"),
+                                app(
+                                    app(
+                                        v("T.build"),
+                                        Core::Prim("-#".into(), vec![v("d"), Core::Lit(Lit::Int(1))]),
+                                    ),
+                                    Core::Prim("*#".into(), vec![Core::Lit(Lit::Int(2)), v("v")]),
+                                ),
+                            ],
+                        )),
+                    ],
+                )),
+            )),
+        );
+        let entry_body = app(
+            app(v("T.build"), Core::Lit(Lit::Int(10))),
+            Core::Lit(Lit::Int(1)),
+        );
+        let mut pkg_binds = vec![
+            TopBind { name: "T.build".into(), body: build_body },
+            TopBind { name: "T.entry".into(), body: entry_body },
+        ];
+        simplify(&mut pkg_binds);
+        let build = pkg_binds.iter().find(|b| b.name == "T.build").unwrap();
+        let (_, inner) = params(&build.body);
+        let Core::Case(_, _, alts) = inner else { panic!("expected case: {inner:?}") };
+        let Alt::Default(Core::Con(_, node_args)) = &alts[1] else {
+            panic!("expected T.Node in default alt: {alts:?}");
+        };
+        fn contains_prim_arg_to(e: &Core, callee: &str, prim: &str) -> bool {
+            let mut head = e;
+            let mut args = Vec::new();
+            while let Core::App(f, a) = head {
+                args.push(a.as_ref());
+                head = f;
+            }
+            if matches!(head, Core::Var(n) if n == callee)
+                && args.iter().any(|a| matches!(a, Core::Prim(p, _) if p == prim))
+            {
+                return true;
+            }
+            match e {
+                Core::App(f, a) => {
+                    contains_prim_arg_to(f, callee, prim) || contains_prim_arg_to(a, callee, prim)
+                }
+                Core::Lam(_, b) => contains_prim_arg_to(b, callee, prim),
+                Core::Let(bs, b) => {
+                    bs.iter().any(|(_, r)| contains_prim_arg_to(r, callee, prim))
+                        || contains_prim_arg_to(b, callee, prim)
+                }
+                Core::Case(s, _, alts) => {
+                    contains_prim_arg_to(s, callee, prim)
+                        || alts.iter().any(|a| {
+                            let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                            contains_prim_arg_to(b, callee, prim)
+                        })
+                }
+                Core::Con(_, xs) | Core::Prim(_, xs) => {
+                    xs.iter().any(|x| contains_prim_arg_to(x, callee, prim))
+                }
+                Core::Var(_) | Core::Lit(_) | Core::Fail(_) => false,
+            }
+        }
+        // `d` is forced by `<=# d 0#` so `-# d 1#` may speculate, but `v` is NOT assumed
+        // caller-WHNF in package-only mode, so `*# 2# v` must remain unspeculated.
+        assert!(
+            contains_prim_arg_to(&node_args[1], "T.build", "*#"),
+            "package-only simplify must not assume top-level caller WHNF for v: {:?}",
+            node_args[1]
+        );
+
+        // 2) Non-escaping local `let go = ...` in package-only simplify: all call sites are
+        //    visible, so `v` IS proven caller-WHNF and `*# 2# v` IS speculated.
+        let go_rhs = Core::Lam(
+            "d".into(),
+            Box::new(Core::Lam(
+                "v".into(),
+                Box::new(Core::Case(
+                    Box::new(Core::Prim("<=#".into(), vec![v("d"), Core::Lit(Lit::Int(0))])),
+                    "c".into(),
+                    vec![
+                        Alt::Lit(Lit::Int(1), Core::Con("T.Tip".into(), vec![v("v")])),
+                        Alt::Default(Core::Con(
+                            "T.Node".into(),
+                            vec![
+                                v("v"),
+                                app(
+                                    app(
+                                        v("go"),
+                                        Core::Prim("-#".into(), vec![v("d"), Core::Lit(Lit::Int(1))]),
+                                    ),
+                                    Core::Prim("*#".into(), vec![Core::Lit(Lit::Int(2)), v("v")]),
+                                ),
+                            ],
+                        )),
+                    ],
+                )),
+            )),
+        );
+        let local_body = Core::Let(
+            vec![("go".into(), go_rhs)],
+            Box::new(app(
+                app(v("go"), Core::Lit(Lit::Int(10))),
+                Core::Lit(Lit::Int(1)),
+            )),
+        );
+        let mut local_binds = vec![TopBind { name: "T.local".into(), body: local_body }];
+        simplify(&mut local_binds);
+        let Core::Let(bs, _) = &local_binds[0].body else {
+            panic!("expected local let go: {:?}", local_binds[0].body);
+        };
+        let (_, go_inner) = params(&bs[0].1);
+        let Core::Case(_, _, go_alts) = go_inner else { panic!("expected case: {go_inner:?}") };
+        let Alt::Default(Core::Con(_, go_node_args)) = &go_alts[1] else {
+            panic!("expected T.Node in local go: {go_alts:?}");
+        };
+        assert!(
+            !contains_prim_arg_to(&go_node_args[1], "go", "*#"),
+            "local non-escaping let should speculate caller-WHNF `*# 2# v` arg: {:?}",
+            go_node_args[1]
+        );
+    }
+
+    #[test]
+    fn speculate_app_args_does_not_turn_pap_in_non_eval_pos_into_thunk() {
+        // `let f = T.add (bx +# 1#) in T.use f f` where `T.add` is a recursive arity-2 function
+        // (so it won't be inlined): `f` is a PAP (WHNF value) in a non-eval position; we must NOT
+        // wrap its RHS in a `Core::Case`, which would turn a PAP into a thunk.
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        let add_body = Core::Lam(
+            "a".into(),
+            Box::new(Core::Lam(
+                "b".into(),
+                Box::new(Core::Case(
+                    Box::new(Core::Prim("<=#".into(), vec![v("a"), Core::Lit(Lit::Int(0))])),
+                    "c".into(),
+                    vec![
+                        Alt::Lit(Lit::Int(1), v("b")),
+                        Alt::Default(app(
+                            app(
+                                v("T.add"),
+                                Core::Prim("-#".into(), vec![v("a"), Core::Lit(Lit::Int(1))]),
+                            ),
+                            Core::Prim("+#".into(), vec![v("b"), Core::Lit(Lit::Int(1))]),
+                        )),
+                    ],
+                )),
+            )),
+        );
+        let make_pap = Core::Lam(
+            "x".into(),
+            Box::new(Core::Case(
+                Box::new(v("x")),
+                "bx".into(),
+                vec![Alt::Default(Core::Let(
+                    vec![(
+                        "f".into(),
+                        app(
+                            v("T.add"),
+                            Core::Prim("+#".into(), vec![v("bx"), Core::Lit(Lit::Int(1))]),
+                        ),
+                    )],
+                    Box::new(app(app(v("T.use"), v("f")), v("f"))),
+                ))],
+            )),
+        );
+        let mut binds = vec![
+            TopBind { name: "T.add".into(), body: add_body },
+            TopBind { name: "T.make_pap".into(), body: make_pap },
+        ];
+        simplify(&mut binds);
+        fn find_f_rhs(e: &Core) -> Option<&Core> {
+            match e {
+                Core::Lam(_, b) => find_f_rhs(b),
+                Core::Case(_, _, alts) => alts.iter().find_map(|a| {
+                    let (Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b)) = a;
+                    find_f_rhs(b)
+                }),
+                Core::Let(bs, body) => bs
+                    .iter()
+                    .find(|(n, _)| n == "f")
+                    .map(|(_, r)| r)
+                    .or_else(|| find_f_rhs(body)),
+                _ => None,
+            }
+        }
+        let rhs = find_f_rhs(&binds[1].body).expect("let binding f should remain");
+        assert!(
+            matches!(rhs, Core::App(..)),
+            "PAP in non-eval let must stay a Core::App value, not a Case thunk: {rhs:?}"
         );
     }
 }

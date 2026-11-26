@@ -2038,8 +2038,10 @@ impl Gen {
                     });
                 }
                 joins.insert(*id, uses.clone());
-                if !uses.is_empty() && count_jumps(code, *id) > 0 {
-                    let _ = self.find_raw_uses(code, joins);
+                if !uses.is_empty() {
+                    let mut reaching = std::collections::HashSet::new();
+                    reaching.insert(*id);
+                    Self::propagate_join_uses(&mut self.raw_uses, code, &mut reaching, &uses);
                 }
                 out.extend(uses);
                 out.extend(self.find_raw_uses(body, joins));
@@ -2057,6 +2059,98 @@ impl Gen {
         out.dedup();
         self.raw_uses.insert(e as *const SExpr, out.clone());
         out
+    }
+
+    /// Linearly propagates a recursive join point's free raw uses along back-edge paths in `code`
+    /// without re-traversing nested joins exponentially.
+    fn propagate_join_uses(
+        raw_uses: &mut HashMap<*const SExpr, Vec<u32>>,
+        e: &SExpr,
+        reaching: &mut std::collections::HashSet<u32>,
+        extra: &[u32],
+    ) -> bool {
+        if extra.is_empty() {
+            return false;
+        }
+        let mut add_extra = extra;
+        let filtered_buf: Vec<u32>;
+        let reaches = match e {
+            SExpr::Atom(_)
+            | SExpr::App(..)
+            | SExpr::CallWorker(..)
+            | SExpr::Con(..)
+            | SExpr::Prim(..)
+            | SExpr::Closure(_)
+            | SExpr::Fail(_) => false,
+            SExpr::Jump(id, _) => reaching.contains(id),
+            SExpr::Let(_, body) => Self::propagate_join_uses(raw_uses, body, reaching, extra),
+            SExpr::Case(scrut, bslot, alts) => {
+                let alt_extra: &[u32] = if *bslot & RAW != 0 {
+                    let bi = raw_idx(*bslot);
+                    filtered_buf = extra
+                        .iter()
+                        .copied()
+                        .filter(|&s| s == ALL_LIVE || raw_idx(s) != bi)
+                        .collect();
+                    &filtered_buf
+                } else {
+                    extra
+                };
+                let mut any_alt = false;
+                if !alt_extra.is_empty() {
+                    for a in alts {
+                        let (SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b)) = a;
+                        if Self::propagate_join_uses(raw_uses, b, reaching, alt_extra) {
+                            any_alt = true;
+                        }
+                    }
+                }
+                let in_scrut = Self::propagate_join_uses(raw_uses, scrut, reaching, extra);
+                if any_alt && !in_scrut {
+                    add_extra = alt_extra;
+                }
+                any_alt || in_scrut
+            }
+            SExpr::Join(id, params, code, body) => {
+                if reaching.contains(id) {
+                    return false;
+                }
+                let code_extra: &[u32] = if params.iter().any(|&p| p & RAW != 0) {
+                    filtered_buf = extra
+                        .iter()
+                        .copied()
+                        .filter(|&s| {
+                            s == ALL_LIVE
+                                || !params.iter().any(|&p| p & RAW != 0 && raw_idx(p) == raw_idx(s))
+                        })
+                        .collect();
+                    &filtered_buf
+                } else {
+                    extra
+                };
+                let in_code = !code_extra.is_empty()
+                    && Self::propagate_join_uses(raw_uses, code, reaching, code_extra);
+                if in_code {
+                    reaching.insert(*id);
+                }
+                let in_body = Self::propagate_join_uses(raw_uses, body, reaching, extra);
+                if in_code {
+                    reaching.remove(id);
+                }
+                if in_code && !in_body {
+                    add_extra = code_extra;
+                }
+                in_code || in_body
+            }
+        };
+        if reaches && !add_extra.is_empty() {
+            if let Some(u) = raw_uses.get_mut(&(e as *const SExpr)) {
+                u.extend_from_slice(add_extra);
+                u.sort_unstable();
+                u.dedup();
+            }
+        }
+        reaches
     }
 
     /// Whether raw slot `k` may be used by `e` or by what follows it (for a scrutinee, the
