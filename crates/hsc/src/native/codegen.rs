@@ -5353,12 +5353,13 @@ impl Gen {
                                 if let Some(reg) = fast_reg {
                                     self.cache_put(*bslot, reg, true);
                                 }
+                                self.safe_slots = saved_safe;
                             } else if let Some(reg) = fast_reg {
                                 self.cache_put(*bslot, reg, true);
                             } else {
                                 self.cache = post_cache;
+                                self.safe_slots = saved_safe;
                             }
-                            self.safe_slots = saved_safe;
                             self.known_kind = saved_kind;
                             for &(s, k) in &checked_slots {
                                 if s != *bslot {
@@ -11150,6 +11151,82 @@ mod sprint6_codegen_tests {
             !hot_loop.contains("(%rbp)"),
             "expected zero (%rbp) stack accesses in hot String compare .Lloop:\n{hot_loop}"
         );
+    }
+
+    #[test]
+    fn boxed_ptr_cache_preserves_safe_slots_after_fast_raw_eviction() {
+        // When all 6 CACHE_REGS are full (4 dirty boxed pointers + 2 raw ints) and a `!slow_used`
+        // raw-dest `int_fast_path` calls `fresh_reg`, the evicted boxed pointer is spilled to its
+        // stack slot and marked safe. Subsequent `zero_unsafe_slots` must NOT overwrite that slot
+        // with `$0`.
+        let r0 = RAW | 0;
+        let r1 = RAW | 1;
+        let r2 = RAW | 2;
+        let body = SExpr::Case(
+            Box::new(SExpr::Atom(Atom::Slot(1))),
+            UNUSED_SLOT,
+            vec![SAlt::Con(
+                "Test.Bin".into(),
+                vec![2, 3, 4, 5],
+                // Evaluate slot 3 as INT (`negateInt#`) -> populates r1 and marks slot 3 KnownVal::Kind(INT).
+                SExpr::Case(
+                    Box::new(SExpr::Prim("negateInt#".into(), vec![Atom::Slot(3)])),
+                    r1,
+                    vec![SAlt::Default(
+                        // Now slot 3 is known INT, r1 is raw, r0 is raw (param), slots 2..5 are dirty ptrs (6 regs full!).
+                        // `xorI#` with slot 3 (known INT) and r1 (raw) has `!slow_used` and calls `fresh_reg`,
+                        // evicting dirty pointer slot 2 (`movq %rdi, 24(%rbp)`).
+                        SExpr::Case(
+                            Box::new(SExpr::Prim("xorI#".into(), vec![Atom::Slot(r1), Atom::Slot(3)])),
+                            r2,
+                            vec![SAlt::Default(
+                                // Force a GC-capable call (`zero_unsafe_slots`) while slot 2 is still live.
+                                SExpr::Case(
+                                    Box::new(SExpr::App(Atom::Global(1), vec![Atom::Slot(r2), Atom::Slot(r0)])),
+                                    6,
+                                    vec![SAlt::Default(SExpr::Con(
+                                        "Test.Pair".into(),
+                                        vec![Atom::Slot(2), Atom::Slot(6)],
+                                    ))],
+                                ),
+                            )],
+                        ),
+                    )],
+                ),
+            )],
+        );
+        let mut worker_c = simple_closure(1, 7, 3, body);
+        worker_c.raw_args = vec![(0, r0)];
+        let helper_c = simple_closure(2, 3, 0, SExpr::Atom(Atom::Slot(1)));
+        let prog = make_prog(vec![
+            SGlobal {
+                name: "Test.f".into(),
+                closure: simple_closure(2, 3, 0, SExpr::CallWorker(0, vec![Atom::Lit(SLit::Int(1)), Atom::Slot(2)])),
+                worker: Some((worker_c, vec![true, false])),
+            },
+            SGlobal { name: "Test.h".into(), closure: helper_c, worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let (_, fn_asm) = asm.split_once("\n.Lw").expect("worker label");
+        let (hot_before_call, _) = fn_asm.split_once("jmp .Lg").expect("call to helper");
+        let mut saw_spill = false;
+        for line in hot_before_call.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("movq %") {
+                if let Some((reg, dst)) = rest.split_once(", ") {
+                    if ["rdi", "rsi", "r8", "r9", "r10", "r11"].contains(&reg) && dst.ends_with("(%rbp)") {
+                        saw_spill = true;
+                        let after_spill = &hot_before_call[hot_before_call.find(trimmed).unwrap() + trimmed.len()..];
+                        let zero_instr = format!("movq $0, {dst}");
+                        assert!(
+                            !after_spill.contains(&zero_instr),
+                            "spilled slot {dst} (from %{reg}) was overwritten with $0:\n{hot_before_call}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(saw_spill, "expected a cached pointer spill before the call:\n{hot_before_call}");
     }
 
     #[test]
