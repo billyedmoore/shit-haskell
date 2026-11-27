@@ -2809,27 +2809,47 @@ impl Simp<'_> {
     /// Whether every free occurrence of `x` in `e` lies inside a diverging/bottoming subexpression
     /// (including lambdas whose bodies unconditionally diverge, e.g. `\_ -> error d ...`).
     fn used_only_in_bottom(&self, e: &Core, x: &str) -> bool {
-        let (_, inner) = lambdas(e);
+        let mut fuel = USED_ONLY_IN_BOTTOM_FUEL;
+        self.used_only_in_bottom_fuel(e, x, &mut fuel)
+    }
+
+    /// `used_only_in_bottom` with a work budget. Each node visited, and each `let` peeled while
+    /// looking for a diverging body, spends one unit; an empty budget answers `false` (keep the
+    /// binding where it is). Without it, long `let` chains are walked again at every level and
+    /// once per binding, which never finished on ShellCheck.
+    fn used_only_in_bottom_fuel(&self, e: &Core, x: &str, fuel: &mut usize) -> bool {
+        if *fuel == 0 {
+            return false;
+        }
+        *fuel -= 1;
+        let (_, mut inner) = lambdas(e);
+        while let Core::Let(_, b) = inner {
+            if *fuel == 0 {
+                return false;
+            }
+            *fuel -= 1;
+            inner = b;
+        }
         if is_bottom_expr_with(inner, self.bottom_fns) {
             return true;
         }
         match e {
             Core::Var(v) => v != x,
             Core::Lit(_) | Core::Fail(_) => true,
-            Core::App(f, a) => self.used_only_in_bottom(f, x) && self.used_only_in_bottom(a, x),
-            Core::Lam(p, b) => p == x || self.used_only_in_bottom(b, x),
+            Core::App(f, a) => self.used_only_in_bottom_fuel(f, x, fuel) && self.used_only_in_bottom_fuel(a, x, fuel),
+            Core::Lam(p, b) => p == x || self.used_only_in_bottom_fuel(b, x, fuel),
             Core::Con(_, args) | Core::Prim(_, args) => {
-                args.iter().all(|a| self.used_only_in_bottom(a, x))
+                args.iter().all(|a| self.used_only_in_bottom_fuel(a, x, fuel))
             }
             Core::Case(s, b, alts) => {
-                self.used_only_in_bottom(s, x)
+                self.used_only_in_bottom_fuel(s, x, fuel)
                     && (b == x
                         || alts.iter().all(|a| match a {
                             Alt::Con(_, vs, body) => {
-                                vs.iter().any(|v| v == x) || self.used_only_in_bottom(body, x)
+                                vs.iter().any(|v| v == x) || self.used_only_in_bottom_fuel(body, x, fuel)
                             }
                             Alt::Lit(_, body) | Alt::Default(body) => {
-                                self.used_only_in_bottom(body, x)
+                                self.used_only_in_bottom_fuel(body, x, fuel)
                             }
                         }))
             }
@@ -2837,14 +2857,14 @@ impl Simp<'_> {
                 if bs.iter().any(|(n, _)| n == x) {
                     return true;
                 }
-                if !self.used_only_in_bottom(body, x) {
+                if !self.used_only_in_bottom_fuel(body, x, fuel) {
                     return false;
                 }
                 bs.iter().all(|(n, r)| {
-                    self.used_only_in_bottom(r, x)
+                    self.used_only_in_bottom_fuel(r, x, fuel)
                         || (!mentions(r, n)
                             && bs.iter().all(|(m, mr)| m == n || !mentions(mr, n))
-                            && self.used_only_in_bottom(body, n))
+                            && self.used_only_in_bottom_fuel(body, n, fuel))
                 })
             }
         }
@@ -4671,6 +4691,9 @@ fn extract_rules(binds: &[TopBind]) -> Vec<RuleDef> {
 }
 
 /// The longest explicit list "foldr/literal" unrolls.
+/// Work allowed for one `used_only_in_bottom` query.
+const USED_ONLY_IN_BOTTOM_FUEL: usize = 4096;
+
 const FOLDR_LITERAL_MAX: usize = 8;
 
 /// The list parameter of a recursive local function `f` that a "list unroll" template can
