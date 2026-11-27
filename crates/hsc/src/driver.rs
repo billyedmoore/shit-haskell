@@ -2625,11 +2625,13 @@ pub fn write_native_with(out: &str, binds: &[crate::core::TopBind], c_sources: &
     let mut roots: Vec<&str> = vec![entry];
     roots.extend_from_slice(crate::native::RTS_GLOBALS);
     let t = std::time::Instant::now();
+    // Before `reachable` drops the constructor wrappers that were inlined everywhere.
+    let strict_cons = crate::core::simplify::extract_strict_cons(&binds);
     let mut binds = crate::native::reachable(binds, &roots);
     let mut numeric = numeric.clone();
     crate::native::lift::lambda_lift(&mut binds, &mut numeric);
     crate::native::stg::collapse_case_chains(&mut binds);
-    crate::native::strict_ops::evaluate_double_operands(&mut binds);
+    crate::native::strict_ops::evaluate_double_operands(&mut binds, &strict_cons);
     let prog = crate::native::stg::Lowering::program(&binds, &numeric);
     let mut text = crate::native::codegen::Gen::program(&prog);
     text.push_str(&crate::native::program_main());
