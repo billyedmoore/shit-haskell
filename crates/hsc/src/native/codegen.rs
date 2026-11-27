@@ -69,6 +69,10 @@ pub mod frame {
     pub const STOP: u64 = 5;
     /// A mask frame: the masking state to put back (one word, not a pointer).
     pub const MASK: u64 = 6;
+    /// A body's frame with a liveness mask: as `BODY`, but only the words whose bit is set in the
+    /// mask word (at -24 from the return address) hold pointers; the others may be garbage (slots
+    /// not written yet), so they need not be cleared before the call.
+    pub const BODY_MAP: u64 = 7;
 }
 
 /// Machine record offsets (`machine::Machine` is `#[repr(C)]` with these fields).
@@ -1132,6 +1136,29 @@ impl Gen {
 
     /// Zeroes any local pointer slots not yet guaranteed initialized on this path, right before
     /// a GC-capable point (collection, yield, runtime call, or pushing a case return address).
+    /// The liveness mask of this body's frame (`frame::BODY_MAP`) at a call: every pointer word
+    /// except the local slots not written yet (`safe_slots`), or None for a nested position or
+    /// a frame of more than 64 words (which clears those slots instead).
+    fn frame_mask(&self, p: Pos) -> Option<u64> {
+        if p.pushed != 0 || self.cur_nslots > 64 {
+            return None;
+        }
+        let size = p.f.size_word();
+        let (words, raw) = (frame::words(size), frame::raw(size));
+        if words > 64 || words == 0 {
+            return None;
+        }
+        let mut mask: u64 = if words == 64 { u64::MAX } else { (1u64 << words) - 1 };
+        mask &= !((1u64 << raw) - 1);
+        for k in (p.f.a + 1)..self.cur_nslots {
+            if self.safe_slots & (1u64 << k) == 0 {
+                let w = p.f.off(k) / 8;
+                mask &= !(1u64 << w);
+            }
+        }
+        Some(mask)
+    }
+
     fn zero_unsafe_slots(&mut self, p: Pos, mark_safe: bool) {
         if self.cur_nslots > 64 {
             return;
@@ -5651,7 +5678,17 @@ impl Gen {
                         self.flush(p);
                     }
                 }
-                self.zero_unsafe_slots(p, true);
+                // The slots not written yet are left out of the frame's liveness mask rather than
+                // cleared (a frame of up to 64 words). Only for a scrutinee that writes no slot of
+                // this frame itself (a call): the mask is fixed before the scrutinee runs.
+                let mask = if matches!(scrut.as_ref(), SExpr::App(..) | SExpr::CallWorker(..) | SExpr::Atom(_)) {
+                    self.frame_mask(p)
+                } else {
+                    None
+                };
+                if mask.is_none() {
+                    self.zero_unsafe_slots(p, true);
+                }
                 // Push the return address (its frame is this body's, above it).
                 self.emit("subq $8, %rbp");
                 let _ = writeln!(self.out, "    leaq {cont}(%rip), %rax");
@@ -5663,7 +5700,11 @@ impl Gen {
                 // at -8. Control reaches the label only by a return, never by falling through. A case
                 // in a scrutinee (nested) has the outer case's return address above it, not the
                 // frame: its own frame is empty (the collector reads the outer one's next).
-                let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
+                if let Some(mask) = mask {
+                    let _ = writeln!(self.out, "    .quad {mask}, {}, {}", frame::BODY_MAP, size);
+                } else {
+                    let _ = writeln!(self.out, "    .quad {}, {}", frame::BODY, size);
+                }
                 self.put_label(&cont);
                 if raw_binder && self.returns_raw(scrut) {
                     let [SAlt::Default(body)] = &alts[..] else {

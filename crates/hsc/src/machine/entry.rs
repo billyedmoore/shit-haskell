@@ -354,7 +354,7 @@ pub extern "C" fn hsc_unwind(m: *mut Machine) -> i32 {
                 m.sp = p - 8;
                 return 0;
             }
-            frame::BODY => {
+            frame::BODY | frame::BODY_MAP => {
                 let size = crate::native::codegen::frame::words(m.stack_load(ret - 8));
                 p += 8 * size;
             }
