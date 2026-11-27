@@ -4690,10 +4690,10 @@ fn extract_rules(binds: &[TopBind]) -> Vec<RuleDef> {
     out
 }
 
-/// The longest explicit list "foldr/literal" unrolls.
 /// Work allowed for one `used_only_in_bottom` query.
 const USED_ONLY_IN_BOTTOM_FUEL: usize = 4096;
 
+/// The longest explicit list "foldr/literal" unrolls.
 const FOLDR_LITERAL_MAX: usize = 8;
 
 /// The list parameter of a recursive local function `f` that a "list unroll" template can
