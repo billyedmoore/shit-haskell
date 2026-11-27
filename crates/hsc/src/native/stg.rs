@@ -98,8 +98,11 @@ pub const MAX_REG_RAW_ARGS: usize = 6;
 pub struct SClosure {
     /// Stack arguments (boxed parameters, plus any raw parameters beyond `MAX_REG_RAW_ARGS`).
     pub arity: u32,
-    /// The atoms, in the enclosing frame, that are captured, in capture order.
+    /// The atoms, in the enclosing frame, that are captured, in capture order: boxed pointer
+    /// captures first, followed by `raw_captures` trailing raw (non-pointer) captures.
     pub captures: Vec<Atom>,
+    /// Number of trailing words in `captures` that hold raw (unboxed) values skipped by GC.
+    pub raw_captures: u32,
     /// The number of frame slots: slot 0 is the closure, then the stack arguments, then the locals.
     pub nslots: u32,
     /// The raw (unboxed) slots, numbered `RAW | i` (see `RAW`), apart from those.
@@ -107,6 +110,9 @@ pub struct SClosure {
     /// A worker's raw parameters: `(arg_slot, raw_slot)`. `arg_slot == 0` means the raw parameter
     /// arrives directly in a cache register (`CACHE_REGS[i]`) rather than on the stack.
     pub raw_args: Vec<(u32, u32)>,
+    /// Captured raw variables loaded from the closure's free-variable tail on entry:
+    /// `(free_idx, raw_slot)`, where `free_idx >= captures.len() - raw_captures`.
+    pub raw_free: Vec<(u32, u32)>,
     /// The body returns its (numeric) result raw in R1, not a pointer (see `raw_returns`).
     pub ret_raw: bool,
     /// Whether the body (or nested closure captures) ever reads slot 0 (`Slot(0)` or `Free(_)`).
@@ -117,6 +123,10 @@ pub struct SClosure {
 /// The bit that marks a slot number as a raw slot: it holds an unboxed `Int#`/`Word#`/`Char#`/`Double#`
 /// (a number, not a pointer), which the collector does not read.
 pub const RAW: u32 = 1 << 31;
+
+/// Lowering-only sentinel bit marking a raw slot allocated for a captured raw variable before
+/// `closure_with` assigns it a final non-overlapping index above `Body::nraw`.
+const RAW_FREE_TMP: u32 = 1 << 28;
 
 /// Primitives whose result can be held raw: computed inline from raw or boxed operands.
 pub const RAW_RESULT_PRIMS: &[&str] = &[
@@ -362,6 +372,26 @@ fn raw_uses(
     raw_uses_in(e, x, w, strict_map, whnf, true)
 }
 
+/// Whether an argument lowered via `atom()` can mention raw variable `x` without boxing `x` in
+/// the enclosing body: constructors recurse into their fields, and any non-atomic expression
+/// (thunk or lambda) becomes a closure that captures `x` raw in its trailing raw-capture words.
+fn raw_uses_atom(
+    a: &Core,
+    x: &str,
+    w: &Workers,
+    strict_map: &Workers,
+    whnf: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !mentions(a, x) {
+        return true;
+    }
+    match a {
+        Core::Var(_) | Core::Lit(_) => false,
+        Core::Con(_, args) => args.iter().all(|sub| raw_uses_atom(sub, x, w, strict_map, whnf)),
+        other => raw_uses_in(other, x, w, strict_map, whnf, true),
+    }
+}
+
 /// `raw_uses`; `result` says whether `e` is in a result position of the body. Elsewhere (inside a
 /// scrutinee, whose own results become a join point's arguments, or an operand) `x` itself must
 /// not be the value.
@@ -376,12 +406,11 @@ fn raw_uses_in(
     match e {
         Core::Var(v) => v != x || result,
         Core::Lit(_) | Core::Fail(_) => true,
-        // An operand that is not an atom becomes a thunk: it must not mention the raw value.
-        Core::Prim(p, args) if prim_accepts_any_raw(p) => {
-            args.iter().enumerate().all(|(i, a)| {
-                (prim_arg_accepts_raw(p, i) && matches!(a, Core::Var(v) if v == x)) || !mentions(a, x)
-            })
-        }
+        // An operand that is not an atom becomes a thunk, which can capture `x` raw.
+        Core::Prim(p, args) if prim_accepts_any_raw(p) => args.iter().enumerate().all(|(i, a)| {
+            (prim_arg_accepts_raw(p, i) && matches!(a, Core::Var(v) if v == x))
+                || raw_uses_atom(a, x, w, strict_map, whnf)
+        }),
         Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
             if mentions(&args[0], x) {
                 return false;
@@ -420,20 +449,28 @@ fn raw_uses_in(
                 if can_call_worker(g.as_str(), &args, w, strict_map, whnf) {
                     let raw = &w[g.as_str()];
                     // A raw parameter's argument is evaluated in place (see `worker_call`); the others
-                    // are passed or captured.
+                    // are lowered via `atom()` (non-atomic arguments become raw-capturing thunks).
                     return g != x
                         && args.iter().zip(raw).all(|(a, r)| match a {
                             Core::Var(v) if v == x => *r,
                             a if *r => raw_uses_in(a, x, w, strict_map, whnf, false),
-                            a => !mentions(a, x),
+                            a => raw_uses_atom(a, x, w, strict_map, whnf),
                         });
                 }
             }
-            // Otherwise the function and arguments are passed or captured (a non-atomic argument
-            // becomes a thunk), never evaluated in place: they must not mention the raw value.
-            !mentions(e, x)
+            // Otherwise the function and arguments are lowered via `atom()`.
+            raw_uses_atom(f, x, w, strict_map, whnf)
+                && args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf))
         }
-        Core::Lam(_, b) => !mentions(b, x),
+        Core::Lam(p, b) => {
+            if p == x {
+                return true;
+            }
+            let removed = push_shadow_whnf(std::iter::once(p.as_str()), whnf);
+            let ok = raw_uses_in(b, x, w, strict_map, whnf, true);
+            pop_removed_whnf(removed, whnf);
+            ok
+        }
         Core::Let(binds, body) => {
             let body_shadowed = binds.iter().any(|(n, _)| n == x);
             if result && is_join(binds, body) {
@@ -466,14 +503,15 @@ fn raw_uses_in(
                 pop_removed_whnf(removed, whnf);
                 ok
             } else {
-                if !binds.iter().all(|(_, r)| !mentions(r, x)) {
-                    return false;
-                }
                 if body_shadowed {
                     return true;
                 }
                 let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
-                let ok = raw_uses_in(body, x, w, strict_map, whnf, result);
+                let binds_ok = binds.iter().all(|(_, r)| match r {
+                    Core::Con(_, args) => args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf)),
+                    other => raw_uses_in(other, x, w, strict_map, whnf, true),
+                });
+                let ok = binds_ok && raw_uses_in(body, x, w, strict_map, whnf, result);
                 pop_removed_whnf(removed, whnf);
                 ok
             }
@@ -504,7 +542,14 @@ fn raw_uses_in(
             ok
         }
         Core::Prim(p, _) if p == "raise#" => no_bad_raw_case(e, x),
-        Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, x)),
+        Core::Con(_, args) => args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf)),
+        Core::Prim(p, args) => {
+            if strict_integer_arity(p).is_some_and(|n| n == args.len()) {
+                args.iter().all(|a| !mentions(a, x))
+            } else {
+                args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf))
+            }
+        }
     }
 }
 
@@ -930,11 +975,17 @@ fn has_unboxed_recursive_path(
                 pop_removed_whnf(removed, whnf);
                 ok
             } else {
-                if !binds.iter().all(|(_, r)| !mentions(r, x)) {
-                    return false;
-                }
                 let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
-                let ok = has_unboxed_recursive_path(body, x, target, w, strict_map, whnf);
+                let binds_ok = binds.iter().all(|(_, r)| match r {
+                    Core::Con(_, args) => args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf)),
+                    other => raw_uses_in(other, x, w, strict_map, whnf, true),
+                });
+                let ok = binds_ok
+                    && (binds.iter().any(|(_, r)| {
+                        !matches!(r, Core::Var(_) | Core::Lit(_) | Core::Con(..))
+                            && numeric_use(r, x)
+                            && has_self_raw_call(r, target, w, strict_map, whnf)
+                    }) || has_unboxed_recursive_path(body, x, target, w, strict_map, whnf));
                 pop_removed_whnf(removed, whnf);
                 ok
             }
@@ -980,6 +1031,12 @@ fn has_unboxed_recursive_path(
             pop_added_whnf(added, whnf);
             ok
         }
+        Core::Con(_, args) => args.iter().any(|a| {
+            !matches!(a, Core::Var(_) | Core::Lit(_) | Core::Con(..))
+                && numeric_use(a, x)
+                && raw_uses_in(a, x, w, strict_map, whnf, true)
+                && has_self_raw_call(a, target, w, strict_map, whnf)
+        }),
         _ => false,
     }
 }
@@ -1004,10 +1061,14 @@ struct Body {
     nslots: u32,
     /// Raw slots allocated.
     nraw: u32,
-    /// Captured names, to their index, with the outer variable each is copied from.
+    /// Boxed captured names, to their index, with the outer variable each is copied from.
     captures: Vec<(String, Atom)>,
-    /// Captured names by index into `captures`.
+    /// Boxed captured names by index into `captures`.
     capture_index: HashMap<String, u32>,
+    /// Raw captured names: `(name, outer_raw_atom, temporary_inner_raw_slot)`.
+    raw_captures: Vec<(String, Atom, u32)>,
+    /// Raw captured names by their temporary inner raw slot (`RAW | kind | RAW_FREE_TMP | idx`).
+    raw_capture_index: HashMap<String, u32>,
     /// The join points in scope, to their id and arity.
     joins: HashMap<String, (u32, usize)>,
     /// Objects for the non-atomic arguments of the operation being lowered in this body.
@@ -1054,6 +1115,8 @@ impl Body {
             nraw: 0,
             captures: Vec::new(),
             capture_index: HashMap::new(),
+            raw_captures: Vec::new(),
+            raw_capture_index: HashMap::new(),
             joins: HashMap::new(),
             pending: Vec::new(),
             whnf: std::collections::HashSet::new(),
@@ -1123,6 +1186,10 @@ impl Lowering {
     /// further ones arrive in stack argument slots.
     fn closure_with(&mut self, e: &Core, raw: Option<(&[bool], &[u8])>, ret_raw: Option<u8>) -> SClosure {
         let mut body = Body::new();
+        // Variables already in WHNF in the enclosing body stay in WHNF whenever this closure runs.
+        if let Some(outer) = self.bodies.last() {
+            body.whnf = outer.whnf.clone();
+        }
         body.ret_raw = ret_raw;
         self.bodies.push(body);
         let mut raw_args = Vec::new();
@@ -1156,23 +1223,51 @@ impl Lowering {
                         let s = top.fresh_slot();
                         stack_arity += 1;
                         top.locals.insert(p.clone(), s);
+                        top.whnf.remove(p);
                     }
                 }
                 (stack_arity, cur)
             }
             other => (0, other),
         };
-        let body = self.strict(body_expr);
+        let mut body = self.strict(body_expr);
         let b = self.bodies.pop().expect("body");
         debug_assert!(b.pending.is_empty(), "internal: unconsumed pending bindings");
-        let captures: Vec<Atom> = b.captures.iter().map(|(_, a)| a.clone()).collect();
-        let uses_closure = !captures.is_empty() || expr_uses_closure(&body);
+        let ptr_count = b.captures.len() as u32;
+        let raw_count = b.raw_captures.len() as u32;
+        let mut nraw = b.nraw;
+        let mut captures: Vec<Atom> = b.captures.iter().map(|(_, a)| a.clone()).collect();
+        let mut raw_free = Vec::with_capacity(b.raw_captures.len());
+        if !b.raw_captures.is_empty() {
+            let base = nraw;
+            nraw += raw_count;
+            let finalize = |s: &mut u32| {
+                if *s & RAW != 0 && *s & RAW_FREE_TMP != 0 {
+                    let idx = *s & !(RAW_MASK | RAW_FREE_TMP);
+                    *s = RAW | (*s & RAW_KIND_MASK) | (base + idx);
+                }
+            };
+            let finalize_atom = |a: &mut Atom| {
+                if let Atom::Slot(s) = a {
+                    finalize(s);
+                }
+            };
+            rewrite_expr(&mut body, &finalize, &finalize_atom);
+            for (idx, (_, outer, mut inner_r)) in b.raw_captures.into_iter().enumerate() {
+                finalize(&mut inner_r);
+                captures.push(outer);
+                raw_free.push((ptr_count + idx as u32, inner_r));
+            }
+        }
+        let uses_closure = !b.captures.is_empty() || expr_uses_closure(&body);
         let mut closure = SClosure {
             arity,
             captures,
+            raw_captures: raw_count,
             nslots: b.nslots,
-            nraw: b.nraw,
+            nraw,
             raw_args,
+            raw_free,
             ret_raw: b.ret_raw.is_some(),
             uses_closure,
             body,
@@ -1216,14 +1311,29 @@ impl Lowering {
         if let Some(&i) = self.bodies[depth].capture_index.get(name) {
             return Some(Atom::Free(i));
         }
+        if let Some(&r) = self.bodies[depth].raw_capture_index.get(name) {
+            return Some(Atom::Slot(r));
+        }
         if depth == 0 {
             return None;
         }
-        // Capture from the enclosing body; raw slots cannot be captured directly by a closure
-        // (the collector traces closure captures as heap pointers), so box on demand in the outer body.
+        // Capture from the enclosing body; raw slots are captured directly in the closure's
+        // trailing raw-capture words (up to the 255-word header limit) so thunks and lambdas
+        // avoid boxing and unboxing them.
         let mut outer = self.resolve_at(depth - 1, name)?;
         if let Atom::Slot(r) = outer {
             if r & RAW != 0 {
+                let b = &mut self.bodies[depth];
+                if b.raw_captures.len() < 255
+                    && b.captures.len() + b.raw_captures.len() + 1 < (1 << 16)
+                {
+                    let idx = b.raw_captures.len() as u32;
+                    let inner_r = RAW | (r & RAW_KIND_MASK) | RAW_FREE_TMP | idx;
+                    b.raw_captures.push((name.to_string(), outer, inner_r));
+                    b.raw_capture_index.insert(name.to_string(), inner_r);
+                    b.whnf.insert(name.to_string());
+                    return Some(Atom::Slot(inner_r));
+                }
                 outer = self.box_raw_at(depth - 1, r);
             }
         }
@@ -1262,7 +1372,11 @@ impl Lowering {
 
     /// Whether an exact call `g args` in the current body may invoke `g`'s worker.
     fn can_invoke_worker(&self, g: &str, args: &[&Core]) -> bool {
-        if self.bodies.iter().any(|b| b.locals.contains_key(g) || b.capture_index.contains_key(g)) {
+        if self.bodies.iter().any(|b| {
+            b.locals.contains_key(g)
+                || b.capture_index.contains_key(g)
+                || b.raw_capture_index.contains_key(g)
+        }) {
             return false;
         }
         let Some(body) = self.bodies.last() else { return false };
@@ -1380,11 +1494,11 @@ impl Lowering {
                 SExpr::Join(id, params, Box::new(code), Box::new(body))
             }
             Core::Let(binds, body) => {
-                let bound = self.let_binds(binds);
                 let removed = push_shadow_whnf(
                     binds.iter().map(|(n, _)| n.as_str()),
                     &mut self.bodies.last_mut().expect("body").whnf,
                 );
+                let bound = self.let_binds(binds);
                 let body = self.strict(body);
                 pop_removed_whnf(removed, &mut self.bodies.last_mut().expect("body").whnf);
                 SExpr::Let(bound, Box::new(body))
@@ -1958,22 +2072,22 @@ fn compact_raw_slots(c: &mut SClosure) {
 
     let mut joins = HashMap::new();
     let body_in = liveness(&c.body, 0, all_mask, &mut joins, &mut adj, &mut active, &atom_bit, &interfere);
-    let mut raw_args_mask = 0u64;
-    for &(_, r) in &c.raw_args {
+    let mut raw_entry_mask = 0u64;
+    for &(_, r) in c.raw_args.iter().chain(c.raw_free.iter()) {
         let d = (r & !RAW_MASK) as usize;
-        raw_args_mask |= 1u64 << d;
+        raw_entry_mask |= 1u64 << d;
         active |= 1u64 << d;
     }
-    for &(_, r) in &c.raw_args {
+    for &(_, r) in c.raw_args.iter().chain(c.raw_free.iter()) {
         let d = (r & !RAW_MASK) as usize;
-        interfere(&mut adj, d, body_in | raw_args_mask);
+        interfere(&mut adj, d, body_in | raw_entry_mask);
     }
 
     let mut color = [u32::MAX; 64];
     let mut max_color = 0u32;
     let mut colored_any = false;
-    // Keep raw_args in their original 0.. order when possible.
-    for &(_, r) in &c.raw_args {
+    // Keep raw_args and raw_free in their original 0.. order when possible.
+    for &(_, r) in c.raw_args.iter().chain(c.raw_free.iter()) {
         let i = (r & !RAW_MASK) as usize;
         if color[i] == u32::MAX {
             let mut used = 0u64;
@@ -2028,55 +2142,59 @@ fn compact_raw_slots(c: &mut SClosure) {
             remap(s);
         }
     };
-    fn rewrite_expr(e: &mut SExpr, remap: &impl Fn(&mut u32), remap_atom: &impl Fn(&mut Atom)) {
-        match e {
-            SExpr::Atom(a) => remap_atom(a),
-            SExpr::App(f, args) => {
-                remap_atom(f);
-                args.iter_mut().for_each(remap_atom);
-            }
-            SExpr::CallWorker(_, args) | SExpr::Con(_, args) | SExpr::Prim(_, args) | SExpr::Jump(_, args) => {
-                args.iter_mut().for_each(remap_atom);
-            }
-            SExpr::Let(binds, body) => {
-                for (_, b) in binds {
-                    match b {
-                        SBind::Closure(cl) => cl.captures.iter_mut().for_each(remap_atom),
-                        SBind::Con(_, args) => args.iter_mut().for_each(remap_atom),
-                        SBind::BoxRaw(r) => remap(r),
-                    }
-                }
-                rewrite_expr(body, remap, remap_atom);
-            }
-            SExpr::Case(scrut, bslot, alts) => {
-                rewrite_expr(scrut, remap, remap_atom);
-                remap(bslot);
-                for a in alts {
-                    match a {
-                        SAlt::Con(_, slots, b) => {
-                            for s in slots {
-                                remap(s);
-                            }
-                            rewrite_expr(b, remap, remap_atom);
-                        }
-                        SAlt::Lit(_, b) | SAlt::Default(b) => rewrite_expr(b, remap, remap_atom),
-                    }
-                }
-            }
-            SExpr::Closure(cl) => cl.captures.iter_mut().for_each(remap_atom),
-            SExpr::Fail(_) => {}
-            SExpr::Join(_, _, code, body) => {
-                rewrite_expr(code, remap, remap_atom);
-                rewrite_expr(body, remap, remap_atom);
-            }
-        }
-    }
 
     for (_, r) in &mut c.raw_args {
         remap(r);
     }
+    for (_, r) in &mut c.raw_free {
+        remap(r);
+    }
     rewrite_expr(&mut c.body, &remap, &remap_atom);
     c.nraw = new_nraw;
+}
+
+fn rewrite_expr(e: &mut SExpr, remap: &impl Fn(&mut u32), remap_atom: &impl Fn(&mut Atom)) {
+    match e {
+        SExpr::Atom(a) => remap_atom(a),
+        SExpr::App(f, args) => {
+            remap_atom(f);
+            args.iter_mut().for_each(remap_atom);
+        }
+        SExpr::CallWorker(_, args) | SExpr::Con(_, args) | SExpr::Prim(_, args) | SExpr::Jump(_, args) => {
+            args.iter_mut().for_each(remap_atom);
+        }
+        SExpr::Let(binds, body) => {
+            for (_, b) in binds {
+                match b {
+                    SBind::Closure(cl) => cl.captures.iter_mut().for_each(remap_atom),
+                    SBind::Con(_, args) => args.iter_mut().for_each(remap_atom),
+                    SBind::BoxRaw(r) => remap(r),
+                }
+            }
+            rewrite_expr(body, remap, remap_atom);
+        }
+        SExpr::Case(scrut, bslot, alts) => {
+            rewrite_expr(scrut, remap, remap_atom);
+            remap(bslot);
+            for a in alts {
+                match a {
+                    SAlt::Con(_, slots, b) => {
+                        for s in slots {
+                            remap(s);
+                        }
+                        rewrite_expr(b, remap, remap_atom);
+                    }
+                    SAlt::Lit(_, b) | SAlt::Default(b) => rewrite_expr(b, remap, remap_atom),
+                }
+            }
+        }
+        SExpr::Closure(cl) => cl.captures.iter_mut().for_each(remap_atom),
+        SExpr::Fail(_) => {}
+        SExpr::Join(_, _, code, body) => {
+            rewrite_expr(code, remap, remap_atom);
+            rewrite_expr(body, remap, remap_atom);
+        }
+    }
 }
 
 /// Whether `e` (or the capture list of any nested closure it allocates) reads slot 0 or a free variable.
@@ -3042,16 +3160,9 @@ mod raw_slot_tests {
         let escapes = vec![
             Core::App(Box::new(var("Test.k")), Box::new(var("y"))),
             Core::Con("Test.K".into(), vec![var("y")]),
-            Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(Core::Con("Test.K".into(), vec![var("t")]))),
             Core::Case(Box::new(var("y")), "z".into(), vec![Alt::Default(var("z"))]),
-            Core::App(Box::new(var("Test.k")), Box::new(prim("+#", vec![var("y"), Core::Lit(Lit::Int(1))]))),
             Core::Case(
                 Box::new(Core::Case(Box::new(var("x")), "u".into(), vec![Alt::Default(var("y"))])),
-                "s".into(),
-                vec![Alt::Default(var("s"))],
-            ),
-            Core::Case(
-                Box::new(Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t")))),
                 "s".into(),
                 vec![Alt::Default(var("s"))],
             ),
@@ -3059,6 +3170,20 @@ mod raw_slot_tests {
         for body in escapes {
             let c = lower(case(prim("+#", vec![var("x"), var("x")]), "y", body.clone()));
             assert_eq!(c.nraw, 0, "{body:?}");
+        }
+        // Thunks capturing `y` raw keep `y` unboxed in the outer body and record a trailing raw capture.
+        let raw_captured_thunks = vec![
+            Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(Core::Con("Test.K".into(), vec![var("t")]))),
+            Core::App(Box::new(var("Test.k")), Box::new(prim("+#", vec![var("y"), Core::Lit(Lit::Int(1))]))),
+            Core::Case(
+                Box::new(Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t")))),
+                "s".into(),
+                vec![Alt::Default(var("s"))],
+            ),
+        ];
+        for body in raw_captured_thunks {
+            let c = lower(case(prim("+#", vec![var("x"), var("x")]), "y", body.clone()));
+            assert_eq!(c.nraw, 1, "{body:?}");
         }
         // A join point runs in the same stack frame and does not capture `y`, so `y` stays raw.
         let join_body = Core::Let(vec![("t".into(), prim("+#", vec![var("y"), var("y")]))], Box::new(var("t")));
@@ -3943,6 +4068,108 @@ mod raw_slot_tests {
             binders.iter().any(|&b| b & RAW != 0 && b & RAW_DOUBLE == 0),
             "expected RAW int comparison binder: {binders:#x?}"
         );
+    }
+
+    #[test]
+    fn raw_thunk_captures_enable_recursive_tree_builder_worker() {
+        // build v d = case d ==# 0# of
+        //   1# -> Node Leaf v Leaf
+        //   _  -> Node (case d -# 1# of d1 -> case 2# *# v of v1 -> build v1 d1)
+        //              v
+        //              (case d -# 1# of d2 -> case 2# *# v of t -> case t +# 1# of v2 -> build v2 d2)
+        let left_thunk = case(
+            prim("-#", vec![var("d"), Core::Lit(Lit::Int(1))]),
+            "d1",
+            case(
+                prim("*#", vec![Core::Lit(Lit::Int(2)), var("v")]),
+                "v1",
+                app(app(var("Test.build"), var("v1")), var("d1")),
+            ),
+        );
+        let right_thunk = case(
+            prim("-#", vec![var("d"), Core::Lit(Lit::Int(1))]),
+            "d2",
+            case(
+                prim("*#", vec![Core::Lit(Lit::Int(2)), var("v")]),
+                "t",
+                case(
+                    prim("+#", vec![var("t"), Core::Lit(Lit::Int(1))]),
+                    "v2",
+                    app(app(var("Test.build"), var("v2")), var("d2")),
+                ),
+            ),
+        );
+        let build_body = Core::Lam(
+            "v".into(),
+            Box::new(Core::Lam(
+                "d".into(),
+                Box::new(case(
+                    prim("==#", vec![var("d"), Core::Lit(Lit::Int(0))]),
+                    "eq",
+                    Core::Case(
+                        Box::new(var("eq")),
+                        "cb".into(),
+                        vec![
+                            Alt::Lit(
+                                Lit::Int(1),
+                                Core::Con("Test.Node".into(), vec![var("Test.Leaf"), var("v"), var("Test.Leaf")]),
+                            ),
+                            Alt::Default(Core::Con(
+                                "Test.Node".into(),
+                                vec![left_thunk, var("v"), right_thunk],
+                            )),
+                        ],
+                    ),
+                )),
+            )),
+        );
+        let binds = vec![
+            TopBind { name: "Test.Leaf".into(), body: Core::Con("Test.Leaf".into(), vec![]) },
+            TopBind { name: "Test.build".into(), body: build_body },
+        ];
+        let numeric = NumericParams {
+            params: [("Test.build".to_string(), vec![NUM_INT, NUM_INT])].into_iter().collect(),
+            results: HashMap::new(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, raw) = prog.globals[1].worker.as_ref().expect("Test.build should get a worker");
+        assert_eq!(raw, &vec![true, true], "both v and d should be unboxed");
+
+        fn collect_thunks<'a>(e: &'a SExpr, out: &mut Vec<&'a SClosure>) {
+            match e {
+                SExpr::Let(bs, b) => {
+                    for (_, bind) in bs {
+                        if let SBind::Closure(cl) = bind {
+                            out.push(cl);
+                        }
+                    }
+                    collect_thunks(b, out);
+                }
+                SExpr::Case(s, _, alts) => {
+                    collect_thunks(s, out);
+                    for a in alts {
+                        match a {
+                            SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => collect_thunks(b, out),
+                        }
+                    }
+                }
+                SExpr::Join(_, _, c, b) => {
+                    collect_thunks(c, out);
+                    collect_thunks(b, out);
+                }
+                _ => {}
+            }
+        }
+        let mut thunks = Vec::new();
+        collect_thunks(&worker.body, &mut thunks);
+        assert_eq!(thunks.len(), 2, "expected 2 recursive child thunks");
+        for th in thunks {
+            assert_eq!(th.arity, 0);
+            assert_eq!(th.raw_captures, 2, "child thunk should capture both v# and d# raw");
+            assert_eq!(th.captures.len(), 2, "child thunk should have no boxed captures");
+            assert_eq!(th.raw_free.len(), 2);
+            assert!(!th.uses_closure, "raw-only child thunk should not save slot 0");
+        }
     }
 }
 
