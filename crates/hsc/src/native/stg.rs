@@ -861,9 +861,6 @@ fn pair_returns(
                     collect_pair_exits(&args[1], arities, w_all, strict_map, whnf, shadowed, out)
                 }
             }
-            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
-                collect_pair_exits(&args[0], arities, w_all, strict_map, whnf, shadowed, out)
-            }
             Core::Let(bs, body) => {
                 let join_ok = if is_join(bs, body) {
                     let mut cur = &bs[0].1;
