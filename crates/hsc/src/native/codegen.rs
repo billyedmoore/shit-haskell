@@ -83,6 +83,10 @@ pub mod mach {
     pub const CODE: i64 = 56;
     pub const ARGS: i64 = 64;
     pub const TID: i64 = 192;
+    pub const NURSERY_LO: i64 = 200;
+    pub const NURSERY_HI: i64 = 208;
+    pub const REM_PTR: i64 = 216;
+    pub const REM_END: i64 = 224;
 }
 
 /// Where an expression's result goes.
@@ -635,6 +639,38 @@ impl Gen {
         self.cold_out.push_str(&chunk);
     }
 
+    /// The write barrier after storing pointer `val` into heap object `obj` (registers): an
+    /// object outside the nursery is checked out of line (`hsc_wb_slow`, which preserves every
+    /// register) and remembered when `val` is in the nursery.
+    fn write_barrier(&mut self, obj: &str, val: &str) {
+        let old = self.label("barold");
+        let done = self.label("bark");
+        let _ = writeln!(self.out, "    cmpq {}(%rbx), {obj}", mach::NURSERY_LO);
+        let _ = writeln!(self.out, "    jb {old}");
+        let _ = writeln!(self.out, "    cmpq {}(%rbx), {obj}", mach::NURSERY_HI);
+        let _ = writeln!(self.out, "    jae {old}");
+        self.put_label(&done);
+        let (obj, val) = (obj.to_string(), val.to_string());
+        self.emit_cold(|g| {
+            g.put_label(&old);
+            // `hsc_wb_slow` takes the object in %rax and the pointer in %rcx.
+            if obj == "%rax" && val == "%rcx" {
+                g.emit("call hsc_wb_slow");
+            } else {
+                g.emit("pushq %rax");
+                g.emit("pushq %rcx");
+                g.emit(&format!("pushq {obj}"));
+                g.emit(&format!("pushq {val}"));
+                g.emit("popq %rcx");
+                g.emit("popq %rax");
+                g.emit("call hsc_wb_slow");
+                g.emit("popq %rcx");
+                g.emit("popq %rax");
+            }
+            let _ = writeln!(g.out, "    jmp {done}");
+        });
+    }
+
     /// Emits out-of-line IND-chasing and native `THUNK` evaluation (via `hsc_eval`) for a boxed
     /// operand currently in `reg` (one of `%rax`, `%rcx`, `%rdx`). On success, `reg` holds the
     /// verified `in_kind` heap cell (and if `store_slot` is `Some(s)`, the cell is written back to
@@ -680,9 +716,16 @@ impl Gen {
             let _ = writeln!(g.out, "    cmpb ${in_kind}, ({reg})");
             let _ = writeln!(g.out, "    jne {ind_lbl}");
             if let Some(i) = store_slot.filter(|s| s & STORE_FREE != 0).map(|s| s & !STORE_FREE) {
-                // `%r14` is free here: the THUNK path below clobbers it too.
+                // `%r14` is free here: the THUNK path below clobbers it too. Only a closure in
+                // the nursery is written (an old one would need the write barrier).
+                let skip = g.label("nofree");
                 let _ = writeln!(g.out, "    movq {}(%rbp), %r14", p.slot_off(0));
+                let _ = writeln!(g.out, "    cmpq {}(%rbx), %r14", mach::NURSERY_LO);
+                let _ = writeln!(g.out, "    jb {skip}");
+                let _ = writeln!(g.out, "    cmpq {}(%rbx), %r14", mach::NURSERY_HI);
+                let _ = writeln!(g.out, "    jae {skip}");
                 let _ = writeln!(g.out, "    movq {reg}, {}(%r14)", 8 * (2 + i as i64));
+                g.put_label(&skip);
             } else if let Some(s) = store_slot {
                 let _ = writeln!(g.out, "    movq {reg}, {}(%rbp)", p.slot_off(s));
                 if let Some(c) = cached.iter().find(|c| c.slot == s && c.reg != reg) {
@@ -724,6 +767,10 @@ impl Gen {
                 let _ = writeln!(g.out, "    movq {}(%rbp), {reg}", p.slot_off(0));
                 let _ = writeln!(g.out, "    testq {reg}, {reg}");
                 let _ = writeln!(g.out, "    je {skip}");
+                let _ = writeln!(g.out, "    cmpq {}(%rbx), {reg}", mach::NURSERY_LO);
+                let _ = writeln!(g.out, "    jb {skip}");
+                let _ = writeln!(g.out, "    cmpq {}(%rbx), {reg}", mach::NURSERY_HI);
+                let _ = writeln!(g.out, "    jae {skip}");
                 let _ = writeln!(g.out, "    movq %r14, {}({reg})", 8 * (2 + i as i64));
                 g.put_label(&skip);
             } else if let Some(s) = store_slot {
@@ -4683,6 +4730,7 @@ impl Gen {
                                         self.load(&args[0], p, "%rax");
                                         self.load(&args[1], p, "%rcx");
                                         self.emit("movq %rcx, 8(%rax)");
+                                        self.write_barrier("%rax", "%rcx");
                                         if *bslot != UNUSED_SLOT && uses.contains(bslot) {
                                             let unit_id = self.con_id("Builtin.()");
                                             let unit_lbl = self.nullary_con(unit_id);
@@ -4962,6 +5010,7 @@ impl Gen {
                                         let _ = writeln!(self.out, "    jne {slow}");
                                         self.load(&args[1], p, "%rcx");
                                         self.emit("movq %rcx, 8(%rax)");
+                                        self.write_barrier("%rax", "%rcx");
                                         if write_bslot && !defer_unit {
                                             let ul = unit_lbl.as_ref().unwrap();
                                             let _ = writeln!(self.out, "    leaq {ul}(%rip), %rcx");
@@ -5553,6 +5602,7 @@ impl Gen {
                                             }
                                             self.load(&wargs[0], p, "%rax");
                                             self.emit("movq %r14, 8(%rax)");
+                                            self.write_barrier("%rax", "%r14");
                                             if *wbslot != UNUSED_SLOT && uses.contains(wbslot) {
                                                 let unit_id = self.con_id("Builtin.()");
                                                 let unit_lbl = self.nullary_con(unit_id);
@@ -7837,6 +7887,7 @@ impl Gen {
         } else {
             self.load(&args[1], p, "%rcx");
             self.emit("movq %rcx, 8(%rax)");
+            self.write_barrier("%rax", "%rcx");
             let unit = self.con_id("Builtin.()");
             let cell = self.nullary_con(unit);
             self.emit(&format!("leaq {cell}(%rip), %r14"));
@@ -9048,6 +9099,16 @@ hsc_upd_ret:
     orl $9, %eax
     movq %rax, (%rcx)
     movq %r14, 8(%rcx)
+    cmpq 200(%rbx), %rcx
+    jb .Lupd_old
+    cmpq 208(%rbx), %rcx
+    jae .Lupd_old
+    addq $16, %rbp
+    jmp *(%rbp)
+.Lupd_old:
+    movq %rcx, %rax
+    movq %r14, %rcx
+    call hsc_wb_slow
     addq $16, %rbp
     jmp *(%rbp)
 
@@ -9271,6 +9332,62 @@ hsc_raise_pending:
 .Lrt_raise:
     addq $8, %rsp
     jmp hsc_raise_pending
+
+# The write barrier's slow path: old object %rax was given pointer %rcx; it is remembered when
+# %rcx is in the nursery. Every register is preserved (the flags are not).
+hsc_wb_slow:
+    cmpq 200(%rbx), %rcx
+    jb .Lrem_done
+    cmpq 208(%rbx), %rcx
+    jae .Lrem_done
+    pushq %rdx
+    movq 216(%rbx), %rdx
+    cmpq -8(%rdx), %rax
+    je .Lrem_same
+    cmpq 224(%rbx), %rdx
+    jae .Lrem_full
+    movq %rax, (%rdx)
+    addq $8, %rdx
+    movq %rdx, 216(%rbx)
+.Lrem_same:
+    popq %rdx
+.Lrem_done:
+    ret
+.Lrem_full:
+    popq %rdx
+    pushq %rax
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r15
+    subq $32, %rsp
+    movdqu %xmm0, (%rsp)
+    movdqu %xmm1, 16(%rsp)
+    movq %rsp, %r15
+    andq $-16, %rsp
+    movq %rbx, %rdi
+    movq %rax, %rsi
+    call hsc_remember
+    movq %r15, %rsp
+    movdqu (%rsp), %xmm0
+    movdqu 16(%rsp), %xmm1
+    addq $32, %rsp
+    popq %r15
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rax
+    ret
 
 hsc_gc_rt:
     movq %r12, 0(%rbx)

@@ -73,7 +73,7 @@ impl SelectorTable {
 /// (and a quarter of its size more), growing if the live data leaves too little.
 pub fn collect(heap: &mut Heap, roots: &mut [Word], need: usize) {
     let empty = SelectorTable::default();
-    collect_with_selectors(heap, roots, need, &empty);
+    collect_with_selectors(heap, roots, need, &empty, (0, 0), (0, 0));
 }
 
 /// Like `collect`, additionally short-circuiting selector thunks listed in `selectors` when their
@@ -83,6 +83,8 @@ pub fn collect_with_selectors(
     roots: &mut [Word],
     need: usize,
     selectors: &SelectorTable,
+    nursery: (Word, Word),
+    survivors: (Word, Word),
 ) {
     let mut space = std::mem::take(&mut heap.from);
     // The new space holds three times the data live at the last collection (as GHC sizes its old
@@ -94,6 +96,11 @@ pub fn collect_with_selectors(
     } else {
         space.len()
     };
+    // Everything in the sources may be live: the old space's data and the young objects.
+    let most = heap.hp + ((nursery.1 + survivors.1) / 8) as usize + need;
+    if capacity < most {
+        capacity = space.len().saturating_mul(2).max(most.checked_next_power_of_two().unwrap_or(most));
+    }
     let pinned = std::mem::take(&mut heap.pinned);
     let bounds = (pinned.keys().min().copied().unwrap_or(1), pinned.keys().max().copied().unwrap_or(0));
     let mut reached: std::collections::HashSet<Word> = std::collections::HashSet::new();
@@ -101,14 +108,14 @@ pub fn collect_with_selectors(
     // would be zeroed page by page.
     let spare = std::mem::take(&mut heap.to);
     let (mut to, mut live) =
-        copy(&mut space, roots, capacity, &pinned, bounds, &mut reached, spare, selectors);
+        copy(&mut space, nursery, (survivors.0, survivors.1, 0), roots, capacity, &pinned, bounds, &mut reached, spare, selectors);
     capacity = to.len();
     while capacity - live < need + capacity / 4 {
         // Too little room: copy again into a larger space (the live data is all in `to`).
         let min_cap = (live + need).saturating_mul(4) / 3 + 1;
         capacity = capacity.saturating_mul(2).max(min_cap.checked_next_power_of_two().unwrap_or(min_cap));
         let (bigger, l) =
-            copy(&mut to, roots, capacity, &pinned, bounds, &mut reached, Vec::new(), selectors);
+            copy(&mut to, (0, 0), (0, 0, 0), roots, capacity, &pinned, bounds, &mut reached, Vec::new(), selectors);
         to = bigger;
         live = l;
     }
@@ -136,12 +143,15 @@ pub fn collect_with_selectors(
     }
 }
 
-/// Copies everything reachable from `roots` out of `src` into a new space of `capacity` words
-/// (`spare` when it is at least that large). Returns the new space and the number of live words.
-/// The roots are updated in place; `src` is left with forwarding pointers.
+/// Copies everything reachable from `roots` out of `src` (and `extra`, a second source range
+/// `(base, bytes)`, e.g. the nursery) into a new space of `capacity` words (`spare` when it is at
+/// least that large). Returns the new space and the number of live words. The roots are updated
+/// in place; the sources are left with forwarding pointers.
 #[allow(clippy::too_many_arguments)]
 fn copy(
     src: &mut [Word],
+    extra: (Word, Word),
+    extra2: (Word, Word, usize),
     roots: &mut [Word],
     capacity: usize,
     pinned: &std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
@@ -151,43 +161,171 @@ fn copy(
     selectors: &SelectorTable,
 ) -> (Vec<Word>, usize) {
     let mut dst: Vec<Word> = if spare.len() >= capacity { spare } else { heap::space(capacity) };
+    let sources = [(src.as_ptr() as Word, (src.len() as Word) * 8, 0), (extra.0, extra.1, 0), extra2];
+    let target = Target { dst: dst.as_mut_ptr(), cap: dst.len(), free: 0 };
+    // SAFETY: as for `copy_into`: `dst` is a distinct live buffer of `cap` words.
+    let frees = unsafe {
+        copy_into(sources, [target, target], roots, &[], (0, 0), &mut Vec::new(), pinned, bounds, reached, selectors)
+    };
+    (dst, frees[0])
+}
+
+/// Copies everything reachable from `roots` and from the pointer fields of the objects
+/// `remembered` (old objects that may point into the sources) out of the `sources` ranges
+/// (`(base, bytes, target)`) into their targets, after each target's `free` words. Objects that
+/// end up outside the sources but point into `young` (the remembered objects, and those copied
+/// into target 1 when it is the old space) are pushed to `still_young`. Returns the targets'
+/// first free words.
+///
+/// # Safety
+/// Each target is valid for `cap` words, distinct from the sources, and has room for its live
+/// data (`Copier::copy_object` checks); every object reached in a source lies wholly in it, as
+/// its header says; the remembered objects are live objects outside the sources.
+#[allow(clippy::too_many_arguments)]
+unsafe fn copy_into(
+    sources: [(Word, Word, usize); 3],
+    targets: [Target; 2],
+    roots: &mut [Word],
+    remembered: &[Word],
+    young: (Word, Word),
+    still_young: &mut Vec<Word>,
+    pinned: &std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
+    bounds: (Word, Word),
+    reached: &mut std::collections::HashSet<Word>,
+    selectors: &SelectorTable,
+) -> [usize; 2] {
+    let shared = targets[0].dst == targets[1].dst;
     let mut c = Copier {
-        src: src.as_mut_ptr(),
-        base: src.as_ptr() as Word,
-        span: (src.len() as Word) * 8,
-        dst: dst.as_mut_ptr(),
-        dst_base: dst.as_ptr() as Word,
-        cap: dst.len(),
-        free: 0,
+        src: [(sources[0].0, sources[0].1), (sources[1].0, sources[1].1), (sources[2].0, sources[2].1)],
+        to: [sources[0].2, sources[1].2, sources[2].2],
+        targets,
+        force_old: false,
         pinned: Pinned { map: pinned, bounds },
         reached,
         selectors,
     };
-    // SAFETY: `src` and `dst` are distinct live buffers, and `dst` is not resized while copying.
-    // Every object reached lies wholly in `src`, as its header says (the heap's invariant: a
-    // corrupt header would now read out of bounds rather than panic), and `dst` has room for
-    // all live data (the caller sizes it and `Copier::evacuate` checks).
-    unsafe {
-        for r in roots.iter_mut() {
-            *r = c.evacuate(*r);
+    let is_young = |v: Word| v.wrapping_sub(young.0) < young.1;
+    for r in roots.iter_mut() {
+        *r = c.evacuate(*r);
+    }
+    // The remembered objects are old: what they reach is promoted directly (when the two
+    // targets differ), as GHC promotes eagerly.
+    c.force_old = !shared;
+    for &obj in remembered {
+        let o = obj as *mut Word;
+        let h = *o;
+        let (first, count) = heap::pointer_fields(h);
+        let mut keep = false;
+        for i in first..first + count {
+            let f = o.add(i);
+            *f = c.evacuate(*f);
+            keep |= is_young(*f);
         }
-        // Cheney scan: the copied objects, in the order they were copied, give up their pointers.
-        let mut scan = 0usize;
-        while scan < c.free {
-            let obj = c.dst.add(scan);
-            let h = *obj;
-            let total = heap::total_words(h);
-            let (first, count) = heap::pointer_fields(h);
-            for i in first..first + count {
-                let f = obj.add(i);
-                // The fields not scanned yet point into `src` (or outside the heap).
-                *f = c.evacuate(*f);
-            }
-            scan += total;
+        if keep {
+            still_young.push(obj);
         }
     }
-    let free = c.free;
-    (dst, free)
+    // Cheney scan of each target: the copied objects, in the order they were copied, give up
+    // their pointers (which may copy more objects into either target).
+    let mut scan = [targets[0].free, targets[1].free];
+    let ntargets = if shared { 1 } else { 2 };
+    loop {
+        let mut progressed = false;
+        for t in 0..ntargets {
+            c.force_old = t == 1 && !shared;
+            while scan[t] < c.targets[t].free {
+                progressed = true;
+                let obj = c.targets[t].dst.add(scan[t]);
+                let h = *obj;
+                let total = heap::total_words(h);
+                let (first, count) = heap::pointer_fields(h);
+                let mut keep = false;
+                for i in first..first + count {
+                    let f = obj.add(i);
+                    // The fields not scanned yet point into the sources (or outside them).
+                    *f = c.evacuate(*f);
+                    keep |= is_young(*f);
+                }
+                if t == 1 && keep {
+                    still_young.push(obj as Word);
+                }
+                scan[t] += total;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    [c.targets[0].free, c.targets[1].free]
+}
+
+/// A minor collection. Live objects in the nursery (`nursery`: base and bytes used) move to the
+/// survivor space `to_surv` (`to_cap` words); live objects in the survivor space `from_surv`
+/// (base and bytes used), having survived a collection there, are promoted into the old space
+/// after its live data. The roots are the stack's and so on, and the `remembered` old objects;
+/// the old objects left pointing into the young space (`young`) are pushed to `still_young`.
+/// Pinned objects are not freed (only a full collection knows which are unreachable). Answers
+/// the survivor space's words used, or None, copying nothing, when the old space lacks room.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_minor(
+    heap: &mut Heap,
+    nursery: (Word, Word),
+    from_surv: (Word, Word),
+    to_surv: (*mut Word, usize),
+    young: (Word, Word),
+    roots: &mut [Word],
+    remembered: &[Word],
+    still_young: &mut Vec<Word>,
+    selectors: &SelectorTable,
+) -> Option<usize> {
+    let direct = heap.direct_left > 0;
+    // Eager promotion may move nursery objects into the old space too.
+    let room = ((from_surv.1 + nursery.1) / 8) as usize;
+    if heap.from.len() - heap.hp < room {
+        return None;
+    }
+    let pinned = std::mem::take(&mut heap.pinned);
+    let bounds = (pinned.keys().min().copied().unwrap_or(1), pinned.keys().max().copied().unwrap_or(0));
+    let mut reached = std::collections::HashSet::new();
+    let start = heap.hp;
+    let targets = [
+        Target { dst: to_surv.0, cap: to_surv.1, free: 0 },
+        Target { dst: heap.from.as_mut_ptr(), cap: heap.from.len(), free: start },
+    ];
+    // SAFETY: the survivor spaces and the old space are distinct; the to-survivor space holds a
+    // whole nursery and the old space has room for the whole from-survivor space.
+    let frees = unsafe {
+        copy_into(
+            [(nursery.0, nursery.1, direct as usize), (from_surv.0, from_surv.1, 1), (0, 0, 0)],
+            targets,
+            roots,
+            remembered,
+            young,
+            still_young,
+            &pinned,
+            bounds,
+            &mut reached,
+            selectors,
+        )
+    };
+    heap.pinned = pinned;
+    heap.hp = frees[1];
+    heap.minor_collections += 1;
+    // When most of the nursery survives (a program building a large structure), ageing it in
+    // the survivor space only copies it twice: the next collection promotes it directly.
+    if direct {
+        heap.direct_left -= 1;
+    } else if 2 * frees[0] as Word > nursery.1 / 8 {
+        heap.direct_left = 1;
+    }
+    static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *STATS.get_or_init(|| std::env::var_os("HSC_GC_STATS").is_some()) {
+        eprintln!(
+            "minor gc {}: survivors {} words, promoted {} words, old {} of {} words, remembered {} -> {}",
+            heap.minor_collections, frees[0], frees[1] - start, frees[1], heap.from.len(), remembered.len(), still_young.len()
+        );
+    }
+    Some(frees[0])
 }
 
 /// The pinned objects, with the range of their addresses (a quick test for most pointers).
@@ -196,22 +334,48 @@ struct Pinned<'a> {
     bounds: (Word, Word),
 }
 
-/// The state of one copy: the source space (`span` bytes from `base`), the destination and its
-/// first free word.
-struct Copier<'a> {
-    src: *mut Word,
-    base: Word,
-    span: Word,
+/// A destination of a copy: `cap` words at `dst`, filled up to `free`.
+#[derive(Clone, Copy)]
+struct Target {
     dst: *mut Word,
-    dst_base: Word,
     cap: usize,
     free: usize,
+}
+
+/// The state of one copy: the source ranges (`(base, bytes)`; empty ones have 0 bytes), the
+/// destination each source's objects go to, and the destinations.
+struct Copier<'a> {
+    src: [(Word, Word); 3],
+    to: [usize; 3],
+    targets: [Target; 2],
+    /// Eager promotion: while the fields of an old object are scanned, what they reach goes to
+    /// target 1 (the old space), not the survivor space.
+    force_old: bool,
     pinned: Pinned<'a>,
     reached: &'a mut std::collections::HashSet<Word>,
     selectors: &'a SelectorTable,
 }
 
 impl Copier<'_> {
+    /// The target of the source range holding `v`, if any.
+    #[inline(always)]
+    fn target_of(&self, v: Word) -> Option<usize> {
+        if v.wrapping_sub(self.src[0].0) < self.src[0].1 {
+            Some(self.to[0])
+        } else if v.wrapping_sub(self.src[1].0) < self.src[1].1 {
+            Some(self.to[1])
+        } else if v.wrapping_sub(self.src[2].0) < self.src[2].1 {
+            Some(self.to[2])
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn in_src(&self, v: Word) -> bool {
+        self.target_of(v).is_some()
+    }
+
     /// Copies the object `v` (if it is a pointer into the source space) into the destination,
     /// leaving a forwarding pointer in the source, and returns its new address. Anything else is
     /// unchanged. An indirection (an updated thunk) is replaced by what it points to.
@@ -220,13 +384,13 @@ impl Copier<'_> {
     /// As for `copy`.
     #[inline(always)]
     unsafe fn evacuate(&mut self, v: Word) -> Word {
-        if v.wrapping_sub(self.base) >= self.span {
+        let Some(t) = self.target_of(v).map(|t| t | self.force_old as usize) else {
             if v >= self.pinned.bounds.0 && v <= self.pinned.bounds.1 {
                 self.pin(v);
             }
             return v;
-        }
-        let from = self.src.add(((v - self.base) / 8) as usize);
+        };
+        let from = v as *mut Word;
         let h = *from;
         let k = heap::kind_of(h);
         if k == kind::FORWARD {
@@ -240,15 +404,22 @@ impl Copier<'_> {
                 return new_addr;
             }
         }
-        self.copy_object(from, h)
+        self.copy_to(t, from, h)
     }
 
     #[inline(always)]
     unsafe fn copy_object(&mut self, from: *mut Word, h: Word) -> Word {
+        let t = self.target_of(from as Word).expect("internal: copying a non-source object") | self.force_old as usize;
+        self.copy_to(t, from, h)
+    }
+
+    #[inline(always)]
+    unsafe fn copy_to(&mut self, t: usize, from: *mut Word, h: Word) -> Word {
         let total = heap::total_words(h);
-        let at = self.free;
-        assert!(at + total <= self.cap, "internal: collector out of room");
-        let to = self.dst.add(at);
+        let t = &mut self.targets[t];
+        let at = t.free;
+        assert!(at + total <= t.cap, "internal: collector out of room");
+        let to = t.dst.add(at);
         match total {
             2 => {
                 *to = h;
@@ -261,8 +432,8 @@ impl Copier<'_> {
             }
             _ => std::ptr::copy_nonoverlapping(from, to, total),
         }
-        self.free = at + total;
-        let new_addr = self.dst_base + (at as Word) * 8;
+        t.free = at + total;
+        let new_addr = t.dst as Word + (at as Word) * 8;
         *from = kind::FORWARD as Word;
         *from.add(1) = new_addr;
         new_addr
@@ -313,7 +484,7 @@ impl Copier<'_> {
             // Follow IND / FORWARD on the selected field (bounded to prevent IND cycles).
             let mut ind_ok = false;
             for _ in 0..8 {
-                if target.wrapping_sub(self.base) >= self.span {
+                if !self.in_src(target) {
                     if target >= self.pinned.bounds.0 && target <= self.pinned.bounds.1 {
                         self.pin(target);
                     }
@@ -321,7 +492,7 @@ impl Copier<'_> {
                     *from.add(1) = target;
                     return Some(target);
                 }
-                let next_ptr = self.src.add(((target - self.base) / 8) as usize);
+                let next_ptr = target as *mut Word;
                 if next_ptr == from {
                     // Direct or indirect cycle back to `from`: preserve the thunk for blackholing.
                     return None;
@@ -426,6 +597,51 @@ mod tests {
         assert_eq!(heap.collections, 1);
     }
 
+    /// Allocates a 2-field CON in a raw buffer (a nursery) at word `*at`.
+    fn con_in(buf: &mut [Word], at: &mut usize, a: Word, b: Word) -> Word {
+        let p = buf.as_ptr() as Word + (*at as Word) * 8;
+        buf[*at] = heap::header(kind::CON, 2, 1);
+        buf[*at + 1] = a;
+        buf[*at + 2] = b;
+        *at += 3;
+        p
+    }
+
+    #[test]
+    fn minor_collection_ages_then_promotes_and_keeps_remembered_targets() {
+        let mut heap = Heap::new(4096);
+        heap.set_nursery(256, 256);
+        let lo = heap.nursery.as_ptr() as Word;
+        let young = (lo, (heap.nursery.len() as Word) * 8);
+        // An old REF that points to a young cell (it was remembered by the write barrier).
+        let old_ref = heap.try_alloc(2, heap::header(kind::REF, 1, 0)).unwrap();
+        let mut at = 0;
+        let leaf = con_in(&mut heap.nursery, &mut at, 0, 0);
+        let kept = con_in(&mut heap.nursery, &mut at, leaf, 0);
+        let rooted = con_in(&mut heap.nursery, &mut at, 0, 0);
+        let _garbage = con_in(&mut heap.nursery, &mut at, 0, 0);
+        heap.set_word(old_ref, 1, kept);
+        let mut roots = [rooted];
+        let mut still = Vec::new();
+        let to = (heap.surv_base(1) as *mut Word, 256);
+        let s0 = heap.surv_base(0);
+        let surv = collect_minor(&mut heap, (lo, (at as Word) * 8), (s0, 0), to, young, &mut roots, &[old_ref], &mut still, &SelectorTable::default()).unwrap();
+        // The remembered object's referents are promoted eagerly (into the old space); the
+        // rooted cell ages in the survivor space; the garbage is gone.
+        let kept2 = heap.word(old_ref, 1);
+        assert!(heap.contains(kept2) && heap.contains(heap.word(kept2, 1)), "eagerly promoted");
+        assert_eq!(surv, 3, "only the rooted cell is in the survivor space");
+        assert!(roots[0].wrapping_sub(heap.surv_base(1)) < 256 * 8, "rooted cell aged");
+        assert!(still.is_empty(), "nothing old points into the young space");
+        // The next minor collection promotes the aged cell.
+        let mut still = Vec::new();
+        let to = (heap.surv_base(0) as *mut Word, 256);
+        let s1 = heap.surv_base(1);
+        let surv = collect_minor(&mut heap, (lo, 0), (s1, (surv as Word) * 8), to, young, &mut roots, &[], &mut still, &SelectorTable::default()).unwrap();
+        assert_eq!(surv, 0);
+        assert!(heap.contains(roots[0]), "aged cell promoted");
+    }
+
     #[test]
     fn sharing_and_cycles_survive() {
         let mut heap = Heap::new(256);
@@ -515,7 +731,7 @@ mod tests {
 
         let _ = outer_sel;
         let mut roots = [sel2];
-        collect_with_selectors(&mut heap, &mut roots, 0, &table);
+        collect_with_selectors(&mut heap, &mut roots, 0, &table, (0, 0), (0, 0));
         let r = roots[0];
         assert_eq!(heap::kind_of(heap.word(r, 0)), kind::INT);
         assert_eq!(heap.word(r, 1), 99);
@@ -546,7 +762,7 @@ mod tests {
 
         let table = SelectorTable::new(&[(sel_code, 1, 1)]);
         let mut roots = [cyc_sel, wrong_sel];
-        collect_with_selectors(&mut heap, &mut roots, 0, &table);
+        collect_with_selectors(&mut heap, &mut roots, 0, &table, (0, 0), (0, 0));
         assert_eq!(heap::kind_of(heap.word(roots[0], 0)), kind::THUNK);
         assert_eq!(heap::kind_of(heap.word(roots[1], 0)), kind::THUNK);
     }

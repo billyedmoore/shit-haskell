@@ -181,6 +181,13 @@ impl Machine {
     }
 }
 
+/// The write barrier's slow path when the remembered set's buffer is full (`hsc_wb_slow`).
+#[no_mangle]
+pub extern "C" fn hsc_remember(m: *mut Machine, obj: Word) {
+    // SAFETY: generated code passes the machine record.
+    unsafe { &mut *m }.remember(obj);
+}
+
 /// The collector, called when the heap is full: `words` are needed.
 #[no_mangle]
 pub extern "C" fn hsc_gc(m: *mut Machine, words: u64) {

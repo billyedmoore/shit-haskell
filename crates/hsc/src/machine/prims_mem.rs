@@ -72,7 +72,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
         "writeMutVar#" => {
             let Some(r) = force_arg(m, 0) else { return Some(0) };
             let v = m.args[1];
-            m.heap_set(r + 8, v);
+            m.heap_write(r, 1, v);
             unit(m)
         }
         "atomicModifyMutVar2#" => {
@@ -89,7 +89,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             m.reserve(8);
             let (r, old, res) = (m.args[0], m.args[2], m.args[3]);
             let new_contents = m.heap_get(res, 1);
-            m.heap_set(r + 8, new_contents);
+            m.heap_write(r, 1, new_contents);
             con_value(m, "Builtin.(,,)", 3, &[0, old, res])
         }
         "atomicModifyMutVar_#" => {
@@ -103,7 +103,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             m.args[3] = new;
             m.reserve(8);
             let (r, old, new) = (m.args[0], m.args[2], m.args[3]);
-            m.heap_set(r + 8, new);
+            m.heap_write(r, 1, new);
             con_value(m, "Builtin.(,,)", 3, &[0, old, new])
         }
         "newArray#" => {
@@ -127,7 +127,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let (Some(_), Some(i)) = (force_arg(m, 0), int_arg(m, 1)) else { return Some(0) };
             let a = m.args[0];
             let v = m.args[2];
-            m.heap_set(a + 8 + 8 * i as Word, v);
+            m.heap_write(a, 1 + i as usize, v);
             unit(m)
         }
         "indexArray#" => {
@@ -365,7 +365,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let (src, dst) = (m.args[0], m.args[2]);
             let vals: Vec<Word> = (0..n.max(0) as usize).map(|i| m.heap_get(src, 1 + so as usize + i)).collect();
             for (i, v) in vals.into_iter().enumerate() {
-                m.heap_set(dst + 8 * (1 + dof as usize + i) as Word, v);
+                m.heap_write(dst, 1 + dof as usize + i, v);
             }
             unit(m)
         }
@@ -378,7 +378,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
             let src = m.args[0];
             for i in 0..n {
                 let v = m.heap_get(src, 1 + off as usize + i);
-                m.heap_set(a + 8 + 8 * i as Word, v);
+                m.heap_write(a, 1 + i as usize, v);
             }
             if name.starts_with("clone") && name != "cloneMutableArray#" { a } else { state_pair(m, a) }
         }
@@ -540,7 +540,7 @@ fn atomic_access(m: &mut Machine, name: &str) -> Option<Word> {
             let slot = a + 8 + 8 * i;
             let failed = m.heap_get(slot, 0) != old;
             if !failed {
-                m.heap_set(slot, new);
+                m.heap_write(a, 1 + i as usize, new);
             }
             let f = int_value(m, failed as i64);
             // The allocation may have moved the array: the element is read again.
@@ -552,7 +552,8 @@ fn atomic_access(m: &mut Machine, name: &str) -> Option<Word> {
             force_arg(m, 0)?;
             let r = m.args[0];
             let old = m.heap_get(r, 1);
-            m.heap_set(r + 8, m.args[1]);
+            let v = m.args[1];
+            m.heap_write(r, 1, v);
             Some(state_pair_rooted(m, old))
         }
         _ => None,

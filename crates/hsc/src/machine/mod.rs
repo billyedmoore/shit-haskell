@@ -23,6 +23,13 @@ use heap::{kind, Heap, Word};
 const STACK_WORDS: usize = 1 << 26;
 /// Words of the heap semispace at start.
 const HEAP_WORDS: usize = 1 << 22;
+/// Words of the nursery (8 MB, near GHC's 4 MB allocation area: it mostly stays in the cache).
+const NURSERY_WORDS: usize = 1 << 20;
+/// The nursery grows up to this while many of its objects survive (a program building a large
+/// structure), so that it is not copied in small steps; it shrinks back when few survive.
+const NURSERY_MAX_WORDS: usize = 1 << 22;
+/// Entries of the remembered set's buffer at start (it grows when full).
+const REM_WORDS: usize = 1 << 12;
 /// Argument slots of the record (primitive operations take their arguments here).
 pub const ARG_SLOTS: usize = 16;
 
@@ -49,7 +56,18 @@ pub struct Machine {
     pub args: [Word; ARG_SLOTS],
     /// The number of the running Haskell thread (generated code marks the thunks it evaluates).
     pub tid: Word,
+    /// The nursery's address range `[nursery_lo, nursery_hi)`: an object outside it that is
+    /// given a pointer into it is remembered (the write barrier). When the heap is not
+    /// generational the range is everything, so the barrier never fires.
+    pub nursery_lo: Word,
+    pub nursery_hi: Word,
+    /// The remembered set's buffer: the next entry, and its end (`rem_buf`).
+    pub rem_ptr: Word,
+    pub rem_end: Word,
     // Runtime-only state from here on.
+    /// The remembered set: old objects that may point into the nursery (roots of a minor
+    /// collection), filled from `rem_buf`'s start up to `rem_ptr`.
+    pub rem_buf: Vec<Word>,
     pub heap: Heap,
     /// The Haskell stack: `stack_base..stack_top` words, growing down from the top.
     pub stack: Vec<Word>,
@@ -154,9 +172,25 @@ impl Machine {
         let words = std::env::var("HSC_HEAP_WORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(HEAP_WORDS);
         // At least room for the program's global closures and some slack, whatever was asked.
         let words = words.max(4 * prog.nglobals + (1 << 14));
-        let heap = Heap::new(words);
-        let base = heap.addr(0);
-        let limit = base + (words as Word) * 8;
+        let mut heap = Heap::new(words);
+        // HSC_NURSERY_WORDS: the nursery (0: no nursery, one semispace heap). New objects are
+        // allocated there; a minor collection promotes the survivors into the semispace.
+        let nursery = std::env::var("HSC_NURSERY_WORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(NURSERY_WORDS);
+        let (base, limit) = if nursery > 0 {
+            // Room for the global closures (allocated before the first collection).
+            let n = nursery.max(4 * prog.nglobals + (1 << 14));
+            heap.set_nursery(n, n.max(NURSERY_MAX_WORDS));
+            let lo = heap.nursery.as_ptr() as Word;
+            (lo, lo + (n as Word) * 8)
+        } else {
+            let base = heap.addr(0);
+            (base, base + (words as Word) * 8)
+        };
+        let (nursery_lo, nursery_hi) =
+            if nursery > 0 { (base, base + (heap.nursery.len() as Word) * 8) } else { (0, Word::MAX) };
+        let mut rem_buf: Vec<Word> = vec![0; REM_WORDS];
+        let rem_ptr = rem_buf.as_mut_ptr() as Word + 8;
+        let rem_end = rem_buf.as_ptr() as Word + (REM_WORDS as Word) * 8;
         let stack = vec![0 as Word; STACK_WORDS];
         let nprims = prog.nprims;
         let ccall_plans = vec![prims::CPlan::Unknown; nprims];
@@ -178,6 +212,11 @@ impl Machine {
             nargs: 0,
             code: 0,
             args: [0; ARG_SLOTS],
+            nursery_lo,
+            nursery_hi,
+            rem_ptr,
+            rem_end,
+            rem_buf,
             heap,
             stack: Vec::new(),
             exc: 0,
@@ -250,6 +289,36 @@ impl Machine {
         self.hp += (words as Word) * 8;
         assert!(self.hp <= self.hplim, "heap exhausted at start-up");
         p
+    }
+
+    /// The index of the remembered set's next entry in `rem_buf` (the entries are `1..`; entry 0
+    /// is a sentinel, so the barrier can compare an object with the last one recorded).
+    pub fn rem_count(&self) -> usize {
+        ((self.rem_ptr - self.rem_buf.as_ptr() as Word) / 8) as usize
+    }
+
+    /// Records object `obj` in the remembered set (it may hold pointers into the nursery).
+    pub fn remember(&mut self, obj: Word) {
+        let n = self.rem_count();
+        if self.rem_buf[n - 1] == obj {
+            return;
+        }
+        if n == self.rem_buf.len() {
+            self.rem_buf.resize(2 * n, 0);
+            self.rem_end = self.rem_buf.as_ptr() as Word + (self.rem_buf.len() as Word) * 8;
+        }
+        self.rem_buf[n] = obj;
+        self.rem_ptr = self.rem_buf.as_ptr() as Word + ((n + 1) as Word) * 8;
+    }
+
+    /// Writes pointer field `i` of object `obj`, which may be an old object (a mutation, not
+    /// the initialisation of a new object): the write barrier remembers it when `v` is young.
+    pub fn heap_write(&mut self, obj: Word, i: usize, v: Word) {
+        // SAFETY: callers pass live objects and a field index within them.
+        unsafe { *((obj as *mut Word).add(i)) = v };
+        if (obj < self.nursery_lo || obj >= self.nursery_hi) && v >= self.nursery_lo && v < self.nursery_hi {
+            self.remember(obj);
+        }
     }
 
     /// Writes a heap word at an address.
@@ -408,14 +477,80 @@ impl Machine {
         }
         // Copy the heap pointers into the collector's root vector and back.
         let mut roots: Vec<Word> = locs.iter().map(|&p| unsafe { *p }).collect();
-        self.heap.hp = ((self.hp - self.heap.addr(0)) / 8) as usize;
-        gc::collect_with_selectors(&mut self.heap, &mut roots, need, &self.selectors);
+        if self.heap.nursery.is_empty() {
+            self.heap.hp = ((self.hp - self.heap.addr(0)) / 8) as usize;
+            gc::collect_with_selectors(&mut self.heap, &mut roots, need, &self.selectors, (0, 0), (0, 0));
+        } else {
+            let lo = self.heap.nursery.as_ptr() as Word;
+            let used = (lo, self.hp - lo);
+            let young = (lo, (self.heap.nursery.len() as Word) * 8);
+            let cur = self.heap.surv_cur;
+            let from_surv = (self.heap.surv_base(cur), (self.heap.surv_used as Word) * 8);
+            let to_surv = (self.heap.surv_base(1 - cur) as *mut Word, self.heap.nursery_max);
+            let n = self.rem_count();
+            let remembered: Vec<Word> = self.rem_buf[1..n].to_vec();
+            let mut still_young = Vec::new();
+            let budget = (self.heap.from.len() * 8).max(64 << 20);
+            // A request larger than the nursery empties the survivors too (a major collection),
+            // so that the young space can be resized below.
+            let minor = if self.heap.pinned_since_gc > budget || need > self.heap.nursery_max / 2 {
+                None
+            } else {
+                gc::collect_minor(&mut self.heap, used, from_surv, to_surv, young, &mut roots, &remembered, &mut still_young, &self.selectors)
+            };
+            match minor {
+                Some(surv) => {
+                    self.heap.surv_cur = 1 - cur;
+                    self.heap.surv_used = surv;
+                    let (words, usual) = (self.heap.nursery_words, NURSERY_WORDS.max(4 * self.prog.nglobals + (1 << 14)));
+                    if 4 * surv > words && 2 * words <= self.heap.nursery_max {
+                        self.heap.nursery_words = 2 * words;
+                    } else if 32 * surv < words && words / 2 >= usual {
+                        self.heap.nursery_words = words / 2;
+                    }
+                }
+                None => {
+                    // Room after it for a whole nursery of promotions (and the request).
+                    let reserve = self.heap.nursery_words.max(need) + need;
+                    gc::collect_with_selectors(&mut self.heap, &mut roots, reserve, &self.selectors, used, from_surv);
+                    self.heap.surv_used = 0;
+                    still_young.clear();
+                }
+            }
+            self.rem_ptr = self.rem_buf.as_mut_ptr() as Word + 8;
+            for obj in still_young {
+                self.remember(obj);
+            }
+            // The nursery is empty now: resized (survivors are promoted first) for a request
+            // larger than it, and back to its usual size once such an object has been promoted.
+            let len = self.heap.nursery_max;
+            let usual = NURSERY_WORDS.max(4 * self.prog.nglobals + (1 << 14));
+            let usual_max = usual.max(NURSERY_MAX_WORDS);
+            if (need > len / 2 || (len > usual_max && need <= usual / 2)) && self.heap.surv_used == 0 {
+                if need > len / 2 {
+                    let want = (2 * need).next_power_of_two();
+                    self.heap.set_nursery(want, want);
+                } else {
+                    self.heap.set_nursery(usual, usual_max);
+                }
+            }
+        }
         for (p, v) in locs.iter().zip(roots) {
             // SAFETY: each location is a live slot the collector was given.
             unsafe { **p = v };
         }
-        self.hp = self.heap.addr(self.heap.hp);
-        self.hplim = self.heap.addr(self.heap.from.len());
+        if self.heap.nursery.is_empty() {
+            self.hp = self.heap.addr(self.heap.hp);
+            self.hplim = self.heap.addr(self.heap.from.len());
+        } else {
+            if 2 * need > self.heap.nursery_words {
+                self.heap.nursery_words = (2 * need).next_power_of_two().min(self.heap.nursery_max);
+            }
+            self.hp = self.heap.nursery.as_ptr() as Word;
+            self.hplim = self.hp + (self.heap.nursery_words as Word) * 8;
+            self.nursery_lo = self.hp;
+            self.nursery_hi = self.hp + (self.heap.nursery.len() as Word) * 8;
+        }
         if std::env::var_os("HSC_GC_CENSUS").is_some() {
             self.census();
         }
