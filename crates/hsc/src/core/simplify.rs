@@ -46,9 +46,9 @@ const O1: Tuning = Tuning {
     inline_pragma_size: 120,
     rounds: 8,
     inline_budget: 64,
-    spec_size: 60,
+    spec_size: 115,
     spec_per_fn: 4,
-    spec_total: 32,
+    spec_total: 48,
     push_size: 30,
     push_call_size: 90,
 };
@@ -58,7 +58,7 @@ const O2: Tuning = Tuning {
     inline_pragma_size: 200,
     rounds: 12,
     inline_budget: 128,
-    spec_size: 120,
+    spec_size: 160,
     spec_per_fn: 8,
     spec_total: 128,
     push_size: 45,
@@ -138,6 +138,23 @@ fn simplify_with_mode(binds: &mut Vec<TopBind>, whole_program: bool) {
         }
         pass(binds, 0, &rules, &strict_cons, Some(&changed));
     }
+    // A second specialization pass catches higher-order/dictionary calls exposed by phase-0
+    // inlining (e.g. `fromListWith` -> `insertWithKey`) and wrappers newly eta-expanded above.
+    let post_spec = specialise_static_args(binds, &rules);
+    if !post_spec.is_empty() {
+        let mut clean = post_spec;
+        clean.extend(call_by_value(binds));
+        pass(binds, 0, &rules, &strict_cons, Some(&clean));
+        let mut clean2 = if std::env::var_os("HSC_NO_ETA").is_none() {
+            eta_expand(binds, Some(&clean), &rules)
+        } else {
+            HashSet::new()
+        };
+        clean2.extend(call_by_value(binds));
+        if !clean2.is_empty() {
+            pass(binds, 0, &rules, &strict_cons, Some(&clean2));
+        }
+    }
     // Caller-WHNF parameter analysis and speculation of cheap total primitive arguments at call
     // sites (whole-program mode analyzes non-escaping top-level functions too; package mode analyzes
     // local `let`-bound functions only).
@@ -210,20 +227,150 @@ fn extract_strict_cons(binds: &[TopBind]) -> HashMap<String, Vec<bool>> {
 /// `span`, `filter`) on static global function arguments (`dropWhile isSpace` → `dropWhile$spec`),
 /// turning indirect `hsc_apply` calls into direct calls (or inlined bodies) and shrinking recursive
 /// thunk captures.
-fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
+fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) -> HashSet<String> {
     let Tuning { spec_size, spec_per_fn, spec_total, .. } = tuning();
 
+    let top_globals: HashSet<String> = binds.iter().map(|b| b.name.clone()).collect();
     let mut global_fns: HashSet<String> = HashSet::new();
+    let mut known_dicts: HashSet<String> = HashSet::new();
     for b in binds.iter() {
-        if !is_rule_binding(&b.name) && value_arity(&b.body) > 0 {
+        if is_rule_binding(&b.name) {
+            continue;
+        }
+        if value_arity(&b.body) > 0 {
             global_fns.insert(b.name.clone());
         }
+        if is_dict_rhs(&b.body) {
+            known_dicts.insert(b.name.clone());
+        }
+    }
+    loop {
+        let mut added = false;
+        for b in binds.iter() {
+            if !is_rule_binding(&b.name) {
+                if let Core::Var(v) = &b.body {
+                    if known_dicts.contains(v) && known_dicts.insert(b.name.clone()) {
+                        added = true;
+                    }
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StaticKind {
+        Fn,
+        Dict,
+    }
+
+    enum CandKind {
+        Direct,
+        LocalLoop {
+            go_arity: usize,
+            /// For each outer param index `i`, the `go` param indices that receive `ps[i]` at
+            /// every initial call in the wrapper body and pass it unchanged across all self-calls.
+            go_param_map: Vec<Vec<usize>>,
+        },
     }
 
     struct Cand {
         arity: usize,
-        static_pos: Vec<bool>,
+        static_pos: Vec<Option<StaticKind>>,
+        kind: CandKind,
         body: Core,
+    }
+
+    fn dict_case_mentions(e: &Core, var: &str) -> bool {
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => false,
+            Core::App(f, a) => dict_case_mentions(f, var) || dict_case_mentions(a, var),
+            Core::Lam(x, b) => x != var && dict_case_mentions(b, var),
+            Core::Let(bs, body) => {
+                if bs.iter().any(|(n, _)| n == var) {
+                    return false;
+                }
+                bs.iter().any(|(_, r)| dict_case_mentions(r, var)) || dict_case_mentions(body, var)
+            }
+            Core::Case(s, b, alts) => {
+                let direct = matches!(s.as_ref(), Core::Var(v) if v == var)
+                    && alts.iter().any(|a| matches!(a, Alt::Con(k, _, _) if is_dict_con(k)));
+                if direct || dict_case_mentions(s, var) {
+                    return true;
+                }
+                if b == var {
+                    return false;
+                }
+                alts.iter().any(|a| match a {
+                    Alt::Con(_, xs, body) => !xs.iter().any(|x| x == var) && dict_case_mentions(body, var),
+                    Alt::Lit(_, body) | Alt::Default(body) => dict_case_mentions(body, var),
+                })
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => args.iter().any(|a| dict_case_mentions(a, var)),
+        }
+    }
+
+    fn is_closed_wrt_globals(e: &Core, globals: &HashSet<String>, bound: &mut HashSet<String>) -> bool {
+        match e {
+            Core::Var(v) => bound.contains(v) || globals.contains(v),
+            Core::Lit(_) | Core::Fail(_) => true,
+            Core::App(f, a) => {
+                is_closed_wrt_globals(f, globals, bound) && is_closed_wrt_globals(a, globals, bound)
+            }
+            Core::Lam(x, b) => {
+                let inserted = bound.insert(x.clone());
+                let ok = is_closed_wrt_globals(b, globals, bound);
+                if inserted {
+                    bound.remove(x);
+                }
+                ok
+            }
+            Core::Let(bs, body) => {
+                let mut added = Vec::new();
+                for (n, _) in bs {
+                    if bound.insert(n.clone()) {
+                        added.push(n.clone());
+                    }
+                }
+                let ok = bs.iter().all(|(_, r)| is_closed_wrt_globals(r, globals, bound))
+                    && is_closed_wrt_globals(body, globals, bound);
+                for n in added {
+                    bound.remove(&n);
+                }
+                ok
+            }
+            Core::Case(s, b, alts) => {
+                if !is_closed_wrt_globals(s, globals, bound) {
+                    return false;
+                }
+                let b_ins = bound.insert(b.clone());
+                let ok = alts.iter().all(|a| match a {
+                    Alt::Con(_, xs, body) => {
+                        let mut added = Vec::new();
+                        for x in xs {
+                            if bound.insert(x.clone()) {
+                                added.push(x.clone());
+                            }
+                        }
+                        let r = is_closed_wrt_globals(body, globals, bound);
+                        for x in added {
+                            bound.remove(&x);
+                        }
+                        r
+                    }
+                    Alt::Lit(_, body) | Alt::Default(body) => is_closed_wrt_globals(body, globals, bound),
+                });
+                if b_ins {
+                    bound.remove(b);
+                }
+                ok
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                args.iter().all(|a| is_closed_wrt_globals(a, globals, bound))
+            }
+        }
     }
 
     fn collect_self_calls(e: &Core, f: &str, out: &mut Vec<Option<Vec<Option<String>>>>) {
@@ -282,6 +429,16 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
         }
     }
 
+    let classify = |body: &Core, var: &str| -> Option<StaticKind> {
+        if dict_case_mentions(body, var) {
+            Some(StaticKind::Dict)
+        } else if app_head_mentions(body, var) {
+            Some(StaticKind::Fn)
+        } else {
+            None
+        }
+    };
+
     let mut cands: HashMap<String, Cand> = HashMap::new();
     for b in binds.iter() {
         if is_rule_binding(&b.name) || rules.by_head.contains_key(&b.name) {
@@ -291,29 +448,103 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
         if ps.len() < 2 || size(&b.body, spec_size + 1) > spec_size {
             continue;
         }
-        if !mentions(inner, &b.name) {
-            continue;
-        }
-        let mut self_calls = Vec::new();
-        collect_self_calls(inner, &b.name, &mut self_calls);
-        if self_calls.is_empty() || self_calls.iter().any(|c| c.is_none()) {
-            continue;
-        }
-        let calls: Vec<Vec<Option<String>>> = self_calls.into_iter().flatten().collect();
-        let static_pos: Vec<bool> = ps
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                app_head_mentions(inner, p)
-                    && calls.iter().all(|c| matches!(c.get(i), Some(Some(v)) if v == p))
-            })
-            .collect();
-        if static_pos.iter().any(|&s| s) && static_pos.iter().any(|&s| !s) {
-            cands.insert(b.name.clone(), Cand { arity: ps.len(), static_pos, body: b.body.clone() });
+        if mentions(inner, &b.name) {
+            let mut self_calls = Vec::new();
+            collect_self_calls(inner, &b.name, &mut self_calls);
+            if self_calls.is_empty() || self_calls.iter().any(|c| c.is_none()) {
+                continue;
+            }
+            let calls: Vec<Vec<Option<String>>> = self_calls.into_iter().flatten().collect();
+            if calls.iter().any(|c| c.len() < ps.len()) {
+                continue;
+            }
+            let static_pos: Vec<Option<StaticKind>> = ps
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if calls.iter().all(|c| matches!(c.get(i), Some(Some(v)) if v == p)) {
+                        classify(inner, p)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if static_pos.iter().any(|s| s.is_some()) && static_pos.iter().any(|s| s.is_none()) {
+                cands.insert(
+                    b.name.clone(),
+                    Cand { arity: ps.len(), static_pos, kind: CandKind::Direct, body: b.body.clone() },
+                );
+            }
+        } else if let Core::Let(bs, let_body) = inner {
+            if bs.len() != 1 {
+                continue;
+            }
+            let (go_name, go_rhs) = &bs[0];
+            let (qs, go_body) = params(go_rhs);
+            if qs.is_empty() || !mentions(go_body, go_name) {
+                continue;
+            }
+            let mut go_self_calls = Vec::new();
+            collect_self_calls(go_body, go_name, &mut go_self_calls);
+            let mut go_init_calls = Vec::new();
+            collect_self_calls(let_body, go_name, &mut go_init_calls);
+            if go_self_calls.is_empty()
+                || go_init_calls.is_empty()
+                || go_self_calls.iter().any(|c| c.is_none())
+                || go_init_calls.iter().any(|c| c.is_none())
+            {
+                continue;
+            }
+            let self_calls: Vec<Vec<Option<String>>> = go_self_calls.into_iter().flatten().collect();
+            let init_calls: Vec<Vec<Option<String>>> = go_init_calls.into_iter().flatten().collect();
+            if self_calls.iter().any(|c| c.len() < qs.len())
+                || init_calls.iter().any(|c| c.len() < qs.len())
+            {
+                continue;
+            }
+            let mut go_param_map: Vec<Vec<usize>> = vec![Vec::new(); ps.len()];
+            let mut static_pos: Vec<Option<StaticKind>> = vec![None; ps.len()];
+            for (j, q) in qs.iter().enumerate() {
+                if !self_calls.iter().all(|c| matches!(c.get(j), Some(Some(v)) if v == q)) {
+                    continue;
+                }
+                let Some(Some(init_var)) = init_calls[0].get(j) else { continue };
+                if !init_calls.iter().all(|c| matches!(c.get(j), Some(Some(v)) if v == init_var)) {
+                    continue;
+                }
+                if let Some(i) = ps.iter().position(|p| p == init_var) {
+                    go_param_map[i].push(j);
+                    if let Some(k) = classify(go_body, q) {
+                        static_pos[i] = match (static_pos[i], k) {
+                            (Some(StaticKind::Dict), _) | (_, StaticKind::Dict) => Some(StaticKind::Dict),
+                            _ => Some(StaticKind::Fn),
+                        };
+                    }
+                }
+            }
+            // Also catch outer static params captured directly inside `go_body` (not passed to `go`).
+            for (i, p) in ps.iter().enumerate() {
+                if static_pos[i].is_none() && !qs.iter().any(|q| q == p) {
+                    if let Some(k) = classify(go_body, p) {
+                        static_pos[i] = Some(k);
+                    }
+                }
+            }
+            if static_pos.iter().any(|s| s.is_some()) && static_pos.iter().any(|s| s.is_none()) {
+                cands.insert(
+                    b.name.clone(),
+                    Cand {
+                        arity: ps.len(),
+                        static_pos,
+                        kind: CandKind::LocalLoop { go_arity: qs.len(), go_param_map },
+                        body: b.body.clone(),
+                    },
+                );
+            }
         }
     }
     if cands.is_empty() {
-        return;
+        return HashSet::new();
     }
 
     fn rewrite_self(c: &mut Core, old_f: &str, new_f: &str, dropped: &[Option<String>]) {
@@ -372,14 +603,23 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
         }
     }
 
+    enum SpecArg {
+        Global(String),
+        ClosedLam(Core, String),
+    }
+
     struct SpecCtx<'a> {
         cands: &'a HashMap<String, Cand>,
+        top_globals: &'a HashSet<String>,
         global_fns: &'a HashSet<String>,
+        known_dicts: &'a HashSet<String>,
         created: HashMap<(String, Vec<Option<String>>), String>,
+        closed_lams: HashMap<String, String>,
         per_fn: HashMap<String, usize>,
         spec_per_fn: usize,
         spec_total: usize,
         new_binds: Vec<TopBind>,
+        changed: HashSet<String>,
         fresh: u64,
     }
 
@@ -396,42 +636,80 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
                     if f != cur_bind {
                         if let Some(cand) = self.cands.get(f.as_str()) {
                             if nargs >= cand.arity {
-                                // Collect raw argument refs to check static function arguments.
-                                let mut arg_vars: Vec<Option<String>> = vec![None; nargs];
+                                let mut arg_refs: Vec<&Core> = Vec::with_capacity(nargs);
                                 let mut cur_e = &*c;
-                                let mut idx = nargs;
                                 while let Core::App(g, a) = cur_e {
-                                    idx -= 1;
-                                    if let Core::Var(v) = &**a {
-                                        arg_vars[idx] = Some(v.clone());
-                                    }
+                                    arg_refs.push(a);
                                     cur_e = g;
                                 }
-                                let spec_args: Vec<Option<String>> = (0..cand.arity)
-                                    .map(|i| {
-                                        if cand.static_pos[i] {
-                                            arg_vars[i]
-                                                .as_ref()
-                                                .filter(|g| g.as_str() != f.as_str() && self.global_fns.contains(g.as_str()))
-                                                .cloned()
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                if spec_args.iter().any(|s| s.is_some()) && spec_args.iter().any(|s| s.is_none()) {
+                                arg_refs.reverse();
+                                let mut spec_entries: Vec<Option<SpecArg>> = Vec::with_capacity(cand.arity);
+                                for i in 0..cand.arity {
+                                    let entry = match cand.static_pos[i] {
+                                        Some(StaticKind::Dict) => match arg_refs[i] {
+                                            Core::Var(g) if g != f && self.known_dicts.contains(g.as_str()) => {
+                                                Some(SpecArg::Global(g.clone()))
+                                            }
+                                            _ => None,
+                                        },
+                                        Some(StaticKind::Fn) => match arg_refs[i] {
+                                            Core::Var(g) if g != f && self.global_fns.contains(g.as_str()) => {
+                                                Some(SpecArg::Global(g.clone()))
+                                            }
+                                            lam @ Core::Lam(..)
+                                                if size(lam, 33) <= 32
+                                                    && is_closed_wrt_globals(lam, self.top_globals, &mut HashSet::new()) =>
+                                            {
+                                                Some(SpecArg::ClosedLam(lam.clone(), format!("{lam:?}")))
+                                            }
+                                            _ => None,
+                                        },
+                                        None => None,
+                                    };
+                                    spec_entries.push(entry);
+                                }
+                                if spec_entries.iter().any(|s| s.is_some())
+                                    && spec_entries.iter().any(|s| s.is_none())
+                                {
                                     let f_name = f.clone();
-                                    let key = (f_name.clone(), spec_args.clone());
+                                    let key_args: Vec<Option<String>> = spec_entries
+                                        .iter()
+                                        .map(|e| match e {
+                                            Some(SpecArg::Global(g)) => Some(format!("G:{g}")),
+                                            Some(SpecArg::ClosedLam(_, k)) => Some(format!("L:{k}")),
+                                            None => None,
+                                        })
+                                        .collect();
+                                    let key = (f_name.clone(), key_args);
                                     let spec_name = if let Some(existing) = self.created.get(&key) {
                                         Some(existing.clone())
                                     } else if self.new_binds.len() < self.spec_total
                                         && self.per_fn.get(&f_name).copied().unwrap_or(0) < self.spec_per_fn
                                     {
+                                        // Materialize any closed lambda args as deduplicated top-level helpers.
+                                        let spec_args: Vec<Option<String>> = spec_entries
+                                            .into_iter()
+                                            .map(|e| match e {
+                                                Some(SpecArg::Global(g)) => Some(g),
+                                                Some(SpecArg::ClosedLam(mut lam, k)) => {
+                                                    if let Some(existing_lam) = self.closed_lams.get(&k) {
+                                                        Some(existing_lam.clone())
+                                                    } else {
+                                                        self.fresh += 1;
+                                                        let lname = format!("{f_name}$lam${}", self.fresh);
+                                                        freshen(&mut lam, &format!("~sl{}", self.fresh), &mut HashMap::new());
+                                                        self.closed_lams.insert(k, lname.clone());
+                                                        self.new_binds.push(TopBind { name: lname.clone(), body: lam });
+                                                        Some(lname)
+                                                    }
+                                                }
+                                                None => None,
+                                            })
+                                            .collect();
                                         self.fresh += 1;
                                         let sname = format!("{f_name}$spec${}", self.fresh);
-                                        let mut cloned = cand.body.clone();
                                         let mut lams = Vec::new();
-                                        let mut inner = cloned;
+                                        let mut inner = cand.body.clone();
                                         loop {
                                             if one_shot_lambda(&inner).is_some() {
                                                 let Core::App(_, lam) = inner else { unreachable!() };
@@ -455,21 +733,75 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
                                                 subst(&mut inner, p, &Core::Var(g.clone()));
                                             }
                                         }
-                                        rewrite_self(&mut inner, &f_name, &sname, &spec_args);
+                                        match &cand.kind {
+                                            CandKind::Direct => {
+                                                rewrite_self(&mut inner, &f_name, &sname, &spec_args);
+                                            }
+                                            CandKind::LocalLoop { go_arity, go_param_map } => {
+                                                let mut go_dropped: Vec<Option<String>> = vec![None; *go_arity];
+                                                for (i, g) in spec_args.iter().enumerate() {
+                                                    if let Some(g) = g {
+                                                        for &j in &go_param_map[i] {
+                                                            go_dropped[j] = Some(g.clone());
+                                                        }
+                                                    }
+                                                }
+                                                if go_dropped.iter().any(|x| x.is_some())
+                                                    && go_dropped.iter().any(|x| x.is_none())
+                                                {
+                                                    if let Core::Let(bs, let_body) = &mut inner {
+                                                        if bs.len() == 1 {
+                                                            let go_freshened = bs[0].0.clone();
+                                                            let mut go_lams = Vec::new();
+                                                            let mut go_inner = take(&mut bs[0].1);
+                                                            loop {
+                                                                if one_shot_lambda(&go_inner).is_some() {
+                                                                    let Core::App(_, lam) = go_inner else { unreachable!() };
+                                                                    go_inner = *lam;
+                                                                }
+                                                                match go_inner {
+                                                                    Core::Lam(x, b) => {
+                                                                        go_lams.push(x);
+                                                                        go_inner = *b;
+                                                                    }
+                                                                    other => {
+                                                                        go_inner = other;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                            for (q, g) in go_lams.iter().zip(&go_dropped) {
+                                                                if let Some(g) = g {
+                                                                    subst(&mut go_inner, q, &Core::Var(g.clone()));
+                                                                }
+                                                            }
+                                                            rewrite_self(&mut go_inner, &go_freshened, &go_freshened, &go_dropped);
+                                                            for (q, g) in go_lams.into_iter().zip(&go_dropped).rev() {
+                                                                if g.is_none() {
+                                                                    go_inner = Core::Lam(q, Box::new(go_inner));
+                                                                }
+                                                            }
+                                                            bs[0].1 = go_inner;
+                                                            rewrite_self(let_body, &go_freshened, &go_freshened, &go_dropped);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         for (p, g) in lams.into_iter().zip(&spec_args).rev() {
                                             if g.is_none() {
                                                 inner = Core::Lam(p, Box::new(inner));
                                             }
                                         }
-                                        cloned = inner;
                                         *self.per_fn.entry(f_name.clone()).or_default() += 1;
-                                        self.created.insert(key, sname.clone());
-                                        self.new_binds.push(TopBind { name: sname.clone(), body: cloned });
+                                        self.created.insert(key.clone(), sname.clone());
+                                        self.new_binds.push(TopBind { name: sname.clone(), body: inner });
                                         Some(sname)
                                     } else {
                                         None
                                     };
                                     if let Some(sname) = spec_name {
+                                        let drop_mask: Vec<bool> = key.1.iter().map(|k| k.is_some()).collect();
                                         let mut args = Vec::new();
                                         let mut cur = take(c);
                                         while let Core::App(g, a) = cur {
@@ -479,13 +811,14 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
                                         args.reverse();
                                         let mut e = Core::Var(sname);
                                         for (i, mut a) in args.into_iter().enumerate() {
-                                            if spec_args.get(i).is_some_and(|k| k.is_some()) {
+                                            if drop_mask.get(i).copied().unwrap_or(false) {
                                                 continue;
                                             }
                                             self.visit(&mut a, cur_bind);
                                             e = Core::App(Box::new(e), Box::new(a));
                                         }
                                         *c = e;
+                                        self.changed.insert(cur_bind.to_string());
                                         return;
                                     }
                                 }
@@ -526,15 +859,21 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
 
     let mut ctx = SpecCtx {
         cands: &cands,
+        top_globals: &top_globals,
         global_fns: &global_fns,
+        known_dicts: &known_dicts,
         created: HashMap::new(),
+        closed_lams: HashMap::new(),
         per_fn: HashMap::new(),
         spec_per_fn,
         spec_total,
         new_binds: Vec::new(),
+        changed: HashSet::new(),
         fresh: FRESH.load(std::sync::atomic::Ordering::Relaxed),
     };
-    for b in binds.iter_mut() {
+    // Reverse order visits user/Main modules before base libraries so user hot calls get first
+    // priority in the `spec_total` budget.
+    for b in binds.iter_mut().rev() {
         if is_rule_binding(&b.name) {
             continue;
         }
@@ -542,7 +881,11 @@ fn specialise_static_args(binds: &mut Vec<TopBind>, rules: &Rules) {
         ctx.visit(&mut b.body, &name);
     }
     FRESH.store(ctx.fresh, std::sync::atomic::Ordering::Relaxed);
+    for b in &ctx.new_binds {
+        ctx.changed.insert(b.name.clone());
+    }
     binds.extend(ctx.new_binds);
+    ctx.changed
 }
 
 /// Replaces `oneShot e` by `e`.
@@ -8330,6 +8673,211 @@ mod rule_tests {
         assert!(
             matches!(rhs, Core::App(..)),
             "PAP in non-eval let must stay a Core::App value, not a Case thunk: {rhs:?}"
+        );
+    }
+
+    #[test]
+    fn specialise_static_args_handles_dict_and_closed_lambda_in_local_loop() {
+        // Wrapper with a local recursive loop taking a dictionary (`D:Ord`) and a combining
+        // function `f`, called with a known global dict and a small closed lambda.
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        let cmp_fn = Core::Lam(
+            "a".into(),
+            Box::new(Core::Lam(
+                "b".into(),
+                Box::new(Core::Prim("<#".into(), vec![v("a"), v("b")])),
+            )),
+        );
+        let dict = Core::Con("GHC.Classes.D:Ord".into(), vec![v("T.cmpInt")]);
+        // go d f x t = case t of Tip -> x; Bin k v l r -> case d of D:Ord cmp ->
+        //   case cmp x k of 1# -> go d f x l; _ -> f x v
+        let go_body = Core::Case(
+            Box::new(v("t")),
+            "cb".into(),
+            vec![
+                Alt::Con("T.Tip".into(), vec![], v("x")),
+                Alt::Con(
+                    "T.Bin".into(),
+                    vec!["k".into(), "val".into(), "l".into(), "r".into()],
+                    Core::Case(
+                        Box::new(v("gd")),
+                        "db".into(),
+                        vec![Alt::Con(
+                            "GHC.Classes.D:Ord".into(),
+                            vec!["cmp".into()],
+                            Core::Case(
+                                Box::new(app(app(v("cmp"), v("x")), v("k"))),
+                                "c".into(),
+                                vec![
+                                    Alt::Lit(
+                                        Lit::Int(1),
+                                        app(
+                                            app(app(app(v("go"), v("gd")), v("gf")), v("x")),
+                                            v("l"),
+                                        ),
+                                    ),
+                                    Alt::Lit(
+                                        Lit::Int(0),
+                                        app(
+                                            app(app(app(v("go"), v("gd")), v("gf")), v("x")),
+                                            v("r"),
+                                        ),
+                                    ),
+                                    Alt::Default(app(app(v("gf"), v("x")), v("val"))),
+                                ],
+                            ),
+                        )],
+                    ),
+                ),
+            ],
+        );
+        let go_rhs = Core::Lam(
+            "gd".into(),
+            Box::new(Core::Lam(
+                "gf".into(),
+                Box::new(Core::Lam("x".into(), Box::new(Core::Lam("t".into(), Box::new(go_body))))),
+            )),
+        );
+        let ins_body = Core::Lam(
+            "d".into(),
+            Box::new(Core::Lam(
+                "f".into(),
+                Box::new(Core::Lam(
+                    "x".into(),
+                    Box::new(Core::Lam(
+                        "t".into(),
+                        Box::new(Core::Let(
+                            vec![("go".into(), go_rhs)],
+                            Box::new(app(app(app(app(v("go"), v("d")), v("f")), v("x")), v("t"))),
+                        )),
+                    )),
+                )),
+            )),
+        );
+        let closed_add = Core::Lam(
+            "u".into(),
+            Box::new(Core::Lam(
+                "w".into(),
+                Box::new(Core::Prim("+#".into(), vec![v("u"), v("w")])),
+            )),
+        );
+        let caller_body = Core::Lam(
+            "k".into(),
+            Box::new(Core::Lam(
+                "m".into(),
+                Box::new(Core::Con(
+                    "Builtin.(,)".into(),
+                    vec![
+                        app(
+                            app(app(app(v("T.ins"), v("T.dOrdInt")), closed_add.clone()), v("k")),
+                            v("m"),
+                        ),
+                        app(
+                            app(app(app(v("T.ins"), v("T.dOrdInt")), closed_add), v("k")),
+                            v("m"),
+                        ),
+                    ],
+                )),
+            )),
+        );
+        let mut binds = vec![
+            TopBind { name: "T.cmpInt".into(), body: cmp_fn },
+            TopBind { name: "T.dOrdInt".into(), body: dict },
+            TopBind { name: "T.ins".into(), body: ins_body },
+            TopBind { name: "T.caller".into(), body: caller_body },
+        ];
+        simplify(&mut binds);
+        let spec = binds
+            .iter()
+            .find(|b| b.name.starts_with("T.ins$spec$"))
+            .expect("expected specialized T.ins$spec$ binding");
+        let (ps, _) = params(&spec.body);
+        assert_eq!(ps.len(), 2, "specialized T.ins should drop both dict and closed-lambda params: {:?}", spec.body);
+        let rendered = format!("{:?}", spec.body);
+        assert!(
+            !rendered.contains("D:Ord"),
+            "dictionary case should fold away inside specialized binding: {rendered}"
+        );
+        assert!(
+            rendered.contains("+#"),
+            "closed lambda body should inline into specialized binding: {rendered}"
+        );
+    }
+
+    #[test]
+    fn specialise_static_args_handles_direct_recursive_dict() {
+        let app = |f: Core, a: Core| Core::App(Box::new(f), Box::new(a));
+        let eq_fn = Core::Lam(
+            "a".into(),
+            Box::new(Core::Lam(
+                "b".into(),
+                Box::new(Core::Prim("==#".into(), vec![v("a"), v("b")])),
+            )),
+        );
+        let dict = Core::Con("GHC.Classes.D:Eq".into(), vec![v("T.eqInt")]);
+        let elem_body = Core::Lam(
+            "d".into(),
+            Box::new(Core::Lam(
+                "x".into(),
+                Box::new(Core::Lam(
+                    "xs".into(),
+                    Box::new(Core::Case(
+                        Box::new(v("xs")),
+                        "cb".into(),
+                        vec![
+                            Alt::Con("Builtin.[]".into(), vec![], Core::Con(FALSE.into(), vec![])),
+                            Alt::Con(
+                                "Builtin.:".into(),
+                                vec!["h".into(), "t".into()],
+                                Core::Case(
+                                    Box::new(v("d")),
+                                    "db".into(),
+                                    vec![Alt::Con(
+                                        "GHC.Classes.D:Eq".into(),
+                                        vec!["eq".into()],
+                                        Core::Case(
+                                            Box::new(app(app(v("eq"), v("x")), v("h"))),
+                                            "c".into(),
+                                            vec![
+                                                Alt::Lit(Lit::Int(1), Core::Con(TRUE.into(), vec![])),
+                                                Alt::Default(app(
+                                                    app(app(v("T.elem"), v("d")), v("x")),
+                                                    v("t"),
+                                                )),
+                                            ],
+                                        ),
+                                    )],
+                                ),
+                            ),
+                        ],
+                    )),
+                )),
+            )),
+        );
+        let caller = Core::Lam(
+            "x".into(),
+            Box::new(Core::Lam(
+                "xs".into(),
+                Box::new(app(app(app(v("T.elem"), v("T.dEqInt")), v("x")), v("xs"))),
+            )),
+        );
+        let mut binds = vec![
+            TopBind { name: "T.eqInt".into(), body: eq_fn },
+            TopBind { name: "T.dEqInt".into(), body: dict },
+            TopBind { name: "T.elem".into(), body: elem_body },
+            TopBind { name: "T.caller".into(), body: caller },
+        ];
+        simplify(&mut binds);
+        let spec = binds
+            .iter()
+            .find(|b| b.name.starts_with("T.elem$spec$"))
+            .expect("expected specialized T.elem$spec$ binding");
+        let (ps, _) = params(&spec.body);
+        assert_eq!(ps.len(), 2, "specialized T.elem should drop static D:Eq param: {:?}", spec.body);
+        let rendered = format!("{:?}", spec.body);
+        assert!(
+            !rendered.contains("D:Eq"),
+            "D:Eq case should fold away in specialized T.elem: {rendered}"
         );
     }
 }
