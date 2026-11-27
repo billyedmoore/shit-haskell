@@ -639,7 +639,7 @@ impl Gen {
             }
             let _ = writeln!(g.out, "    leaq {ret_lbl}(%rip), %rcx");
             g.emit("movq %rcx, (%rbp)");
-            g.emit("jmp hsc_eval");
+            g.emit("jmp hsc_enter_thunk");
             let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, frame_size);
             g.put_label(&ret_lbl);
             if preserve_rcx {
@@ -4292,8 +4292,9 @@ impl Gen {
                             let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
                             g.emit("movq %rax, (%rbp)");
                             g.live.push(live);
-                            g.expr(scrut, sp);
+                            g.clear_dead(std::slice::from_ref(a), sp);
                             g.live.pop();
+                            g.emit("jmp hsc_enter_thunk");
                             let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
                             g.put_label(&cont);
                             g.emit("addq $8, %rbp");
@@ -8074,6 +8075,7 @@ const RUNTIME_ASM: &str = r#"
     .globl hsc_stop_ret
     .globl hsc_apply_ret
     .globl hsc_eval
+    .globl hsc_enter_thunk
     .globl hsc_apply
     .globl hsc_raise_pending
     .globl hsc_mask_ret
@@ -8126,7 +8128,7 @@ hsc_eval:
     movq (%r14), %rax
     cmpb $8, %al
     jb .Leval_void
-    je .Leval_thunk
+    je hsc_enter_thunk
     cmpb $9, %al
     je .Leval_ind
 .Leval_void:
@@ -8134,21 +8136,16 @@ hsc_eval:
 .Leval_ind:
     movq 8(%r14), %r14
     jmp hsc_eval
-.Leval_thunk:
-    movq %rax, %rdx
-    shrq $32, %rdx
-    testq %rdx, %rdx
-    jnz .Leval_loop
-    movq 192(%rbx), %rdx
-    shlq $32, %rdx
-    orq %rdx, %rax
-    movq %rax, (%r14)
+hsc_enter_thunk:
+    cmpl $0, 4(%r14)
+    jne .Leval_loop
+    movl 192(%rbx), %eax
+    movl %eax, 4(%r14)
     subq $16, %rbp
     leaq hsc_upd_ret(%rip), %rcx
     movq %rcx, (%rbp)
     movq %r14, 8(%rbp)
-    movq 8(%r14), %rcx
-    jmp *%rcx
+    jmp *8(%r14)
 .Leval_loop:
     movq %r14, 40(%rbx)
     movq %r12, 0(%rbx)
@@ -8172,40 +8169,48 @@ hsc_eval:
     .quad 2, 1
 hsc_upd_ret:
     movq 8(%rbp), %rcx
-    movq (%rcx), %rdx
-    movabsq $0x00000000ffffff00, %rax
-    andq %rax, %rdx
-    orq $9, %rdx
-    movq %rdx, (%rcx)
+    movl (%rcx), %eax
+    andl $-256, %eax
+    orl $9, %eax
+    movq %rax, (%rcx)
     movq %r14, 8(%rcx)
     addq $16, %rbp
     jmp *(%rbp)
 
 hsc_apply:
     movq (%r14), %rax
-    movzbl %al, %edx
-    cmpb $9, %dl
-    je .Lap_ind
-    cmpb $8, %dl
-    je .Lap_eval
-    cmpb $7, %dl
-    je .Lap_pap
-    cmpb $6, %dl
-    jne .Lap_slow
-    movq %rax, %rdx
-    shrq $32, %rdx
-    cmpq %rcx, %rdx
+    cmpb $6, %al
+    jne .Lap_not_fun
+    shrq $32, %rax
+    cmpq %rcx, %rax
     jne .Lap_arity
-    movq 8(%r14), %rdx
-    jmp *%rdx
+    jmp *8(%r14)
+.Lap_not_fun:
+    cmpb $7, %al
+    je .Lap_pap
+    cmpb $8, %al
+    je .Lap_eval
+    cmpb $9, %al
+    je .Lap_ind
+    jmp .Lap_slow
 .Lap_arity:
     ja .Lap_under
-    # Over-application (arity rdx < rcx): the first rdx arguments move down two words, and an
+    # Over-application (arity rax < rcx): the first rax arguments move down two words, and an
     # apply frame [hsc_apply_ret][count] holds the rest, which stay where they are.
     subq $16, %rbp
+    cmpq $1, %rax
+    jne .Lap_over_multi
+    movq 16(%rbp), %r9
+    movq %r9, (%rbp)
+    leaq hsc_apply_ret(%rip), %r9
+    movq %r9, 8(%rbp)
+    decq %rcx
+    movq %rcx, 16(%rbp)
+    jmp *8(%r14)
+.Lap_over_multi:
     xorl %r8d, %r8d
 .Lap_over_copy:
-    cmpq %rdx, %r8
+    cmpq %rax, %r8
     jae .Lap_over_done
     movq 16(%rbp,%r8,8), %r9
     movq %r9, (%rbp,%r8,8)
@@ -8213,14 +8218,28 @@ hsc_apply:
     jmp .Lap_over_copy
 .Lap_over_done:
     leaq hsc_apply_ret(%rip), %r9
-    movq %r9, (%rbp,%rdx,8)
-    subq %rdx, %rcx
-    movq %rcx, 8(%rbp,%rdx,8)
-    movq 8(%r14), %rdx
-    jmp *%rdx
+    movq %r9, (%rbp,%rax,8)
+    subq %rax, %rcx
+    movq %rcx, 8(%rbp,%rax,8)
+    jmp *8(%r14)
 .Lap_under:
-    # Under-application (arity rdx > rcx): allocate a PAP object inline when heap room permits,
+    # Under-application (arity rax > rcx): allocate a PAP object inline when heap room permits,
     # falling back to hsc_apply_slow on GC or extreme argument counts.
+    cmpq $1, %rcx
+    jne .Lap_under_multi
+    leaq 24(%r12), %r9
+    cmpq %r13, %r9
+    ja .Lap_slow
+    movabsq $0x100000207, %rdx
+    movq %rdx, (%r12)
+    movq %r14, 8(%r12)
+    movq (%rbp), %rax
+    movq %rax, 16(%r12)
+    addq $8, %rbp
+    movq %r12, %r14
+    movq %r9, %r12
+    jmp *(%rbp)
+.Lap_under_multi:
     cmpq $0xfffffe, %rcx
     ja .Lap_slow
     leaq 16(%r12,%rcx,8), %r9
@@ -8250,20 +8269,28 @@ hsc_apply:
 .Lap_pap:
     # A partial application: its held arguments go below the new ones, and its function is
     # applied to all of them.
-    movq %rax, %rdx
-    shrq $32, %rdx
-    leaq (,%rdx,8), %r8
+    shrq $32, %rax
+    cmpq $1, %rax
+    jne .Lap_pap_multi
+    subq $8, %rbp
+    movq 16(%r14), %r9
+    movq %r9, (%rbp)
+    incq %rcx
+    movq 8(%r14), %r14
+    jmp hsc_apply
+.Lap_pap_multi:
+    leaq (,%rax,8), %r8
     subq %r8, %rbp
     xorl %r8d, %r8d
 .Lap_pap_copy:
-    cmpq %rdx, %r8
+    cmpq %rax, %r8
     jae .Lap_pap_done
     movq 16(%r14,%r8,8), %r9
     movq %r9, (%rbp,%r8,8)
     incq %r8
     jmp .Lap_pap_copy
 .Lap_pap_done:
-    addq %rdx, %rcx
+    addq %rax, %rcx
     movq 8(%r14), %r14
     jmp hsc_apply
 .Lap_ind:
@@ -8274,7 +8301,7 @@ hsc_apply:
     leaq hsc_apply_ret(%rip), %rdx
     movq %rdx, (%rbp)
     movq %rcx, 8(%rbp)
-    jmp hsc_eval
+    jmp hsc_enter_thunk
 .Lap_slow:
     movq %r12, 0(%rbx)
     movq %rbp, 16(%rbx)
@@ -9506,7 +9533,10 @@ mod sprint6_codegen_tests {
         let start = asm.find(&format!("{lbl0}:\n")).expect("g0");
         let body = &asm[start..];
         assert!(body.contains(".Lopev"), "expected cold operand eval stub:\n{body}");
-        assert!(body.contains("jmp hsc_eval"), "expected native hsc_eval in operand stub:\n{body}");
+        assert!(
+            body.contains("jmp hsc_enter_thunk"),
+            "expected native hsc_enter_thunk in operand stub:\n{body}"
+        );
         assert!(body.contains(".Lopret"), "expected operand eval continuation:\n{body}");
     }
 
@@ -10340,6 +10370,35 @@ mod sprint6_codegen_tests {
         assert!(body.contains("btrq "), "expected fused btrq inside recursive Join:\n{body}");
         assert!(body.contains("btq "), "expected fused btq with peeled Join:\n{body}");
         assert!(!body.contains("shlq "), "unexpected shlq when btrq/btq fused:\n{body}");
+    }
+
+    #[test]
+    fn case_atom_eval_stub_jumps_directly_to_hsc_enter_thunk() {
+        // Scrutinizing a boxed argument slot (`Case (Atom (Slot 1))`) emits a cold eval stub that
+        // chases IND and jumps directly to `hsc_enter_thunk` without reloading Slot 1 over `%r14`.
+        let body = SExpr::Case(
+            Box::new(SExpr::Atom(Atom::Slot(1))),
+            UNUSED_SLOT,
+            vec![
+                SAlt::Con("Builtin.[]".into(), vec![], SExpr::Atom(Atom::Lit(SLit::Int(0)))),
+                SAlt::Con("Builtin.:".into(), vec![2, 3], SExpr::Atom(Atom::Slot(2))),
+            ],
+        );
+        let c = simple_closure(1, 4, 0, body);
+        let prog = make_prog(vec![SGlobal { name: "Test.headOr0".into(), closure: c, worker: None }]);
+        let asm = Gen::program(&prog);
+        assert!(asm.contains("hsc_enter_thunk:\n"), "expected hsc_enter_thunk runtime entry");
+        let (_, fn_asm) = asm.split_once("\n.Lg").expect("body label");
+        let (_, eval_rest) = fn_asm.split_once("\n.Leval").expect("expected cold thunk eval stub");
+        let stub = eval_rest.split_once("\n.Lk").expect("expected continuation label").0;
+        assert!(
+            stub.contains("jmp hsc_enter_thunk"),
+            "expected Case atom stub to jump directly to hsc_enter_thunk:\n{stub}"
+        );
+        assert!(
+            !stub.contains("jmp hsc_eval"),
+            "Case atom stub should not re-enter full hsc_eval:\n{stub}"
+        );
     }
 }
 
