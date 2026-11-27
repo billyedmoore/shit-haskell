@@ -4758,7 +4758,7 @@ impl Gen {
                         // (e.g. a strict constructor field after `case x of _ -> C x`) store the
                         // direct cell rather than an `IND` that every later reader must chase.
                         let write_back = match a {
-                            Atom::Slot(s) if s & RAW == 0 && (live.contains(s) || live.contains(&ALL_LIVE)) => Some(*s),
+                            Atom::Slot(s) if *s != 0 && s & RAW == 0 && (live.contains(s) || live.contains(&ALL_LIVE)) => Some(*s),
                             _ => None,
                         };
                         let wb_regs: Vec<&'static str> = match write_back {
