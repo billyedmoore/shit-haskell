@@ -550,4 +550,32 @@ mod tests {
         assert_eq!(heap::kind_of(heap.word(roots[0], 0)), kind::THUNK);
         assert_eq!(heap::kind_of(heap.word(roots[1], 0)), kind::THUNK);
     }
+
+    #[test]
+    fn closure_raw_captures_are_preserved_verbatim_across_gc() {
+        let mut heap = Heap::new(4096);
+        let boxed = heap.try_alloc(2, heap::header(kind::INT, 1, 0)).unwrap();
+        heap.set_word(boxed, 1, 777);
+        // Allocate a THUNK with 1 boxed capture + 2 trailing raw captures (total 5 words).
+        // Put `boxed` itself (a real in-heap address!) as one of the raw words to verify GC does
+        // NOT rewrite trailing raw captures as pointers.
+        let hdr = heap::closure_header(kind::THUNK, 4, 2, 0);
+        let thunk = heap.try_alloc(5, hdr).unwrap();
+        heap.set_word(thunk, 1, 0x1234_5678);
+        heap.set_word(thunk, 2, boxed);
+        heap.set_word(thunk, 3, boxed); // raw word matching a heap address — must stay verbatim
+        heap.set_word(thunk, 4, 0xdead_beef_cafe_babe);
+
+        let mut roots = [thunk];
+        collect(&mut heap, &mut roots, 0);
+        let moved = roots[0];
+        assert_ne!(moved, thunk);
+        assert_eq!(heap.word(moved, 0), hdr);
+        assert_eq!(heap.word(moved, 1), 0x1234_5678);
+        let moved_boxed = heap.word(moved, 2);
+        assert_ne!(moved_boxed, boxed);
+        assert_eq!(heap.word(moved_boxed, 1), 777);
+        assert_eq!(heap.word(moved, 3), boxed);
+        assert_eq!(heap.word(moved, 4), 0xdead_beef_cafe_babe);
+    }
 }

@@ -447,6 +447,13 @@ fn header(kind: u8, size: u64, aux: u64) -> u64 {
     kind as u64 | (size << 8) | (aux << 32)
 }
 
+/// The header word of a `FUN` or `THUNK` closure: `kind | size:16 << 8 | raw_captures:8 << 24 | aux << 32`.
+fn closure_header(kind: u8, size: u64, raw_captures: u64, aux: u64) -> u64 {
+    debug_assert!(kind == FUN || kind == THUNK);
+    debug_assert!(size < (1 << 16) && raw_captures < (1 << 8));
+    kind as u64 | (size << 8) | (raw_captures << 24) | (aux << 32)
+}
+
 /// The words a closure occupies: its header, code word and captures (at least two).
 fn closure_words(c: &SClosure) -> usize {
     (c.captures.len() + 2).max(2)
@@ -1004,7 +1011,7 @@ impl Gen {
     /// Recognises a single-capture selector thunk (`case Free(0) of Con [.., f_i, ..] -> f_i`)
     /// so the garbage collector can short-circuit it when `Free(0)` is already evaluated.
     fn selector_info(&mut self, c: &SClosure) -> Option<(u32, u32)> {
-        if c.arity != 0 || c.captures.len() != 1 {
+        if c.arity != 0 || c.captures.len() != 1 || c.raw_captures != 0 {
             return None;
         }
         let SExpr::Case(scrut, bslot, alts) = &c.body else {
@@ -1162,7 +1169,7 @@ impl Gen {
     /// call using only captured/global/static atoms: reads captures straight from `%r14`, pushes
     /// arguments below the update frame, and tail-jumps without allocating or sliding a frame.
     fn direct_thunk_tail_call(&mut self, label: &str, c: &SClosure) -> bool {
-        if c.arity != 0 || c.nraw != 0 || !c.uses_closure || c.ret_raw {
+        if c.arity != 0 || c.nraw != 0 || !c.uses_closure || c.ret_raw || !c.raw_free.is_empty() {
             return false;
         }
         match &c.body {
@@ -1726,7 +1733,11 @@ impl Gen {
     /// return (e.g. `fib`'s `n < 2 -> n`). Returns the remaining (non-leaf) branch to emit after
     /// the normal prologue so the comparison is not repeated.
     fn try_raw_cmp_fast_exit<'a>(&mut self, c: &'a SClosure) -> Option<&'a SExpr> {
-        if c.uses_closure || c.raw_args.is_empty() || !c.raw_args.iter().all(|(a, _)| *a == 0) {
+        if c.uses_closure
+            || c.raw_args.is_empty()
+            || !c.raw_free.is_empty()
+            || !c.raw_args.iter().all(|(a, _)| *a == 0)
+        {
             return None;
         }
         let SExpr::Case(scrut, tmp, outer_alts) = &c.body else { return None };
@@ -1879,6 +1890,7 @@ impl Gen {
             || c.ret_raw
             || c.arity != 1
             || !c.raw_args.is_empty()
+            || !c.raw_free.is_empty()
             || f.s <= f.a
         {
             return false;
@@ -2045,6 +2057,13 @@ impl Gen {
         if has_closure {
             let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", f.off(0));
         }
+        if loop_lbl.is_some() {
+            for &(free_idx, raw) in &c.raw_free {
+                let off = 8 * (2 + free_idx) as i64;
+                let _ = writeln!(self.out, "    movq {off}(%r14), %rcx");
+                let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", f.off(raw));
+            }
+        }
         let mut pre_safe = 0u64;
         let hoisted = self.loop_known_kinds.clone();
         let reg_ptrs = self.self_reg_ptr_args.clone();
@@ -2140,6 +2159,19 @@ impl Gen {
                     }
                 }
                 let _ = writeln!(self.out, "    movq $0, {}(%rbp)", f.off(arg));
+            }
+        }
+        if loop_lbl.is_none() {
+            for &(free_idx, raw) in &c.raw_free {
+                let off = 8 * (2 + free_idx) as i64;
+                if self.cache.len() < CACHE_REGS.len() {
+                    let r = self.fresh_reg(p, &[]);
+                    let _ = writeln!(self.out, "    movq {off}(%r14), {r}");
+                    self.cache_put(raw, r, true);
+                } else {
+                    let _ = writeln!(self.out, "    movq {off}(%r14), %rcx");
+                    let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", f.off(raw));
+                }
             }
         }
         for &(slot, reg) in &reg_ptrs {
@@ -2497,6 +2529,7 @@ impl Gen {
             SExpr::CallWorker(_, args) => args.iter().all(plain),
             SExpr::Let(binds, _) => binds.iter().all(|(_, b)| b.atoms().iter().all(plain)),
             SExpr::Con(_, args) => args.iter().all(plain),
+            SExpr::Closure(c) => c.captures.iter().all(plain),
             SExpr::Prim(name, args) => tail && name == "tagToEnum#" && args.len() == 1 && is_raw(&args[0]),
             SExpr::Join(..) => true,
             SExpr::Jump(id, args) => args.is_empty() && self.inline_joins.contains_key(id),
@@ -6320,10 +6353,11 @@ impl Gen {
     fn fill_closure(&mut self, c: &SClosure, base: usize, p: Pos) {
         let code = self.label("c");
         self.pending.push((code.clone(), c.clone(), format!("{}/closure", self.current_name)));
+        let size = (c.captures.len() as u64 + 1).max(1);
         let hdr = if c.arity > 0 {
-            header(FUN, c.captures.len() as u64 + 1, c.arity as u64)
+            closure_header(FUN, size, c.raw_captures as u64, c.arity as u64)
         } else {
-            header(THUNK, (c.captures.len() as u64 + 1).max(1), 0)
+            closure_header(THUNK, size, c.raw_captures as u64, 0)
         };
         let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
         let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * base);
@@ -6331,6 +6365,15 @@ impl Gen {
         let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * (base + 1));
         for (i, cap) in c.captures.iter().enumerate() {
             if let Atom::Slot(k) = cap {
+                if k & RAW != 0 {
+                    if let Some(r) = self.cached(*k) {
+                        let _ = writeln!(self.out, "    movq {r}, {}(%rax)", 8 * (base + 2 + i));
+                    } else {
+                        let _ = writeln!(self.out, "    movq {}(%rbp), %rdx", p.slot_off(*k));
+                        let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (base + 2 + i));
+                    }
+                    continue;
+                }
                 if !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) {
                     if let Some(r) = self.cached(*k) {
                         let _ = writeln!(self.out, "    movq {r}, {}(%rax)", 8 * (base + 2 + i));
@@ -8844,7 +8887,7 @@ hsc_enter_thunk:
 hsc_upd_ret:
     movq 8(%rbp), %rcx
     movl (%rcx), %eax
-    andl $-256, %eax
+    andl $0x00ffff00, %eax
     orl $9, %eax
     movq %rax, (%rcx)
     movq %r14, 8(%rcx)
@@ -9253,8 +9296,8 @@ mod known_global_call_tests {
     #[test]
     fn forward_and_mutual_entries_are_registered_before_body_generation() {
         let globals = vec![
-            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, nraw: 0, raw_args: Vec::new(), ret_raw: false, uses_closure: false, body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) }, worker: None },
-            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), nslots: 2, nraw: 0, raw_args: Vec::new(), ret_raw: false, uses_closure: false, body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) }, worker: None },
+            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), raw_captures: 0, nslots: 2, nraw: 0, raw_args: Vec::new(), raw_free: Vec::new(), ret_raw: false, uses_closure: false, body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) }, worker: None },
+            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), raw_captures: 0, nslots: 2, nraw: 0, raw_args: Vec::new(), raw_free: Vec::new(), ret_raw: false, uses_closure: false, body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) }, worker: None },
         ];
         let index = [("Main.main".to_string(), 0), ("Test.other".to_string(), 1)].into_iter().collect();
         let asm = Gen::program(&SProgram { globals, index });
@@ -9273,9 +9316,11 @@ mod known_global_call_tests {
         let worker_closure = SClosure {
             arity: 0,
             captures: Vec::new(),
+            raw_captures: 0,
             nslots: 1,
             nraw: 2,
             raw_args: vec![(0, r0), (0, r1)],
+            raw_free: Vec::new(),
             ret_raw: true,
             uses_closure: false,
             body: SExpr::CallWorker(0, vec![Atom::Slot(r1), Atom::Slot(r0)]),
@@ -9285,9 +9330,11 @@ mod known_global_call_tests {
             closure: SClosure {
                 arity: 2,
                 captures: Vec::new(),
+                raw_captures: 0,
                 nslots: 3,
                 nraw: 0,
                 raw_args: Vec::new(),
+                raw_free: Vec::new(),
                 ret_raw: false,
                 uses_closure: false,
                 body: SExpr::Atom(Atom::Slot(1)),
@@ -9307,9 +9354,11 @@ mod known_global_call_tests {
         let worker_closure = SClosure {
             arity: 0,
             captures: Vec::new(),
+            raw_captures: 0,
             nslots: 1,
             nraw: 1,
             raw_args: vec![(0, r0)],
+            raw_free: Vec::new(),
             ret_raw: false,
             uses_closure: false,
             body: SExpr::Atom(Atom::Lit(SLit::Int(999))),
@@ -9319,9 +9368,11 @@ mod known_global_call_tests {
             closure: SClosure {
                 arity: 1,
                 captures: Vec::new(),
+                raw_captures: 0,
                 nslots: 2,
                 nraw: 0,
                 raw_args: Vec::new(),
+                raw_free: Vec::new(),
                 ret_raw: false,
                 uses_closure: false,
                 body: SExpr::Atom(Atom::Slot(1)),
@@ -9385,9 +9436,11 @@ mod known_global_call_tests {
         let thunk = SClosure {
             arity: 0,
             captures: vec![Atom::Slot(1), Atom::Slot(2)],
+            raw_captures: 0,
             nslots: 1,
             nraw: 0,
             raw_args: Vec::new(),
+            raw_free: Vec::new(),
             ret_raw: false,
             uses_closure: true,
             body: SExpr::App(Atom::Global(0), vec![Atom::Free(0), Atom::Free(1)]),
@@ -9415,9 +9468,11 @@ mod known_global_call_tests {
         let leaf = SClosure {
             arity: 1,
             captures: Vec::new(),
+            raw_captures: 0,
             nslots: 4,
             nraw: 0,
             raw_args: Vec::new(),
+            raw_free: Vec::new(),
             ret_raw: false,
             uses_closure: false,
             body: SExpr::Atom(Atom::Slot(1)),
@@ -9540,9 +9595,11 @@ mod sprint6_codegen_tests {
         SClosure {
             arity,
             captures: Vec::new(),
+            raw_captures: 0,
             nslots,
             nraw,
             raw_args: Vec::new(),
+            raw_free: Vec::new(),
             body,
             ret_raw: false,
             uses_closure: false,
@@ -11358,6 +11415,76 @@ mod sprint6_codegen_tests {
         assert_eq!(
             int_checks, 2,
             "expected exactly 2 hot INT tag checks (rs once, ls once), got {int_checks}:\n{hot}"
+        );
+    }
+
+    #[test]
+    fn raw_capture_thunk_emits_closure_header_and_zero_alloc_worker_tail_jump() {
+        // Worker `Test.build(v#, d#)` allocates a raw-capture thunk capturing `(v#, d#)` that
+        // computes `(2*v#, d#-1)` in CACHE_REGS and tail-jumps back to `Test.build/worker`.
+        let r0 = RAW | 0;
+        let r1 = RAW | 1;
+        let mut thunk = simple_closure(
+            0,
+            1,
+            2,
+            SExpr::Case(
+                Box::new(SExpr::Prim("-#".into(), vec![Atom::Slot(r1), Atom::Lit(SLit::Int(1))])),
+                r1,
+                vec![SAlt::Default(SExpr::Case(
+                    Box::new(SExpr::Prim("*#".into(), vec![Atom::Lit(SLit::Int(2)), Atom::Slot(r0)])),
+                    r0,
+                    vec![SAlt::Default(SExpr::CallWorker(0, vec![Atom::Slot(r0), Atom::Slot(r1)]))],
+                ))],
+            ),
+        );
+        thunk.captures = vec![Atom::Slot(r0), Atom::Slot(r1)];
+        thunk.raw_captures = 2;
+        thunk.raw_free = vec![(0, r0), (1, r1)];
+
+        let mut worker = simple_closure(0, 2, 2, SExpr::Closure(Box::new(thunk)));
+        worker.raw_args = vec![(0, r0), (0, r1)];
+
+        let entry = simple_closure(2, 3, 0, SExpr::Atom(Atom::Slot(1)));
+        let caller = simple_closure(
+            0,
+            1,
+            0,
+            SExpr::CallWorker(0, vec![Atom::Lit(SLit::Int(1)), Atom::Lit(SLit::Int(10))]),
+        );
+        let prog = make_prog(vec![
+            SGlobal { name: "Test.build".into(), closure: entry, worker: Some((worker, vec![true, true])) },
+            SGlobal { name: "Main.main".into(), closure: caller, worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let expected_hdr = closure_header(THUNK, 3, 2, 0);
+        assert!(
+            asm.contains(&format!("movabsq ${expected_hdr}, %rcx")),
+            "expected THUNK closure_header with raw_captures=2:\n{asm}"
+        );
+        assert!(
+            asm.contains("andl $0x00ffff00, %eax"),
+            "expected hsc_upd_ret to clear raw_captures bits when updating THUNK to IND"
+        );
+        // Locate the emitted child thunk label `.Lc...`.
+        let c_start = asm.find("\n.Lc").expect("child thunk label") + 1;
+        let c_end = asm[c_start + 1..]
+            .find("\n.L")
+            .or_else(|| asm[c_start + 1..].find("\n    .section"))
+            .map(|i| c_start + 1 + i)
+            .unwrap_or(asm.len());
+        let thunk_asm = &asm[c_start..c_end];
+        assert!(
+            thunk_asm.contains("movq 16(%r14), ") && thunk_asm.contains("movq 24(%r14), "),
+            "expected raw_free loads from closure tail:\n{thunk_asm}"
+        );
+        assert!(
+            !thunk_asm.contains("hsc_gc") && !thunk_asm.contains("cmpq %r13"),
+            "raw-capture thunk should not allocate or check heap:\n{thunk_asm}"
+        );
+        assert!(
+            thunk_asm.contains("jmp .Lw"),
+            "raw-capture thunk should tail-jump directly to worker:\n{thunk_asm}"
         );
     }
 }

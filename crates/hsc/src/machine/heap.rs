@@ -36,13 +36,40 @@ pub const fn header(kind: u8, size: u32, aux: u32) -> Word {
     kind as u64 | ((size as u64) << 8) | ((aux as u64) << 32)
 }
 
+/// Packs a `FUN` or `THUNK` header whose trailing `raw_captures` free-variable words hold raw
+/// (non-pointer) values skipped by the collector. For closures, bits `8..23` hold `size` (words
+/// after the header, up to 65,535) and bits `24..31` hold `raw_captures` (up to 255). When
+/// `raw_captures == 0`, this is bit-for-bit identical to [`header`].
+pub const fn closure_header(kind: u8, size: u32, raw_captures: u32, aux: u32) -> Word {
+    debug_assert!(kind == kind::FUN || kind == kind::THUNK);
+    debug_assert!(size < (1 << 16), "closure too large");
+    debug_assert!(raw_captures < (1 << 8), "too many raw captures");
+    debug_assert!(raw_captures <= size.saturating_sub(1), "raw captures exceed free vars");
+    kind as u64 | ((size as u64) << 8) | ((raw_captures as u64) << 24) | ((aux as u64) << 32)
+}
+
 pub fn kind_of(h: Word) -> u8 {
     (h & 0xff) as u8
 }
 
 /// The number of words after the header.
 pub fn size_of(h: Word) -> u32 {
-    ((h >> 8) & 0xff_ffff) as u32
+    let k = kind_of(h);
+    if k == kind::FUN || k == kind::THUNK {
+        ((h >> 8) & 0xffff) as u32
+    } else {
+        ((h >> 8) & 0xff_ffff) as u32
+    }
+}
+
+/// The number of trailing raw (non-pointer) free-variable words in a `FUN` or `THUNK` closure.
+pub fn raw_captures_of(h: Word) -> usize {
+    let k = kind_of(h);
+    if k == kind::FUN || k == kind::THUNK {
+        ((h >> 24) & 0xff) as usize
+    } else {
+        0
+    }
 }
 
 pub fn aux_of(h: Word) -> u32 {
@@ -61,8 +88,9 @@ pub fn pointer_fields(h: Word) -> (usize, usize) {
     let n = size_of(h) as usize;
     match kind_of(h) {
         kind::CON | kind::ARRAY | kind::REF => (1, n),
-        // word 1 is the code entry (raw); the rest are free variables
-        kind::FUN | kind::THUNK => (2, n.saturating_sub(1)),
+        // word 1 is the code entry (raw); boxed pointer captures come first, followed by
+        // `raw_captures_of(h)` trailing raw words
+        kind::FUN | kind::THUNK => (2, n.saturating_sub(1 + raw_captures_of(h))),
         // word 1 is the function object, the rest are its arguments
         kind::PAP => (1, n),
         kind::IND => (1, 1),
@@ -215,6 +243,24 @@ mod tests {
         assert_eq!(size_of(h), 5);
         assert_eq!(aux_of(h), 3);
         assert_eq!(total_words(header(kind::INT, 0, 0)), 2);
+    }
+
+    #[test]
+    fn closure_header_raw_captures() {
+        assert_eq!(closure_header(kind::THUNK, 3, 0, 0), header(kind::THUNK, 3, 0));
+        let h = closure_header(kind::THUNK, 4, 2, 7);
+        assert_eq!(kind_of(h), kind::THUNK);
+        assert_eq!(size_of(h), 4);
+        assert_eq!(raw_captures_of(h), 2);
+        assert_eq!(aux_of(h), 7);
+        assert_eq!(total_words(h), 5);
+        assert_eq!(pointer_fields(h), (2, 1));
+        let h_raw_only = closure_header(kind::FUN, 3, 2, 1);
+        assert_eq!(pointer_fields(h_raw_only), (2, 0));
+        // Non-closure objects retain full 24-bit size.
+        let big = header(kind::BYTES, 100_000, 0);
+        assert_eq!(size_of(big), 100_000);
+        assert_eq!(raw_captures_of(big), 0);
     }
 
     #[test]
