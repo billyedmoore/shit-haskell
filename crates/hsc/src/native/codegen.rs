@@ -522,6 +522,11 @@ fn operand_kind(prim: &str, slot: u32) -> u8 {
 /// A slot use that stands for every slot (nothing may be cleared).
 const ALL_LIVE: u32 = u32::MAX;
 
+/// Marks an `emit_cold_eval_operand` store target as closure field `Free(i)` (`i | STORE_FREE`)
+/// rather than a stack slot: the evaluated cell is written back into the closure (slot 0), so
+/// later checks of the same captured variable find the direct cell instead of an `IND`.
+const STORE_FREE: u32 = 1 << 27;
+
 impl Gen {
     fn new() -> Gen {
         Gen {
@@ -674,7 +679,11 @@ impl Gen {
             let _ = writeln!(g.out, "    je {slow_lbl}");
             let _ = writeln!(g.out, "    cmpb ${in_kind}, ({reg})");
             let _ = writeln!(g.out, "    jne {ind_lbl}");
-            if let Some(s) = store_slot {
+            if let Some(i) = store_slot.filter(|s| s & STORE_FREE != 0).map(|s| s & !STORE_FREE) {
+                // `%r14` is free here: the THUNK path below clobbers it too.
+                let _ = writeln!(g.out, "    movq {}(%rbp), %r14", p.slot_off(0));
+                let _ = writeln!(g.out, "    movq {reg}, {}(%r14)", 8 * (2 + i as i64));
+            } else if let Some(s) = store_slot {
                 let _ = writeln!(g.out, "    movq {reg}, {}(%rbp)", p.slot_off(s));
                 if let Some(c) = cached.iter().find(|c| c.slot == s && c.reg != reg) {
                     let _ = writeln!(g.out, "    movq {reg}, {}", c.reg);
@@ -709,7 +718,15 @@ impl Gen {
             let _ = writeln!(g.out, "    je {slow_lbl}");
             let _ = writeln!(g.out, "    cmpb ${in_kind}, (%r14)");
             let _ = writeln!(g.out, "    jne {slow_lbl}");
-            if let Some(s) = store_slot {
+            if let Some(i) = store_slot.filter(|s| s & STORE_FREE != 0).map(|s| s & !STORE_FREE) {
+                // The closure slot may have been cleared as dead before the call.
+                let skip = g.label("nofree");
+                let _ = writeln!(g.out, "    movq {}(%rbp), {reg}", p.slot_off(0));
+                let _ = writeln!(g.out, "    testq {reg}, {reg}");
+                let _ = writeln!(g.out, "    je {skip}");
+                let _ = writeln!(g.out, "    movq %r14, {}({reg})", 8 * (2 + i as i64));
+                g.put_label(&skip);
+            } else if let Some(s) = store_slot {
                 let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(s));
                 if let Some(c) = cached.iter().find(|c| c.slot == s && c.reg != reg) {
                     let _ = writeln!(g.out, "    movq %r14, {}", c.reg);
@@ -4737,6 +4754,18 @@ impl Gen {
                             self.live.pop();
                         }
                         let fast_kind = self.known_kind.clone();
+                        // A live scrutinee slot gets the evaluated cell written back, so later uses
+                        // (e.g. a strict constructor field after `case x of _ -> C x`) store the
+                        // direct cell rather than an `IND` that every later reader must chase.
+                        let write_back = match a {
+                            Atom::Slot(s) if s & RAW == 0 && (live.contains(s) || live.contains(&ALL_LIVE)) => Some(*s),
+                            _ => None,
+                        };
+                        let wb_regs: Vec<&'static str> = match write_back {
+                            Some(s) => self.cache.iter().filter(|c| c.slot == s).map(|c| c.reg).collect(),
+                            None => Vec::new(),
+                        };
+                        let ind_set = self.label("indset");
                         self.emit_cold(|g| {
                             g.put_label(&slow_chk);
                             let _ = writeln!(g.out, "    je {eval}");
@@ -4748,8 +4777,19 @@ impl Gen {
                                 let _ = writeln!(g.out, "    je {value}");
                             }
                             let _ = writeln!(g.out, "    cmpb ${THUNK}, (%r14)");
-                            let _ = writeln!(g.out, "    jb {value}");
-                            let _ = writeln!(g.out, "    jmp {slow_chk}");
+                            if let Some(s) = write_back {
+                                let _ = writeln!(g.out, "    jb {ind_set}");
+                                let _ = writeln!(g.out, "    jmp {slow_chk}");
+                                g.put_label(&ind_set);
+                                let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(s));
+                                for r in &wb_regs {
+                                    let _ = writeln!(g.out, "    movq %r14, {r}");
+                                }
+                                let _ = writeln!(g.out, "    jmp {value}");
+                            } else {
+                                let _ = writeln!(g.out, "    jb {value}");
+                                let _ = writeln!(g.out, "    jmp {slow_chk}");
+                            }
                             g.put_label(&eval);
                             g.safe_slots = saved_safe;
                             g.save_cache(&saved_cache, p);
@@ -4766,6 +4806,9 @@ impl Gen {
                             let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
                             g.put_label(&cont);
                             g.emit("addq $8, %rbp");
+                            if let Some(s) = write_back {
+                                let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(s));
+                            }
                             g.reload_cache(&post_cache, p);
                             let _ = writeln!(g.out, "    jmp {ready}");
                         });
@@ -6899,7 +6942,11 @@ impl Gen {
                 }
             }
             let is_last_check = idx == 1 || !chk1;
-            let native_eval = store_slot.is_some() || (is_last_check && non_slot_eval_ok);
+            let store_target = store_slot.or(match a {
+                Atom::Free(i) if *i < STORE_FREE => Some(*i | STORE_FREE),
+                _ => None,
+            });
+            let native_eval = store_target.is_some() || (is_last_check && non_slot_eval_ok);
             self.emit(&format!("cmpb ${in_kind}, (%rax)"));
             self.fast_slow_used = true;
             if idx == 0 && have_ops_lbl.is_some() {
@@ -6936,7 +6983,7 @@ impl Gen {
                 let _ = writeln!(self.out, "    jne {eval_lbl}");
                 self.put_label(&got_lbl);
                 self.emit_cold_eval_operand(
-                    &eval_lbl, &got_lbl, slow, "%rax", in_kind, store_slot, false, &cached, safe_snap, p,
+                    &eval_lbl, &got_lbl, slow, "%rax", in_kind, store_target, false, &cached, safe_snap, p,
                 );
             } else {
                 self.emit(&format!("jne {slow}"));
