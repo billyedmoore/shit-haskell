@@ -1923,6 +1923,9 @@ enum LocalTrigger {
         scrut_free: Option<String>,
         scrut_param: Option<usize>,
     },
+    /// A recursive list consumer (`go [] = ..; go (x : xs) = .. go xs ..`, recursing only on the
+    /// tail): unrolled at calls whose list argument (this parameter) is a short explicit list.
+    ListUnroll(usize),
 }
 
 struct Simp<'a> {
@@ -2173,6 +2176,14 @@ impl Simp<'_> {
                                         },
                                     ),
                                 );
+                                local_template_added = Some(name.clone());
+                            }
+                        }
+                    } else if !self.pending.keys().any(|k| mentions(rhs, k)) {
+                        let (ps, inner) = params(rhs);
+                        if let Some(i) = list_unroll_param(name, &ps, inner) {
+                            if hot_size(inner, self.tune.push_call_size + 1) <= self.tune.push_call_size {
+                                self.local_templates.insert(name.clone(), (ps.len(), rhs.clone(), LocalTrigger::ListUnroll(i)));
                                 local_template_added = Some(name.clone());
                             }
                         }
@@ -3231,6 +3242,38 @@ impl Simp<'_> {
         if target == "GHC.Internal.Base.foldr" && !self.rules.by_head.contains_key(g) {
             g = target;
         }
+        // "foldr/literal" (arguments are already simplified, so a single-use list binding has
+        // been substituted): `foldr k z [x1, .., xn]` over a short explicit list is
+        // `k x1 (.. (k xn z))` (GHC gets this by desugaring explicit lists with `build`): no
+        // list cells, no loop, and `concatMap f [a, b, c]` becomes `f a ++ (f b ++ f c)`.
+        if target == "GHC.Internal.Base.foldr" && args.len() >= 3 {
+            if let Some(elems) = literal_list(args[2], FOLDR_LITERAL_MAX) {
+                *self.fresh += 1;
+                let k = if is_atom(args[0]) {
+                    args[0].clone()
+                } else {
+                    Core::Var(format!("fl~{}", self.fresh))
+                };
+                let mut out = args[1].clone();
+                for x in elems.into_iter().rev() {
+                    out = Core::App(Box::new(Core::App(Box::new(k.clone()), Box::new(x.clone()))), Box::new(out));
+                }
+                for a in args.iter().skip(3) {
+                    out = Core::App(Box::new(out), Box::new((*a).clone()));
+                }
+                if let Core::Var(name) = &k {
+                    if !is_atom(args[0]) {
+                        out = Core::Let(vec![(name.clone(), args[0].clone())], Box::new(out));
+                    }
+                }
+                if std::env::var_os("HSC_DEBUG_RULES").is_some() {
+                    eprintln!("rule foldr/literal fired in {}", self.this);
+                }
+                *c = out;
+                self.rule_budget -= 1;
+                return true;
+            }
+        }
         let Some(candidates) = self.rules.by_head.get(g) else { return false };
         for rule in candidates {
             if !rule.active(self.phase) || args.len() < rule.args.len() {
@@ -3327,6 +3370,7 @@ impl Simp<'_> {
             }
             let fire = match trigger {
                 LocalTrigger::Always => true,
+                LocalTrigger::ListUnroll(_) => false,
                 LocalTrigger::Conditional {
                     ho_params,
                     scrut_free,
@@ -3350,6 +3394,9 @@ impl Simp<'_> {
                         })
                 }
             };
+            let fire = fire
+                || matches!(trigger, LocalTrigger::ListUnroll(i)
+                    if args.get(*i).is_some_and(|a| literal_list(a, FOLDR_LITERAL_MAX).is_some()));
             if !fire {
                 return;
             }
@@ -4617,6 +4664,69 @@ fn extract_rules(binds: &[TopBind]) -> Vec<RuleDef> {
         out.push(RuleDef { name: b.name.clone(), act, vars, head: head.clone(), args, rhs });
     }
     out
+}
+
+/// The longest explicit list "foldr/literal" unrolls.
+const FOLDR_LITERAL_MAX: usize = 8;
+
+/// The list parameter of a recursive local function `f` that a "list unroll" template can
+/// unroll: the body is `case p_i of` with a cons alternative `x : xs`, and every occurrence of
+/// `f` is a call with at least `ps.len()` arguments whose `i`th is `xs` (so each unrolled step
+/// consumes a cell and the unrolling ends with the explicit list).
+fn list_unroll_param(f: &str, ps: &[&str], inner: &Core) -> Option<usize> {
+    let Core::Case(scrut, _, alts) = inner else { return None };
+    let Core::Var(v) = scrut.as_ref() else { return None };
+    let i = ps.iter().position(|p| p == v)?;
+    let tail = alts.iter().find_map(|a| match a {
+        Alt::Con(c, fs, _) if c == "Builtin.:" && fs.len() == 2 => Some(fs[1].as_str()),
+        _ => None,
+    })?;
+    fn ok(e: &Core, f: &str, n: usize, i: usize, tail: &str) -> bool {
+        let mut args = Vec::new();
+        let mut h = e;
+        while let Core::App(g, a) = h {
+            args.push(&**a);
+            h = g;
+        }
+        if let Core::Var(g) = h {
+            if g == f {
+                args.reverse();
+                return args.len() >= n
+                    && matches!(args[i], Core::Var(t) if t == tail)
+                    && args.iter().all(|a| ok(a, f, n, i, tail));
+            }
+        }
+        match e {
+            Core::Var(g) => g != f,
+            Core::Lit(_) | Core::Fail(_) => true,
+            Core::App(g, a) => ok(g, f, n, i, tail) && ok(a, f, n, i, tail),
+            Core::Lam(x, b) => x != f && ok(b, f, n, i, tail),
+            Core::Let(bs, b) => bs.iter().all(|(x, r)| x != f && ok(r, f, n, i, tail)) && ok(b, f, n, i, tail),
+            Core::Case(s, _, alts) => {
+                ok(s, f, n, i, tail)
+                    && alts.iter().all(|a| match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => ok(b, f, n, i, tail),
+                    })
+            }
+            Core::Con(_, xs) | Core::Prim(_, xs) => xs.iter().all(|x| ok(x, f, n, i, tail)),
+        }
+    }
+    ok(inner, f, ps.len(), i, tail).then_some(i)
+}
+
+/// The elements of an explicit list `[x1, .., xn]` (`n <= max`) built from constructors.
+fn literal_list(mut e: &Core, max: usize) -> Option<Vec<&Core>> {
+    let mut out = Vec::new();
+    loop {
+        match e {
+            Core::Con(c, fs) if c == "Builtin.[]" && fs.is_empty() => return Some(out),
+            Core::Con(c, fs) if c == "Builtin.:" && fs.len() == 2 && out.len() < max => {
+                out.push(&fs[0]);
+                e = &fs[1];
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// "fold/build" and "foldr/augment", whose `g` has a rank-2 type the checker cannot give a rule
@@ -10315,6 +10425,31 @@ mod rule_tests {
             !rendered.contains("D:Eq"),
             "D:Eq case should fold away in specialized T.elem: {rendered}"
         );
+    }
+
+    #[test]
+    fn literal_list_and_list_unroll_param() {
+        let cons = |h: Core, t: Core| Core::Con("Builtin.:".into(), vec![h, t]);
+        let nil = || Core::Con("Builtin.[]".into(), vec![]);
+        let l = cons(v("a"), cons(v("b"), nil()));
+        assert_eq!(literal_list(&l, 8).map(|e| e.len()), Some(2));
+        assert!(literal_list(&l, 1).is_none());
+        assert!(literal_list(&cons(v("a"), v("xs")), 8).is_none());
+        // go xs = case xs of [] -> z; y : ys -> k y (go ys)
+        let body = |rec_arg: Core| {
+            Core::Case(
+                Box::new(v("xs")),
+                "cb".into(),
+                vec![
+                    Alt::Con("Builtin.[]".into(), vec![], v("z")),
+                    Alt::Con("Builtin.:".into(), vec!["y".into(), "ys".into()], app(v("k"), vec![v("y"), app(v("go"), vec![rec_arg])])),
+                ],
+            )
+        };
+        assert_eq!(list_unroll_param("go", &["xs"], &body(v("ys"))), Some(0));
+        // Recursing on anything but the tail (here a growing list) must not unroll.
+        assert_eq!(list_unroll_param("go", &["xs"], &body(cons(v("y"), v("ys")))), None);
+        assert_eq!(list_unroll_param("go", &["xs"], &body(v("xs"))), None);
     }
 
     #[test]
