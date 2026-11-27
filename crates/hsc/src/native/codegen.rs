@@ -179,6 +179,9 @@ pub struct Gen {
     /// Loop-invariant stack parameter slots whose heap tag (`BYTES` or `REF`) was verified/forced
     /// once in the self-loop pre-header so the loop body can omit per-iteration tag checks.
     loop_known_kinds: Vec<(u32, u8)>,
+    /// Loop-varying boxed stack parameter slots (`1 <= slot <= arity`) kept in `CACHE_REGS`
+    /// across a self-loop's `.Lloop` back-edge: `(slot, reg)`.
+    self_reg_ptr_args: Vec<(u32, &'static str)>,
     /// Static objects (label, header, payload: a number or a label).
     statics: Vec<(String, u64, String)>,
     /// Multi-field static constructor objects emitted in `.data.rel.ro`: `(label, header, fields)`.
@@ -189,8 +192,12 @@ pub struct Gen {
     static_cells: HashMap<(u64, u64), String>,
     /// Shared static cells for constructors without fields, indexed by constructor ID.
     nullary_cons: HashMap<u32, String>,
-    /// Global indices whose body is a nullary constructor (loaded directly via `leaq`).
+    /// Global indices whose body is a nullary constructor or static literal (loaded directly via `leaq`).
     nullary_globals: HashMap<u32, String>,
+    /// Global indices whose body is a static scalar literal (`Int`, `Char`, `Double`).
+    static_lit_globals: HashMap<u32, SLit>,
+    /// Boxed operand slots `(slot, kind)` tag-checked by the most recent `int_fast_path`.
+    fast_checked_slots: Vec<(u32, u8)>,
     /// Byte strings (label, bytes).
     strings: Vec<(String, Vec<u8>)>,
     /// Deduplicated byte strings.
@@ -460,6 +467,13 @@ fn raw_idx(k: u32) -> u32 {
     k & !RAW_MASK
 }
 
+/// Whether two frame slot identifiers refer to the same physical slot in `Gen::cache`
+/// (distinguishing boxed pointer slots from raw slots, and normalizing raw tag bits).
+#[inline]
+fn same_cache_slot(a: u32, b: u32) -> bool {
+    (a & RAW) == (b & RAW) && if a & RAW != 0 { raw_idx(a) == raw_idx(b) } else { a == b }
+}
+
 /// Boxed heap cell kind corresponding to a raw slot's tag bits.
 fn raw_slot_kind(k: u32) -> u8 {
     if k & RAW_CHAR != 0 {
@@ -507,12 +521,15 @@ impl Gen {
             current_self: None,
             self_dead_state_params: 0,
             loop_known_kinds: Vec::new(),
+            self_reg_ptr_args: Vec::new(),
             statics: Vec::new(),
             rel_cons: Vec::new(),
             static_cons: HashMap::new(),
             static_cells: HashMap::new(),
             nullary_cons: HashMap::new(),
             nullary_globals: HashMap::new(),
+            static_lit_globals: HashMap::new(),
+            fast_checked_slots: Vec::new(),
             strings: Vec::new(),
             string_pool: HashMap::new(),
             joins: HashMap::new(),
@@ -537,6 +554,16 @@ impl Gen {
             uses_charlike: false,
             rodata_tables: Vec::new(),
             cold_out: String::new(),
+        }
+    }
+
+    /// Resolves a direct literal or a top-level constant scalar literal global (e.g. `delta = 3`).
+    #[inline]
+    fn atom_lit<'a>(&'a self, a: &'a Atom) -> Option<&'a SLit> {
+        match a {
+            Atom::Lit(l) => Some(l),
+            Atom::Global(g) => self.static_lit_globals.get(g),
+            _ => None,
         }
     }
 
@@ -569,10 +596,17 @@ impl Gen {
     }
 
     /// Emits cold assembly (GC/yield/slow/failure paths) into a separate buffer appended after
-    /// the enclosing closure's hot body. Safe to nest: inner cold blocks append first.
+    /// the enclosing closure's hot body. Safe to nest: inner cold blocks append first, and
+    /// per-path codegen state (`safe_slots`, `cache`, `known_kind`) is isolated from the hot path.
     fn emit_cold(&mut self, f: impl FnOnce(&mut Self)) {
         let saved = std::mem::take(&mut self.out);
+        let saved_safe = self.safe_slots;
+        let saved_cache = self.cache.clone();
+        let saved_kind = self.known_kind.clone();
         f(self);
+        self.safe_slots = saved_safe;
+        self.cache = saved_cache;
+        self.known_kind = saved_kind;
         let chunk = std::mem::replace(&mut self.out, saved);
         self.cold_out.push_str(&chunk);
     }
@@ -623,6 +657,9 @@ impl Gen {
             let _ = writeln!(g.out, "    jne {ind_lbl}");
             if let Some(s) = store_slot {
                 let _ = writeln!(g.out, "    movq {reg}, {}(%rbp)", p.slot_off(s));
+                if let Some(c) = cached.iter().find(|c| c.slot == s && c.reg != reg) {
+                    let _ = writeln!(g.out, "    movq {reg}, {}", c.reg);
+                }
             }
             let _ = writeln!(g.out, "    jmp {got_lbl}");
             g.put_label(&chk_thk);
@@ -655,6 +692,9 @@ impl Gen {
             let _ = writeln!(g.out, "    jne {slow_lbl}");
             if let Some(s) = store_slot {
                 let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(s));
+                if let Some(c) = cached.iter().find(|c| c.slot == s && c.reg != reg) {
+                    let _ = writeln!(g.out, "    movq %r14, {}", c.reg);
+                }
             }
             let _ = writeln!(g.out, "    movq %r14, {reg}");
             let _ = writeln!(g.out, "    jmp {got_lbl}");
@@ -729,6 +769,9 @@ impl Gen {
                     SExpr::Atom(Atom::Lit(l)) => {
                         if let Some(lbl) = g.static_literal_label(l) {
                             g.nullary_globals.insert(gi as u32, lbl);
+                            if matches!(l, SLit::Int(_) | SLit::Char(_) | SLit::Double(_)) {
+                                g.static_lit_globals.insert(gi as u32, l.clone());
+                            }
                         }
                     }
                     _ => {}
@@ -757,6 +800,12 @@ impl Gen {
                         if !g.nullary_globals.contains_key(&key) {
                             if let Some(lbl) = g.nullary_globals.get(target).cloned() {
                                 g.nullary_globals.insert(key, lbl);
+                                changed = true;
+                            }
+                        }
+                        if !g.static_lit_globals.contains_key(&key) {
+                            if let Some(lit) = g.static_lit_globals.get(target).cloned() {
+                                g.static_lit_globals.insert(key, lit);
                                 changed = true;
                             }
                         }
@@ -1009,19 +1058,55 @@ impl Gen {
         }
     }
 
-    /// Saves all cached raw registers to their frame slots (for a cold call/GC that clobbers
-    /// caller-saved registers).
-    fn save_cache(&mut self, cached: &[Cached], p: Pos) {
-        for c in cached {
-            let _ = writeln!(self.out, "    movq {}, {}(%rbp)", c.reg, p.slot_off(c.slot));
+    /// Removes any cached register entry for `k` without storing it (used when `k` is overwritten
+    /// directly in the frame or cleared).
+    #[inline]
+    fn evict_slot(&mut self, k: u32) {
+        if k != UNUSED_SLOT {
+            self.cache.retain(|c| !same_cache_slot(c.slot, k));
         }
     }
 
-    /// Reloads cached raw registers from their frame slots after a cold call/GC.
+    /// Saves all cached registers (raw and boxed pointer) to their frame slots (for a cold
+    /// call/GC that clobbers caller-saved registers), marking saved boxed pointer slots safe.
+    fn save_cache(&mut self, cached: &[Cached], p: Pos) {
+        for c in cached {
+            let _ = writeln!(self.out, "    movq {}, {}(%rbp)", c.reg, p.slot_off(c.slot));
+            if c.slot & RAW == 0 {
+                self.mark_slot_safe(c.slot);
+            }
+        }
+    }
+
+    /// Reloads cached registers from their frame slots after a cold call/GC.
     fn reload_cache(&mut self, cached: &[Cached], p: Pos) {
         for c in cached {
             let _ = writeln!(self.out, "    movq {}(%rbp), {}", p.slot_off(c.slot), c.reg);
         }
+    }
+
+    /// Computes `safe_slots` at a non-inlined join label: `base_safe`, plus `params`, plus any
+    /// boxed pointer slot cached at the join definition that is live in the join body (flushed
+    /// before every non-inlined `Jump`).
+    fn join_safe_slots(&self, base_safe: u64, cached: &[Cached], id: u32, params: &[u32]) -> u64 {
+        let mut safe = base_safe;
+        for &s in params {
+            if s != UNUSED_SLOT && s & RAW == 0 && s < 64 {
+                safe |= 1u64 << s;
+            }
+        }
+        if let Some(uses) = self.join_uses.get(&id) {
+            for c in cached {
+                if c.slot != UNUSED_SLOT
+                    && c.slot & RAW == 0
+                    && c.slot < 64
+                    && (uses.contains(&c.slot) || uses.contains(&ALL_LIVE))
+                {
+                    safe |= 1u64 << c.slot;
+                }
+            }
+        }
+        safe
     }
 
     /// Chases any `IND` chain in pointer slot `slot` and writes the direct cell back to the slot
@@ -1496,6 +1581,146 @@ impl Gen {
         out
     }
 
+    /// Picks up to 2 loop-varying boxed stack parameters (`1 <= slot <= arity`, with
+    /// `reg_raw_args + ptr_args <= 3`) of a self-looping closure to keep in `CACHE_REGS` across
+    /// the `.Lloop` back-edge, eliminating per-iteration stack spills and reloads.
+    fn find_self_reg_ptr_args(
+        &self,
+        entry_label: &str,
+        c: &SClosure,
+        hoisted: &[(u32, u8)],
+    ) -> Vec<(u32, &'static str)> {
+        if c.arity == 0 || c.nslots > 64 || !c.raw_args.iter().all(|(a, _)| *a == 0) {
+            return Vec::new();
+        }
+        let reg_raw_n = c.raw_args.len();
+        let budget = 2usize.min(3usize.saturating_sub(reg_raw_n));
+        if budget == 0 {
+            return Vec::new();
+        }
+        let cap = c.arity.min(63);
+        let mut written = 0u64;
+        fn collect_writes(e: &SExpr, cap: u32, written: &mut u64) {
+            fn mark(s: u32, cap: u32, written: &mut u64) {
+                if s != UNUSED_SLOT && s & RAW == 0 && s >= 1 && s <= cap {
+                    *written |= 1u64 << s;
+                }
+            }
+            match e {
+                SExpr::Let(binds, body) => {
+                    for (s, _) in binds {
+                        mark(*s, cap, written);
+                    }
+                    collect_writes(body, cap, written);
+                }
+                SExpr::Join(_, params, code, body) => {
+                    for p in params {
+                        mark(*p, cap, written);
+                    }
+                    collect_writes(code, cap, written);
+                    collect_writes(body, cap, written);
+                }
+                SExpr::Case(scrut, bslot, alts) => {
+                    mark(*bslot, cap, written);
+                    collect_writes(scrut, cap, written);
+                    for a in alts {
+                        match a {
+                            SAlt::Con(_, slots, b) => {
+                                for s in slots {
+                                    mark(*s, cap, written);
+                                }
+                                collect_writes(b, cap, written);
+                            }
+                            SAlt::Lit(_, b) | SAlt::Default(b) => collect_writes(b, cap, written),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect_writes(&c.body, cap, &mut written);
+        let mut varying = 0u64;
+        fn collect_varying(
+            g: &Gen,
+            entry_label: &str,
+            self_arity: u32,
+            cap: u32,
+            e: &SExpr,
+            varying: &mut u64,
+        ) {
+            match e {
+                SExpr::App(func, args) => {
+                    if g.known_global_entry(func, args.len()).is_some_and(|(l, _)| l == entry_label)
+                        && args.len() == self_arity as usize
+                    {
+                        for k in 1..=cap {
+                            if !matches!(args[(k - 1) as usize], Atom::Slot(s) if s == k) {
+                                *varying |= 1u64 << k;
+                            }
+                        }
+                    }
+                }
+                SExpr::CallWorker(w, args) => {
+                    if let Some(Some((l, raw_pos, _, _))) = g.workers.get(*w as usize) {
+                        let mut reg_raw = 0usize;
+                        let mut stack_args = Vec::new();
+                        for (i, a) in args.iter().enumerate() {
+                            if raw_pos.get(i).copied().unwrap_or(false) && reg_raw < MAX_REG_RAW_ARGS {
+                                reg_raw += 1;
+                            } else {
+                                stack_args.push(a);
+                            }
+                        }
+                        if l == entry_label && stack_args.len() == self_arity as usize {
+                            for k in 1..=cap {
+                                if !matches!(stack_args[(k - 1) as usize], Atom::Slot(s) if *s == k) {
+                                    *varying |= 1u64 << k;
+                                }
+                            }
+                        }
+                    }
+                }
+                SExpr::Let(_, body) => collect_varying(g, entry_label, self_arity, cap, body, varying),
+                SExpr::Join(_, _, code, body) => {
+                    collect_varying(g, entry_label, self_arity, cap, code, varying);
+                    collect_varying(g, entry_label, self_arity, cap, body, varying);
+                }
+                SExpr::Case(scrut, _, alts) => {
+                    collect_varying(g, entry_label, self_arity, cap, scrut, varying);
+                    for a in alts {
+                        match a {
+                            SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => {
+                                collect_varying(g, entry_label, self_arity, cap, b, varying);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect_varying(self, entry_label, c.arity, cap, &c.body, &mut varying);
+        let mut uses = std::collections::HashSet::new();
+        self.slot_uses(&c.body, &mut uses);
+        let mut out = Vec::new();
+        for k in 1..=cap {
+            if out.len() >= budget {
+                break;
+            }
+            let bit = 1u64 << k;
+            if varying & bit == 0
+                || written & bit != 0
+                || self.self_dead_state_params & bit != 0
+                || hoisted.iter().any(|&(s, _)| s == k)
+                || (!uses.contains(&k) && !uses.contains(&ALL_LIVE))
+            {
+                continue;
+            }
+            let reg = CACHE_REGS[reg_raw_n + out.len()];
+            out.push((k, reg));
+        }
+        out
+    }
+
     /// Emits a frameless fast-exit before frame allocation and preemption check when a closure
     /// starts with a raw register comparison whose taken or untaken branch is a trivial leaf
     /// return (e.g. `fib`'s `n < 2 -> n`). Returns the remaining (non-leaf) branch to emit after
@@ -1746,6 +1971,7 @@ impl Gen {
         self.cold_out.clear();
         self.self_dead_state_params = 0;
         self.loop_known_kinds.clear();
+        self.self_reg_ptr_args.clear();
         let sel_info = self.selector_info(c);
         if let Some((con_id, field_word)) = sel_info {
             self.selectors.push((label.to_string(), con_id, field_word));
@@ -1770,6 +1996,7 @@ impl Gen {
             self.current_self = Some((label.to_string(), ll.clone(), c.arity));
             self.self_dead_state_params = Self::find_dead_state_params(&c.body, c.arity);
             self.loop_known_kinds = self.find_hoistable_loop_kinds(label, c);
+            self.self_reg_ptr_args = self.find_self_reg_ptr_args(label, c, &self.loop_known_kinds);
             Some(ll)
         } else {
             self.current_self = None;
@@ -1820,6 +2047,7 @@ impl Gen {
         }
         let mut pre_safe = 0u64;
         let hoisted = self.loop_known_kinds.clone();
+        let reg_ptrs = self.self_reg_ptr_args.clone();
         if let Some(ll) = &loop_lbl {
             // Hoist zeroing of cold local pointer slots never written on any path back to `.Lloop`
             // so loops with hot calls/GC points don't re-zero them on every iteration.
@@ -1871,6 +2099,9 @@ impl Gen {
                     let _ = writeln!(g.out, "    jmp {pre_ok}");
                 });
             }
+            for &(slot, reg) in &reg_ptrs {
+                let _ = writeln!(self.out, "    movq {}(%rbp), {reg}", f.off(slot));
+            }
             self.emit(".p2align 4");
             self.put_label(ll);
             for &(slot, kind) in &hoisted {
@@ -1911,6 +2142,9 @@ impl Gen {
                 let _ = writeln!(self.out, "    movq $0, {}(%rbp)", f.off(arg));
             }
         }
+        for &(slot, reg) in &reg_ptrs {
+            self.cache_put(slot, reg, true);
+        }
         // A function's entry is a preemption point (inline arithmetic has none, and every loop
         // goes through one): at the end of a time slice another thread runs, and an exception
         // thrown to this one is raised. Yield stub is emitted out-of-line in `cold_out`.
@@ -1941,6 +2175,7 @@ impl Gen {
         self.current_self = None;
         self.self_dead_state_params = 0;
         self.loop_known_kinds.clear();
+        self.self_reg_ptr_args.clear();
     }
 
     /// Leaves a WHNF value in R1 as the result of the expression.
@@ -1982,15 +2217,13 @@ impl Gen {
         self.cache.clear();
     }
 
-    /// Records the raw slots each expression in `e` uses (its own, and those of the join points
-    /// it jumps to), answering `e`'s.
+    /// Records the frame slots (raw and boxed pointer) each expression in `e` uses (its own,
+    /// and those of the join points it jumps to), answering `e`'s.
     fn find_raw_uses(&mut self, e: &SExpr, joins: &mut HashMap<u32, Vec<u32>>) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         let atom = |a: &Atom, out: &mut Vec<u32>| {
             if let Atom::Slot(k) = a {
-                if k & RAW != 0 {
-                    out.push(*k);
-                }
+                out.push(*k);
             }
         };
         match e {
@@ -2009,19 +2242,34 @@ impl Gen {
                     }
                 }
                 out.extend(self.find_raw_uses(body, joins));
+                out.retain(|&s| {
+                    s == ALL_LIVE
+                        || !binds.iter().any(|(bs, _)| *bs != UNUSED_SLOT && same_cache_slot(s, *bs))
+                });
             }
             SExpr::Case(scrut, bslot, alts) => {
                 let mut alt_uses = Vec::new();
                 for a in alts {
                     match a {
-                        SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => {
+                        SAlt::Con(_, slots, b) => {
+                            let mut bu = self.find_raw_uses(b, joins);
+                            if slots.iter().any(|&sl| sl != UNUSED_SLOT) {
+                                bu.retain(|&s| {
+                                    s == ALL_LIVE
+                                        || !slots
+                                            .iter()
+                                            .any(|&sl| sl != UNUSED_SLOT && same_cache_slot(s, sl))
+                                });
+                            }
+                            alt_uses.extend(bu);
+                        }
+                        SAlt::Lit(_, b) | SAlt::Default(b) => {
                             alt_uses.extend(self.find_raw_uses(b, joins));
                         }
                     }
                 }
-                if *bslot & RAW != 0 {
-                    let b_idx = raw_idx(*bslot);
-                    alt_uses.retain(|&s| s == ALL_LIVE || raw_idx(s) != b_idx);
+                if *bslot != UNUSED_SLOT {
+                    alt_uses.retain(|&s| s == ALL_LIVE || !same_cache_slot(s, *bslot));
                 }
                 out.extend(alt_uses);
                 out.extend(self.find_raw_uses(scrut, joins));
@@ -2034,7 +2282,7 @@ impl Gen {
                 if !params.is_empty() {
                     uses.retain(|&s| {
                         s == ALL_LIVE
-                            || !params.iter().any(|&p| p & RAW != 0 && raw_idx(p) == raw_idx(s))
+                            || !params.iter().any(|&p| p != UNUSED_SLOT && same_cache_slot(s, p))
                     });
                 }
                 joins.insert(*id, uses.clone());
@@ -2061,7 +2309,7 @@ impl Gen {
         out
     }
 
-    /// Linearly propagates a recursive join point's free raw uses along back-edge paths in `code`
+    /// Linearly propagates a recursive join point's free slot uses along back-edge paths in `code`
     /// without re-traversing nested joins exponentially.
     fn propagate_join_uses(
         raw_uses: &mut HashMap<*const SExpr, Vec<u32>>,
@@ -2083,14 +2331,35 @@ impl Gen {
             | SExpr::Closure(_)
             | SExpr::Fail(_) => false,
             SExpr::Jump(id, _) => reaching.contains(id),
-            SExpr::Let(_, body) => Self::propagate_join_uses(raw_uses, body, reaching, extra),
-            SExpr::Case(scrut, bslot, alts) => {
-                let alt_extra: &[u32] = if *bslot & RAW != 0 {
-                    let bi = raw_idx(*bslot);
+            SExpr::Let(binds, body) => {
+                let body_extra: &[u32] = if binds.iter().any(|(bs, _)| *bs != UNUSED_SLOT) {
                     filtered_buf = extra
                         .iter()
                         .copied()
-                        .filter(|&s| s == ALL_LIVE || raw_idx(s) != bi)
+                        .filter(|&s| {
+                            s == ALL_LIVE
+                                || !binds
+                                    .iter()
+                                    .any(|(bs, _)| *bs != UNUSED_SLOT && same_cache_slot(s, *bs))
+                        })
+                        .collect();
+                    &filtered_buf
+                } else {
+                    extra
+                };
+                let r = !body_extra.is_empty()
+                    && Self::propagate_join_uses(raw_uses, body, reaching, body_extra);
+                if r {
+                    add_extra = body_extra;
+                }
+                r
+            }
+            SExpr::Case(scrut, bslot, alts) => {
+                let alt_extra: &[u32] = if *bslot != UNUSED_SLOT {
+                    filtered_buf = extra
+                        .iter()
+                        .copied()
+                        .filter(|&s| s == ALL_LIVE || !same_cache_slot(s, *bslot))
                         .collect();
                     &filtered_buf
                 } else {
@@ -2099,9 +2368,35 @@ impl Gen {
                 let mut any_alt = false;
                 if !alt_extra.is_empty() {
                     for a in alts {
-                        let (SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b)) = a;
-                        if Self::propagate_join_uses(raw_uses, b, reaching, alt_extra) {
-                            any_alt = true;
+                        match a {
+                            SAlt::Con(_, slots, b) => {
+                                let con_buf: Vec<u32>;
+                                let con_extra: &[u32] = if slots.iter().any(|&sl| sl != UNUSED_SLOT) {
+                                    con_buf = alt_extra
+                                        .iter()
+                                        .copied()
+                                        .filter(|&s| {
+                                            s == ALL_LIVE
+                                                || !slots.iter().any(|&sl| {
+                                                    sl != UNUSED_SLOT && same_cache_slot(s, sl)
+                                                })
+                                        })
+                                        .collect();
+                                    &con_buf
+                                } else {
+                                    alt_extra
+                                };
+                                if !con_extra.is_empty()
+                                    && Self::propagate_join_uses(raw_uses, b, reaching, con_extra)
+                                {
+                                    any_alt = true;
+                                }
+                            }
+                            SAlt::Lit(_, b) | SAlt::Default(b) => {
+                                if Self::propagate_join_uses(raw_uses, b, reaching, alt_extra) {
+                                    any_alt = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -2115,13 +2410,15 @@ impl Gen {
                 if reaching.contains(id) {
                     return false;
                 }
-                let code_extra: &[u32] = if params.iter().any(|&p| p & RAW != 0) {
+                let code_extra: &[u32] = if params.iter().any(|&p| p != UNUSED_SLOT) {
                     filtered_buf = extra
                         .iter()
                         .copied()
                         .filter(|&s| {
                             s == ALL_LIVE
-                                || !params.iter().any(|&p| p & RAW != 0 && raw_idx(p) == raw_idx(s))
+                                || !params
+                                    .iter()
+                                    .any(|&p| p != UNUSED_SLOT && same_cache_slot(s, p))
                         })
                         .collect();
                     &filtered_buf
@@ -2153,8 +2450,8 @@ impl Gen {
         reaches
     }
 
-    /// Whether raw slot `k` may be used by `e` or by what follows it (for a scrutinee, the
-    /// enclosing cases' alternatives).
+    /// Whether slot `k` (raw or boxed pointer) may be used by `e` or by what follows it (for a
+    /// scrutinee, the enclosing cases' alternatives).
     fn raw_live(&self, k: u32, e: &SExpr, p: Pos) -> bool {
         let Some(uses) = self.raw_uses.get(&(e as *const SExpr)) else { return true };
         if uses.binary_search(&k).is_ok() || uses.binary_search(&ALL_LIVE).is_ok() {
@@ -2163,20 +2460,17 @@ impl Gen {
         p.mode == Mode::Scrut && self.live.last().is_none_or(|l| l.contains(&k) || l.contains(&ALL_LIVE))
     }
 
-    /// Forgets the cached numbers that neither `e` nor what follows it uses.
+    /// Forgets the cached values that neither `e` nor what follows it uses.
     fn drop_dead(&mut self, e: &SExpr, p: Pos) {
         let cache = std::mem::take(&mut self.cache);
         self.cache = cache.into_iter().filter(|c| self.raw_live(c.slot, e, p)).collect();
     }
 
-    /// Whether an expression's code reads or preserves cached numbers in `CACHE_REGS` (see `expr`).
+    /// Whether an expression's code reads or preserves cached values in `CACHE_REGS` (see `expr`).
     fn keeps_cache(&self, e: &SExpr, p: Pos) -> bool {
         let tail = p.mode == Mode::Tail;
         // Atoms that are loaded without calling the runtime.
-        let plain = |a: &Atom| {
-            !matches!(a, Atom::Lit(l) if !matches!(l, SLit::Int(_) | SLit::Char(_) | SLit::Double(_))
-                && !matches!(l, SLit::Integer(s) if s.parse::<i64>().is_ok()))
-        };
+        let plain = |a: &Atom| !matches!(a, Atom::Lit(l) if !is_static_slit(l));
         let no_rt_lit_alt = |alts: &[SAlt]| {
             !alts.iter().any(|a| {
                 matches!(a, SAlt::Lit(l, _) if !matches!(l, Lit::Int(_) | Lit::Char(_) | Lit::Double(_)))
@@ -2190,11 +2484,16 @@ impl Gen {
                         || (matches!(a, Atom::Slot(_) | Atom::Free(_) | Atom::Global(_)) && no_rt_lit_alt(alts))
                 }
                 SExpr::CallWorker(_, args) => args.iter().all(plain),
+                SExpr::App(f, args) => plain(f) && args.iter().all(plain),
                 _ => false,
             },
-            SExpr::Atom(Atom::Slot(k)) => k & RAW != 0,
-            SExpr::Atom(Atom::Lit(SLit::Int(_) | SLit::Char(_) | SLit::Double(_))) => tail && self.ret_raw,
-            SExpr::App(f, args) => tail && plain(f) && args.iter().all(plain),
+            SExpr::Atom(Atom::Slot(k)) => *k & RAW != 0 || tail,
+            SExpr::Atom(Atom::Free(_) | Atom::Global(_)) => tail,
+            SExpr::Atom(Atom::Lit(l)) => {
+                (tail && self.ret_raw && matches!(l, SLit::Int(_) | SLit::Char(_) | SLit::Double(_)))
+                    || (tail && is_static_slit(l))
+            }
+            SExpr::App(f, args) => plain(f) && args.iter().all(plain),
             SExpr::CallWorker(_, args) => args.iter().all(plain),
             SExpr::Let(binds, _) => binds.iter().all(|(_, b)| b.atoms().iter().all(plain)),
             SExpr::Con(_, args) => args.iter().all(plain),
@@ -2205,50 +2504,65 @@ impl Gen {
         }
     }
 
-    /// The register holding raw slot `k`'s number, if one does.
+    /// The register holding slot `k`'s value (raw or boxed pointer), if one does.
     fn cached(&self, k: u32) -> Option<&'static str> {
         self.cache.iter().find(|c| c.slot == k).map(|c| c.reg)
     }
 
-    /// Stores the cached numbers their slots may not have yet, and forgets the registers.
+    /// Stores the cached values their slots may not have yet, and forgets the registers.
     fn flush(&mut self, p: Pos) {
         for c in std::mem::take(&mut self.cache) {
             if c.dirty {
                 self.emit(&format!("movq {}, {}", c.reg, p.slot(c.slot)));
+                if c.slot & RAW == 0 {
+                    self.mark_slot_safe(c.slot);
+                }
             }
         }
     }
 
-    /// In `Mode::Scrut`, stores only the dirty cached raw slots that are still live after the
+    /// In `Mode::Scrut`, stores only the dirty cached slots that are still live after the
     /// scrutinee returns, keeping the cache entries intact for argument moves.
     fn flush_live_raws(&mut self, p: Pos) {
         let live = self.live.last();
+        let mut newly_safe = 0u64;
         for c in &mut self.cache {
             if c.dirty && live.is_none_or(|l| l.contains(&c.slot) || l.contains(&ALL_LIVE)) {
                 let _ = writeln!(self.out, "    movq {}, {}(%rbp)", c.reg, p.slot_off(c.slot));
+                if c.slot != UNUSED_SLOT && c.slot & RAW == 0 && c.slot < 64 {
+                    newly_safe |= 1u64 << c.slot;
+                }
                 c.dirty = false;
             }
         }
+        self.safe_slots |= newly_safe;
     }
 
-    /// A cache register for a new number, none of `avoid`: a free one, or the oldest one's (its
-    /// number stored first).
+    /// A cache register for a new value, none of `avoid`: a free one, or an evicted entry (preferring
+    /// boxed pointers over raw numbers, oldest first, storing dirty entries to their stack slots).
     fn fresh_reg(&mut self, p: Pos, avoid: &[&str]) -> &'static str {
         if let Some(r) = CACHE_REGS.iter().find(|r| !avoid.contains(r) && self.cache.iter().all(|c| c.reg != **r)) {
             return r;
         }
-        let i = self.cache.iter().position(|c| !avoid.contains(&c.reg)).expect("internal: no cache register");
+        let i = self
+            .cache
+            .iter()
+            .position(|c| c.slot & RAW == 0 && !avoid.contains(&c.reg))
+            .or_else(|| self.cache.iter().position(|c| !avoid.contains(&c.reg)))
+            .expect("internal: no cache register");
         let c = self.cache.remove(i);
         if c.dirty {
             self.emit(&format!("movq {}, {}", c.reg, p.slot(c.slot)));
+            if c.slot & RAW == 0 {
+                self.mark_slot_safe(c.slot);
+            }
         }
         c.reg
     }
 
-    /// Records that `reg` holds raw slot `k`'s number; `dirty` when the slot does not have it.
+    /// Records that `reg` holds slot `k`'s value; `dirty` when the stack slot does not have it.
     fn cache_put(&mut self, k: u32, reg: &'static str, dirty: bool) {
-        let idx = raw_idx(k);
-        self.cache.retain(|c| raw_idx(c.slot) != idx && c.reg != reg);
+        self.cache.retain(|c| !same_cache_slot(c.slot, k) && c.reg != reg);
         self.cache.push(Cached { slot: k, reg, dirty });
     }
 
@@ -2305,16 +2619,18 @@ impl Gen {
                     self.emit(&format!("movsd {}, {xmm}", p.slot(*k)));
                 }
             }
-            Atom::Lit(SLit::Double(v)) => {
-                let bits = v.to_bits();
-                if bits == 0 {
-                    self.emit(&format!("xorpd {xmm}, {xmm}"));
-                } else {
-                    self.emit(&format!("movabsq ${}, %rdx", bits as i64));
-                    self.emit(&format!("movq %rdx, {xmm}"));
+            _ => match self.atom_lit(a) {
+                Some(SLit::Double(v)) => {
+                    let bits = v.to_bits();
+                    if bits == 0 {
+                        self.emit(&format!("xorpd {xmm}, {xmm}"));
+                    } else {
+                        self.emit(&format!("movabsq ${}, %rdx", bits as i64));
+                        self.emit(&format!("movq %rdx, {xmm}"));
+                    }
                 }
-            }
-            other => panic!("internal: raw double operand {other:?}"),
+                _ => panic!("internal: raw double operand {a:?}"),
+            },
         }
     }
 
@@ -3014,14 +3330,14 @@ impl Gen {
                         Src::Reg(br) => self.emit(&format!("btq {br}, {word_reg}")),
                         Src::Imm(v) => self.emit(&format!("btq ${}, {word_reg}", v & 63)),
                     }
-                    let mut join_defs: Vec<(String, &[u32], &SExpr)> = Vec::new();
+                    let mut join_defs: Vec<(u32, String, &[u32], &SExpr)> = Vec::new();
                     for (idx, &(id, params, code)) in peeled_joins.iter().enumerate() {
                         let mut jcount = count_jumps(dispatch_expr, id);
                         for &(_, _, later) in &peeled_joins[idx + 1..] {
                             jcount += count_jumps(later, id);
                         }
                         if let Some(l) = self.register_join(id, params, code, jcount) {
-                            join_defs.push((l, params, code));
+                            join_defs.push((id, l, params, code));
                         }
                     }
                     let cold_hot = if self.is_cold_error(nz_body) && !self.is_cold_error(z_body) {
@@ -3040,7 +3356,7 @@ impl Gen {
                         self.expr(hot_body, p);
                         self.emit_cold(|g| {
                             g.put_label(&cold_lbl);
-                            g.cache = snapshot;
+                            g.cache = snapshot.clone();
                             g.safe_slots = safe_snap;
                             g.known_kind = kind_snap;
                             g.expr(cold_body, p);
@@ -3050,18 +3366,15 @@ impl Gen {
                         self.emit(&format!("jc {nz_lbl}"));
                         self.expr(z_body, p);
                         self.put_label(&nz_lbl);
-                        self.cache = snapshot;
+                        self.cache = snapshot.clone();
                         self.safe_slots = safe_snap;
                         self.known_kind = kind_snap;
                         self.expr(nz_body, p);
                     }
-                    for (l, params, code) in join_defs.into_iter().rev() {
+                    for (id, l, params, code) in join_defs.into_iter().rev() {
                         self.put_label(&l);
                         self.cache.clear();
-                        self.safe_slots = safe_snap;
-                        for &s in params {
-                            self.mark_slot_safe(s);
-                        }
+                        self.safe_slots = self.join_safe_slots(safe_snap, &snapshot, id, params);
                         self.known_kind.clear();
                         if !self.loop_known_kinds.is_empty() {
                             let mut c_uses = std::collections::HashSet::new();
@@ -3193,24 +3506,22 @@ impl Gen {
         }
         let (cc, flipped) = emit_cmp(self);
         let negated = Self::negate_cc(cc);
-        let mut join_defs: Vec<(String, &[u32], &SExpr)> = Vec::new();
+        let join_cache = self.cache.clone();
+        let mut join_defs: Vec<(u32, String, &[u32], &SExpr)> = Vec::new();
         for (idx, &(id, params, code)) in peeled_joins.iter().enumerate() {
             let mut jcount = count_jumps(cur, id);
             for &(_, _, later) in &peeled_joins[idx + 1..] {
                 jcount += count_jumps(later, id);
             }
             if let Some(l) = self.register_join(id, params, code, jcount) {
-                join_defs.push((l, params, code));
+                join_defs.push((id, l, params, code));
             }
         }
         let emit_joins = |g: &mut Self, safe_snap: u64| {
-            for (l, params, code) in join_defs.into_iter().rev() {
+            for (id, l, params, code) in join_defs.into_iter().rev() {
                 g.put_label(&l);
                 g.cache.clear();
-                g.safe_slots = safe_snap;
-                for &s in params {
-                    g.mark_slot_safe(s);
-                }
+                g.safe_slots = g.join_safe_slots(safe_snap, &join_cache, id, params);
                 g.known_kind.clear();
                 if !g.loop_known_kinds.is_empty() {
                     let mut c_uses = std::collections::HashSet::new();
@@ -3339,7 +3650,7 @@ impl Gen {
         let is_char = matches!(k, K::CharCmp(_));
         let in_kind = if is_char { CHAR } else { INT };
         let lit_ok = |l: &SLit| matches!((l, in_kind), (SLit::Int(_), INT) | (SLit::Char(_), CHAR));
-        if args.len() != 2 || args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
+        if args.len() != 2 || args.iter().any(|a| self.atom_lit(a).is_some_and(|l| !lit_ok(l))) {
             return false;
         }
         let [SAlt::Default(outer_body)] = alts else { return false };
@@ -3389,14 +3700,22 @@ impl Gen {
                     "%rcx".to_string()
                 }
             },
-            Atom::Lit(_) => {
-                self.operand(&args[0], p, "%rcx");
+            a if self.atom_lit(a).is_some() => {
+                self.operand(a, p, "%rcx");
                 "%rcx".to_string()
             }
             a => {
+                let cached_ptr = match a {
+                    Atom::Slot(s) if !matches!(post_kind.get(s), Some(KnownVal::StaticCon(_))) => self.cached(*s),
+                    _ => None,
+                };
                 let already_known = matches!(a, Atom::Slot(s) if post_kind.get(s) == Some(&KnownVal::Kind(in_kind)));
                 if already_known {
-                    self.operand(a, p, "%rcx");
+                    if let Some(r) = cached_ptr {
+                        let _ = writeln!(self.out, "    movq 8({r}), %rcx");
+                    } else {
+                        self.operand(a, p, "%rcx");
+                    }
                 } else {
                     let store_slot = match a {
                         Atom::Slot(s)
@@ -3412,16 +3731,21 @@ impl Gen {
                     };
                     let eval_lbl = self.label("opev");
                     let got_lbl = self.label("opgot");
-                    self.load(a, p, "%rcx");
-                    let _ = writeln!(self.out, "    cmpb ${in_kind}, (%rcx)");
+                    let ptr_reg = if let Some(r) = cached_ptr {
+                        r
+                    } else {
+                        self.load(a, p, "%rcx");
+                        "%rcx"
+                    };
+                    let _ = writeln!(self.out, "    cmpb ${in_kind}, ({ptr_reg})");
                     let _ = writeln!(self.out, "    jne {eval_lbl}");
                     self.put_label(&got_lbl);
-                    self.emit("movq 8(%rcx), %rcx");
+                    let _ = writeln!(self.out, "    movq 8({ptr_reg}), %rcx");
                     self.emit_cold_eval_operand(
                         &eval_lbl,
                         &got_lbl,
                         &slow,
-                        "%rcx",
+                        ptr_reg,
                         in_kind,
                         store_slot,
                         false,
@@ -3448,19 +3772,29 @@ impl Gen {
                     if is_char { "%edx".to_string() } else { "%rdx".to_string() }
                 }
             },
-            Atom::Lit(SLit::Int(v)) if !is_char && i32::try_from(*v).is_ok() => format!("${v}"),
-            Atom::Lit(SLit::Char(ch)) if is_char => {
-                format!("${}", crate::syntax::lexer::char_code(*ch) as u32 as i32)
-            }
-            Atom::Lit(_) => {
-                self.operand(&args[1], p, "%rdx");
-                if is_char { "%edx".to_string() } else { "%rdx".to_string() }
-            }
+            a if self.atom_lit(a).is_some() => match self.atom_lit(a) {
+                Some(SLit::Int(v)) if !is_char && i32::try_from(*v).is_ok() => format!("${v}"),
+                Some(SLit::Char(ch)) if is_char => {
+                    format!("${}", crate::syntax::lexer::char_code(*ch) as u32 as i32)
+                }
+                _ => {
+                    self.operand(a, p, "%rdx");
+                    if is_char { "%edx".to_string() } else { "%rdx".to_string() }
+                }
+            },
             a => {
+                let cached_ptr = match a {
+                    Atom::Slot(s) if !matches!(post_kind.get(s), Some(KnownVal::StaticCon(_))) => self.cached(*s),
+                    _ => None,
+                };
                 let already_known = matches!(a, Atom::Slot(s) if post_kind.get(s) == Some(&KnownVal::Kind(in_kind)));
-                if already_known {
-                    self.load(a, p, "%rdx");
+                let ptr_reg = if let Some(r) = cached_ptr {
+                    r
                 } else {
+                    self.load(a, p, "%rdx");
+                    "%rdx"
+                };
+                if !already_known {
                     let store_slot = match a {
                         Atom::Slot(s)
                             if *s != 0 && !matches!(post_kind.get(s), Some(KnownVal::StaticCon(_))) =>
@@ -3475,15 +3809,14 @@ impl Gen {
                     };
                     let eval_lbl = self.label("opev");
                     let got_lbl = self.label("opgot");
-                    self.load(a, p, "%rdx");
-                    let _ = writeln!(self.out, "    cmpb ${in_kind}, (%rdx)");
+                    let _ = writeln!(self.out, "    cmpb ${in_kind}, ({ptr_reg})");
                     let _ = writeln!(self.out, "    jne {eval_lbl}");
                     self.put_label(&got_lbl);
                     self.emit_cold_eval_operand(
                         &eval_lbl,
                         &got_lbl,
                         &slow,
-                        "%rdx",
+                        ptr_reg,
                         in_kind,
                         store_slot,
                         lhs_reg == "%rcx",
@@ -3493,7 +3826,7 @@ impl Gen {
                     );
                     emitted_slow = true;
                 }
-                "8(%rdx)".to_string()
+                format!("8({ptr_reg})")
             }
         };
         if is_char {
@@ -3506,24 +3839,21 @@ impl Gen {
         }
         let cc = &set[3..];
         let negated = Self::negate_cc(cc);
-        let mut join_defs: Vec<(String, &[u32], &SExpr)> = Vec::new();
+        let mut join_defs: Vec<(u32, String, &[u32], &SExpr)> = Vec::new();
         for (idx, &(id, params, code)) in peeled_joins.iter().enumerate() {
             let mut jcount = count_jumps(cur, id);
             for &(_, _, later) in &peeled_joins[idx + 1..] {
                 jcount += count_jumps(later, id);
             }
             if let Some(l) = self.register_join(id, params, code, jcount) {
-                join_defs.push((l, params, code));
+                join_defs.push((id, l, params, code));
             }
         }
         let emit_joins = |g: &mut Self| {
-            for (l, params, code) in join_defs.into_iter().rev() {
+            for (id, l, params, code) in join_defs.into_iter().rev() {
                 g.put_label(&l);
                 g.cache.clear();
-                g.safe_slots = saved_safe;
-                for &s in params {
-                    g.mark_slot_safe(s);
-                }
+                g.safe_slots = g.join_safe_slots(saved_safe, &saved_cache, id, params);
                 g.known_kind.clear();
                 g.expr(code, p);
             }
@@ -3570,9 +3900,9 @@ impl Gen {
                     let live = self.case_live(alts, bslot, p);
                     self.emit_cold(|g| {
                         g.put_label(&slow);
+                        g.safe_slots = saved_safe;
                         g.save_cache(&saved_cache, p);
                         g.cache.clear();
-                        g.safe_slots = saved_safe;
                         g.known_kind = saved_kind;
                         g.zero_unsafe_slots(p, true);
                         g.emit("subq $8, %rbp");
@@ -3636,9 +3966,9 @@ impl Gen {
                     let live = self.case_live(alts, bslot, p);
                     self.emit_cold(|g| {
                         g.put_label(&slow);
+                        g.safe_slots = saved_safe;
                         g.save_cache(&saved_cache, p);
                         g.cache.clear();
-                        g.safe_slots = saved_safe;
                         g.known_kind = saved_kind;
                         g.zero_unsafe_slots(p, true);
                         g.emit("subq $8, %rbp");
@@ -3705,9 +4035,9 @@ impl Gen {
             let live = self.case_live(alts, bslot, p);
             self.emit_cold(|g| {
                 g.put_label(&slow);
+                g.safe_slots = saved_safe;
                 g.save_cache(&saved_cache, p);
                 g.cache.clear();
-                g.safe_slots = saved_safe;
                 g.known_kind = saved_kind;
                 g.zero_unsafe_slots(p, true);
                 g.emit("subq $8, %rbp");
@@ -3838,6 +4168,14 @@ impl Gen {
                     self.emit(&format!("movabsq ${}, %rcx", header(CON, args.len() as u64, id as u64)));
                     self.emit("movq %rcx, (%rax)");
                     for (i, a) in args.iter().enumerate() {
+                        if let Atom::Slot(k) = a {
+                            if !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) {
+                                if let Some(r) = self.cached(*k) {
+                                    let _ = writeln!(self.out, "    movq {r}, {}(%rax)", 8 * (i + 1));
+                                    continue;
+                                }
+                            }
+                        }
                         self.load(a, p, "%rcx");
                         self.emit(&format!("movq %rcx, {}(%rax)", 8 * (i + 1)));
                     }
@@ -3937,6 +4275,7 @@ impl Gen {
                 let mut off = 0usize;
                 let mut offs = Vec::with_capacity(binds.len());
                 for ((slot, b), sb) in binds.iter().zip(&static_binds) {
+                    self.evict_slot(*slot);
                     if let Some(lbl) = sb {
                         if needed.contains(slot) || needed.contains(&ALL_LIVE) {
                             let _ = writeln!(self.out, "    leaq {lbl}(%rip), %rcx");
@@ -3974,6 +4313,14 @@ impl Gen {
                             let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
                             let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * base);
                             for (i, a) in args.iter().enumerate() {
+                                if let Atom::Slot(k) = a {
+                                    if !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) {
+                                        if let Some(r) = self.cached(*k) {
+                                            let _ = writeln!(self.out, "    movq {r}, {}(%rax)", 8 * (base + 1 + i));
+                                            continue;
+                                        }
+                                    }
+                                }
                                 self.load(a, p, "%rdx");
                                 let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (base + 1 + i));
                             }
@@ -4000,6 +4347,14 @@ impl Gen {
                     let _ = writeln!(self.out, "    movabsq ${hdr}, %rcx");
                     let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * off);
                     for (i, a) in args.iter().enumerate() {
+                        if let Atom::Slot(k) = a {
+                            if !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) {
+                                if let Some(r) = self.cached(*k) {
+                                    let _ = writeln!(self.out, "    movq {r}, {}(%rax)", 8 * (off + 1 + i));
+                                    continue;
+                                }
+                            }
+                        }
                         self.load(a, p, "%rdx");
                         let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (off + 1 + i));
                     }
@@ -4149,6 +4504,7 @@ impl Gen {
                         } else {
                             if *bslot != UNUSED_SLOT {
                                 let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                                self.evict_slot(*bslot);
                                 self.mark_slot_safe(*bslot);
                                 self.known_kind.insert(*bslot, known_k);
                             }
@@ -4180,12 +4536,14 @@ impl Gen {
                                             self.load(&args[0], p, "%rax");
                                             if !skip_state {
                                                 let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
+                                                self.evict_slot(slots[0]);
                                                 self.mark_slot_safe(slots[0]);
                                                 self.known_kind.remove(&slots[0]);
                                             }
                                             if slots[1] != UNUSED_SLOT {
                                                 self.emit("movq 8(%rax), %rax");
                                                 let _ = writeln!(self.out, "    movq %rax, {}(%rbp)", p.slot_off(slots[1]));
+                                                self.evict_slot(slots[1]);
                                                 self.mark_slot_safe(slots[1]);
                                                 self.known_kind.remove(&slots[1]);
                                                 self.rax_slot = Some(slots[1]);
@@ -4206,6 +4564,7 @@ impl Gen {
                                         if *bslot != UNUSED_SLOT && uses.contains(bslot) {
                                             let unit_id = self.con_id("Builtin.()");
                                             let unit_lbl = self.nullary_con(unit_id);
+                                            self.evict_slot(*bslot);
                                             if p.mode == Mode::Tail && !expr_contains_jump(body) {
                                                 self.known_kind.insert(*bslot, KnownVal::StaticCon(unit_lbl));
                                             } else {
@@ -4227,9 +4586,8 @@ impl Gen {
                 let sp = Pos { f: p.f, mode: Mode::Scrut, pushed: p.pushed + 1 };
                 let size = if p.pushed == 0 { p.f.size_word() } else { 0 };
                 let mut post_cache = saved_cache.clone();
-                if raw_binder {
-                    let b_idx = raw_idx(*bslot);
-                    post_cache.retain(|c| raw_idx(c.slot) != b_idx);
+                if *bslot != UNUSED_SLOT {
+                    post_cache.retain(|c| !same_cache_slot(c.slot, *bslot));
                 }
                 // Fast paths whose cold slow path lives in `cold_out` so the hot path falls straight through.
                 match scrut.as_ref() {
@@ -4256,6 +4614,11 @@ impl Gen {
                         let _ = writeln!(self.out, "    jae {slow_chk}");
                         self.put_label(&value);
                         let live = self.case_live(alts, *bslot, p);
+                        if let Atom::Slot(s) = a {
+                            if !live.contains(s) && !live.contains(&ALL_LIVE) {
+                                post_cache.retain(|c| !same_cache_slot(c.slot, *s));
+                            }
+                        }
                         let need_fast_clear = p.mode == Mode::Scrut
                             || !alts.iter().all(|alt| {
                                 let body = match alt {
@@ -4283,9 +4646,9 @@ impl Gen {
                             let _ = writeln!(g.out, "    jb {value}");
                             let _ = writeln!(g.out, "    jmp {slow_chk}");
                             g.put_label(&eval);
+                            g.safe_slots = saved_safe;
                             g.save_cache(&saved_cache, p);
                             g.cache.clear();
-                            g.safe_slots = saved_safe;
                             g.known_kind = saved_kind;
                             g.zero_unsafe_slots(p, true);
                             g.emit("subq $8, %rbp");
@@ -4317,6 +4680,7 @@ impl Gen {
                         }
                         if *bslot != UNUSED_SLOT {
                             let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                            self.evict_slot(*bslot);
                             self.mark_slot_safe(*bslot);
                             self.known_kind.remove(bslot);
                         }
@@ -4362,11 +4726,18 @@ impl Gen {
                                                 self.emit("movq 8(%rax), %rax");
                                                 let _ = writeln!(self.out, "    movq %rax, {}(%rbp)", p.slot_off(slots[1]));
                                             }
+                                            let mut mv_post_cache = saved_cache.clone();
+                                            if !skip_state {
+                                                mv_post_cache.retain(|c| !same_cache_slot(c.slot, slots[0]));
+                                            }
+                                            if slots[1] != UNUSED_SLOT {
+                                                mv_post_cache.retain(|c| !same_cache_slot(c.slot, slots[1]));
+                                            }
                                             self.emit_cold(|g| {
                                                 g.put_label(&slow);
+                                                g.safe_slots = saved_safe;
                                                 g.save_cache(&saved_cache, p);
                                                 g.cache.clear();
-                                                g.safe_slots = saved_safe;
                                                 g.known_kind = saved_kind;
                                                 g.zero_unsafe_slots(p, true);
                                                 g.emit("subq $8, %rbp");
@@ -4384,7 +4755,7 @@ impl Gen {
                                                         g.chase_ind_slot(rs, p);
                                                     }
                                                 }
-                                                g.reload_cache(&saved_cache, p);
+                                                g.reload_cache(&mv_post_cache, p);
                                                 if !skip_state {
                                                     g.emit("movq 8(%r14), %rcx");
                                                     let _ = writeln!(g.out, "    movq %rcx, {}(%rbp)", p.slot_off(slots[0]));
@@ -4396,7 +4767,7 @@ impl Gen {
                                                 let _ = writeln!(g.out, "    jmp {body_lbl}");
                                             });
                                             self.put_label(&body_lbl);
-                                            self.cache = saved_cache;
+                                            self.cache = mv_post_cache;
                                             self.safe_slots = saved_safe;
                                             self.known_kind = fast_kind;
                                             if !skip_state {
@@ -4448,11 +4819,16 @@ impl Gen {
                                             let _ = writeln!(self.out, "    leaq {ul}(%rip), %rcx");
                                             let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*bslot));
                                         }
+                                        let wm_post_cache = if write_bslot {
+                                            post_cache.clone()
+                                        } else {
+                                            saved_cache.clone()
+                                        };
                                         self.emit_cold(|g| {
                                             g.put_label(&slow);
+                                            g.safe_slots = saved_safe;
                                             g.save_cache(&saved_cache, p);
                                             g.cache.clear();
-                                            g.safe_slots = saved_safe;
                                             g.known_kind = saved_kind;
                                             g.zero_unsafe_slots(p, true);
                                             g.emit("subq $8, %rbp");
@@ -4470,14 +4846,14 @@ impl Gen {
                                                     g.chase_ind_slot(rs, p);
                                                 }
                                             }
-                                            g.reload_cache(&saved_cache, p);
+                                            g.reload_cache(&wm_post_cache, p);
                                             if write_bslot && !defer_unit {
                                                 let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
                                             }
                                             let _ = writeln!(g.out, "    jmp {body_lbl}");
                                         });
                                         self.put_label(&body_lbl);
-                                        self.cache = saved_cache;
+                                        self.cache = wm_post_cache;
                                         self.safe_slots = saved_safe;
                                         self.known_kind = fast_kind;
                                         if write_bslot {
@@ -4550,9 +4926,11 @@ impl Gen {
                                                 let val_slot = slots[1];
                                                 let val_is_raw = val_slot != UNUSED_SLOT && val_slot & RAW != 0;
                                                 let mut read_post_cache = saved_cache.clone();
-                                                if val_is_raw {
-                                                    let vidx = raw_idx(val_slot);
-                                                    read_post_cache.retain(|c| raw_idx(c.slot) != vidx);
+                                                if !skip_state {
+                                                    read_post_cache.retain(|c| !same_cache_slot(c.slot, slots[0]));
+                                                }
+                                                if val_slot != UNUSED_SLOT {
+                                                    read_post_cache.retain(|c| !same_cache_slot(c.slot, val_slot));
                                                 }
                                                 let idx_cached = match &args[1] {
                                                     Atom::Slot(s) if *s & RAW != 0 => self.cached(*s),
@@ -4562,6 +4940,7 @@ impl Gen {
                                                     if !slow_used {
                                                         if !skip_state {
                                                             let _ = writeln!(self.out, "    movq $0, {}(%rbp)", p.slot_off(slots[0]));
+                                                            self.evict_slot(slots[0]);
                                                         }
                                                         let idx_str = if let Some(r) = idx_cached {
                                                             r
@@ -4569,10 +4948,10 @@ impl Gen {
                                                             self.operand(&args[1], p, "%rdx");
                                                             "%rdx"
                                                         };
-                                                        self.cache.retain(|c| raw_idx(c.slot) != raw_idx(val_slot));
+                                                        self.evict_slot(val_slot);
                                                         let reg = if let (Atom::Slot(is), Some(r)) = (&args[1], idx_cached) {
                                                             if !self.raw_live(*is, body, p) {
-                                                                self.cache.retain(|c| raw_idx(c.slot) != raw_idx(*is));
+                                                                self.evict_slot(*is);
                                                                 r
                                                             } else {
                                                                 self.fresh_reg(p, &[r])
@@ -4649,9 +5028,9 @@ impl Gen {
                                                     let live = self.case_live(alts, *bslot, p);
                                                     self.emit_cold(|g| {
                                                         g.put_label(&slow);
+                                                        g.safe_slots = saved_safe;
                                                         g.save_cache(&saved_cache, p);
                                                         g.cache.clear();
-                                                        g.safe_slots = saved_safe;
                                                         g.known_kind = saved_kind;
                                                         g.zero_unsafe_slots(p, true);
                                                         g.emit("subq $8, %rbp");
@@ -4697,6 +5076,13 @@ impl Gen {
                                                     self.cache = read_post_cache;
                                                     if let Some(reg) = direct_reg {
                                                         self.cache_put(val_slot, reg, true);
+                                                    }
+                                                } else {
+                                                    if !skip_state {
+                                                        self.evict_slot(slots[0]);
+                                                    }
+                                                    if val_slot != UNUSED_SLOT {
+                                                        self.evict_slot(val_slot);
                                                     }
                                                 }
                                                 self.safe_slots = saved_safe;
@@ -4832,6 +5218,11 @@ impl Gen {
                                                 let _ = writeln!(self.out, "    leaq {ul}(%rip), %rcx");
                                                 let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", p.slot_off(*bslot));
                                             }
+                                            let wb_post_cache = if write_bslot {
+                                                post_cache.clone()
+                                            } else {
+                                                saved_cache.clone()
+                                            };
                                             if slow_used {
                                                 let slow = slow.unwrap();
                                                 let body_lbl = body_lbl.unwrap();
@@ -4839,9 +5230,9 @@ impl Gen {
                                                 let live = self.case_live(alts, *bslot, p);
                                                 self.emit_cold(|g| {
                                                     g.put_label(&slow);
+                                                    g.safe_slots = saved_safe;
                                                     g.save_cache(&saved_cache, p);
                                                     g.cache.clear();
-                                                    g.safe_slots = saved_safe;
                                                     g.known_kind = saved_kind;
                                                     g.zero_unsafe_slots(p, true);
                                                     g.emit("subq $8, %rbp");
@@ -4861,14 +5252,16 @@ impl Gen {
                                                             }
                                                         }
                                                     }
-                                                    g.reload_cache(&saved_cache, p);
+                                                    g.reload_cache(&wb_post_cache, p);
                                                     if write_bslot && !defer_unit {
                                                         let _ = writeln!(g.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
                                                     }
                                                     let _ = writeln!(g.out, "    jmp {body_lbl}");
                                                 });
                                                 self.put_label(&body_lbl);
-                                                self.cache = saved_cache;
+                                                self.cache = wb_post_cache;
+                                            } else if write_bslot {
+                                                self.evict_slot(*bslot);
                                             }
                                             self.safe_slots = saved_safe;
                                             self.known_kind = fast_kind;
@@ -4894,6 +5287,7 @@ impl Gen {
                         self.raw_dest = raw_binder.then_some(*bslot);
                         self.fast_slow_used = false;
                         self.fast_raw_reg = None;
+                        self.fast_checked_slots.clear();
                         self.rax_slot = rax_slot;
                         let fast = self.int_fast_path(name, args, p, &slow);
                         self.rax_slot = None;
@@ -4917,26 +5311,32 @@ impl Gen {
                             };
                             let slow_used = self.fast_slow_used;
                             let fast_reg = self.fast_raw_reg.take();
+                            let checked_slots = std::mem::take(&mut self.fast_checked_slots);
                             if slow_used {
                                 let cont = self.label("k");
                                 let live = self.case_live(alts, *bslot, p);
                                 self.emit_cold(|g| {
                                     g.put_label(&slow);
+                                    g.safe_slots = saved_safe;
                                     g.save_cache(&saved_cache, p);
                                     g.cache.clear();
-                                    g.safe_slots = saved_safe;
                                     g.known_kind = saved_kind.clone();
                                     g.zero_unsafe_slots(p, true);
                                     g.emit("subq $8, %rbp");
                                     let _ = writeln!(g.out, "    leaq {cont}(%rip), %rax");
                                     g.emit("movq %rax, (%rbp)");
-                                    g.live.push(live);
+                                    g.live.push(live.clone());
                                     g.slow_only = true;
                                     g.expr(scrut, sp);
                                     g.live.pop();
                                     let _ = writeln!(g.out, "    .quad {}, {}", frame::BODY, size);
                                     g.put_label(&cont);
                                     g.emit("addq $8, %rbp");
+                                    for &(s, _) in &checked_slots {
+                                        if s != *bslot && (live.contains(&s) || live.contains(&ALL_LIVE)) {
+                                            g.chase_ind_slot(s, p);
+                                        }
+                                    }
                                     g.reload_cache(&post_cache, p);
                                     if raw_binder {
                                         if let Some(reg) = fast_reg {
@@ -4960,6 +5360,11 @@ impl Gen {
                             }
                             self.safe_slots = saved_safe;
                             self.known_kind = saved_kind;
+                            for &(s, k) in &checked_slots {
+                                if s != *bslot {
+                                    self.known_kind.insert(s, KnownVal::Kind(k));
+                                }
+                            }
                             if raw_binder {
                                 let [SAlt::Default(body)] = &alts[..] else {
                                     panic!("internal: raw binder with alternatives")
@@ -4989,6 +5394,7 @@ impl Gen {
                                                 && self.live.last().is_none_or(|l| l.contains(bslot) || l.contains(&ALL_LIVE));
                                             if uses.contains(bslot) || outer_uses_v {
                                                 let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                                                self.evict_slot(*bslot);
                                                 self.mark_slot_safe(*bslot);
                                                 if let Some(k) = prim_out_kind {
                                                     self.known_kind.insert(*bslot, KnownVal::Kind(k));
@@ -5001,6 +5407,7 @@ impl Gen {
                                             if *wbslot != UNUSED_SLOT && uses.contains(wbslot) {
                                                 let unit_id = self.con_id("Builtin.()");
                                                 let unit_lbl = self.nullary_con(unit_id);
+                                                self.evict_slot(*wbslot);
                                                 if p.mode == Mode::Tail && !expr_contains_jump(wbody) {
                                                     self.known_kind.insert(*wbslot, KnownVal::StaticCon(unit_lbl));
                                                 } else {
@@ -5016,6 +5423,7 @@ impl Gen {
                                     }
                                 }
                                 let _ = writeln!(self.out, "    movq %r14, {}(%rbp)", p.slot_off(*bslot));
+                                self.evict_slot(*bslot);
                                 self.mark_slot_safe(*bslot);
                                 if let Some(k) = prim_out_kind {
                                     self.known_kind.insert(*bslot, KnownVal::Kind(k));
@@ -5031,16 +5439,24 @@ impl Gen {
                 }
                 // General case scrutinee (no inline fast path).
                 let cont = self.label("k");
-                if !matches!(scrut.as_ref(), SExpr::CallWorker(..)) && !self.cache.is_empty() {
-                    self.flush(p);
+                // What the alternatives (and, for a nested case, what follows it) still use.
+                let live = self.case_live(alts, *bslot, p);
+                if !self.cache.is_empty() {
+                    if matches!(scrut.as_ref(), SExpr::CallWorker(..) | SExpr::App(..))
+                        && self.keeps_cache(scrut, sp)
+                    {
+                        self.live.push(live.clone());
+                        self.flush_live_raws(p);
+                        self.live.pop();
+                    } else {
+                        self.flush(p);
+                    }
                 }
                 self.zero_unsafe_slots(p, true);
                 // Push the return address (its frame is this body's, above it).
                 self.emit("subq $8, %rbp");
                 let _ = writeln!(self.out, "    leaq {cont}(%rip), %rax");
                 self.emit("movq %rax, (%rbp)");
-                // What the alternatives (and, for a nested case, what follows it) still use.
-                let live = self.case_live(alts, *bslot, p);
                 self.live.push(live.clone());
                 self.expr(scrut, sp);
                 self.live.pop();
@@ -5205,14 +5621,12 @@ impl Gen {
                 let jcount = count_jumps(body, *id);
                 let out_lbl = self.register_join(*id, params, code, jcount);
                 let join_safe = self.safe_slots;
+                let join_cache = self.cache.clone();
                 self.expr(body, p);
                 if let Some(l) = out_lbl {
                     self.put_label(&l);
                     self.cache.clear();
-                    self.safe_slots = join_safe;
-                    for &s in params {
-                        self.mark_slot_safe(s);
-                    }
+                    self.safe_slots = self.join_safe_slots(join_safe, &join_cache, *id, params);
                     self.known_kind.clear();
                     if !self.loop_known_kinds.is_empty() {
                         let mut c_uses = std::collections::HashSet::new();
@@ -5449,9 +5863,13 @@ impl Gen {
                 let _ = writeln!(self.out, "    jne {}", labels[1]);
                 fallthrough_idx = Some(0);
             }
-        } else if let [SAlt::Con(n0, s0, b0), SAlt::Con(n1, s1, b1)]
-            | [SAlt::Con(n0, s0, b0), SAlt::Con(n1, s1, b1), SAlt::Default(SExpr::Fail(_))] = alts
-        {
+        } else if let Some((n0, s0, b0, n1, s1, b1)) = match alts {
+            [SAlt::Con(n0, s0, b0), SAlt::Con(n1, s1, b1)] => Some((n0, s0, b0, n1, s1, b1)),
+            [SAlt::Con(n0, s0, b0), SAlt::Con(n1, s1, b1), SAlt::Default(b2)] if self.is_cold_error(b2) => {
+                Some((n0, s0, b0, n1, s1, b1))
+            }
+            _ => None,
+        } {
             if n0 != n1 {
                 let hot_idx = if fast_body.is_some() {
                     0
@@ -5529,6 +5947,7 @@ impl Gen {
                     }
                     SAlt::Lit(lit, _) => {
                         // The runtime compares the scrutinee with the literal's text (no allocation).
+                        self.flush(p);
                         self.zero_unsafe_slots(p, true);
                         let (kind, text) = lit_text(lit);
                         let t = self.string_label(text.as_bytes());
@@ -5627,6 +6046,10 @@ impl Gen {
                 match a {
                     SAlt::Con(_, slots, body) => {
                         g.put_label(l);
+                        for &s in slots {
+                            g.evict_slot(s);
+                        }
+                        g.drop_dead(body, p);
                         for (i, s) in slots.iter().enumerate() {
                             if *s == UNUSED_SLOT {
                                 continue;
@@ -5635,10 +6058,23 @@ impl Gen {
                                 let _ = writeln!(g.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
                                 g.emit("movq 8(%rcx), %rcx");
                                 let _ = writeln!(g.out, "    movq %rcx, {}", p.slot(*s));
-                                g.cache.retain(|c| raw_idx(c.slot) != raw_idx(*s));
+                                g.evict_slot(*s);
+                            } else if fast_body.is_none()
+                                && g.raw_live(*s, body, p)
+                                && g.cache.len() + 1 < CACHE_REGS.len()
+                            {
+                                let reg = CACHE_REGS
+                                    .iter()
+                                    .copied()
+                                    .find(|r| g.cache.iter().all(|c| c.reg != *r))
+                                    .expect("cache.len() + 1 < CACHE_REGS.len()");
+                                let _ = writeln!(g.out, "    movq {}(%r14), {reg}", 8 * (i + 1));
+                                g.cache_put(*s, reg, true);
+                                g.known_kind.remove(s);
                             } else {
                                 let _ = writeln!(g.out, "    movq {}(%r14), %rcx", 8 * (i + 1));
                                 let _ = writeln!(g.out, "    movq %rcx, {}(%rbp)", p.slot_off(*s));
+                                g.evict_slot(*s);
                                 g.mark_slot_safe(*s);
                                 g.known_kind.remove(s);
                             }
@@ -5672,6 +6108,7 @@ impl Gen {
     /// A pattern-match failure: the runtime builds the exception (with the stack in its state at
     /// this point), and it is raised.
     fn fail(&mut self, msg: &str, p: Pos) {
+        self.flush(p);
         self.zero_unsafe_slots(p, false);
         let l = self.string_label(msg.as_bytes());
         let _ = writeln!(self.out, "    leaq {l}(%rip), %rsi");
@@ -5687,6 +6124,10 @@ impl Gen {
             Atom::Slot(k) => {
                 if let Some(KnownVal::StaticCon(lbl)) = self.known_kind.get(k) {
                     let _ = writeln!(self.out, "    leaq {lbl}(%rip), {reg}");
+                } else if let Some(r) = self.cached(*k) {
+                    if r != reg {
+                        let _ = writeln!(self.out, "    movq {r}, {reg}");
+                    }
                 } else {
                     let _ = writeln!(self.out, "    movq {}(%rbp), {reg}", p.slot_off(*k));
                 }
@@ -5773,6 +6214,7 @@ impl Gen {
         }
         // Long strings, big integers, fractions and addresses: the runtime builds the object (the
         // call allocates, so the atom is loaded last).
+        self.flush(p);
         self.zero_unsafe_slots(p, true);
         let (kind, text) = match l {
             SLit::Str(s) => (0u64, s.clone()),
@@ -5887,6 +6329,14 @@ impl Gen {
         let _ = writeln!(self.out, "    leaq {code}(%rip), %rcx");
         let _ = writeln!(self.out, "    movq %rcx, {}(%rax)", 8 * (base + 1));
         for (i, cap) in c.captures.iter().enumerate() {
+            if let Atom::Slot(k) = cap {
+                if !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) {
+                    if let Some(r) = self.cached(*k) {
+                        let _ = writeln!(self.out, "    movq {r}, {}(%rax)", 8 * (base + 2 + i));
+                        continue;
+                    }
+                }
+            }
             // The captured atom is loaded through %rdx so that %rax (the block) survives.
             self.load(cap, p, "%rdx");
             let _ = writeln!(self.out, "    movq %rdx, {}(%rax)", 8 * (base + 2 + i));
@@ -5897,8 +6347,8 @@ impl Gen {
     /// token. Its normal return pops the frame; an exception unwinds to it.
     fn catch(&mut self, args: &[Atom], p: Pos) {
         self.load(&args[1], p, "%rdx");
-        self.load(&args[2], p, "%r8");
         self.load(&args[0], p, "%r14");
+        self.load(&args[2], p, "%r8");
         if p.mode == Mode::Tail && p.f.s > 0 {
             let _ = writeln!(self.out, "    addq ${}, %rbp", 8 * p.f.s as i64);
         }
@@ -5939,6 +6389,7 @@ impl Gen {
     }
 
     fn emit_prim_rt(&mut self, name: &str, args: &[Atom], p: Pos) {
+        self.flush(p);
         self.zero_unsafe_slots(p, true);
         let id = self.prim_id(name);
         for (i, a) in args.iter().enumerate() {
@@ -5971,7 +6422,7 @@ impl Gen {
         let arity = if matches!(k, D::Bin(_) | D::Cmp(_)) { 2 } else { 1 };
         let in_kind = if k == D::IntToDouble { INT } else { DOUBLE };
         let lit_ok = |l: &SLit| matches!((l, in_kind), (SLit::Double(_), DOUBLE) | (SLit::Int(_), INT));
-        if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
+        if args.len() != arity || args.iter().any(|a| self.atom_lit(a).is_some_and(|l| !lit_ok(l))) {
             return false;
         }
         if args.iter().any(|a| matches!(a, Atom::Slot(s) if *s & RAW != 0 && raw_slot_kind(*s) != in_kind)) {
@@ -5985,7 +6436,7 @@ impl Gen {
             }
             let a = &args[idx];
             !is_raw(a)
-                && !matches!(a, Atom::Lit(_))
+                && self.atom_lit(a).is_none()
                 && !matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(in_kind)))
         };
         let store_slots = [
@@ -6015,6 +6466,11 @@ impl Gen {
             }
             let a = &args[idx];
             let store_slot = store_slots[idx];
+            if let Some(s) = store_slot {
+                if !self.fast_checked_slots.iter().any(|&(cs, _)| cs == s) {
+                    self.fast_checked_slots.push((s, in_kind));
+                }
+            }
             self.load(a, p, "%rax");
             self.emit(&format!("cmpb ${in_kind}, (%rax)"));
             self.fast_slow_used = true;
@@ -6068,8 +6524,9 @@ impl Gen {
                             let src = g.cached(*s).map(str::to_owned).unwrap_or_else(|| p.slot(*s));
                             g.emit(&format!("cvtsi2sdq {src}, %xmm0"));
                         }
-                        Atom::Lit(SLit::Int(v)) => {
-                            g.mov_src(Src::Imm(*v), "%rcx");
+                        a if matches!(g.atom_lit(a), Some(SLit::Int(_))) => {
+                            let Some(SLit::Int(v)) = g.atom_lit(a).cloned() else { unreachable!() };
+                            g.mov_src(Src::Imm(v), "%rcx");
                             g.emit("cvtsi2sdq %rcx, %xmm0");
                         }
                         a => {
@@ -6092,7 +6549,7 @@ impl Gen {
                 } else {
                     match a {
                         Atom::Slot(s) if *s & RAW != 0 => g.load_raw_xmm(a, p, x),
-                        Atom::Lit(SLit::Double(_)) => g.load_raw_xmm(a, p, x),
+                        a if matches!(g.atom_lit(a), Some(SLit::Double(_))) => g.load_raw_xmm(a, p, x),
                         a => {
                             g.load(a, p, "%rdx");
                             g.emit(&format!("movsd 8(%rdx), {x}"));
@@ -6206,6 +6663,7 @@ impl Gen {
     /// switches wait for a function's entry, see `closure_code`.) Answers whether the fast path
     /// was emitted.
     fn int_fast_path(&mut self, name: &str, args: &[Atom], p: Pos, slow: &str) -> bool {
+        self.fast_checked_slots.clear();
         let rax_slot = self.rax_slot.take();
         if self.raw_dest.is_none() && self.mutvar_fast_path(name, args, p, slow) {
             return true;
@@ -6228,7 +6686,7 @@ impl Gen {
             _ => (INT, INT),
         };
         let lit_ok = |l: &SLit| matches!((l, in_kind), (SLit::Int(_), INT) | (SLit::Char(_), CHAR));
-        if args.len() != arity || args.iter().any(|a| matches!(a, Atom::Lit(l) if !lit_ok(l))) {
+        if args.len() != arity || args.iter().any(|a| self.atom_lit(a).is_some_and(|l| !lit_ok(l))) {
             return false;
         }
         // A raw destination (a case binder kept unboxed) takes the number itself.
@@ -6246,19 +6704,19 @@ impl Gen {
                 return false;
             }
             let a = &args[idx];
-            if is_raw(a) || matches!(a, Atom::Lit(_)) {
+            if is_raw(a) || self.atom_lit(a).is_some() {
                 return false;
             }
             !matches!(a, Atom::Slot(s) if self.known_kind.get(s) == Some(&KnownVal::Kind(in_kind)))
         };
         let store_slots = [
             match &args[0] {
-                Atom::Slot(s) if *s != 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) => Some(*s),
+                Atom::Slot(s) if *s != 0 && *s & RAW == 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) => Some(*s),
                 _ => None,
             },
             if arity == 2 {
                 match &args[1] {
-                    Atom::Slot(s) if *s != 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) => Some(*s),
+                    Atom::Slot(s) if *s != 0 && *s & RAW == 0 && !matches!(self.known_kind.get(s), Some(KnownVal::StaticCon(_))) => Some(*s),
                     _ => None,
                 }
             } else {
@@ -6297,6 +6755,11 @@ impl Gen {
                 self.load(a, p, "%rax");
             }
             let store_slot = store_slots[idx];
+            if let Some(s) = store_slot {
+                if !self.fast_checked_slots.iter().any(|&(cs, _)| cs == s) {
+                    self.fast_checked_slots.push((s, in_kind));
+                }
+            }
             let is_last_check = idx == 1 || !chk1;
             let native_eval = store_slot.is_some() || (is_last_check && non_slot_eval_ok);
             self.emit(&format!("cmpb ${in_kind}, (%rax)"));
@@ -6467,18 +6930,52 @@ impl Gen {
         if dest.is_none() {
             if let K::Bin(op) = k {
                 let emit_bin_rcx = |g: &mut Self, use_rax0: bool, use_rax1: bool, have_lbl: Option<&str>| {
+                    let is_comm = matches!(op, "addq" | "imulq" | "andq" | "orq" | "xorq");
+                    let lit0 = match g.atom_lit(&args[0]) {
+                        Some(SLit::Int(v)) if i32::try_from(*v).is_ok() => Some(*v),
+                        _ => None,
+                    };
                     if use_rax0 && use_rax1 {
                         g.emit("movq 8(%rax), %rcx");
                         g.emit(&format!("{op} %rcx, %rcx"));
                         return;
                     }
                     if use_rax1 {
+                        if is_comm && have_lbl.is_none() {
+                            if let Some(v) = lit0 {
+                                if op == "imulq" {
+                                    g.emit(&format!("imulq ${v}, 8(%rax), %rcx"));
+                                } else {
+                                    g.emit("movq 8(%rax), %rcx");
+                                    g.emit(&format!("{op} ${v}, %rcx"));
+                                }
+                                return;
+                            }
+                        }
                         g.emit("movq 8(%rax), %rdx");
                         g.operand(&args[0], p, "%rcx");
                         if let Some(lbl) = have_lbl {
                             g.put_label(lbl);
                         }
                         g.emit(&format!("{op} %rdx, %rcx"));
+                        return;
+                    }
+                    if !use_rax0 && is_comm && lit0.is_some() && g.atom_lit(&args[1]).is_none() {
+                        let v = lit0.unwrap();
+                        if op == "imulq" {
+                            if let Atom::Slot(sk) = &args[1] {
+                                if *sk & RAW == 0
+                                    && !matches!(g.known_kind.get(sk), Some(KnownVal::StaticCon(_)))
+                                {
+                                    if let Some(r1) = g.cached(*sk) {
+                                        g.emit(&format!("imulq ${v}, 8({r1}), %rcx"));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        g.operand(&args[1], p, "%rcx");
+                        g.emit(&format!("{op} ${v}, %rcx"));
                         return;
                     }
                     if use_rax0 {
@@ -6494,12 +6991,21 @@ impl Gen {
                                 g.emit(&format!("{op} {}, %rcx", p.slot(*sk)));
                             }
                         }
-                        Atom::Lit(SLit::Int(v)) if i32::try_from(*v).is_ok() => {
-                            g.emit(&format!("{op} ${v}, %rcx"));
+                        a if matches!(g.atom_lit(a), Some(SLit::Int(_))) => {
+                            let Some(SLit::Int(v)) = g.atom_lit(a).cloned() else { unreachable!() };
+                            if i32::try_from(v).is_ok() {
+                                g.emit(&format!("{op} ${v}, %rcx"));
+                            } else {
+                                g.emit(&format!("movabsq ${v}, %rdx"));
+                                g.emit(&format!("{op} %rdx, %rcx"));
+                            }
                         }
-                        Atom::Lit(SLit::Int(v)) => {
-                            g.emit(&format!("movabsq ${v}, %rdx"));
-                            g.emit(&format!("{op} %rdx, %rcx"));
+                        Atom::Slot(sk)
+                            if !matches!(g.known_kind.get(sk), Some(KnownVal::StaticCon(_)))
+                                && g.cached(*sk).is_some() =>
+                        {
+                            let r1 = g.cached(*sk).unwrap();
+                            g.emit(&format!("{op} 8({r1}), %rcx"));
                         }
                         a => {
                             g.load(a, p, "%rdx");
@@ -6547,10 +7053,8 @@ impl Gen {
                 let mut avoid: Vec<&str> = Vec::new();
                 for a in args {
                     if let Atom::Slot(sk) = a {
-                        if sk & RAW != 0 {
-                            if let Some(r) = self.cached(*sk) {
-                                avoid.push(r);
-                            }
+                        if let Some(r) = self.cached(*sk) {
+                            avoid.push(r);
                         }
                     }
                 }
@@ -6559,6 +7063,14 @@ impl Gen {
                 free_cache_reg
             };
             if let Some(reg) = direct_reg {
+                let lit0 = if arity == 2 {
+                    match self.atom_lit(&args[0]) {
+                        Some(SLit::Int(v)) if i32::try_from(*v).is_ok() => Some(*v),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 if rax_holds_arg0 && rax_holds_arg1 {
                     self.emit(&format!("movq 8(%rax), {reg}"));
                     match k {
@@ -6570,18 +7082,53 @@ impl Gen {
                         _ => unreachable!(),
                     }
                 } else if rax_holds_arg1 {
-                    self.emit("movq 8(%rax), %rdx");
-                    self.operand(&args[0], p, reg);
-                    if let Some(ref lbl) = have_ops_lbl {
-                        self.put_label(lbl);
-                    }
-                    match k {
-                        K::Bin(op) => self.emit(&format!("{op} %rdx, {reg}")),
-                        K::Shift(op) => {
-                            self.emit("movq %rdx, %rcx");
-                            self.emit(&format!("{op} %cl, {reg}"));
+                    if let (K::Bin(op @ ("addq" | "imulq" | "andq" | "orq" | "xorq")), Some(v), None) =
+                        (k, lit0, have_ops_lbl.as_ref())
+                    {
+                        if op == "imulq" {
+                            self.emit(&format!("imulq ${v}, 8(%rax), {reg}"));
+                        } else {
+                            self.emit(&format!("movq 8(%rax), {reg}"));
+                            self.emit(&format!("{op} ${v}, {reg}"));
                         }
-                        _ => unreachable!(),
+                    } else {
+                        self.emit("movq 8(%rax), %rdx");
+                        self.operand(&args[0], p, reg);
+                        if let Some(ref lbl) = have_ops_lbl {
+                            self.put_label(lbl);
+                        }
+                        match k {
+                            K::Bin(op) => self.emit(&format!("{op} %rdx, {reg}")),
+                            K::Shift(op) => {
+                                self.emit("movq %rdx, %rcx");
+                                self.emit(&format!("{op} %cl, {reg}"));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                } else if !rax_holds_arg0
+                    && matches!(k, K::Bin("addq" | "imulq" | "andq" | "orq" | "xorq"))
+                    && lit0.is_some()
+                    && self.atom_lit(&args[1]).is_none()
+                {
+                    let K::Bin(op) = k else { unreachable!() };
+                    let v = lit0.unwrap();
+                    let mut done = false;
+                    if op == "imulq" {
+                        if let Atom::Slot(sk) = &args[1] {
+                            if *sk & RAW == 0
+                                && !matches!(self.known_kind.get(sk), Some(KnownVal::StaticCon(_)))
+                            {
+                                if let Some(r1) = self.cached(*sk) {
+                                    self.emit(&format!("imulq ${v}, 8({r1}), {reg}"));
+                                    done = true;
+                                }
+                            }
+                        }
+                    }
+                    if !done {
+                        self.operand(&args[1], p, reg);
+                        self.emit(&format!("{op} ${v}, {reg}"));
                     }
                 } else {
                     if rax_holds_arg0 {
@@ -6598,22 +7145,31 @@ impl Gen {
                                     self.emit(&format!("{op} {}, {reg}", p.slot(*sk)));
                                 }
                             }
-                            Atom::Lit(SLit::Int(v)) if i32::try_from(*v).is_ok() => {
-                                self.emit(&format!("{op} ${v}, {reg}"));
+                            a if matches!(self.atom_lit(a), Some(SLit::Int(_))) => {
+                                let Some(SLit::Int(v)) = self.atom_lit(a).cloned() else { unreachable!() };
+                                if i32::try_from(v).is_ok() {
+                                    self.emit(&format!("{op} ${v}, {reg}"));
+                                } else {
+                                    self.emit(&format!("movabsq ${v}, %rdx"));
+                                    self.emit(&format!("{op} %rdx, {reg}"));
+                                }
                             }
-                            Atom::Lit(SLit::Int(v)) => {
-                                self.emit(&format!("movabsq ${v}, %rdx"));
-                                self.emit(&format!("{op} %rdx, {reg}"));
+                            Atom::Slot(sk)
+                                if !matches!(self.known_kind.get(sk), Some(KnownVal::StaticCon(_)))
+                                    && self.cached(*sk).is_some() =>
+                            {
+                                let r1 = self.cached(*sk).unwrap();
+                                self.emit(&format!("{op} 8({r1}), {reg}"));
                             }
                             a => {
                                 self.load(a, p, "%rdx");
                                 self.emit(&format!("{op} 8(%rdx), {reg}"));
                             }
                         },
-                        K::Shift(op) => match &args[1] {
-                            Atom::Lit(SLit::Int(v)) => self.emit(&format!("{op} ${}, {reg}", v & 63)),
-                            a => {
-                                self.operand(a, p, "%rcx");
+                        K::Shift(op) => match self.atom_lit(&args[1]) {
+                            Some(SLit::Int(v)) => self.emit(&format!("{op} ${}, {reg}", v & 63)),
+                            _ => {
+                                self.operand(&args[1], p, "%rcx");
                                 self.emit(&format!("{op} %cl, {reg}"));
                             }
                         },
@@ -6706,14 +7262,19 @@ impl Gen {
                 _ => false,
             };
 
-        if p.mode == Mode::Tail && p.pushed == 0 && self.in_place_args(&stack_args, &reg_raw_args, p) {
+        if p.mode == Mode::Tail && p.pushed == 0 && self.in_place_args(&stack_args, &reg_raw_args, is_self_loop, p) {
             if !is_self_loop && direct.as_ref().is_none_or(|(_, uc)| *uc) {
                 self.load(func, p, "%r14");
             }
             // The stack arguments go straight to the top words of the frame, where the callee's
-            // stack arguments live (none is read from a word another one replaces).
+            // stack arguments live (none is read from a word another one replaces). Self-loop
+            // register-resident pointer parameters skip the stack and join the parallel register transfer.
             let base = p.f.s as i64 - stack_n;
+            let mut reg_ptr_args: Vec<&Atom> = Vec::new();
             for (i, (a, is_raw_arg)) in stack_args.iter().enumerate() {
+                if is_self_loop && self.self_reg_ptr_args.iter().any(|&(s, _)| s == (i + 1) as u32) {
+                    continue;
+                }
                 let dst = format!("{}(%rbp)", 8 * (base + i as i64));
                 match a {
                     Atom::Slot(k) if k & RAW != 0 => match self.cached(*k) {
@@ -6735,8 +7296,21 @@ impl Gen {
                             && (self.self_dead_state_params & (1u64 << (i + 1))) != 0
                             && self.nullary_globals.contains_key(g) => {}
                     Atom::Slot(k)
-                        if p.slot(*k) == dst
-                            && !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) => {}
+                        if !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) =>
+                    {
+                        match self.cache.iter().find(|c| c.slot == *k) {
+                            Some(c) if p.slot(*k) == dst && !c.dirty => {}
+                            Some(c) => {
+                                let r = c.reg;
+                                self.emit(&format!("movq {r}, {dst}"));
+                            }
+                            None if p.slot(*k) == dst => {}
+                            None => {
+                                self.emit(&format!("movq {}, %rcx", p.slot(*k)));
+                                self.emit(&format!("movq %rcx, {dst}"));
+                            }
+                        }
+                    }
                     Atom::Lit(l @ (SLit::Int(_) | SLit::Char(_) | SLit::Double(_))) if *is_raw_arg => {
                         let v = match l {
                             SLit::Int(v) => *v,
@@ -6757,7 +7331,12 @@ impl Gen {
                     }
                 }
             }
-            self.load_reg_raw_args(&reg_raw_args, p);
+            if is_self_loop {
+                for &(s, _) in &self.self_reg_ptr_args {
+                    reg_ptr_args.push(stack_args[(s - 1) as usize].0);
+                }
+            }
+            self.load_reg_args(&reg_raw_args, &reg_ptr_args, p);
             if is_self_loop {
                 let loop_lbl = self.current_self.as_ref().unwrap().1.clone();
                 let _ = writeln!(self.out, "    jmp {loop_lbl}");
@@ -6789,7 +7368,10 @@ impl Gen {
             if *is_raw_arg {
                 match a {
                     Atom::Slot(k) if k & RAW != 0 => match self.cached(*k) {
-                        Some(r) => self.emit(&format!("movq {r}, %rcx")),
+                        Some(r) => {
+                            let _ = writeln!(self.out, "    movq {r}, {}(%rbp)", 8 * i as i64);
+                            continue;
+                        }
                         None => self.emit(&format!("movq {}, %rcx", inner.slot(*k))),
                     },
                     Atom::Lit(SLit::Int(v)) => {
@@ -6813,6 +7395,14 @@ impl Gen {
                     other => panic!("internal: worker argument {other:?} is not raw"),
                 }
             } else {
+                if let Atom::Slot(k) = a {
+                    if !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) {
+                        if let Some(r) = self.cached(*k) {
+                            let _ = writeln!(self.out, "    movq {r}, {}(%rbp)", 8 * i as i64);
+                            continue;
+                        }
+                    }
+                }
                 self.load(a, inner, "%rcx");
             }
             let _ = writeln!(self.out, "    movq %rcx, {}(%rbp)", 8 * i as i64);
@@ -6820,7 +7410,7 @@ impl Gen {
         if direct.as_ref().is_none_or(|(_, uc)| *uc) {
             self.load(func, inner, "%r14");
         }
-        self.load_reg_raw_args(&reg_raw_args, inner);
+        self.load_reg_args(&reg_raw_args, &[], inner);
         if p.mode == Mode::Tail {
             let s = p.f.s as i64;
             if s > 0 {
@@ -6844,15 +7434,19 @@ impl Gen {
         }
     }
 
-    /// Moves a worker's register-passed raw arguments into `CACHE_REGS[0..raws.len()]` using a
-    /// cycle-safe parallel register transfer (breaking register cycles via `%rax`).
-    fn load_reg_raw_args(&mut self, raws: &[&Atom], p: Pos) {
-        if raws.is_empty() {
+    /// Moves register-passed raw arguments into `CACHE_REGS[0..raws.len()]` and self-loop
+    /// register-resident pointer arguments into `CACHE_REGS[raws.len()..raws.len()+ptrs.len()]`
+    /// using a single cycle-safe parallel register transfer (breaking cycles via `%rax`).
+    fn load_reg_args(&mut self, raws: &[&Atom], ptrs: &[&Atom], p: Pos) {
+        if raws.is_empty() && ptrs.is_empty() {
             return;
         }
         enum NonReg {
             Mem(i64),
             Imm(i64),
+            StaticLbl(String),
+            Free(i64, i64),
+            Global(i64),
         }
         let mut reg_moves: Vec<(usize, &'static str)> = Vec::new();
         let mut non_reg: Vec<(usize, NonReg)> = Vec::new();
@@ -6870,6 +7464,42 @@ impl Gen {
                 Atom::Lit(SLit::Char(c)) => non_reg.push((i, NonReg::Imm(crate::syntax::lexer::char_code(*c) as i64))),
                 Atom::Lit(SLit::Double(d)) => non_reg.push((i, NonReg::Imm(d.to_bits() as i64))),
                 other => panic!("internal: worker raw argument {other:?} is not raw"),
+            }
+        }
+        let ptr_base = raws.len();
+        for (j, a) in ptrs.iter().enumerate() {
+            let dst_idx = ptr_base + j;
+            match a {
+                Atom::Slot(k) if k & RAW != 0 => {
+                    panic!("internal: raw slot {k:#x} used as loop pointer arg in {}", self.current_name)
+                }
+                Atom::Slot(k) => {
+                    if let Some(KnownVal::StaticCon(lbl)) = self.known_kind.get(k) {
+                        non_reg.push((dst_idx, NonReg::StaticLbl(lbl.clone())));
+                    } else if let Some(src_reg) = self.cached(*k) {
+                        if src_reg != CACHE_REGS[dst_idx] {
+                            reg_moves.push((dst_idx, src_reg));
+                        }
+                    } else {
+                        non_reg.push((dst_idx, NonReg::Mem(p.slot_off(*k))));
+                    }
+                }
+                Atom::Free(fi) => {
+                    non_reg.push((dst_idx, NonReg::Free(p.slot_off(0), 8 * (2 + *fi as i64))));
+                }
+                Atom::Global(g) => {
+                    if let Some(lbl) = self.nullary_globals.get(g) {
+                        non_reg.push((dst_idx, NonReg::StaticLbl(lbl.clone())));
+                    } else {
+                        non_reg.push((dst_idx, NonReg::Global(8 * *g as i64)));
+                    }
+                }
+                Atom::Lit(l) => {
+                    let lbl = self
+                        .static_literal_label(l)
+                        .expect("internal: non-static literal in in-place loop reg arg");
+                    non_reg.push((dst_idx, NonReg::StaticLbl(lbl)));
+                }
             }
         }
         while !reg_moves.is_empty() {
@@ -6906,39 +7536,61 @@ impl Gen {
                 NonReg::Imm(v) => {
                     let _ = writeln!(self.out, "    movabsq ${v}, {dst}");
                 }
+                NonReg::StaticLbl(lbl) => {
+                    let _ = writeln!(self.out, "    leaq {lbl}(%rip), {dst}");
+                }
+                NonReg::Free(c_off, f_off) => {
+                    let _ = writeln!(self.out, "    movq {c_off}(%rbp), {dst}");
+                    let _ = writeln!(self.out, "    movq {f_off}({dst}), {dst}");
+                }
+                NonReg::Global(g_off) => {
+                    let _ = writeln!(self.out, "    movq {}(%rbx), {dst}", mach::GLOBALS);
+                    let _ = writeln!(self.out, "    movq {g_off}({dst}), {dst}");
+                }
             }
         }
     }
 
     /// Whether a tail call's stack arguments can be written straight over the top `n` words of the
-    /// frame: no argument (stack or uncached register-raw) is read from one of those words, other
-    /// than its own destination, and none is a literal the runtime builds.
-    fn in_place_args(&self, stack_args: &[(&Atom, bool)], reg_raw_args: &[&Atom], p: Pos) -> bool {
+    /// frame: no argument (stack, uncached register-raw, or uncached self-loop register-ptr) is
+    /// read from a word that another stack argument overwrites, and none is a literal the runtime builds.
+    fn in_place_args(
+        &self,
+        stack_args: &[(&Atom, bool)],
+        reg_raw_args: &[&Atom],
+        is_self_loop: bool,
+        p: Pos,
+    ) -> bool {
         let n = stack_args.len() as i64;
         let s = p.f.s as i64;
         if n > s {
             return false;
         }
         let range = 8 * (s - n)..8 * s;
+        let is_reg_ptr_param = |i: usize| -> bool {
+            is_self_loop && self.self_reg_ptr_args.iter().any(|&(ps, _)| ps == (i + 1) as u32)
+        };
+        let written = |off: i64| -> bool {
+            range.contains(&off)
+                && !(is_self_loop && self.self_reg_ptr_args.iter().any(|&(ps, _)| p.f.off(ps) == off))
+        };
         let stack_ok = stack_args.iter().enumerate().all(|(i, (a, _))| {
+            let reg_ptr = is_reg_ptr_param(i);
             let own = 8 * (s - n + i as i64);
             match a {
-                Atom::Slot(k) if k & RAW != 0 && self.cached(*k).is_some() => true,
                 Atom::Slot(k) if matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) => true,
+                Atom::Slot(k) if self.cached(*k).is_some() => true,
                 Atom::Slot(k) => {
                     let off = p.f.off(*k);
-                    off == own || !range.contains(&off)
+                    (!reg_ptr && off == own) || !written(off)
                 }
-                Atom::Free(_) => !range.contains(&p.f.off(0)),
+                Atom::Free(_) => !written(p.f.off(0)),
                 Atom::Global(_) => true,
-                Atom::Lit(l) => {
-                    matches!(l, SLit::Int(_) | SLit::Char(_) | SLit::Double(_))
-                        || matches!(l, SLit::Integer(s) if s.parse::<i64>().is_ok())
-                }
+                Atom::Lit(l) => is_static_slit(l),
             }
         });
         let raw_ok = reg_raw_args.iter().all(|a| match a {
-            Atom::Slot(k) if k & RAW != 0 && self.cached(*k).is_none() => !range.contains(&p.f.off(*k)),
+            Atom::Slot(k) if k & RAW != 0 && self.cached(*k).is_none() => !written(p.f.off(*k)),
             _ => true,
         });
         stack_ok && raw_ok
@@ -7052,7 +7704,7 @@ impl Gen {
         if let Some(dest) = self.raw_dest {
             if !self.fast_slow_used {
                 element(self);
-                self.cache.retain(|c| raw_idx(c.slot) != raw_idx(dest));
+                self.evict_slot(dest);
                 let reg = self.fresh_reg(p, &[]);
                 self.emit(&format!("{load} 8(%rax,%rdx,{scale}), {reg}"));
                 self.fast_raw_reg = Some(reg);
@@ -7060,7 +7712,7 @@ impl Gen {
                 let reg = CACHE_REGS
                     .iter()
                     .copied()
-                    .find(|r| !self.cache.iter().any(|c| c.reg == *r && raw_idx(c.slot) != raw_idx(dest)));
+                    .find(|r| !self.cache.iter().any(|c| c.reg == *r && !same_cache_slot(c.slot, dest)));
                 element(self);
                 if let Some(reg) = reg {
                     self.emit(&format!("{load} 8(%rax,%rdx,{scale}), {reg}"));
@@ -7312,32 +7964,51 @@ impl Gen {
                 self.emit(&format!("movq {src}, {reg}"));
                 return;
             }
-            Atom::Lit(SLit::Int(v)) => {
-                self.emit(&format!("movabsq ${v}, {reg}"));
-                return;
+            Atom::Slot(k) if !matches!(self.known_kind.get(k), Some(KnownVal::StaticCon(_))) => {
+                if let Some(r) = self.cached(*k) {
+                    self.emit(&format!("movq 8({r}), {reg}"));
+                    return;
+                }
             }
-            Atom::Lit(SLit::Char(c)) => {
-                self.emit(&format!("movq ${}, {reg}", crate::syntax::lexer::char_code(*c)));
-                return;
-            }
-            _ => {}
+            _ => match self.atom_lit(a) {
+                Some(SLit::Int(v)) => {
+                    let v = *v;
+                    self.mov_src(Src::Imm(v), reg);
+                    return;
+                }
+                Some(SLit::Char(c)) => {
+                    self.emit(&format!("movq ${}, {reg}", crate::syntax::lexer::char_code(*c)));
+                    return;
+                }
+                _ => {}
+            },
         }
         self.load(a, p, reg);
         self.emit(&format!("movq 8({reg}), {reg}"));
     }
 
-    /// The slots used after a case's scrutinee: by its alternatives (excluding `bslot` if it is a
-    /// raw binder being defined here) and, for a case in a scrutinee, by what follows the enclosing one.
+    /// The slots used after a case's scrutinee: by its alternatives (excluding `bslot` and any
+    /// constructor pattern slots bound by each alternative) and, for a case in a scrutinee, by
+    /// what follows the enclosing one.
     fn case_live(&self, alts: &[SAlt], bslot: u32, p: Pos) -> std::collections::HashSet<u32> {
         let mut live = std::collections::HashSet::new();
         for a in alts {
             match a {
-                SAlt::Con(_, _, b) | SAlt::Lit(_, b) | SAlt::Default(b) => self.slot_uses(b, &mut live),
+                SAlt::Con(_, slots, b) => {
+                    let mut a_uses = std::collections::HashSet::new();
+                    self.slot_uses(b, &mut a_uses);
+                    for &sl in slots {
+                        if sl != UNUSED_SLOT {
+                            a_uses.retain(|&s| s == ALL_LIVE || !same_cache_slot(s, sl));
+                        }
+                    }
+                    live.extend(a_uses);
+                }
+                SAlt::Lit(_, b) | SAlt::Default(b) => self.slot_uses(b, &mut live),
             }
         }
-        if bslot & RAW != 0 {
-            let b_idx = raw_idx(bslot);
-            live.retain(|&s| s == ALL_LIVE || s & RAW == 0 || raw_idx(s) != b_idx);
+        if bslot != UNUSED_SLOT {
+            live.retain(|&s| s == ALL_LIVE || !same_cache_slot(s, bslot));
         }
         if p.mode == Mode::Scrut {
             if let Some(outer) = self.live.last() {
@@ -7369,6 +8040,8 @@ impl Gen {
         dead.dedup();
         for k in dead {
             self.emit(&format!("movq $0, {}", p.slot(k)));
+            self.evict_slot(k);
+            self.mark_slot_safe(k);
             self.known_kind.remove(&k);
         }
     }
@@ -10400,5 +11073,216 @@ mod sprint6_codegen_tests {
             "Case atom stub should not re-enter full hsc_eval:\n{stub}"
         );
     }
+
+    #[test]
+    fn boxed_ptr_cache_keeps_string_compare_loop_register_only() {
+        // 2-arg boxed pointer self-recursive loop (`String` `compare` pattern): loop parameters
+        // and unpacked `:` fields stay in `CACHE_REGS` with zero `(%rbp)` accesses in the hot
+        // `.Lloop` body.
+        let r_lt = RAW | 0;
+        let r_gt = RAW | 1;
+        let body = SExpr::Case(
+            Box::new(SExpr::Atom(Atom::Slot(1))),
+            UNUSED_SLOT,
+            vec![
+                SAlt::Con(
+                    "Builtin.[]".into(),
+                    vec![],
+                    SExpr::Case(
+                        Box::new(SExpr::Atom(Atom::Slot(2))),
+                        UNUSED_SLOT,
+                        vec![
+                            SAlt::Con("Builtin.[]".into(), vec![], SExpr::Con("GHC.Types.EQ".into(), vec![])),
+                            SAlt::Con("Builtin.:".into(), vec![UNUSED_SLOT, UNUSED_SLOT], SExpr::Con("GHC.Types.LT".into(), vec![])),
+                        ],
+                    ),
+                ),
+                SAlt::Con(
+                    "Builtin.:".into(),
+                    vec![3, 4],
+                    SExpr::Case(
+                        Box::new(SExpr::Atom(Atom::Slot(2))),
+                        UNUSED_SLOT,
+                        vec![
+                            SAlt::Con("Builtin.[]".into(), vec![], SExpr::Con("GHC.Types.GT".into(), vec![])),
+                            SAlt::Con(
+                                "Builtin.:".into(),
+                                vec![5, 6],
+                                SExpr::Case(
+                                    Box::new(SExpr::Prim("ltChar#".into(), vec![Atom::Slot(3), Atom::Slot(5)])),
+                                    r_lt,
+                                    vec![SAlt::Default(SExpr::Case(
+                                        Box::new(SExpr::Atom(Atom::Slot(r_lt))),
+                                        UNUSED_SLOT,
+                                        vec![
+                                            SAlt::Lit(Lit::Int(1), SExpr::Con("GHC.Types.LT".into(), vec![])),
+                                            SAlt::Default(SExpr::Case(
+                                                Box::new(SExpr::Prim("gtChar#".into(), vec![Atom::Slot(3), Atom::Slot(5)])),
+                                                r_gt,
+                                                vec![SAlt::Default(SExpr::Case(
+                                                    Box::new(SExpr::Atom(Atom::Slot(r_gt))),
+                                                    UNUSED_SLOT,
+                                                    vec![
+                                                        SAlt::Lit(Lit::Int(1), SExpr::Con("GHC.Types.GT".into(), vec![])),
+                                                        SAlt::Default(SExpr::App(
+                                                            Atom::Global(0),
+                                                            vec![Atom::Slot(4), Atom::Slot(6)],
+                                                        )),
+                                                    ],
+                                                ))],
+                                            )),
+                                        ],
+                                    ))],
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+            ],
+        );
+        let c = simple_closure(2, 7, 2, body);
+        let prog = make_prog(vec![SGlobal { name: "Test.cmpStr".into(), closure: c, worker: None }]);
+        let asm = Gen::program(&prog);
+        let (_, fn_asm) = asm.split_once("\n.Lg").expect("body label");
+        let (_, loop_rest) = fn_asm.split_once("\n.Lloop").expect("expected .Lloop");
+        let (hot_loop, _) = loop_rest.split_once("jmp .Lloop").expect("expected backedge jmp .Lloop");
+        assert!(
+            !hot_loop.contains("(%rbp)"),
+            "expected zero (%rbp) stack accesses in hot String compare .Lloop:\n{hot_loop}"
+        );
+    }
+
+    #[test]
+    fn two_way_con_dispatch_falls_through_when_default_is_cold_error() {
+        // Two constructor arms + a diverging `patError` default should dispatch the smaller
+        // constructor with a single `je` and fall through into the larger constructor, emitting
+        // `patError` out of line.
+        let err_global = simple_closure(1, 2, 0, SExpr::Fail("patError".into()));
+        let body = SExpr::Case(
+            Box::new(SExpr::Atom(Atom::Slot(1))),
+            UNUSED_SLOT,
+            vec![
+                SAlt::Con("Test.Tip".into(), vec![], SExpr::Atom(Atom::Lit(SLit::Int(0)))),
+                SAlt::Con("Test.Bin".into(), vec![2, 3], SExpr::Atom(Atom::Slot(2))),
+                SAlt::Default(SExpr::App(Atom::Global(0), vec![Atom::Lit(SLit::Int(1))])),
+            ],
+        );
+        let c = simple_closure(1, 4, 0, body);
+        let prog = make_prog(vec![
+            SGlobal { name: "Control.Exception.Base.patError".into(), closure: err_global, worker: None },
+            SGlobal { name: "Test.unboxTree".into(), closure: c, worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let fn_lbl = table
+            .lines()
+            .nth(1)
+            .unwrap()
+            .rsplit_once(',')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let fn_start = asm.find(&format!("{fn_lbl}:\n")).expect("unboxTree label");
+        let fn_end = asm[fn_start + 1..]
+            .find("\n.Lg")
+            .or_else(|| asm[fn_start + 1..].find("\n    .section"))
+            .map(|i| fn_start + 1 + i)
+            .unwrap_or(asm.len());
+        let fn_asm = &asm[fn_start..fn_end];
+        let hot = fn_asm.split("\n.Leval").next().unwrap_or(fn_asm);
+        assert!(
+            hot.contains("movq 8(%r14), %r14") || hot.contains("movq 8(%r14), %rsi"),
+            "expected Bin arm to fall through directly in hot body:\n{hot}"
+        );
+        assert!(
+            !hot.contains("patError"),
+            "expected patError default to be emitted cold:\n{hot}"
+        );
+    }
+
+    #[test]
+    fn static_lit_globals_fold_into_immediates_and_propagate_checked_kind() {
+        // Mirrors `Data.Map.balanceL`: top-level constant `delta = 3`, 5-field `Bin` unpacked
+        // while `rs` (Slot 1) is live, computing `delta * rs`, comparing `ls > delta * rs`, and
+        // reusing `rs` in `1 + rs` without a duplicate tag check or stack spill.
+        let r_prod = RAW | 0;
+        let r_cmp = RAW | 1;
+        let delta_c = simple_closure(0, 1, 0, SExpr::Atom(Atom::Lit(SLit::Int(3))));
+        let body = SExpr::Case(
+            Box::new(SExpr::Atom(Atom::Slot(2))),
+            UNUSED_SLOT,
+            vec![
+                SAlt::Con("Test.Tip".into(), vec![], SExpr::Atom(Atom::Slot(1))),
+                SAlt::Con(
+                    "Test.Bin".into(),
+                    vec![3, 4, 5, 6, 7],
+                    SExpr::Case(
+                        Box::new(SExpr::Prim("*#".into(), vec![Atom::Global(0), Atom::Slot(1)])),
+                        r_prod,
+                        vec![SAlt::Default(SExpr::Case(
+                            Box::new(SExpr::Prim(">#".into(), vec![Atom::Slot(3), Atom::Slot(r_prod)])),
+                            r_cmp,
+                            vec![SAlt::Default(SExpr::Case(
+                                Box::new(SExpr::Atom(Atom::Slot(r_cmp))),
+                                UNUSED_SLOT,
+                                vec![
+                                    SAlt::Lit(
+                                        Lit::Int(1),
+                                        SExpr::Con(
+                                            "Test.Bin".into(),
+                                            vec![Atom::Slot(3), Atom::Slot(4), Atom::Slot(5), Atom::Slot(6), Atom::Slot(7)],
+                                        ),
+                                    ),
+                                    SAlt::Default(SExpr::Prim(
+                                        "+#".into(),
+                                        vec![Atom::Lit(SLit::Int(1)), Atom::Slot(1)],
+                                    )),
+                                ],
+                            ))],
+                        ))],
+                    ),
+                ),
+            ],
+        );
+        let c = simple_closure(2, 8, 2, body);
+        let prog = make_prog(vec![
+            SGlobal { name: "Test.delta".into(), closure: delta_c, worker: None },
+            SGlobal { name: "Test.balanceCheck".into(), closure: c, worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let table = asm.split_once("hsc_globals:\n").unwrap().1;
+        let fn_lbl = table
+            .lines()
+            .nth(1)
+            .unwrap()
+            .rsplit_once(',')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let fn_start = asm.find(&format!("{fn_lbl}:\n")).expect("balanceCheck label");
+        let fn_end = asm[fn_start + 1..]
+            .find("\n.Lg")
+            .or_else(|| asm[fn_start + 1..].find("\n    .section"))
+            .map(|i| fn_start + 1 + i)
+            .unwrap_or(asm.len());
+        let fn_asm = &asm[fn_start..fn_end];
+        let hot = fn_asm.split("\n.Lyield").next().unwrap_or(fn_asm);
+        assert!(
+            hot.contains("imulq $3, 8(%rax), "),
+            "expected delta = 3 to fold into immediate 3-operand imulq into a free CACHE_REG:\n{hot}"
+        );
+        // Only 2 hot `cmpb $2` checks total (once for `rs` in `delta * rs`, once for `ls` in
+        // `ls > prod`); `delta` needs 0 checks and `1 + rs` reuses `rs`'s propagated `known_kind`.
+        let int_checks = hot.matches("cmpb $2,").count();
+        assert_eq!(
+            int_checks, 2,
+            "expected exactly 2 hot INT tag checks (rs once, ls once), got {int_checks}:\n{hot}"
+        );
+    }
 }
+
 
