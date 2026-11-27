@@ -680,7 +680,7 @@ fn take_full(m: &mut Machine) -> Option<Word> {
     m.heap_set(mv + 8, 0);
     if m.sched.front_kind(key) == Some(WaitKind::Putter) {
         if let Some(w) = m.sched.pop_waiter(key) {
-            m.heap_set(mv + 8, w.value.unwrap_or(0));
+            m.heap_write(mv, 1, w.value.unwrap_or(0));
             m.sched.wake(w.thread, None);
         }
     }
@@ -699,7 +699,7 @@ fn put_empty(m: &mut Machine, v: Word) {
                 return;
             }
             None => {
-                m.heap_set(mv + 8, v);
+                m.heap_write(mv, 1, v);
                 return;
             }
         }
@@ -760,7 +760,7 @@ fn throw_to(mp: *mut Machine) -> Word {
 fn rollback(m: &mut Machine, mark: usize) {
     while m.stm_log.len() > mark {
         if let Some((tv, old)) = m.stm_log.pop() {
-            m.heap_set(tv + 8, old);
+            m.heap_write(tv, 1, old);
         }
     }
 }
@@ -867,7 +867,7 @@ impl ConcOp {
                     m.heap_set(mv + 8, 0);
                     if m.sched.front_kind(key) == Some(WaitKind::Putter) {
                         if let Some(w) = m.sched.pop_waiter(key) {
-                            m.heap_set(mv + 8, w.value.unwrap_or(0));
+                            m.heap_write(mv, 1, w.value.unwrap_or(0));
                             m.sched.wake(w.thread, None);
                         }
                     }
@@ -1119,7 +1119,7 @@ pub fn run(m: &mut Machine, name: &str) -> Option<Word> {
                 m.stm_log.push((tv, old));
             }
             let v = m.args[1];
-            m.heap_set(tv + 8, v);
+            m.heap_write(tv, 1, v);
             unit(m)
         }
         "atomically#" => atomically(mp)?,

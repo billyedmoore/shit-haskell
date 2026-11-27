@@ -152,6 +152,21 @@ pub struct Heap {
     pub pinned_since_gc: usize,
     /// The live words after the last collection (the next space is sized from it).
     pub last_live: usize,
+    /// The nursery new objects are allocated in (empty when the heap is not generational, see
+    /// `Machine::collect`); survivors of a minor collection are promoted into `from`.
+    pub nursery: Vec<Word>,
+    /// Minor collections so far.
+    pub minor_collections: u64,
+    /// The words of the nursery proper at the start of `nursery`; two survivor spaces of the
+    /// same size follow it. `surv_cur` is the one holding survivors (`surv_used` words).
+    pub nursery_words: usize,
+    pub surv_cur: usize,
+    pub surv_used: usize,
+    /// Minor collections left that promote the nursery's survivors directly into the old space
+    /// (ageing them in the survivor space did not pay: most of them were promoted anyway).
+    pub direct_left: u32,
+    /// The words reserved for the nursery (it grows up to this without moving).
+    pub nursery_max: usize,
 }
 
 impl Heap {
@@ -164,6 +179,13 @@ impl Heap {
             pinned: std::collections::HashMap::new(),
             pinned_since_gc: 0,
             last_live: 0,
+            nursery: Vec::new(),
+            minor_collections: 0,
+            nursery_words: 0,
+            surv_cur: 0,
+            surv_used: 0,
+            direct_left: 0,
+            nursery_max: 0,
         }
     }
 
@@ -184,6 +206,21 @@ impl Heap {
         self.pinned_since_gc += size;
         self.set_word(p as Word, 0, h);
         p as Word
+    }
+
+    /// Makes the young space room for a nursery of up to `max` words (`words` of it in use)
+    /// and two empty survivor spaces of `max` words. Pages never touched cost nothing.
+    pub fn set_nursery(&mut self, words: usize, max: usize) {
+        self.nursery = space(3 * max);
+        self.nursery_max = max;
+        self.nursery_words = words;
+        self.surv_cur = 0;
+        self.surv_used = 0;
+    }
+
+    /// The base address of survivor space `k`.
+    pub fn surv_base(&self, k: usize) -> Word {
+        self.nursery.as_ptr() as Word + ((self.nursery_max * (1 + k)) as Word) * 8
     }
 
     /// Whether `p` is a pinned object.
