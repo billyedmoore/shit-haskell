@@ -655,7 +655,7 @@ impl Machine {
             p += 8;
             use crate::native::codegen::frame;
             let what = match fkind {
-                frame::BODY => {
+                frame::BODY | frame::BODY_MAP => {
                     p += 8 * size;
                     "body"
                 }
@@ -705,7 +705,7 @@ impl Machine {
             let size = crate::native::codegen::frame::words(unsafe { *((ret - 8) as *const Word) });
             p += 8;
             match fkind {
-                crate::native::codegen::frame::BODY => p += 8 * size,
+                crate::native::codegen::frame::BODY | crate::native::codegen::frame::BODY_MAP => p += 8 * size,
                 crate::native::codegen::frame::UPDATE => p += 8,
                 crate::native::codegen::frame::CATCH | crate::native::codegen::frame::MASK => p += 8,
                 crate::native::codegen::frame::APPLY => {
@@ -745,7 +745,7 @@ pub fn stack_roots(sp: Word, top: Word, out: &mut Vec<*mut Word>) {
         }
         let fkind = unsafe { *((ret - 16) as *const Word) };
         let size = unsafe { *((ret - 8) as *const Word) };
-        if !(1..=6).contains(&fkind) {
+        if !(1..=7).contains(&fkind) {
             eprintln!("hsc: bad frame at {p:#x} (sp {sp:#x}, top {first_top}): word {ret:#x} (stack_roots is at {:#x}); the last frames before it, innermost first:", stack_roots as usize);
             for i in walked.saturating_sub(TRAIL)..walked {
                 let (r, k, n, at) = trail[i % TRAIL];
@@ -769,6 +769,15 @@ pub fn stack_roots(sp: Word, top: Word, out: &mut Vec<*mut Word>) {
             frame::BODY => {
                 for i in frame::raw(size)..frame::words(size) {
                     out.push((p + 8 * i) as *mut Word);
+                }
+                p += 8 * frame::words(size);
+            }
+            frame::BODY_MAP => {
+                let mask = unsafe { *((ret - 24) as *const Word) };
+                for i in frame::raw(size)..frame::words(size) {
+                    if mask & (1 << i) != 0 {
+                        out.push((p + 8 * i) as *mut Word);
+                    }
                 }
                 p += 8 * frame::words(size);
             }
