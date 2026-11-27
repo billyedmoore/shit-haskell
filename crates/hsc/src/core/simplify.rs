@@ -203,7 +203,7 @@ fn simplify_with_mode(binds: &mut Vec<TopBind>, whole_program: bool) {
 
 /// Identifies constructors whose wrapper binding forces one or more fields before building the
 /// `Core::Con` (`\c0..ck -> case c_i of _ -> ... -> Con(name, [c0..ck])`).
-fn extract_strict_cons(binds: &[TopBind]) -> HashMap<String, Vec<bool>> {
+pub(crate) fn extract_strict_cons(binds: &[TopBind]) -> HashMap<String, Vec<bool>> {
     let mut out = HashMap::new();
     for b in binds {
         let mut params = Vec::new();
@@ -2087,6 +2087,10 @@ impl Simp<'_> {
                     let atom = match &rhs {
                         Core::Lit(_) => is_atom(&rhs),
                         Core::Var(y) => !group.contains(y) && !self.once.contains(y),
+                        // A constructor of number literals is a static value: substituted, so
+                        // its uses see the constructor (`go [] = acc` with `acc = (0, 0)`
+                        // returns a known pair).
+                        Core::Con(_, args) => !args.is_empty() && args.iter().all(|a| matches!(a, Core::Lit(Lit::Int(_) | Lit::Char(_) | Lit::Double(_)))),
                         _ => false,
                     };
                     if self.dead.contains(&name) {

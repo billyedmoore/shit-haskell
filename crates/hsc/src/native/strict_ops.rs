@@ -7,7 +7,7 @@
 //! the same for operands evaluated before, but hides a strict worker's raw parameters from the
 //! numeric analysis: `loop !acc i` loses its unboxed loop.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::core::{Alt, Core, TopBind};
 
@@ -20,22 +20,25 @@ fn strict_operands(prim: &str) -> bool {
     )
 }
 
-pub fn evaluate_double_operands(binds: &mut [TopBind]) {
+pub fn evaluate_double_operands(binds: &mut [TopBind], strict: &HashMap<String, Vec<bool>>) {
     for b in binds {
-        let mut cx = Cx { fresh: 0, evaluated: HashSet::new() };
+        let mut cx = Cx { fresh: 0, evaluated: HashSet::new(), strict };
         cx.expr(&mut b.body);
     }
 }
 
-struct Cx {
+struct Cx<'a> {
     fresh: u64,
+    /// Constructors whose wrapper evaluates some fields (`simplify::extract_strict_cons`): their
+    /// pattern variables for those fields are values too.
+    strict: &'a HashMap<String, Vec<bool>>,
     /// The case binders in scope: values. (A binder shadowed by a lambda or let of the same name
     /// is then taken for a value too, which only loses the native evaluation: the primitive's
     /// runtime path evaluates what it is given.)
     evaluated: HashSet<String>,
 }
 
-impl Cx {
+impl Cx<'_> {
     fn expr(&mut self, c: &mut Core) {
         match c {
             Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
@@ -55,7 +58,21 @@ impl Cx {
                 let added = self.evaluated.insert(b.clone());
                 for alt in alts.iter_mut() {
                     match alt {
-                        Alt::Con(_, _, body) | Alt::Lit(_, body) | Alt::Default(body) => self.expr(body),
+                        Alt::Con(con, vars, body) => {
+                            let mut fields = Vec::new();
+                            if let Some(flags) = self.strict.get(con.as_str()) {
+                                for (v, &f) in vars.iter().zip(flags) {
+                                    if f && self.evaluated.insert(v.clone()) {
+                                        fields.push(v.clone());
+                                    }
+                                }
+                            }
+                            self.expr(body);
+                            for v in fields {
+                                self.evaluated.remove(v.as_str());
+                            }
+                        }
+                        Alt::Lit(_, body) | Alt::Default(body) => self.expr(body),
                     }
                 }
                 if added {
@@ -108,7 +125,7 @@ mod tests {
     }
 
     fn run(mut e: Core) -> Core {
-        Cx { fresh: 0, evaluated: HashSet::new() }.expr(&mut e);
+        Cx { fresh: 0, evaluated: HashSet::new(), strict: &HashMap::new() }.expr(&mut e);
         e
     }
 
@@ -132,6 +149,30 @@ mod tests {
             vec![Alt::Default(Core::Prim("+##".into(), vec![var("b%2"), Core::Lit(crate::core::Lit::Double(1.0))]))],
         );
         assert_eq!(run(e.clone()), e);
+    }
+
+    #[test]
+    fn strict_constructor_fields_are_values() {
+        let body = Core::Prim("-##".into(), vec![var("x%1"), var("y%2")]);
+        let e = Core::Case(
+            Box::new(var("p%0")),
+            "b%3".into(),
+            vec![Alt::Con("T.P".into(), vec!["x%1".into(), "y%2".into()], body.clone())],
+        );
+        let strict: HashMap<String, Vec<bool>> = [("T.P".to_string(), vec![true, false])].into_iter().collect();
+        let mut out = e.clone();
+        Cx { fresh: 0, evaluated: HashSet::new(), strict: &strict }.expr(&mut out);
+        // Only the lazy field is evaluated first.
+        let expected = Core::Case(
+            Box::new(var("p%0")),
+            "b%3".into(),
+            vec![Alt::Con(
+                "T.P".into(),
+                vec!["x%1".into(), "y%2".into()],
+                Core::Case(Box::new(var("y%2")), "y%2~ev1".into(), vec![Alt::Default(Core::Prim("-##".into(), vec![var("x%1"), var("y%2~ev1")]))]),
+            )],
+        );
+        assert_eq!(out, expected);
     }
 
     #[test]
