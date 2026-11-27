@@ -155,6 +155,21 @@ fn simplify_with_mode(binds: &mut Vec<TopBind>, whole_program: bool) {
             pass(binds, 0, &rules, &strict_cons, Some(&clean2));
         }
     }
+    // Whole-program caller-strict product-result analysis: when every caller of a non-escaping
+    // constructor-returning function strictly evaluates field `i` of the returned constructor,
+    // evaluate field `i` before constructing the result (eliminating inner thunks such as
+    // `State.Strict` computations returning `(a, s)` whose callers always force `a`).
+    if whole_program {
+        let strict_res_changed = caller_strict_result_fields(binds, &strict_cons);
+        if !strict_res_changed.is_empty() {
+            let no_rules = Rules {
+                by_head: HashMap::new(),
+                protected: HashSet::new(),
+                inlines: rules.inlines.clone(),
+            };
+            pass(binds, 0, &no_rules, &strict_cons, Some(&strict_res_changed));
+        }
+    }
     // Caller-WHNF parameter analysis and speculation of cheap total primitive arguments at call
     // sites (whole-program mode analyzes non-escaping top-level functions too; package mode analyzes
     // local `let`-bound functions only).
@@ -5390,6 +5405,1427 @@ fn is_external_entry(name: &str) -> bool {
         || crate::native::RTS_GLOBALS.contains(&name)
 }
 
+/// Whole-program caller-strict product-result analysis.
+///
+/// Finds non-escaping top-level functions `f` (`arity > 0`) whose every non-bottom tail path
+/// returns the same constructor `C` of arity `1 <= m <= 4` (directly or via tail calls to peer
+/// functions), computes via greatest fixed point which fields `i` of `C` are certainly evaluated
+/// by every caller of `f`, and wraps non-WHNF arguments in those field positions in
+/// `case arg as sf of _ -> C ... sf ...` so inner thunks are evaluated before returning `C`.
+fn caller_strict_result_fields(
+    binds: &mut [TopBind],
+    strict_cons: &HashMap<String, Vec<bool>>,
+) -> HashSet<String> {
+    let direct: HashMap<&str, &Core> = binds.iter().map(|b| (b.name.as_str(), &b.body)).collect();
+    let global_arities: HashMap<String, usize> = binds
+        .iter()
+        .filter_map(|b| {
+            let (n, _) = lambdas(&b.body);
+            (n > 0).then(|| (b.name.clone(), n))
+        })
+        .collect();
+
+    // Top-level bindings guaranteed to already be in WHNF.
+    let mut whnf_globals: HashSet<String> = HashSet::new();
+    for b in binds.iter() {
+        let mut cur = &b.body;
+        for _ in 0..8 {
+            match cur {
+                Core::Var(v) => match direct.get(v.as_str()) {
+                    Some(next) if v != &b.name => cur = next,
+                    _ => break,
+                },
+                Core::Lit(_) | Core::Con(..) | Core::Lam(..) => {
+                    whnf_globals.insert(b.name.clone());
+                    break;
+                }
+                Core::App(..) => {
+                    let mut n = 0usize;
+                    let mut all_atom = true;
+                    let mut h = cur;
+                    while let Core::App(f, a) = h {
+                        if !is_atom(a) {
+                            all_atom = false;
+                            break;
+                        }
+                        n += 1;
+                        h = f;
+                    }
+                    if all_atom
+                        && matches!(h, Core::Var(g) if global_arities.get(g.as_str()).is_some_and(|&a| a > n))
+                    {
+                        whnf_globals.insert(b.name.clone());
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    // Greatest fixed point of top-level bindings whose evaluation cannot perform IO side effects
+    // (no effectful primops and no calls to unknown/effectful functions). Used only to avoid the
+    // conservative IO hack on `case pureFn args of (x, s) -> ...`.
+    let is_pure_prim = |p: &str| {
+        STRICT_PRIMS.contains(&p)
+            || matches!(p, "seq" | "lazy" | "oneShot" | "inline" | "noinline" | "raise#")
+    };
+    let all_globals: HashSet<&str> = binds.iter().map(|b| b.name.as_str()).collect();
+    fn expr_is_pure(
+        e: &Core,
+        pure_globals: &HashSet<String>,
+        all_globals: &HashSet<&str>,
+        local_lams: &HashSet<String>,
+        shadowed: &mut HashMap<String, usize>,
+        is_pure_prim: &impl Fn(&str) -> bool,
+    ) -> bool {
+        match e {
+            Core::Lit(_) | Core::Fail(_) => true,
+            Core::Var(v) => {
+                if shadowed.get(v.as_str()).copied().unwrap_or(0) > 0 {
+                    true
+                } else {
+                    !all_globals.contains(v.as_str()) || pure_globals.contains(v.as_str())
+                }
+            }
+            Core::Lam(p, b) => {
+                *shadowed.entry(p.clone()).or_default() += 1;
+                let ok = expr_is_pure(b, pure_globals, all_globals, local_lams, shadowed, is_pure_prim);
+                *shadowed.get_mut(p.as_str()).unwrap() -= 1;
+                ok
+            }
+            Core::App(..) => {
+                let mut args = Vec::new();
+                let mut head = e;
+                while let Core::App(f, a) = head {
+                    args.push(&**a);
+                    head = f;
+                }
+                let head_ok = match head {
+                    Core::Fail(_) => true,
+                    Core::Var(v) => {
+                        if shadowed.get(v.as_str()).copied().unwrap_or(0) > 0 {
+                            local_lams.contains(v.as_str())
+                        } else {
+                            is_diverging_error_call(v, args.len()) || pure_globals.contains(v.as_str())
+                        }
+                    }
+                    Core::Lam(..) => {
+                        expr_is_pure(head, pure_globals, all_globals, local_lams, shadowed, is_pure_prim)
+                    }
+                    _ => false,
+                };
+                head_ok
+                    && args.into_iter().all(|a| {
+                        expr_is_pure(a, pure_globals, all_globals, local_lams, shadowed, is_pure_prim)
+                    })
+            }
+            Core::Let(bs, body) => {
+                let mut added_lams = Vec::new();
+                let mut next_lams = local_lams.clone();
+                for (n, rhs) in bs {
+                    *shadowed.entry(n.clone()).or_default() += 1;
+                    if lambdas(rhs).0 > 0 {
+                        next_lams.insert(n.clone());
+                        added_lams.push(n.as_str());
+                    } else {
+                        next_lams.remove(n.as_str());
+                    }
+                }
+                let ok = bs.iter().all(|(_, r)| {
+                    expr_is_pure(r, pure_globals, all_globals, &next_lams, shadowed, is_pure_prim)
+                }) && expr_is_pure(body, pure_globals, all_globals, &next_lams, shadowed, is_pure_prim);
+                for (n, _) in bs {
+                    *shadowed.get_mut(n.as_str()).unwrap() -= 1;
+                }
+                let _ = added_lams;
+                ok
+            }
+            Core::Case(s, b, alts) => {
+                if !expr_is_pure(s, pure_globals, all_globals, local_lams, shadowed, is_pure_prim) {
+                    return false;
+                }
+                *shadowed.entry(b.clone()).or_default() += 1;
+                let mut next_lams = local_lams.clone();
+                next_lams.remove(b.as_str());
+                let ok = alts.iter().all(|alt| match alt {
+                    Alt::Con(_, vars, rhs) => {
+                        let mut alt_lams = next_lams.clone();
+                        for v in vars {
+                            *shadowed.entry(v.clone()).or_default() += 1;
+                            alt_lams.remove(v.as_str());
+                        }
+                        let r = expr_is_pure(rhs, pure_globals, all_globals, &alt_lams, shadowed, is_pure_prim);
+                        for v in vars {
+                            *shadowed.get_mut(v.as_str()).unwrap() -= 1;
+                        }
+                        r
+                    }
+                    Alt::Lit(_, rhs) | Alt::Default(rhs) => {
+                        expr_is_pure(rhs, pure_globals, all_globals, &next_lams, shadowed, is_pure_prim)
+                    }
+                });
+                *shadowed.get_mut(b.as_str()).unwrap() -= 1;
+                ok
+            }
+            Core::Con(_, args) => args
+                .iter()
+                .all(|a| expr_is_pure(a, pure_globals, all_globals, local_lams, shadowed, is_pure_prim)),
+            Core::Prim(p, args) => {
+                is_pure_prim(p)
+                    && args.iter().all(|a| {
+                        expr_is_pure(a, pure_globals, all_globals, local_lams, shadowed, is_pure_prim)
+                    })
+            }
+        }
+    }
+    let mut pure_globals: HashSet<String> = binds
+        .iter()
+        .filter(|b| !is_rule_binding(&b.name))
+        .map(|b| b.name.clone())
+        .collect();
+    loop {
+        let mut dropped = Vec::new();
+        for b in binds.iter() {
+            if !pure_globals.contains(&b.name) {
+                continue;
+            }
+            let mut shadowed = HashMap::new();
+            if !expr_is_pure(
+                &b.body,
+                &pure_globals,
+                &all_globals,
+                &HashSet::new(),
+                &mut shadowed,
+                &is_pure_prim,
+            ) {
+                dropped.push(b.name.clone());
+            }
+        }
+        if dropped.is_empty() {
+            break;
+        }
+        for name in dropped {
+            pure_globals.remove(&name);
+        }
+    }
+
+    // Non-escaping top-level candidate functions (arity > 0, called only saturated at exact arity).
+    let mut cands: HashMap<String, usize> = HashMap::new();
+    for b in binds.iter() {
+        if is_rule_binding(&b.name) || is_external_entry(&b.name) {
+            continue;
+        }
+        let (n, _) = lambdas(&b.body);
+        if n > 0 {
+            cands.insert(b.name.clone(), n);
+        }
+    }
+    let mut escaped: HashSet<String> = HashSet::new();
+    let mut calls: HashMap<String, usize> = HashMap::new();
+    fn scan_escapes(
+        e: &Core,
+        cands: &HashMap<String, usize>,
+        escaped: &mut HashSet<String>,
+        calls: &mut HashMap<String, usize>,
+        shadowed: &mut HashMap<String, usize>,
+    ) {
+        match e {
+            Core::Var(v) => {
+                if shadowed.get(v.as_str()).copied().unwrap_or(0) == 0 && cands.contains_key(v.as_str()) {
+                    escaped.insert(v.clone());
+                }
+            }
+            Core::Lit(_) | Core::Fail(_) => {}
+            Core::App(..) => {
+                let mut args = Vec::new();
+                let mut head = e;
+                while let Core::App(f, a) = head {
+                    args.push(&**a);
+                    head = f;
+                }
+                match head {
+                    Core::Var(v) => {
+                        if shadowed.get(v.as_str()).copied().unwrap_or(0) == 0 {
+                            if let Some(&arity) = cands.get(v.as_str()) {
+                                if args.len() == arity {
+                                    *calls.entry(v.clone()).or_default() += 1;
+                                } else {
+                                    escaped.insert(v.clone());
+                                }
+                            }
+                        }
+                    }
+                    other => scan_escapes(other, cands, escaped, calls, shadowed),
+                }
+                for a in args {
+                    scan_escapes(a, cands, escaped, calls, shadowed);
+                }
+            }
+            Core::Lam(p, b) => {
+                *shadowed.entry(p.clone()).or_default() += 1;
+                scan_escapes(b, cands, escaped, calls, shadowed);
+                *shadowed.get_mut(p.as_str()).unwrap() -= 1;
+            }
+            Core::Let(bs, body) => {
+                for (n, _) in bs {
+                    *shadowed.entry(n.clone()).or_default() += 1;
+                }
+                for (_, r) in bs {
+                    scan_escapes(r, cands, escaped, calls, shadowed);
+                }
+                scan_escapes(body, cands, escaped, calls, shadowed);
+                for (n, _) in bs {
+                    *shadowed.get_mut(n.as_str()).unwrap() -= 1;
+                }
+            }
+            Core::Case(s, b, alts) => {
+                scan_escapes(s, cands, escaped, calls, shadowed);
+                *shadowed.entry(b.clone()).or_default() += 1;
+                for alt in alts {
+                    match alt {
+                        Alt::Con(_, vars, rhs) => {
+                            for v in vars {
+                                *shadowed.entry(v.clone()).or_default() += 1;
+                            }
+                            scan_escapes(rhs, cands, escaped, calls, shadowed);
+                            for v in vars {
+                                *shadowed.get_mut(v.as_str()).unwrap() -= 1;
+                            }
+                        }
+                        Alt::Lit(_, rhs) | Alt::Default(rhs) => {
+                            scan_escapes(rhs, cands, escaped, calls, shadowed);
+                        }
+                    }
+                }
+                *shadowed.get_mut(b.as_str()).unwrap() -= 1;
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    scan_escapes(a, cands, escaped, calls, shadowed);
+                }
+            }
+        }
+    }
+    for b in binds.iter() {
+        if is_rule_binding(&b.name) {
+            continue;
+        }
+        let mut shadowed = HashMap::new();
+        scan_escapes(&b.body, &cands, &mut escaped, &mut calls, &mut shadowed);
+    }
+    cands.retain(|k, _| !escaped.contains(k) && calls.get(k).copied().unwrap_or(0) > 0);
+    if cands.is_empty() {
+        return HashSet::new();
+    }
+
+    // Collect tail exits of each non-escaping candidate to find those returning a single
+    // constructor `(con, m)` with `1 <= m <= 4` on every non-bottom path.
+    enum TailExit {
+        Con(String, usize),
+        Call(String),
+    }
+    fn collect_exits(
+        e: &Core,
+        cands: &HashMap<String, usize>,
+        shadowed: &mut HashMap<String, usize>,
+        out: &mut Vec<TailExit>,
+    ) -> bool {
+        match e {
+            Core::Fail(_) => true,
+            Core::Prim(p, args) if p == "raise#" && args.len() == 1 => true,
+            Core::Con(con, args) if !args.is_empty() && args.len() <= 4 => {
+                out.push(TailExit::Con(con.clone(), args.len()));
+                true
+            }
+            Core::App(..) => {
+                let mut nargs = 0usize;
+                let mut head = e;
+                while let Core::App(f, _) = head {
+                    nargs += 1;
+                    head = f;
+                }
+                match head {
+                    Core::Fail(_) => true,
+                    Core::Prim(p, args) if p == "raise#" && args.len() == 1 => true,
+                    Core::Var(v) if shadowed.get(v.as_str()).copied().unwrap_or(0) == 0 => {
+                        if is_diverging_error_call(v, nargs) {
+                            true
+                        } else if cands.get(v.as_str()).is_some_and(|&ar| ar == nargs) {
+                            out.push(TailExit::Call(v.clone()));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                collect_exits(&args[1], cands, shadowed, out)
+            }
+            Core::Prim(p, args)
+                if matches!(p.as_str(), "lazy" | "oneShot" | "inline" | "noinline")
+                    && args.len() == 1 =>
+            {
+                collect_exits(&args[0], cands, shadowed, out)
+            }
+            Core::Let(bs, body) => {
+                for (n, _) in bs {
+                    *shadowed.entry(n.clone()).or_default() += 1;
+                }
+                let ok = collect_exits(body, cands, shadowed, out);
+                for (n, _) in bs {
+                    *shadowed.get_mut(n.as_str()).unwrap() -= 1;
+                }
+                ok
+            }
+            Core::Case(_, b, alts) => {
+                *shadowed.entry(b.clone()).or_default() += 1;
+                let ok = alts.iter().all(|alt| match alt {
+                    Alt::Con(_, vars, rhs) => {
+                        for v in vars {
+                            *shadowed.entry(v.clone()).or_default() += 1;
+                        }
+                        let r = collect_exits(rhs, cands, shadowed, out);
+                        for v in vars {
+                            *shadowed.get_mut(v.as_str()).unwrap() -= 1;
+                        }
+                        r
+                    }
+                    Alt::Lit(_, rhs) | Alt::Default(rhs) => collect_exits(rhs, cands, shadowed, out),
+                });
+                *shadowed.get_mut(b.as_str()).unwrap() -= 1;
+                ok
+            }
+            _ => false,
+        }
+    }
+
+    let mut fn_exits: HashMap<String, Vec<TailExit>> = HashMap::new();
+    let mut ret_con: HashMap<String, Option<(String, usize)>> = HashMap::new();
+    for b in binds.iter() {
+        let Some(&ar) = cands.get(&b.name) else { continue };
+        let mut cur = &b.body;
+        let mut shadowed = HashMap::new();
+        for _ in 0..ar {
+            if let Core::Lam(p, inner) = cur {
+                *shadowed.entry(p.clone()).or_default() += 1;
+                cur = inner;
+            }
+        }
+        let mut exits = Vec::new();
+        if !collect_exits(cur, &cands, &mut shadowed, &mut exits) {
+            continue;
+        }
+        let mut shape: Option<(String, usize)> = None;
+        let mut conflict = false;
+        for ex in &exits {
+            if let TailExit::Con(con, m) = ex {
+                match &shape {
+                    None => shape = Some((con.clone(), *m)),
+                    Some((c0, m0)) if c0 == con && *m0 == *m => {}
+                    _ => {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !conflict && !exits.is_empty() {
+            fn_exits.insert(b.name.clone(), exits);
+            ret_con.insert(b.name.clone(), shape);
+        }
+    }
+    loop {
+        let mut changed = false;
+        let keys: Vec<String> = ret_con.keys().cloned().collect();
+        for f in keys {
+            let Some(mut shape) = ret_con.get(&f).cloned() else { continue };
+            let mut bad = false;
+            for ex in &fn_exits[&f] {
+                if let TailExit::Call(g) = ex {
+                    let Some(g_shape) = ret_con.get(g) else {
+                        bad = true;
+                        break;
+                    };
+                    if let Some(gs) = g_shape {
+                        match &shape {
+                            None => {
+                                shape = Some(gs.clone());
+                                changed = true;
+                            }
+                            Some(s) if s == gs => {}
+                            _ => {
+                                bad = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if bad {
+                ret_con.remove(&f);
+                changed = true;
+            } else {
+                ret_con.insert(f, shape);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let ret_con: HashMap<String, (String, usize)> = ret_con
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|s| (k, s)))
+        .collect();
+    if ret_con.is_empty() {
+        return HashSet::new();
+    }
+
+    // Strict parameters of top-level functions (2 rounds of `forced_d`).
+    let mut global_strict: HashMap<String, Vec<bool>> = HashMap::new();
+    for _ in 0..2 {
+        let mut next = HashMap::new();
+        for b in binds.iter() {
+            if is_rule_binding(&b.name) {
+                continue;
+            }
+            let mut params = Vec::new();
+            let mut cur = &b.body;
+            while let Core::Lam(p, inner) = cur {
+                params.push(p.as_str());
+                cur = inner;
+            }
+            if params.is_empty() {
+                continue;
+            }
+            let f = forced(cur, &global_strict);
+            let flags: Vec<bool> = params.iter().map(|p| f.contains(*p)).collect();
+            if flags.iter().any(|&x| x) {
+                next.insert(b.name.clone(), flags);
+            }
+        }
+        global_strict = next;
+    }
+
+    // Pure-aware demand analysis that also knows local `let`-bound function strictness and
+    // demanded fields of an enclosing candidate function's tail constructor.
+    #[allow(clippy::too_many_arguments)]
+    fn demanded_vars(
+        e: &Core,
+        tail_fn: Option<&str>,
+        ret_con: &HashMap<String, (String, usize)>,
+        strict_fields: &HashMap<String, Vec<bool>>,
+        global_strict: &HashMap<String, Vec<bool>>,
+        local_strict: &HashMap<String, Vec<bool>>,
+        pure_globals: &HashSet<String>,
+        local_pure: &HashSet<String>,
+    ) -> (HashSet<String>, bool) {
+        let mut out = HashSet::new();
+        let mut fails = false;
+        match e {
+            Core::Var(v) => {
+                out.insert(v.clone());
+            }
+            Core::Fail(_) => fails = true,
+            Core::Lit(_) | Core::Lam(..) => {}
+            Core::Con(con, args) => {
+                if let Some(g) = tail_fn {
+                    if let Some((g_con, g_m)) = ret_con.get(g) {
+                        if con == g_con && args.len() == *g_m {
+                            if let Some(sf) = strict_fields.get(g) {
+                                for (a, &is_s) in args.iter().zip(sf) {
+                                    if is_s {
+                                        let (d, fa) = demanded_vars(
+                                            a,
+                                            None,
+                                            ret_con,
+                                            strict_fields,
+                                            global_strict,
+                                            local_strict,
+                                            pure_globals,
+                                            local_pure,
+                                        );
+                                        out.extend(d);
+                                        fails |= fa;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Core::App(..) => {
+                let mut args = Vec::new();
+                let mut head = e;
+                while let Core::App(f, a) = head {
+                    args.push(&**a);
+                    head = f;
+                }
+                args.reverse();
+                if let Core::Fail(_) = head {
+                    fails = true;
+                } else if let Core::Var(f) = head {
+                    if is_diverging_error_call(f, args.len()) {
+                        fails = true;
+                    } else {
+                        out.insert(f.clone());
+                        let s_opt = local_strict.get(f.as_str()).or_else(|| global_strict.get(f.as_str()));
+                        if let Some(s) = s_opt {
+                            if args.len() >= s.len() {
+                                for (a, &st) in args.iter().zip(s) {
+                                    if st {
+                                        let (d, _) = demanded_vars(
+                                            a,
+                                            None,
+                                            ret_con,
+                                            strict_fields,
+                                            global_strict,
+                                            local_strict,
+                                            pure_globals,
+                                            local_pure,
+                                        );
+                                        out.extend(d);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Core::Let(bs, body) => {
+                let mut next_local = local_strict.clone();
+                let mut next_pure = local_pure.clone();
+                for (name, rhs) in bs {
+                    next_local.remove(name.as_str());
+                    next_pure.remove(name.as_str());
+                    let mut params = Vec::new();
+                    let mut cur = rhs;
+                    while let Core::Lam(p, inner) = cur {
+                        params.push(p.as_str());
+                        cur = inner;
+                    }
+                    if !params.is_empty() {
+                        let f = forced(cur, global_strict);
+                        let flags: Vec<bool> = params.iter().map(|p| f.contains(*p)).collect();
+                        if flags.iter().any(|&x| x) {
+                            next_local.insert(name.clone(), flags);
+                        }
+                    }
+                }
+                (out, fails) = demanded_vars(
+                    body,
+                    tail_fn,
+                    ret_con,
+                    strict_fields,
+                    global_strict,
+                    &next_local,
+                    pure_globals,
+                    &next_pure,
+                );
+                for (x, _) in bs {
+                    out.remove(x);
+                }
+            }
+            Core::Case(s, b, alts) => {
+                let is_pure_scrut_call = if let Core::App(..) = &**s {
+                    let mut head = &**s;
+                    while let Core::App(f, _) = head {
+                        head = f;
+                    }
+                    matches!(head, Core::Var(v) if pure_globals.contains(v.as_str()) || local_pure.contains(v.as_str()))
+                } else {
+                    false
+                };
+                let io_hack = matches!(&**s, Core::Prim(p, _) if !STRICT_PRIMS.contains(&p.as_str()))
+                    || (matches!(&**s, Core::App(..))
+                        && !is_pure_scrut_call
+                        && alts.iter().any(|a| matches!(a, Alt::Con(k, _, _) if k == "Builtin.(,)")));
+                if io_hack {
+                    (out, fails) = demanded_vars(
+                        s,
+                        None,
+                        ret_con,
+                        strict_fields,
+                        global_strict,
+                        local_strict,
+                        pure_globals,
+                        local_pure,
+                    );
+                } else {
+                    let mut common: Option<HashSet<String>> = None;
+                    let mut next_local = local_strict.clone();
+                    let mut next_pure = local_pure.clone();
+                    next_local.remove(b.as_str());
+                    next_pure.remove(b.as_str());
+                    for a in alts {
+                        let (vars, body): (&[String], &Core) = match a {
+                            Alt::Con(_, vars, body) => (vars, body),
+                            Alt::Lit(_, body) | Alt::Default(body) => (&[], body),
+                        };
+                        let mut alt_local = next_local.clone();
+                        let mut alt_pure = next_pure.clone();
+                        for v in vars {
+                            alt_local.remove(v.as_str());
+                            alt_pure.remove(v.as_str());
+                        }
+                        let (mut f, alt_fails) = demanded_vars(
+                            body,
+                            tail_fn,
+                            ret_con,
+                            strict_fields,
+                            global_strict,
+                            &alt_local,
+                            pure_globals,
+                            &alt_pure,
+                        );
+                        if alt_fails {
+                            continue;
+                        }
+                        for v in vars {
+                            f.remove(v);
+                        }
+                        common = Some(match common {
+                            None => f,
+                            Some(c) => c.intersection(&f).cloned().collect(),
+                        });
+                    }
+                    fails = common.is_none() && !alts.is_empty();
+                    out = common.unwrap_or_default();
+                    out.remove(b);
+                    let (sf, s_fails) = demanded_vars(
+                        s,
+                        None,
+                        ret_con,
+                        strict_fields,
+                        global_strict,
+                        local_strict,
+                        pure_globals,
+                        local_pure,
+                    );
+                    out.extend(sf);
+                    fails |= s_fails;
+                }
+            }
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                let (a, fa) = demanded_vars(
+                    &args[0],
+                    None,
+                    ret_con,
+                    strict_fields,
+                    global_strict,
+                    local_strict,
+                    pure_globals,
+                    local_pure,
+                );
+                let (b, fb) = demanded_vars(
+                    &args[1],
+                    tail_fn,
+                    ret_con,
+                    strict_fields,
+                    global_strict,
+                    local_strict,
+                    pure_globals,
+                    local_pure,
+                );
+                out = a;
+                out.extend(b);
+                fails = fa || fb;
+            }
+            Core::Prim(p, args)
+                if matches!(p.as_str(), "lazy" | "oneShot" | "inline" | "noinline")
+                    && args.len() == 1 =>
+            {
+                (out, fails) = demanded_vars(
+                    &args[0],
+                    tail_fn,
+                    ret_con,
+                    strict_fields,
+                    global_strict,
+                    local_strict,
+                    pure_globals,
+                    local_pure,
+                );
+            }
+            Core::Prim(p, args) if p == "raise#" && args.len() == 1 => {
+                fails = true;
+            }
+            Core::Prim(p, args) if STRICT_PRIMS.contains(&p.as_str()) => {
+                for a in args {
+                    let (f, fa) = demanded_vars(
+                        a,
+                        None,
+                        ret_con,
+                        strict_fields,
+                        global_strict,
+                        local_strict,
+                        pure_globals,
+                        local_pure,
+                    );
+                    out.extend(f);
+                    fails |= fa;
+                }
+            }
+            Core::Prim(..) => {}
+        }
+        (out, fails)
+    }
+
+    // Greatest fixed point for `strict_fields`: start assuming all fields of each candidate are
+    // strictly demanded by callers, then clear any field not demanded at any call site.
+    let mut strict_fields: HashMap<String, Vec<bool>> = ret_con
+        .iter()
+        .map(|(f, (_, m))| (f.clone(), vec![true; *m]))
+        .collect();
+
+    #[allow(clippy::too_many_arguments)]
+    fn refine_call_sites(
+        e: &Core,
+        tail_fn: Option<&str>,
+        cands: &HashMap<String, usize>,
+        ret_con: &HashMap<String, (String, usize)>,
+        global_strict: &HashMap<String, Vec<bool>>,
+        local_strict: &HashMap<String, Vec<bool>>,
+        pure_globals: &HashSet<String>,
+        shadowed: &mut HashMap<String, usize>,
+        strict_fields: &mut HashMap<String, Vec<bool>>,
+        changed: &mut bool,
+    ) {
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::Case(scrut, binder, alts) => {
+                let mut handled_scrut = false;
+                if let Core::App(..) = &**scrut {
+                    let mut args = Vec::new();
+                    let mut head = &**scrut;
+                    while let Core::App(f, a) = head {
+                        args.push(&**a);
+                        head = f;
+                    }
+                    if let Core::Var(f) = head {
+                        if shadowed.get(f.as_str()).copied().unwrap_or(0) == 0
+                            && ret_con.contains_key(f.as_str())
+                            && cands.get(f.as_str()).is_some_and(|&ar| ar == args.len())
+                        {
+                            handled_scrut = true;
+                            for a in args {
+                                refine_call_sites(
+                                    a,
+                                    None,
+                                    cands,
+                                    ret_con,
+                                    global_strict,
+                                    local_strict,
+                                    pure_globals,
+                                    shadowed,
+                                    strict_fields,
+                                    changed,
+                                );
+                            }
+                            let (con, m) = &ret_con[f.as_str()];
+                            let mut next_local = local_strict.clone();
+                            next_local.remove(binder.as_str());
+                            let mut keep = strict_fields[f.as_str()].clone();
+                            for alt in alts {
+                                match alt {
+                                    Alt::Con(c, vars, rhs) if c == con && vars.len() == *m => {
+                                        let mut alt_local = next_local.clone();
+                                        for v in vars {
+                                            alt_local.remove(v.as_str());
+                                        }
+                                        let (dem, alt_fails) = demanded_vars(
+                                            rhs,
+                                            tail_fn,
+                                            ret_con,
+                                            strict_fields,
+                                            global_strict,
+                                            &alt_local,
+                                            pure_globals,
+                                            &HashSet::new(),
+                                        );
+                                        if !alt_fails {
+                                            for i in 0..*m {
+                                                let shadowed_later = vars[i + 1..].iter().any(|v| v == &vars[i]);
+                                                if shadowed_later || !dem.contains(&vars[i]) {
+                                                    keep[i] = false;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Alt::Con(_, _, rhs) | Alt::Lit(_, rhs) | Alt::Default(rhs) => {
+                                        if !is_bottom_expr(rhs) {
+                                            for k in &mut keep {
+                                                *k = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(cur) = strict_fields.get_mut(f.as_str()) {
+                                for (c, k) in cur.iter_mut().zip(keep) {
+                                    if *c && !k {
+                                        *c = false;
+                                        *changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !handled_scrut {
+                    refine_call_sites(
+                        scrut,
+                        None,
+                        cands,
+                        ret_con,
+                        global_strict,
+                        local_strict,
+                        pure_globals,
+                        shadowed,
+                        strict_fields,
+                        changed,
+                    );
+                }
+                *shadowed.entry(binder.clone()).or_default() += 1;
+                let mut next_local = local_strict.clone();
+                next_local.remove(binder.as_str());
+                for alt in alts {
+                    match alt {
+                        Alt::Con(_, vars, rhs) => {
+                            let mut alt_local = next_local.clone();
+                            for v in vars {
+                                *shadowed.entry(v.clone()).or_default() += 1;
+                                alt_local.remove(v.as_str());
+                            }
+                            refine_call_sites(
+                                rhs,
+                                tail_fn,
+                                cands,
+                                ret_con,
+                                global_strict,
+                                &alt_local,
+                                pure_globals,
+                                shadowed,
+                                strict_fields,
+                                changed,
+                            );
+                            for v in vars {
+                                *shadowed.get_mut(v.as_str()).unwrap() -= 1;
+                            }
+                        }
+                        Alt::Lit(_, rhs) | Alt::Default(rhs) => {
+                            refine_call_sites(
+                                rhs,
+                                tail_fn,
+                                cands,
+                                ret_con,
+                                global_strict,
+                                &next_local,
+                                pure_globals,
+                                shadowed,
+                                strict_fields,
+                                changed,
+                            );
+                        }
+                    }
+                }
+                *shadowed.get_mut(binder.as_str()).unwrap() -= 1;
+            }
+            Core::App(..) => {
+                let mut args = Vec::new();
+                let mut head = e;
+                while let Core::App(f, a) = head {
+                    args.push(&**a);
+                    head = f;
+                }
+                match head {
+                    Core::Var(f)
+                        if shadowed.get(f.as_str()).copied().unwrap_or(0) == 0
+                            && ret_con.contains_key(f.as_str()) =>
+                    {
+                        let inherited = tail_fn
+                            .filter(|g| {
+                                cands.get(f.as_str()).is_some_and(|&ar| ar == args.len())
+                                    && ret_con.get(*g) == ret_con.get(f.as_str())
+                            })
+                            .and_then(|g| strict_fields.get(g).cloned());
+                        if let Some(cur) = strict_fields.get_mut(f.as_str()) {
+                            match inherited {
+                                Some(inh) => {
+                                    for (c, k) in cur.iter_mut().zip(inh) {
+                                        if *c && !k {
+                                            *c = false;
+                                            *changed = true;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    for c in cur.iter_mut() {
+                                        if *c {
+                                            *c = false;
+                                            *changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    other => refine_call_sites(
+                        other,
+                        None,
+                        cands,
+                        ret_con,
+                        global_strict,
+                        local_strict,
+                        pure_globals,
+                        shadowed,
+                        strict_fields,
+                        changed,
+                    ),
+                }
+                for a in args {
+                    refine_call_sites(
+                        a,
+                        None,
+                        cands,
+                        ret_con,
+                        global_strict,
+                        local_strict,
+                        pure_globals,
+                        shadowed,
+                        strict_fields,
+                        changed,
+                    );
+                }
+            }
+            Core::Lam(p, body) => {
+                *shadowed.entry(p.clone()).or_default() += 1;
+                let mut next_local = local_strict.clone();
+                next_local.remove(p.as_str());
+                refine_call_sites(
+                    body,
+                    None,
+                    cands,
+                    ret_con,
+                    global_strict,
+                    &next_local,
+                    pure_globals,
+                    shadowed,
+                    strict_fields,
+                    changed,
+                );
+                *shadowed.get_mut(p.as_str()).unwrap() -= 1;
+            }
+            Core::Let(bs, body) => {
+                let mut next_local = local_strict.clone();
+                for (n, rhs) in bs {
+                    *shadowed.entry(n.clone()).or_default() += 1;
+                    next_local.remove(n.as_str());
+                    let mut params = Vec::new();
+                    let mut cur = rhs;
+                    while let Core::Lam(p, inner) = cur {
+                        params.push(p.as_str());
+                        cur = inner;
+                    }
+                    if !params.is_empty() {
+                        let f = forced(cur, global_strict);
+                        let flags: Vec<bool> = params.iter().map(|p| f.contains(*p)).collect();
+                        if flags.iter().any(|&x| x) {
+                            next_local.insert(n.clone(), flags);
+                        }
+                    }
+                }
+                for (_, r) in bs {
+                    refine_call_sites(
+                        r,
+                        None,
+                        cands,
+                        ret_con,
+                        global_strict,
+                        &next_local,
+                        pure_globals,
+                        shadowed,
+                        strict_fields,
+                        changed,
+                    );
+                }
+                refine_call_sites(
+                    body,
+                    tail_fn,
+                    cands,
+                    ret_con,
+                    global_strict,
+                    &next_local,
+                    pure_globals,
+                    shadowed,
+                    strict_fields,
+                    changed,
+                );
+                for (n, _) in bs {
+                    *shadowed.get_mut(n.as_str()).unwrap() -= 1;
+                }
+            }
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                refine_call_sites(
+                    &args[0],
+                    None,
+                    cands,
+                    ret_con,
+                    global_strict,
+                    local_strict,
+                    pure_globals,
+                    shadowed,
+                    strict_fields,
+                    changed,
+                );
+                refine_call_sites(
+                    &args[1],
+                    tail_fn,
+                    cands,
+                    ret_con,
+                    global_strict,
+                    local_strict,
+                    pure_globals,
+                    shadowed,
+                    strict_fields,
+                    changed,
+                );
+            }
+            Core::Prim(p, args)
+                if matches!(p.as_str(), "lazy" | "oneShot" | "inline" | "noinline")
+                    && args.len() == 1 =>
+            {
+                refine_call_sites(
+                    &args[0],
+                    tail_fn,
+                    cands,
+                    ret_con,
+                    global_strict,
+                    local_strict,
+                    pure_globals,
+                    shadowed,
+                    strict_fields,
+                    changed,
+                );
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    refine_call_sites(
+                        a,
+                        None,
+                        cands,
+                        ret_con,
+                        global_strict,
+                        local_strict,
+                        pure_globals,
+                        shadowed,
+                        strict_fields,
+                        changed,
+                    );
+                }
+            }
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for b in binds.iter() {
+            if is_rule_binding(&b.name) {
+                continue;
+            }
+            let mut shadowed = HashMap::new();
+            if let Some(&ar) = cands.get(&b.name).filter(|_| ret_con.contains_key(&b.name)) {
+                let mut cur = &b.body;
+                for _ in 0..ar {
+                    if let Core::Lam(p, inner) = cur {
+                        *shadowed.entry(p.clone()).or_default() += 1;
+                        cur = inner;
+                    }
+                }
+                refine_call_sites(
+                    cur,
+                    Some(&b.name),
+                    &cands,
+                    &ret_con,
+                    &global_strict,
+                    &HashMap::new(),
+                    &pure_globals,
+                    &mut shadowed,
+                    &mut strict_fields,
+                    &mut changed,
+                );
+            } else {
+                refine_call_sites(
+                    &b.body,
+                    None,
+                    &cands,
+                    &ret_con,
+                    &global_strict,
+                    &HashMap::new(),
+                    &pure_globals,
+                    &mut shadowed,
+                    &mut strict_fields,
+                    &mut changed,
+                );
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    strict_fields.retain(|_, flags| flags.iter().any(|&x| x));
+    if strict_fields.is_empty() {
+        return HashSet::new();
+    }
+
+    // Rewrite every tail `Core::Con(con, args)` in each winning candidate so each caller-strict
+    // field `i` not already known WHNF is evaluated via `case arg as sf of _ -> Con(...)`.
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_tail(
+        e: &mut Core,
+        target_con: &str,
+        flags: &[bool],
+        strict_cons: &HashMap<String, Vec<bool>>,
+        whnf_globals: &HashSet<String>,
+        global_arities: &HashMap<String, usize>,
+        eval_vars: &mut HashSet<String>,
+        shadowed: &mut HashMap<String, usize>,
+        fresh: &mut u64,
+        modified: &mut bool,
+    ) {
+        let is_whnf = |arg: &Core, eval_vars: &HashSet<String>, shadowed: &HashMap<String, usize>| match arg {
+            Core::Lit(_) | Core::Con(..) | Core::Lam(..) => true,
+            Core::Var(v) => {
+                if shadowed.get(v.as_str()).copied().unwrap_or(0) > 0 {
+                    eval_vars.contains(v.as_str())
+                } else {
+                    whnf_globals.contains(v.as_str())
+                }
+            }
+            Core::App(..) => {
+                let mut n = 0usize;
+                let mut h = arg;
+                while let Core::App(f, a) = h {
+                    if !is_atom(a) {
+                        return false;
+                    }
+                    n += 1;
+                    h = f;
+                }
+                matches!(h, Core::Var(g) if shadowed.get(g.as_str()).copied().unwrap_or(0) == 0
+                    && global_arities.get(g.as_str()).is_some_and(|&a| a > n))
+            }
+            _ => false,
+        };
+        match e {
+            Core::Con(con, args) if con == target_con && args.len() == flags.len() => {
+                let mut cases: Vec<(String, Core)> = Vec::new();
+                for (i, (&is_strict, arg)) in flags.iter().zip(args.iter_mut()).enumerate() {
+                    let _ = i;
+                    if is_strict && !is_whnf(arg, eval_vars, shadowed) {
+                        *fresh += 1;
+                        let name = format!("sf~{}", *fresh);
+                        let orig = std::mem::replace(arg, Core::Var(name.clone()));
+                        cases.push((name, orig));
+                    }
+                }
+                if !cases.is_empty() {
+                    *modified = true;
+                    let mut wrapped = std::mem::replace(e, Core::Fail(String::new()));
+                    for (name, orig) in cases.into_iter().rev() {
+                        wrapped = Core::Case(Box::new(orig), name, vec![Alt::Default(wrapped)]);
+                    }
+                    *e = wrapped;
+                }
+            }
+            Core::Let(bs, body) => {
+                let mut saved_eval = Vec::with_capacity(bs.len());
+                for (n, rhs) in bs.iter() {
+                    *shadowed.entry(n.clone()).or_default() += 1;
+                    let was = eval_vars.contains(n.as_str());
+                    saved_eval.push((n.clone(), was));
+                    if matches!(rhs, Core::Lam(..) | Core::Lit(_)) {
+                        eval_vars.insert(n.clone());
+                    } else {
+                        eval_vars.remove(n.as_str());
+                    }
+                }
+                rewrite_tail(
+                    body,
+                    target_con,
+                    flags,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    eval_vars,
+                    shadowed,
+                    fresh,
+                    modified,
+                );
+                for (n, was) in saved_eval {
+                    *shadowed.get_mut(n.as_str()).unwrap() -= 1;
+                    if was {
+                        eval_vars.insert(n);
+                    } else {
+                        eval_vars.remove(&n);
+                    }
+                }
+            }
+            Core::Case(scrut, binder, alts) => {
+                let scrut_var = match scrut.as_ref() {
+                    Core::Var(v) => Some(v.clone()),
+                    _ => None,
+                };
+                let scrut_was = scrut_var.as_ref().map(|v| eval_vars.contains(v.as_str()));
+                if let Some(v) = &scrut_var {
+                    eval_vars.insert(v.clone());
+                }
+                *shadowed.entry(binder.clone()).or_default() += 1;
+                let binder_was = eval_vars.insert(binder.clone());
+                for alt in alts {
+                    match alt {
+                        Alt::Con(c, vars, rhs) => {
+                            let sflags = strict_cons.get(c.as_str());
+                            let mut saved = Vec::with_capacity(vars.len());
+                            for (i, v) in vars.iter().enumerate() {
+                                *shadowed.entry(v.clone()).or_default() += 1;
+                                let was = eval_vars.contains(v.as_str());
+                                saved.push((v.clone(), was));
+                                if sflags.and_then(|fs| fs.get(i)).copied().unwrap_or(false) {
+                                    eval_vars.insert(v.clone());
+                                } else {
+                                    eval_vars.remove(v.as_str());
+                                }
+                            }
+                            rewrite_tail(
+                                rhs,
+                                target_con,
+                                flags,
+                                strict_cons,
+                                whnf_globals,
+                                global_arities,
+                                eval_vars,
+                                shadowed,
+                                fresh,
+                                modified,
+                            );
+                            for (v, was) in saved {
+                                *shadowed.get_mut(v.as_str()).unwrap() -= 1;
+                                if was {
+                                    eval_vars.insert(v);
+                                } else {
+                                    eval_vars.remove(&v);
+                                }
+                            }
+                        }
+                        Alt::Lit(_, rhs) | Alt::Default(rhs) => {
+                            rewrite_tail(
+                                rhs,
+                                target_con,
+                                flags,
+                                strict_cons,
+                                whnf_globals,
+                                global_arities,
+                                eval_vars,
+                                shadowed,
+                                fresh,
+                                modified,
+                            );
+                        }
+                    }
+                }
+                *shadowed.get_mut(binder.as_str()).unwrap() -= 1;
+                if !binder_was {
+                    eval_vars.remove(binder.as_str());
+                }
+                if let (Some(v), Some(false)) = (scrut_var, scrut_was) {
+                    eval_vars.remove(&v);
+                }
+            }
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                let s_var = match &args[0] {
+                    Core::Var(v) => Some(v.clone()),
+                    _ => None,
+                };
+                let was = s_var.as_ref().map(|v| eval_vars.contains(v.as_str()));
+                if let Some(v) = &s_var {
+                    eval_vars.insert(v.clone());
+                }
+                rewrite_tail(
+                    &mut args[1],
+                    target_con,
+                    flags,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    eval_vars,
+                    shadowed,
+                    fresh,
+                    modified,
+                );
+                if let (Some(v), Some(false)) = (s_var, was) {
+                    eval_vars.remove(&v);
+                }
+            }
+            Core::Prim(p, args)
+                if matches!(p.as_str(), "lazy" | "oneShot" | "inline" | "noinline")
+                    && args.len() == 1 =>
+            {
+                rewrite_tail(
+                    &mut args[0],
+                    target_con,
+                    flags,
+                    strict_cons,
+                    whnf_globals,
+                    global_arities,
+                    eval_vars,
+                    shadowed,
+                    fresh,
+                    modified,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut fresh = FRESH.load(std::sync::atomic::Ordering::Relaxed);
+    let mut changed_binds = HashSet::new();
+    for b in binds.iter_mut() {
+        let Some(flags) = strict_fields.get(&b.name) else { continue };
+        let (target_con, _) = &ret_con[&b.name];
+        let ar = cands[&b.name];
+        let mut cur = &mut b.body;
+        let mut shadowed = HashMap::new();
+        for _ in 0..ar {
+            if let Core::Lam(p, inner) = cur {
+                *shadowed.entry(p.clone()).or_default() += 1;
+                cur = inner;
+            }
+        }
+        let mut eval_vars = HashSet::new();
+        let mut modified = false;
+        rewrite_tail(
+            cur,
+            target_con,
+            flags,
+            strict_cons,
+            &whnf_globals,
+            &global_arities,
+            &mut eval_vars,
+            &mut shadowed,
+            &mut fresh,
+            &mut modified,
+        );
+        if modified {
+            changed_binds.insert(b.name.clone());
+        }
+    }
+    FRESH.store(fresh, std::sync::atomic::Ordering::Relaxed);
+    changed_binds
+}
+
 /// Greatest-fixed-point caller-WHNF parameter analysis and call-site speculation.
 ///
 /// Finds non-escaping functions (top-level when `whole_program`, plus local `let`-bound functions
@@ -8878,6 +10314,98 @@ mod rule_tests {
         assert!(
             !rendered.contains("D:Eq"),
             "D:Eq case should fold away in specialized T.elem: {rendered}"
+        );
+    }
+
+    #[test]
+    fn caller_strict_result_fields_forces_strict_pair_field_and_skips_lazy_field() {
+        // Pure state-monad-style evaluator returning `(Int, s)`:
+        //   eval e s = case e of
+        //     Lit n -> (n, s)
+        //     Add a b -> case eval a s of (v1, s1) -> case eval b s1 of (v2, s2) -> (v1 +# v2, s2)
+        //   main e s = case eval e s of (v, _) -> case v +# 1 of r -> r
+        // Every caller of `eval` strictly forces field 0 (`v`), never field 1 (`s`).
+        // `caller_strict_result_fields` should force `n` in `Lit n` and `v1 +# v2` in `Add`,
+        // leaving `s`/`s2` untouched.
+        let eval_body = Core::Lam(
+            "e".into(),
+            Box::new(Core::Lam(
+                "s".into(),
+                Box::new(Core::Case(
+                    Box::new(v("e")),
+                    "eb".into(),
+                    vec![
+                        Alt::Con(
+                            "T.Lit".into(),
+                            vec!["n".into()],
+                            Core::Con("Builtin.(,)".into(), vec![v("n"), v("s")]),
+                        ),
+                        Alt::Con(
+                            "T.Add".into(),
+                            vec!["a".into(), "b".into()],
+                            Core::Case(
+                                Box::new(app(v("T.eval"), vec![v("a"), v("s")])),
+                                "p1".into(),
+                                vec![Alt::Con(
+                                    "Builtin.(,)".into(),
+                                    vec!["v1".into(), "s1".into()],
+                                    Core::Case(
+                                        Box::new(app(v("T.eval"), vec![v("b"), v("s1")])),
+                                        "p2".into(),
+                                        vec![Alt::Con(
+                                            "Builtin.(,)".into(),
+                                            vec!["v2".into(), "s2".into()],
+                                            Core::Con(
+                                                "Builtin.(,)".into(),
+                                                vec![
+                                                    Core::Prim("+#".into(), vec![v("v1"), v("v2")]),
+                                                    v("s2"),
+                                                ],
+                                            ),
+                                        )],
+                                    ),
+                                )],
+                            ),
+                        ),
+                    ],
+                )),
+            )),
+        );
+        let main_body = Core::Lam(
+            "e".into(),
+            Box::new(Core::Lam(
+                "s".into(),
+                Box::new(Core::Case(
+                    Box::new(app(v("T.eval"), vec![v("e"), v("s")])),
+                    "pm".into(),
+                    vec![Alt::Con(
+                        "Builtin.(,)".into(),
+                        vec!["v".into(), "st".into()],
+                        Core::Prim("+#".into(), vec![v("v"), Core::Lit(Lit::Int(1))]),
+                    )],
+                )),
+            )),
+        );
+        let mut binds = vec![
+            TopBind { name: "T.eval".into(), body: eval_body },
+            TopBind { name: "Main.main".into(), body: main_body },
+        ];
+        let rewritten = caller_strict_result_fields(&mut binds, &HashMap::new());
+        assert!(rewritten.contains("T.eval"), "expected caller_strict_result_fields to rewrite T.eval");
+        let eval = &binds[0].body;
+        let rendered = format!("{eval:?}");
+        // `Lit n` must force `n` via `Case(Var("n"), sf, [Default(Con("Builtin.(,)", [Var(sf), Var("s")]))])`
+        assert!(
+            rendered.contains("Case(Var(\"n\"), \"sf~"),
+            "expected Lit arm to force field 0 `n`: {rendered}"
+        );
+        assert!(
+            rendered.contains("Case(Prim(\"+#\", [Var(\"v1\"), Var(\"v2\")]), \"sf~"),
+            "expected Add arm to force field 0 `v1 +# v2`: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Case(Var(\"s\")") && !rendered.contains("Case(Var(\"s2\")"),
+            "field 1 should remain lazy and not be forced: {rendered}"
         );
     }
 }

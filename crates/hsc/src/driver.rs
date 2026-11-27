@@ -2559,8 +2559,18 @@ pub fn numeric_params(values: &crate::tc::env::EnvMap<crate::tc::types::Scheme>)
         },
         _ => 0,
     };
+    fn is_mono_ty(t: &Ty) -> bool {
+        match t {
+            Ty::Con(_) => true,
+            Ty::App(f, a) => is_mono_ty(f) && is_mono_ty(a),
+            _ => false,
+        }
+    }
     let mut out = crate::native::stg::NumericParams::default();
     for (name, scheme) in values {
+        if scheme.nvars == 0 && scheme.preds.is_empty() && is_mono_ty(&scheme.ty) {
+            out.monomorphic_ret.insert(name.clone());
+        }
         let mut params = vec![0u8; scheme.preds.len()];
         let mut t = &scheme.ty;
         loop {

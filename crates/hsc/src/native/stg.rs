@@ -93,6 +93,16 @@ pub enum SAlt {
 /// Maximum number of raw worker arguments passed directly in `CACHE_REGS`.
 pub const MAX_REG_RAW_ARGS: usize = 6;
 
+/// Unboxed 2-field constructor return convention for a worker: field 0 is returned in `%r14`
+/// (raw if `raw0 != 0`, else boxed pointer) and field 1 in `%rax` (raw if `raw1 != 0`, else
+/// boxed pointer), avoiding heap allocation of the 2-field product on every return.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairRet {
+    pub con: String,
+    pub raw0: u8,
+    pub raw1: u8,
+}
+
 /// A closure: a function of `arity` stack arguments, or a thunk (arity 0), with its captured atoms.
 #[derive(Clone, Debug)]
 pub struct SClosure {
@@ -115,6 +125,9 @@ pub struct SClosure {
     pub raw_free: Vec<(u32, u32)>,
     /// The body returns its (numeric) result raw in R1, not a pointer (see `raw_returns`).
     pub ret_raw: bool,
+    /// The body returns a 2-field constructor unboxed in `(%r14, %rax)` (see `pair_returns`):
+    /// `(field0_is_raw, field1_is_raw)`.
+    pub ret_pair: Option<(bool, bool)>,
     /// Whether the body (or nested closure captures) ever reads slot 0 (`Slot(0)` or `Free(_)`).
     pub uses_closure: bool,
     pub body: SExpr,
@@ -232,6 +245,9 @@ pub struct NumericParams {
     /// Functions whose result is a number when applied to all their parameters: their number of
     /// parameters (dictionaries included), and the result's kind.
     pub results: HashMap<String, (usize, u8)>,
+    /// Bindings whose entire Haskell type scheme is monomorphic (no type variables or predicates),
+    /// ensuring all return paths of a non-existential constructor have identical field types.
+    pub monomorphic_ret: std::collections::HashSet<String>,
 }
 pub const NUM_INT: u8 = 1;
 pub const NUM_CHAR: u8 = 2;
@@ -369,7 +385,18 @@ fn raw_uses(
     strict_map: &Workers,
     whnf: &mut std::collections::HashSet<String>,
 ) -> bool {
-    raw_uses_in(e, x, w, strict_map, whnf, true)
+    raw_uses_in(e, x, w, strict_map, whnf, true, None)
+}
+
+fn raw_uses_with_pair(
+    e: &Core,
+    x: &str,
+    w: &Workers,
+    strict_map: &Workers,
+    whnf: &mut std::collections::HashSet<String>,
+    ret_pair: Option<&PairRet>,
+) -> bool {
+    raw_uses_in(e, x, w, strict_map, whnf, true, ret_pair)
 }
 
 /// Whether an argument lowered via `atom()` can mention raw variable `x` without boxing `x` in
@@ -388,7 +415,7 @@ fn raw_uses_atom(
     match a {
         Core::Var(_) | Core::Lit(_) => false,
         Core::Con(_, args) => args.iter().all(|sub| raw_uses_atom(sub, x, w, strict_map, whnf)),
-        other => raw_uses_in(other, x, w, strict_map, whnf, true),
+        other => raw_uses_in(other, x, w, strict_map, whnf, true, None),
     }
 }
 
@@ -402,6 +429,7 @@ fn raw_uses_in(
     strict_map: &Workers,
     whnf: &mut std::collections::HashSet<String>,
     result: bool,
+    ret_pair: Option<&PairRet>,
 ) -> bool {
     match e {
         Core::Var(v) => v != x || result,
@@ -417,23 +445,23 @@ fn raw_uses_in(
             }
             if let Core::Var(v) = &args[0] {
                 let inserted = !whnf.contains(v.as_str()) && whnf.insert(v.clone());
-                let ok = raw_uses_in(&args[1], x, w, strict_map, whnf, result);
+                let ok = raw_uses_in(&args[1], x, w, strict_map, whnf, result, ret_pair);
                 if inserted {
                     whnf.remove(v.as_str());
                 }
                 ok
             } else {
-                raw_uses_in(&args[1], x, w, strict_map, whnf, result)
+                raw_uses_in(&args[1], x, w, strict_map, whnf, result, ret_pair)
             }
         }
         Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
-            raw_uses_in(&args[0], x, w, strict_map, whnf, result)
+            raw_uses_in(&args[0], x, w, strict_map, whnf, result, ret_pair)
         }
         Core::Case(s, b, alts) if matches!(&**s, Core::Var(v) if v == x) => {
             let added = push_case_whnf(s, b, whnf);
             let ok = alts.iter().all(|a| match a {
                 Alt::Lit(Lit::Int(_) | Lit::Char(_), body) | Alt::Default(body) => {
-                    !mentions(body, b) && raw_uses_in(body, x, w, strict_map, whnf, result)
+                    !mentions(body, b) && raw_uses_in(body, x, w, strict_map, whnf, result, ret_pair)
                 }
                 _ => false,
             });
@@ -453,7 +481,7 @@ fn raw_uses_in(
                     return g != x
                         && args.iter().zip(raw).all(|(a, r)| match a {
                             Core::Var(v) if v == x => *r,
-                            a if *r => raw_uses_in(a, x, w, strict_map, whnf, false),
+                            a if *r => raw_uses_in(a, x, w, strict_map, whnf, false, None),
                             a => raw_uses_atom(a, x, w, strict_map, whnf),
                         });
                 }
@@ -467,7 +495,7 @@ fn raw_uses_in(
                 return true;
             }
             let removed = push_shadow_whnf(std::iter::once(p.as_str()), whnf);
-            let ok = raw_uses_in(b, x, w, strict_map, whnf, true);
+            let ok = raw_uses_in(b, x, w, strict_map, whnf, true, None);
             pop_removed_whnf(removed, whnf);
             ok
         }
@@ -488,7 +516,7 @@ fn raw_uses_in(
                     true
                 } else {
                     let removed = push_shadow_whnf(params, whnf);
-                    let ok = raw_uses_in(cur, x, w, strict_map, whnf, result);
+                    let ok = raw_uses_in(cur, x, w, strict_map, whnf, result, ret_pair);
                     pop_removed_whnf(removed, whnf);
                     ok
                 };
@@ -499,7 +527,7 @@ fn raw_uses_in(
                     return true;
                 }
                 let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
-                let ok = raw_uses_in(body, x, w, strict_map, whnf, result);
+                let ok = raw_uses_in(body, x, w, strict_map, whnf, result, ret_pair);
                 pop_removed_whnf(removed, whnf);
                 ok
             } else {
@@ -509,15 +537,15 @@ fn raw_uses_in(
                 let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
                 let binds_ok = binds.iter().all(|(_, r)| match r {
                     Core::Con(_, args) => args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf)),
-                    other => raw_uses_in(other, x, w, strict_map, whnf, true),
+                    other => raw_uses_in(other, x, w, strict_map, whnf, true, None),
                 });
-                let ok = binds_ok && raw_uses_in(body, x, w, strict_map, whnf, result);
+                let ok = binds_ok && raw_uses_in(body, x, w, strict_map, whnf, result, ret_pair);
                 pop_removed_whnf(removed, whnf);
                 ok
             }
         }
         Core::Case(s, b, alts) => {
-            if !raw_uses_in(s, x, w, strict_map, whnf, false) {
+            if !raw_uses_in(s, x, w, strict_map, whnf, false, None) {
                 return false;
             }
             if b == x {
@@ -530,19 +558,40 @@ fn raw_uses_in(
                         return true;
                     }
                     let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
-                    let ok = raw_uses_in(body, x, w, strict_map, whnf, result);
+                    let ok = raw_uses_in(body, x, w, strict_map, whnf, result, ret_pair);
                     pop_removed_whnf(removed, whnf);
                     ok
                 }
                 Alt::Lit(_, body) | Alt::Default(body) => {
-                    raw_uses_in(body, x, w, strict_map, whnf, result)
+                    raw_uses_in(body, x, w, strict_map, whnf, result, ret_pair)
                 }
             });
             pop_added_whnf(added, whnf);
             ok
         }
         Core::Prim(p, _) if p == "raise#" => no_bad_raw_case(e, x),
-        Core::Con(_, args) => args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf)),
+        Core::Con(con, args) => {
+            if result {
+                if let Some(pr) = ret_pair {
+                    if con == &pr.con && args.len() == 2 {
+                        let f0 = if pr.raw0 != 0 {
+                            matches!(&args[0], Core::Var(v) if v == x)
+                                || raw_uses_in(&args[0], x, w, strict_map, whnf, false, None)
+                        } else {
+                            raw_uses_atom(&args[0], x, w, strict_map, whnf)
+                        };
+                        let f1 = if pr.raw1 != 0 {
+                            matches!(&args[1], Core::Var(v) if v == x)
+                                || raw_uses_in(&args[1], x, w, strict_map, whnf, false, None)
+                        } else {
+                            raw_uses_atom(&args[1], x, w, strict_map, whnf)
+                        };
+                        return f0 && f1;
+                    }
+                }
+            }
+            args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf))
+        }
         Core::Prim(p, args) => {
             if strict_integer_arity(p).is_some_and(|n| n == args.len()) {
                 args.iter().all(|a| !mentions(a, x))
@@ -723,6 +772,900 @@ fn raw_returns(
             }
         }
     }
+}
+
+/// Workers that return a 2-field constructor unboxed in `(%r14, %rax)` instead of allocating the
+/// pair on the heap. Any top-level function (`arity > 0`, not already returning raw) whose
+/// non-bottom tail exits all construct the same 2-field constructor `C` (or tail-call peer pair
+/// workers with the same `C`) and that has at least one unpacking `Case` caller gets a `PairRet`
+/// worker. For monomorphic `Builtin.(,)` functions, fields that are already WHNF on every exit,
+/// have a unique numeric kind, and are used numerically by callers are also returned raw.
+fn pair_returns(
+    binds: &[TopBind],
+    w: &Workers,
+    strict_map: &Workers,
+    raw_rets: &HashMap<String, u8>,
+    numeric: &NumericParams,
+) -> HashMap<String, PairRet> {
+    let mut w_all = w.clone();
+    let mut arities: HashMap<&str, usize> = HashMap::new();
+    let mut bodies: HashMap<&str, (&Core, Vec<&str>)> = HashMap::new();
+    for b in binds {
+        if raw_rets.contains_key(&b.name) {
+            continue;
+        }
+        let mut params = Vec::new();
+        let mut cur = &b.body;
+        while let Core::Lam(p, inner) = cur {
+            params.push(p.as_str());
+            cur = inner;
+        }
+        if params.is_empty() {
+            continue;
+        }
+        arities.insert(b.name.as_str(), params.len());
+        w_all.entry(b.name.clone()).or_insert_with(|| vec![false; params.len()]);
+        bodies.insert(b.name.as_str(), (cur, params));
+    }
+
+    enum PairExit {
+        Con(String),
+        Call(String),
+    }
+
+    fn collect_pair_exits(
+        e: &Core,
+        arities: &HashMap<&str, usize>,
+        w_all: &Workers,
+        strict_map: &Workers,
+        whnf: &mut std::collections::HashSet<String>,
+        shadowed: &mut HashMap<String, usize>,
+        out: &mut Vec<PairExit>,
+    ) -> bool {
+        match e {
+            Core::Fail(_) => true,
+            Core::Prim(p, args) if p == "raise#" && args.len() == 1 => true,
+            Core::Con(con, args) if args.len() == 2 => {
+                out.push(PairExit::Con(con.clone()));
+                true
+            }
+            Core::App(..) => {
+                let (f, args) = spine(e);
+                match f {
+                    Core::Fail(_) => true,
+                    Core::Prim(p, pa) if p == "raise#" && pa.len() == 1 => true,
+                    Core::Var(g) if shadowed.get(g.as_str()).copied().unwrap_or(0) == 0 => {
+                        if is_diverging_call(g.as_str(), args.len()) {
+                            true
+                        } else if arities.get(g.as_str()).is_some_and(|&ar| ar == args.len())
+                            && can_call_worker(g.as_str(), &args, w_all, strict_map, whnf)
+                        {
+                            out.push(PairExit::Call(g.clone()));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                if let Core::Var(v) = &args[0] {
+                    let inserted = !whnf.contains(v.as_str()) && whnf.insert(v.clone());
+                    let ok = collect_pair_exits(&args[1], arities, w_all, strict_map, whnf, shadowed, out);
+                    if inserted {
+                        whnf.remove(v.as_str());
+                    }
+                    ok
+                } else {
+                    collect_pair_exits(&args[1], arities, w_all, strict_map, whnf, shadowed, out)
+                }
+            }
+            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+                collect_pair_exits(&args[0], arities, w_all, strict_map, whnf, shadowed, out)
+            }
+            Core::Let(bs, body) => {
+                let join_ok = if is_join(bs, body) {
+                    let mut cur = &bs[0].1;
+                    let mut params = Vec::new();
+                    while let Core::Lam(p, inner) = cur {
+                        params.push(p.as_str());
+                        *shadowed.entry(p.clone()).or_default() += 1;
+                        cur = inner;
+                    }
+                    let removed = push_shadow_whnf(params.iter().copied(), whnf);
+                    let ok = collect_pair_exits(cur, arities, w_all, strict_map, whnf, shadowed, out);
+                    pop_removed_whnf(removed, whnf);
+                    for p in params {
+                        *shadowed.get_mut(p).unwrap() -= 1;
+                    }
+                    ok
+                } else {
+                    true
+                };
+                if !join_ok {
+                    return false;
+                }
+                for (n, _) in bs {
+                    *shadowed.entry(n.clone()).or_default() += 1;
+                }
+                let removed = push_shadow_whnf(bs.iter().map(|(n, _)| n.as_str()), whnf);
+                let ok = collect_pair_exits(body, arities, w_all, strict_map, whnf, shadowed, out);
+                pop_removed_whnf(removed, whnf);
+                for (n, _) in bs {
+                    *shadowed.get_mut(n.as_str()).unwrap() -= 1;
+                }
+                ok
+            }
+            Core::Case(s, b, alts) => {
+                let added = push_case_whnf(s, b, whnf);
+                *shadowed.entry(b.clone()).or_default() += 1;
+                let ok = alts.iter().all(|a| match a {
+                    Alt::Con(_, vars, rhs) => {
+                        for v in vars {
+                            *shadowed.entry(v.clone()).or_default() += 1;
+                        }
+                        let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
+                        let ok = collect_pair_exits(rhs, arities, w_all, strict_map, whnf, shadowed, out);
+                        pop_removed_whnf(removed, whnf);
+                        for v in vars {
+                            *shadowed.get_mut(v.as_str()).unwrap() -= 1;
+                        }
+                        ok
+                    }
+                    Alt::Lit(_, rhs) | Alt::Default(rhs) => {
+                        collect_pair_exits(rhs, arities, w_all, strict_map, whnf, shadowed, out)
+                    }
+                });
+                *shadowed.get_mut(b.as_str()).unwrap() -= 1;
+                pop_added_whnf(added, whnf);
+                ok
+            }
+            _ => false,
+        }
+    }
+
+    let mut fn_exits: HashMap<String, Vec<PairExit>> = HashMap::new();
+    let mut pair_con: HashMap<String, Option<String>> = HashMap::new();
+    for (&name, (body, params)) in &bodies {
+        let mut whnf = std::collections::HashSet::new();
+        let mut shadowed = HashMap::new();
+        for p in params {
+            *shadowed.entry((*p).to_string()).or_default() += 1;
+        }
+        if let Some(raw) = w.get(name) {
+            for (p, r) in params.iter().zip(raw) {
+                if *r {
+                    whnf.insert((*p).to_string());
+                }
+            }
+        }
+        let mut exits = Vec::new();
+        if !collect_pair_exits(body, &arities, &w_all, strict_map, &mut whnf, &mut shadowed, &mut exits) {
+            continue;
+        }
+        let mut con: Option<String> = None;
+        let mut conflict = false;
+        for ex in &exits {
+            if let PairExit::Con(c) = ex {
+                match &con {
+                    None => con = Some(c.clone()),
+                    Some(c0) if c0 == c => {}
+                    _ => {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !conflict && !exits.is_empty() {
+            fn_exits.insert(name.to_string(), exits);
+            pair_con.insert(name.to_string(), con);
+        }
+    }
+
+    // Fixed point for constructor name consistency across tail calls.
+    loop {
+        let mut changed = false;
+        let keys: Vec<String> = pair_con.keys().cloned().collect();
+        for f in keys {
+            let Some(mut con) = pair_con.get(&f).cloned() else { continue };
+            let mut bad = false;
+            for ex in &fn_exits[&f] {
+                if let PairExit::Call(g) = ex {
+                    let Some(g_con) = pair_con.get(g) else {
+                        bad = true;
+                        break;
+                    };
+                    if let Some(gc) = g_con {
+                        match &con {
+                            None => {
+                                con = Some(gc.clone());
+                                changed = true;
+                            }
+                            Some(c0) if c0 == gc => {}
+                            _ => {
+                                bad = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if bad {
+                pair_con.remove(&f);
+                changed = true;
+            } else {
+                pair_con.insert(f, con);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut pair_con: HashMap<String, String> = pair_con
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|c| (k, c)))
+        .collect();
+    if pair_con.is_empty() {
+        return HashMap::new();
+    }
+
+    // Scan all call sites to find unpacking callers, non-unpacking callers (to avoid regressing
+    // existing raw-parameter workers), and numeric uses of unpacked fields.
+    let mut unpack_callers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut non_unpack_callers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut field_numeric_use: HashMap<String, [bool; 2]> = HashMap::new();
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_pair_calls(
+        e: &Core,
+        tail_fn: Option<&str>,
+        pair_con: &HashMap<String, String>,
+        w_all: &Workers,
+        strict_map: &Workers,
+        whnf: &mut std::collections::HashSet<String>,
+        shadowed: &mut HashMap<String, usize>,
+        unpack_callers: &mut std::collections::HashSet<String>,
+        non_unpack_callers: &mut std::collections::HashSet<String>,
+        field_numeric_use: &mut HashMap<String, [bool; 2]>,
+    ) {
+        match e {
+            Core::Var(_) | Core::Lit(_) | Core::Fail(_) => {}
+            Core::Case(scrut, binder, alts) => {
+                let mut handled = false;
+                if let Core::App(..) = &**scrut {
+                    let (f, args) = spine(scrut);
+                    if let Core::Var(g) = f {
+                        if shadowed.get(g.as_str()).copied().unwrap_or(0) == 0 {
+                            if let Some(con) = pair_con.get(g.as_str()) {
+                                if can_call_worker(g.as_str(), &args, w_all, strict_map, whnf)
+                                    && !alts_free_mention(alts, binder)
+                                {
+                                    let matching = alts.iter().find_map(|a| match a {
+                                        Alt::Con(c, vars, rhs) if c == con && vars.len() == 2 => {
+                                            Some((vars, rhs))
+                                        }
+                                        _ => None,
+                                    });
+                                    let others_ok = alts.iter().all(|a| match a {
+                                        Alt::Con(c, vars, _) if c == con && vars.len() == 2 => true,
+                                        Alt::Con(c, _, _) if c != con => true,
+                                        Alt::Default(_) => true,
+                                        _ => false,
+                                    });
+                                    if let Some((vars, rhs)) = matching.filter(|_| others_ok) {
+                                        handled = true;
+                                        unpack_callers.insert(g.clone());
+                                        let entry = field_numeric_use.entry(g.clone()).or_insert([false, false]);
+                                        if vars[0] != vars[1] && numeric_use(rhs, &vars[0]) {
+                                            entry[0] = true;
+                                        }
+                                        if numeric_use(rhs, &vars[1]) {
+                                            entry[1] = true;
+                                        }
+                                        for a in args {
+                                            scan_pair_calls(
+                                                a,
+                                                None,
+                                                pair_con,
+                                                w_all,
+                                                strict_map,
+                                                whnf,
+                                                shadowed,
+                                                unpack_callers,
+                                                non_unpack_callers,
+                                                field_numeric_use,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !handled {
+                    scan_pair_calls(
+                        scrut,
+                        None,
+                        pair_con,
+                        w_all,
+                        strict_map,
+                        whnf,
+                        shadowed,
+                        unpack_callers,
+                        non_unpack_callers,
+                        field_numeric_use,
+                    );
+                }
+                let added = push_case_whnf(scrut, binder, whnf);
+                *shadowed.entry(binder.clone()).or_default() += 1;
+                for alt in alts {
+                    match alt {
+                        Alt::Con(_, vars, rhs) => {
+                            for v in vars {
+                                *shadowed.entry(v.clone()).or_default() += 1;
+                            }
+                            let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
+                            scan_pair_calls(
+                                rhs,
+                                tail_fn,
+                                pair_con,
+                                w_all,
+                                strict_map,
+                                whnf,
+                                shadowed,
+                                unpack_callers,
+                                non_unpack_callers,
+                                field_numeric_use,
+                            );
+                            pop_removed_whnf(removed, whnf);
+                            for v in vars {
+                                *shadowed.get_mut(v.as_str()).unwrap() -= 1;
+                            }
+                        }
+                        Alt::Lit(_, rhs) | Alt::Default(rhs) => {
+                            scan_pair_calls(
+                                rhs,
+                                tail_fn,
+                                pair_con,
+                                w_all,
+                                strict_map,
+                                whnf,
+                                shadowed,
+                                unpack_callers,
+                                non_unpack_callers,
+                                field_numeric_use,
+                            );
+                        }
+                    }
+                }
+                *shadowed.get_mut(binder.as_str()).unwrap() -= 1;
+                pop_added_whnf(added, whnf);
+            }
+            Core::App(..) => {
+                let (f, args) = spine(e);
+                if let Core::Var(g) = f {
+                    if shadowed.get(g.as_str()).copied().unwrap_or(0) == 0 {
+                        if let Some(g_con) = pair_con.get(g.as_str()) {
+                            let same_tail = tail_fn
+                                .and_then(|tf| pair_con.get(tf))
+                                .is_some_and(|tf_con| tf_con == g_con)
+                                && can_call_worker(g.as_str(), &args, w_all, strict_map, whnf);
+                            if !same_tail {
+                                non_unpack_callers.insert(g.clone());
+                            }
+                        }
+                    }
+                } else {
+                    scan_pair_calls(
+                        f,
+                        None,
+                        pair_con,
+                        w_all,
+                        strict_map,
+                        whnf,
+                        shadowed,
+                        unpack_callers,
+                        non_unpack_callers,
+                        field_numeric_use,
+                    );
+                }
+                for a in args {
+                    scan_pair_calls(
+                        a,
+                        None,
+                        pair_con,
+                        w_all,
+                        strict_map,
+                        whnf,
+                        shadowed,
+                        unpack_callers,
+                        non_unpack_callers,
+                        field_numeric_use,
+                    );
+                }
+            }
+            Core::Lam(p, body) => {
+                *shadowed.entry(p.clone()).or_default() += 1;
+                let removed = push_shadow_whnf(std::iter::once(p.as_str()), whnf);
+                scan_pair_calls(
+                    body,
+                    None,
+                    pair_con,
+                    w_all,
+                    strict_map,
+                    whnf,
+                    shadowed,
+                    unpack_callers,
+                    non_unpack_callers,
+                    field_numeric_use,
+                );
+                pop_removed_whnf(removed, whnf);
+                *shadowed.get_mut(p.as_str()).unwrap() -= 1;
+            }
+            Core::Let(bs, body) => {
+                let is_j = is_join(bs, body);
+                for (n, _) in bs {
+                    *shadowed.entry(n.clone()).or_default() += 1;
+                }
+                let removed = push_shadow_whnf(bs.iter().map(|(n, _)| n.as_str()), whnf);
+                for (_, rhs) in bs {
+                    if is_j {
+                        let mut cur = rhs;
+                        let mut params = Vec::new();
+                        while let Core::Lam(p, inner) = cur {
+                            params.push(p.as_str());
+                            *shadowed.entry(p.clone()).or_default() += 1;
+                            cur = inner;
+                        }
+                        let prem = push_shadow_whnf(params.iter().copied(), whnf);
+                        scan_pair_calls(
+                            cur,
+                            tail_fn,
+                            pair_con,
+                            w_all,
+                            strict_map,
+                            whnf,
+                            shadowed,
+                            unpack_callers,
+                            non_unpack_callers,
+                            field_numeric_use,
+                        );
+                        pop_removed_whnf(prem, whnf);
+                        for p in params {
+                            *shadowed.get_mut(p).unwrap() -= 1;
+                        }
+                    } else {
+                        scan_pair_calls(
+                            rhs,
+                            None,
+                            pair_con,
+                            w_all,
+                            strict_map,
+                            whnf,
+                            shadowed,
+                            unpack_callers,
+                            non_unpack_callers,
+                            field_numeric_use,
+                        );
+                    }
+                }
+                scan_pair_calls(
+                    body,
+                    tail_fn,
+                    pair_con,
+                    w_all,
+                    strict_map,
+                    whnf,
+                    shadowed,
+                    unpack_callers,
+                    non_unpack_callers,
+                    field_numeric_use,
+                );
+                pop_removed_whnf(removed, whnf);
+                for (n, _) in bs {
+                    *shadowed.get_mut(n.as_str()).unwrap() -= 1;
+                }
+            }
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                scan_pair_calls(
+                    &args[0],
+                    None,
+                    pair_con,
+                    w_all,
+                    strict_map,
+                    whnf,
+                    shadowed,
+                    unpack_callers,
+                    non_unpack_callers,
+                    field_numeric_use,
+                );
+                let inserted = matches!(&args[0], Core::Var(v) if !whnf.contains(v.as_str()) && whnf.insert(v.clone()));
+                scan_pair_calls(
+                    &args[1],
+                    tail_fn,
+                    pair_con,
+                    w_all,
+                    strict_map,
+                    whnf,
+                    shadowed,
+                    unpack_callers,
+                    non_unpack_callers,
+                    field_numeric_use,
+                );
+                if inserted {
+                    if let Core::Var(v) = &args[0] {
+                        whnf.remove(v.as_str());
+                    }
+                }
+            }
+            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+                scan_pair_calls(
+                    &args[0],
+                    tail_fn,
+                    pair_con,
+                    w_all,
+                    strict_map,
+                    whnf,
+                    shadowed,
+                    unpack_callers,
+                    non_unpack_callers,
+                    field_numeric_use,
+                );
+            }
+            Core::Con(_, args) | Core::Prim(_, args) => {
+                for a in args {
+                    scan_pair_calls(
+                        a,
+                        None,
+                        pair_con,
+                        w_all,
+                        strict_map,
+                        whnf,
+                        shadowed,
+                        unpack_callers,
+                        non_unpack_callers,
+                        field_numeric_use,
+                    );
+                }
+            }
+        }
+    }
+
+    for b in binds {
+        let mut whnf = std::collections::HashSet::new();
+        let mut shadowed = HashMap::new();
+        let mut cur = &b.body;
+        let mut params = Vec::new();
+        while let Core::Lam(p, inner) = cur {
+            params.push(p.as_str());
+            *shadowed.entry(p.clone()).or_default() += 1;
+            cur = inner;
+        }
+        if let Some(raw) = w.get(&b.name) {
+            for (p, r) in params.iter().zip(raw) {
+                if *r {
+                    whnf.insert((*p).to_string());
+                }
+            }
+        }
+        let tf = pair_con.contains_key(&b.name).then_some(b.name.as_str());
+        scan_pair_calls(
+            cur,
+            tf,
+            &pair_con,
+            &w_all,
+            strict_map,
+            &mut whnf,
+            &mut shadowed,
+            &mut unpack_callers,
+            &mut non_unpack_callers,
+            &mut field_numeric_use,
+        );
+    }
+
+    // Drop existing raw-parameter workers that have non-unpacking callers, and keep only
+    // functions reachable from an unpacking caller via tail calls.
+    pair_con.retain(|f, _| !(w.contains_key(f) && non_unpack_callers.contains(f)));
+    loop {
+        let before = pair_con.len();
+        let valid: std::collections::HashSet<String> = pair_con.keys().cloned().collect();
+        pair_con.retain(|f, _| {
+            fn_exits[f].iter().all(|ex| match ex {
+                PairExit::Con(_) => true,
+                PairExit::Call(g) => valid.contains(g),
+            })
+        });
+        if pair_con.len() == before {
+            break;
+        }
+    }
+    let mut reachable: std::collections::HashSet<String> = unpack_callers
+        .into_iter()
+        .filter(|f| pair_con.contains_key(f))
+        .collect();
+    loop {
+        let mut added = Vec::new();
+        for f in &reachable {
+            for ex in &fn_exits[f] {
+                if let PairExit::Call(g) = ex {
+                    if pair_con.contains_key(g) && !reachable.contains(g) {
+                        added.push(g.clone());
+                    }
+                }
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        reachable.extend(added);
+    }
+    pair_con.retain(|f, _| reachable.contains(f));
+    if pair_con.is_empty() {
+        return HashMap::new();
+    }
+
+    // Propagate callers' numeric field uses forward along tail calls.
+    loop {
+        let mut changed = false;
+        for f in pair_con.keys() {
+            let f_use = field_numeric_use.get(f).copied().unwrap_or([false, false]);
+            if !f_use[0] && !f_use[1] {
+                continue;
+            }
+            for ex in &fn_exits[f] {
+                if let PairExit::Call(g) = ex {
+                    if pair_con.contains_key(g) {
+                        let gu = field_numeric_use.entry(g.clone()).or_insert([false, false]);
+                        for i in 0..2 {
+                            if f_use[i] && !gu[i] {
+                                gu[i] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Infer raw field kinds for monomorphic `Builtin.(,)` pair workers.
+    fn infer_field_kind(
+        e: &Core,
+        whnf: &std::collections::HashSet<String>,
+        var_kind: &HashMap<String, u8>,
+        raw_rets: &HashMap<String, u8>,
+    ) -> Option<u8> {
+        if !is_whnf_expr(e, whnf) {
+            return None;
+        }
+        match e {
+            Core::Lit(Lit::Int(_)) => Some(NUM_INT),
+            Core::Lit(Lit::Char(_)) => Some(NUM_CHAR),
+            Core::Lit(Lit::Double(_)) => Some(NUM_DOUBLE),
+            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+                infer_field_kind(&args[0], whnf, var_kind, raw_rets)
+            }
+            Core::Prim(p, _) => raw_prim_result_kind(p),
+            Core::Var(v) => Some(var_kind.get(v.as_str()).copied().unwrap_or(0)),
+            _ => None,
+        }
+    }
+
+    fn scrut_kind(
+        s: &Core,
+        var_kind: &HashMap<String, u8>,
+        raw_rets: &HashMap<String, u8>,
+    ) -> u8 {
+        match s {
+            Core::Lit(Lit::Int(_)) => NUM_INT,
+            Core::Lit(Lit::Char(_)) => NUM_CHAR,
+            Core::Lit(Lit::Double(_)) => NUM_DOUBLE,
+            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+                scrut_kind(&args[0], var_kind, raw_rets)
+            }
+            Core::Prim(p, _) => raw_prim_result_kind(p).unwrap_or(0),
+            Core::Var(v) => var_kind.get(v.as_str()).copied().unwrap_or(0),
+            Core::App(..) => {
+                let (f, _) = spine(s);
+                match f {
+                    Core::Var(g) => raw_rets.get(g.as_str()).copied().unwrap_or(0),
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FieldAcc {
+        Unknown,
+        Kind(u8),
+        Invalid,
+    }
+    impl FieldAcc {
+        fn merge(&mut self, k: Option<u8>) {
+            match (*self, k) {
+                (FieldAcc::Invalid, _) | (_, None) => *self = FieldAcc::Invalid,
+                (cur, Some(0)) => *self = cur,
+                (FieldAcc::Unknown, Some(k)) => *self = FieldAcc::Kind(k),
+                (FieldAcc::Kind(k0), Some(k1)) if k0 == k1 => {}
+                (FieldAcc::Kind(_), Some(_)) => *self = FieldAcc::Invalid,
+            }
+        }
+    }
+
+    fn scan_field_kinds(
+        e: &Core,
+        target_con: &str,
+        whnf: &mut std::collections::HashSet<String>,
+        var_kind: &mut HashMap<String, u8>,
+        raw_rets: &HashMap<String, u8>,
+        acc: &mut [FieldAcc; 2],
+    ) {
+        match e {
+            Core::Con(con, args) if con == target_con && args.len() == 2 => {
+                acc[0].merge(infer_field_kind(&args[0], whnf, var_kind, raw_rets));
+                acc[1].merge(infer_field_kind(&args[1], whnf, var_kind, raw_rets));
+            }
+            Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
+                let inserted = matches!(&args[0], Core::Var(v) if !whnf.contains(v.as_str()) && whnf.insert(v.clone()));
+                scan_field_kinds(&args[1], target_con, whnf, var_kind, raw_rets, acc);
+                if inserted {
+                    if let Core::Var(v) = &args[0] {
+                        whnf.remove(v.as_str());
+                    }
+                }
+            }
+            Core::Prim(p, args) if IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
+                scan_field_kinds(&args[0], target_con, whnf, var_kind, raw_rets, acc);
+            }
+            Core::Let(bs, body) => {
+                if is_join(bs, body) {
+                    let mut cur = &bs[0].1;
+                    let mut params = Vec::new();
+                    let mut saved_k = Vec::new();
+                    while let Core::Lam(p, inner) = cur {
+                        params.push(p.as_str());
+                        saved_k.push((p.clone(), var_kind.remove(p.as_str())));
+                        cur = inner;
+                    }
+                    let removed = push_shadow_whnf(params, whnf);
+                    scan_field_kinds(cur, target_con, whnf, var_kind, raw_rets, acc);
+                    pop_removed_whnf(removed, whnf);
+                    for (p, old) in saved_k {
+                        if let Some(k) = old {
+                            var_kind.insert(p, k);
+                        }
+                    }
+                }
+                let mut saved_k = Vec::new();
+                for (n, _) in bs {
+                    saved_k.push((n.clone(), var_kind.remove(n.as_str())));
+                }
+                let removed = push_shadow_whnf(bs.iter().map(|(n, _)| n.as_str()), whnf);
+                scan_field_kinds(body, target_con, whnf, var_kind, raw_rets, acc);
+                pop_removed_whnf(removed, whnf);
+                for (n, old) in saved_k {
+                    if let Some(k) = old {
+                        var_kind.insert(n, k);
+                    }
+                }
+            }
+            Core::Case(s, b, alts) => {
+                let sk = scrut_kind(s, var_kind, raw_rets);
+                let added = push_case_whnf(s, b, whnf);
+                let prev_b = if sk != 0 {
+                    var_kind.insert(b.clone(), sk)
+                } else {
+                    var_kind.remove(b.as_str())
+                };
+                for a in alts {
+                    match a {
+                        Alt::Con(_, vars, rhs) => {
+                            let mut saved_k = Vec::new();
+                            for v in vars {
+                                saved_k.push((v.clone(), var_kind.remove(v.as_str())));
+                            }
+                            let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
+                            scan_field_kinds(rhs, target_con, whnf, var_kind, raw_rets, acc);
+                            pop_removed_whnf(removed, whnf);
+                            for (v, old) in saved_k {
+                                if let Some(k) = old {
+                                    var_kind.insert(v, k);
+                                }
+                            }
+                        }
+                        Alt::Lit(_, rhs) | Alt::Default(rhs) => {
+                            scan_field_kinds(rhs, target_con, whnf, var_kind, raw_rets, acc);
+                        }
+                    }
+                }
+                match prev_b {
+                    Some(k) => {
+                        var_kind.insert(b.clone(), k);
+                    }
+                    None => {
+                        var_kind.remove(b.as_str());
+                    }
+                }
+                pop_added_whnf(added, whnf);
+            }
+            _ => {}
+        }
+    }
+
+    let mut raw_fields: HashMap<String, [u8; 2]> = HashMap::new();
+    for (f, con) in &pair_con {
+        let mut r = [0u8; 2];
+        if con == "Builtin.(,)" && numeric.monomorphic_ret.contains(f) {
+            let (body, params) = &bodies[f.as_str()];
+            let mut whnf = std::collections::HashSet::new();
+            let mut var_kind = HashMap::new();
+            if let Some(raw) = w.get(f) {
+                let pkinds = numeric.params.get(f);
+                for (i, (p, &is_r)) in params.iter().zip(raw).enumerate() {
+                    if is_r {
+                        whnf.insert((*p).to_string());
+                        if let Some(k) = pkinds.and_then(|ks| ks.get(i).copied()).filter(|&k| k != 0) {
+                            var_kind.insert((*p).to_string(), k);
+                        }
+                    }
+                }
+            }
+            let mut acc = [FieldAcc::Unknown, FieldAcc::Unknown];
+            scan_field_kinds(body, con, &mut whnf, &mut var_kind, raw_rets, &mut acc);
+            let used_num = field_numeric_use.get(f).copied().unwrap_or([false, false]);
+            for i in 0..2 {
+                if used_num[i] {
+                    if let FieldAcc::Kind(k) = acc[i] {
+                        r[i] = k;
+                    }
+                }
+            }
+        }
+        raw_fields.insert(f.clone(), r);
+    }
+
+    // Enforce identical raw-field conventions across peer tail calls.
+    loop {
+        let mut changed = false;
+        for f in pair_con.keys() {
+            let rf = raw_fields[f];
+            for ex in &fn_exits[f] {
+                if let PairExit::Call(g) = ex {
+                    let rg = raw_fields[g];
+                    for i in 0..2 {
+                        if rf[i] != rg[i] {
+                            if rf[i] != 0 {
+                                raw_fields.get_mut(f).unwrap()[i] = 0;
+                                changed = true;
+                            }
+                            if rg[i] != 0 {
+                                raw_fields.get_mut(g).unwrap()[i] = 0;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    pair_con
+        .into_iter()
+        .map(|(f, con)| {
+            let r = raw_fields[&f];
+            (f, PairRet { con, raw0: r[0], raw1: r[1] })
+        })
+        .collect()
 }
 
 /// The global functions given workers: a parameter is passed raw when its type says it is a number,
@@ -963,7 +1906,7 @@ fn has_unboxed_recursive_path(
                     true
                 } else {
                     let removed = push_shadow_whnf(params, whnf);
-                    let ok = raw_uses_in(cur, x, w, strict_map, whnf, true);
+                    let ok = raw_uses_in(cur, x, w, strict_map, whnf, true, None);
                     pop_removed_whnf(removed, whnf);
                     ok
                 };
@@ -978,7 +1921,7 @@ fn has_unboxed_recursive_path(
                 let removed = push_shadow_whnf(binds.iter().map(|(n, _)| n.as_str()), whnf);
                 let binds_ok = binds.iter().all(|(_, r)| match r {
                     Core::Con(_, args) => args.iter().all(|a| raw_uses_atom(a, x, w, strict_map, whnf)),
-                    other => raw_uses_in(other, x, w, strict_map, whnf, true),
+                    other => raw_uses_in(other, x, w, strict_map, whnf, true, None),
                 });
                 let ok = binds_ok
                     && (binds.iter().any(|(_, r)| {
@@ -992,7 +1935,7 @@ fn has_unboxed_recursive_path(
         }
         Core::Case(s, b, alts) => {
             let scrut_is_x = matches!(&**s, Core::Var(v) if v == x);
-            if !scrut_is_x && !raw_uses_in(s, x, w, strict_map, whnf, false) {
+            if !scrut_is_x && !raw_uses_in(s, x, w, strict_map, whnf, false, None) {
                 return false;
             }
             if b == x {
@@ -1005,7 +1948,7 @@ fn has_unboxed_recursive_path(
                         return false;
                     }
                     let removed = push_shadow_whnf(vars.iter().map(|v| v.as_str()), whnf);
-                    let ok = (raw_uses_in(body, x, w, strict_map, whnf, true)
+                    let ok = (raw_uses_in(body, x, w, strict_map, whnf, true, None)
                         && has_self_raw_call(body, target, w, strict_map, whnf))
                         || has_unboxed_recursive_path(body, x, target, w, strict_map, whnf);
                     pop_removed_whnf(removed, whnf);
@@ -1015,7 +1958,7 @@ fn has_unboxed_recursive_path(
                     if scrut_is_x && (!matches!(l, Lit::Int(_) | Lit::Char(_)) || mentions(body, b)) {
                         return false;
                     }
-                    (raw_uses_in(body, x, w, strict_map, whnf, true)
+                    (raw_uses_in(body, x, w, strict_map, whnf, true, None)
                         && has_self_raw_call(body, target, w, strict_map, whnf))
                         || has_unboxed_recursive_path(body, x, target, w, strict_map, whnf)
                 }
@@ -1023,7 +1966,7 @@ fn has_unboxed_recursive_path(
                     if scrut_is_x && mentions(body, b) {
                         return false;
                     }
-                    (raw_uses_in(body, x, w, strict_map, whnf, true)
+                    (raw_uses_in(body, x, w, strict_map, whnf, true, None)
                         && has_self_raw_call(body, target, w, strict_map, whnf))
                         || has_unboxed_recursive_path(body, x, target, w, strict_map, whnf)
                 }
@@ -1034,7 +1977,7 @@ fn has_unboxed_recursive_path(
         Core::Con(_, args) => args.iter().any(|a| {
             !matches!(a, Core::Var(_) | Core::Lit(_) | Core::Con(..))
                 && numeric_use(a, x)
-                && raw_uses_in(a, x, w, strict_map, whnf, true)
+                && raw_uses_in(a, x, w, strict_map, whnf, true, None)
                 && has_self_raw_call(a, target, w, strict_map, whnf)
         }),
         _ => false,
@@ -1079,6 +2022,8 @@ struct Body {
     ctx: Ctx,
     /// The kind of the raw result this body returns (a worker returning its number raw).
     ret_raw: Option<u8>,
+    /// The unboxed pair convention this body returns (a worker returning a 2-field constructor in registers).
+    ret_pair: Option<PairRet>,
 }
 
 /// Where an expression is lowered: its result returned from the body, a case scrutinee, or the
@@ -1104,6 +2049,8 @@ pub struct Lowering {
     numeric: NumericParams,
     /// The workers that return their result raw, with its kind (see `raw_returns`).
     raw_returns: HashMap<String, u8>,
+    /// The workers that return a 2-field constructor unboxed in `(%r14, %rax)` (see `pair_returns`).
+    pair_returns: HashMap<String, PairRet>,
 }
 
 impl Body {
@@ -1122,6 +2069,7 @@ impl Body {
             whnf: std::collections::HashSet::new(),
             ctx: Ctx::Tail,
             ret_raw: None,
+            ret_pair: None,
         }
     }
 
@@ -1150,6 +2098,7 @@ impl Lowering {
             worker_strict,
             numeric: numeric.clone(),
             raw_returns: HashMap::new(),
+            pair_returns: HashMap::new(),
         };
         if !no_workers {
             lw.raw_returns = raw_returns(binds, &lw.workers, &lw.worker_strict, numeric);
@@ -1160,6 +2109,28 @@ impl Lowering {
                     lw.worker_strict.insert(name.clone(), vec![false; n]);
                 }
             }
+            lw.pair_returns = pair_returns(binds, &lw.workers, &lw.worker_strict, &lw.raw_returns, numeric);
+            if !lw.pair_returns.is_empty() {
+                let arities: HashMap<&str, usize> = binds
+                    .iter()
+                    .map(|b| {
+                        let mut n = 0usize;
+                        let mut cur = &b.body;
+                        while let Core::Lam(_, inner) = cur {
+                            n += 1;
+                            cur = inner;
+                        }
+                        (b.name.as_str(), n)
+                    })
+                    .collect();
+                for name in lw.pair_returns.keys() {
+                    if !lw.workers.contains_key(name) {
+                        let n = arities[name.as_str()];
+                        lw.workers.insert(name.clone(), vec![false; n]);
+                        lw.worker_strict.insert(name.clone(), vec![false; n]);
+                    }
+                }
+            }
         }
         let globals = binds
             .iter()
@@ -1168,7 +2139,8 @@ impl Lowering {
                 let worker = lw.workers.get(&b.name).cloned().map(|raw| {
                     let kinds = lw.numeric.params.get(&b.name).cloned().unwrap_or_default();
                     let ret = lw.raw_returns.get(&b.name).copied();
-                    (lw.closure_with(&b.body, Some((&raw, &kinds)), ret), raw)
+                    let ret_pair = lw.pair_returns.get(&b.name).cloned();
+                    (lw.closure_with(&b.body, Some((&raw, &kinds)), ret, ret_pair), raw)
                 });
                 SGlobal { name: b.name.clone(), closure, worker }
             })
@@ -1178,19 +2150,26 @@ impl Lowering {
 
     /// The closure of a top-level or delayed expression: a lambda's parameters, or a thunk.
     fn closure_of(&mut self, e: &Core) -> SClosure {
-        self.closure_with(e, None, None)
+        self.closure_with(e, None, None, None)
     }
 
     /// `closure_of`, with the parameters `raw` marks bound to raw slots (a worker): the first
     /// `MAX_REG_RAW_ARGS` raw parameters arrive in cache registers (`arg_slot == 0`), and any
     /// further ones arrive in stack argument slots.
-    fn closure_with(&mut self, e: &Core, raw: Option<(&[bool], &[u8])>, ret_raw: Option<u8>) -> SClosure {
+    fn closure_with(
+        &mut self,
+        e: &Core,
+        raw: Option<(&[bool], &[u8])>,
+        ret_raw: Option<u8>,
+        ret_pair: Option<PairRet>,
+    ) -> SClosure {
         let mut body = Body::new();
         // Variables already in WHNF in the enclosing body stay in WHNF whenever this closure runs.
         if let Some(outer) = self.bodies.last() {
             body.whnf = outer.whnf.clone();
         }
         body.ret_raw = ret_raw;
+        body.ret_pair = ret_pair;
         self.bodies.push(body);
         let mut raw_args = Vec::new();
         let (arity, body_expr) = match e {
@@ -1269,6 +2248,7 @@ impl Lowering {
             raw_args,
             raw_free,
             ret_raw: b.ret_raw.is_some(),
+            ret_pair: b.ret_pair.as_ref().map(|p| (p.raw0 != 0, p.raw1 != 0)),
             uses_closure,
             body,
         };
@@ -1393,6 +2373,16 @@ impl Lowering {
         self.raw_returns.get(g.as_str()).copied()
     }
 
+    /// The unboxed pair convention of an exact call of a worker returning a 2-field constructor.
+    fn pair_call(&self, e: &Core) -> Option<PairRet> {
+        let (f, args) = spine(e);
+        let Core::Var(g) = f else { return None };
+        if !self.can_invoke_worker(g.as_str(), &args) {
+            return None;
+        }
+        self.pair_returns.get(g.as_str()).cloned()
+    }
+
     /// `case e as r of _ -> r` with a raw binder of the given kind: the number of `e` (unboxed,
     /// or taken raw from a worker returning raw), as the result of the case.
     fn through_raw(&mut self, e: SExpr, kind: u8) -> SExpr {
@@ -1432,7 +2422,15 @@ impl Lowering {
                     return self.allocating(mark, SExpr::Jump(id, aa));
                 }
                 let callee_raw = self.raw_call(e);
-                let call = match self.worker_call(f, &args) {
+                let callee_pair = self.pair_call(e);
+                let allow_worker = match &callee_pair {
+                    Some(pr) => {
+                        self.ctx() == Ctx::Tail
+                            && self.bodies.last().and_then(|b| b.ret_pair.as_ref()) == Some(pr)
+                    }
+                    None => true,
+                };
+                let call = match if allow_worker { self.worker_call(f, &args) } else { None } {
                     Some(call) => call,
                     None => {
                         let fa = self.atom(f);
@@ -1521,8 +2519,131 @@ impl Lowering {
                     }
                     _ => {}
                 }
-                // The result of an inline primitive that is only used raw is kept unboxed.
                 let scrut_core = scrut;
+                if let Some(pr) = self.pair_call(scrut_core) {
+                    if !alts_free_mention(alts, binder) {
+                        let matching = alts.iter().find_map(|a| match a {
+                            Alt::Con(c, vars, body) if c == &pr.con && vars.len() == 2 => Some((vars, body)),
+                            _ => None,
+                        });
+                        let others_ok = alts.iter().all(|a| match a {
+                            Alt::Con(c, vars, _) if c == &pr.con && vars.len() == 2 => true,
+                            Alt::Con(c, _, _) if c != &pr.con => true,
+                            Alt::Default(_) => true,
+                            _ => false,
+                        });
+                        if let Some((vars, body)) = matching.filter(|_| others_ok) {
+                            let (f, args) = spine(scrut_core);
+                            if let Some((evals, pending_binds, call_expr)) = self.worker_call_parts(f, &args) {
+                                let v0_used = vars[0] != vars[1] && free_mentions(body, &vars[0]);
+                                let v1_used = free_mentions(body, &vars[1]);
+                                let saved_v0 = if v0_used {
+                                    self.bodies.last().expect("body").locals.get(&vars[0]).copied()
+                                } else {
+                                    None
+                                };
+                                let saved_v1 = if v1_used {
+                                    self.bodies.last().expect("body").locals.get(&vars[1]).copied()
+                                } else {
+                                    None
+                                };
+                                let removed_whnf = push_shadow_whnf(
+                                    vars.iter().map(|v| v.as_str()),
+                                    &mut self.bodies.last_mut().expect("body").whnf,
+                                );
+                                let s0 = if v0_used {
+                                    if pr.raw0 != 0 {
+                                        self.bodies.last_mut().expect("body").whnf.insert(vars[0].clone());
+                                        self.bind_raw(&vars[0], pr.raw0)
+                                    } else {
+                                        self.bind_local(&vars[0])
+                                    }
+                                } else {
+                                    UNUSED_SLOT
+                                };
+                                let s1 = if v1_used {
+                                    if pr.raw1 != 0 {
+                                        self.bodies.last_mut().expect("body").whnf.insert(vars[1].clone());
+                                        self.bind_raw(&vars[1], pr.raw1)
+                                    } else {
+                                        self.bind_local(&vars[1])
+                                    }
+                                } else {
+                                    UNUSED_SLOT
+                                };
+                                let lowered_body = self.strict(body);
+                                let b = self.bodies.last_mut().expect("body");
+                                if v0_used {
+                                    if pr.raw0 != 0 {
+                                        b.whnf.remove(&vars[0]);
+                                    }
+                                    match saved_v0 {
+                                        Some(s) => {
+                                            b.locals.insert(vars[0].clone(), s);
+                                        }
+                                        None => {
+                                            b.locals.remove(&vars[0]);
+                                        }
+                                    }
+                                }
+                                if v1_used {
+                                    if pr.raw1 != 0 {
+                                        b.whnf.remove(&vars[1]);
+                                    }
+                                    match saved_v1 {
+                                        Some(s) => {
+                                            b.locals.insert(vars[1].clone(), s);
+                                        }
+                                        None => {
+                                            b.locals.remove(&vars[1]);
+                                        }
+                                    }
+                                }
+                                pop_removed_whnf(removed_whnf, &mut b.whnf);
+                                let mut res = SExpr::Case(
+                                    Box::new(call_expr),
+                                    UNUSED_SLOT,
+                                    vec![SAlt::Con(pr.con, vec![s0, s1], lowered_body)],
+                                );
+                                if !pending_binds.is_empty() {
+                                    res = SExpr::Let(pending_binds, Box::new(res));
+                                }
+                                for (slot, ev_scrut) in evals.into_iter().rev() {
+                                    res = SExpr::Case(Box::new(ev_scrut), slot, vec![SAlt::Default(res)]);
+                                }
+                                return res;
+                            }
+                        }
+                    }
+                }
+                // The result of an inline primitive that is only used raw is kept unboxed.
+                let cur_ret_pair = if self.ctx() == Ctx::Tail {
+                    self.bodies.last().and_then(|b| b.ret_pair.clone())
+                } else {
+                    None
+                };
+                let ret_pair_raw_kind = if self.pair_call(scrut_core).is_none() {
+                    cur_ret_pair.as_ref().and_then(|pr| match &alts[..] {
+                        [Alt::Default(Core::Con(c, args))] if c == &pr.con && args.len() == 2 => {
+                            if pr.raw0 != 0
+                                && matches!(&args[0], Core::Var(v) if v == binder)
+                                && !free_mentions(&args[1], binder)
+                            {
+                                Some(pr.raw0)
+                            } else if pr.raw1 != 0
+                                && matches!(&args[1], Core::Var(v) if v == binder)
+                                && !free_mentions(&args[0], binder)
+                            {
+                                Some(pr.raw1)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
                 let raw_call = self.raw_call(scrut_core);
                 let raw_eligible = matches!(
                     scrut_core.as_ref(),
@@ -1532,21 +2653,31 @@ impl Lowering {
                                 && args.len() == 2
                                 && !matches!(args[0], Core::Lit(_))
                                 && !matches!(&args[1], Core::Lit(l) if !matches!(l, Lit::Int(_))))
-                ) || raw_call.is_some();
+                ) || raw_call.is_some()
+                    || ret_pair_raw_kind.is_some();
                 let raw = raw_eligible
                     && match &alts[..] {
                         [Alt::Default(body)] => {
                             let whnf = &mut self.bodies.last_mut().expect("body").whnf;
                             let added = push_case_whnf(scrut_core, binder, whnf);
-                            let ok = raw_uses(body, binder, &self.workers, &self.worker_strict, whnf);
+                            let ok = raw_uses_with_pair(
+                                body,
+                                binder,
+                                &self.workers,
+                                &self.worker_strict,
+                                whnf,
+                                cur_ret_pair.as_ref(),
+                            );
                             pop_added_whnf(added, whnf);
                             ok
                         }
                         _ => false,
                     };
                 let raw_kind = match scrut_core.as_ref() {
-                    Core::Prim(p, _) => raw_prim_result_kind(p).unwrap_or(NUM_INT),
-                    _ => raw_call.unwrap_or(NUM_INT),
+                    Core::Prim(p, _) => raw_prim_result_kind(p)
+                        .or(ret_pair_raw_kind)
+                        .unwrap_or(NUM_INT),
+                    _ => raw_call.or(ret_pair_raw_kind).unwrap_or(NUM_INT),
                 };
                 let flat_alts = if !raw { flatten_case_alts(scrut_core, binder, alts) } else { None };
                 let alts: &[Alt] = flat_alts.as_deref().unwrap_or(alts);
@@ -1690,6 +2821,55 @@ impl Lowering {
                 SExpr::Case(Box::new(scrut), bslot, lowered)
             }
             Core::Con(name, args) => {
+                let ret_pair = if self.ctx() == Ctx::Tail {
+                    self.bodies
+                        .last()
+                        .and_then(|b| b.ret_pair.clone())
+                        .filter(|pr| pr.con == *name && args.len() == 2)
+                } else {
+                    None
+                };
+                if let Some(pr) = ret_pair.filter(|pr| pr.raw0 != 0 || pr.raw1 != 0) {
+                    let kinds = [pr.raw0, pr.raw1];
+                    let mut evals: Vec<(u32, SExpr)> = Vec::new();
+                    let mut atoms: [Option<Atom>; 2] = [None, None];
+                    for (i, a) in args.iter().enumerate() {
+                        if kinds[i] == 0 {
+                            continue;
+                        }
+                        let direct = match a {
+                            Core::Var(v) => match self.resolve(v) {
+                                at @ Atom::Slot(k) if k & RAW != 0 => Some(at),
+                                _ => None,
+                            },
+                            Core::Lit(l @ (Lit::Int(_) | Lit::Char(_) | Lit::Double(_))) => {
+                                Some(Atom::Lit(slit(l)))
+                            }
+                            _ => None,
+                        };
+                        match direct {
+                            Some(at) => atoms[i] = Some(at),
+                            None => {
+                                let scrut = self.strict_in(a, Ctx::RawScrut);
+                                let slot = self.bind_raw(&format!("p%{}", self.next_join), kinds[i]);
+                                self.next_join += 1;
+                                evals.push((slot, scrut));
+                                atoms[i] = Some(Atom::Slot(slot));
+                            }
+                        }
+                    }
+                    let mark = self.pending_len();
+                    let final_atoms: Vec<Atom> = args
+                        .iter()
+                        .zip(atoms)
+                        .map(|(a, at)| at.unwrap_or_else(|| self.atom(a)))
+                        .collect();
+                    let mut e = self.allocating(mark, SExpr::Con(name.clone(), final_atoms));
+                    for (slot, scrut) in evals.into_iter().rev() {
+                        e = SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(e)]);
+                    }
+                    return e;
+                }
                 let mark = self.pending_len();
                 let atoms = args.iter().map(|a| self.atom(a)).collect();
                 self.allocating(mark, SExpr::Con(name.clone(), atoms))
@@ -1785,10 +2965,14 @@ impl Lowering {
         }
     }
 
-    /// An exact call of a function with a worker: each raw parameter's argument is a raw slot or a
-    /// number literal, evaluated first (into a fresh raw slot) otherwise; every raw parameter is
-    /// either strict or receives a guaranteed-WHNF argument (checked by `can_invoke_worker`).
-    fn worker_call(&mut self, f: &Core, args: &[&Core]) -> Option<SExpr> {
+    /// Lowers the argument preparation and `SExpr::CallWorker` of an exact worker call, returning
+    /// `(raw_arg_evals, pending_let_binds, call_worker)` so callers can wrap them outside an
+    /// unpacking `SExpr::Case` for `PairRet` workers.
+    fn worker_call_parts(
+        &mut self,
+        f: &Core,
+        args: &[&Core],
+    ) -> Option<(Vec<(u32, SExpr)>, Vec<(u32, SBind)>, SExpr)> {
         let Core::Var(g) = f else { return None };
         if !self.can_invoke_worker(g.as_str(), args) {
             return None;
@@ -1824,7 +3008,18 @@ impl Lowering {
         let mark = self.pending_len();
         let Atom::Global(gi) = self.atom(f) else { return None };
         let aa: Vec<Atom> = args.iter().zip(atoms).map(|(a, at)| at.unwrap_or_else(|| self.atom(a))).collect();
-        let mut e = self.allocating(mark, SExpr::CallWorker(gi, aa));
+        let pending_binds: Vec<(u32, SBind)> = self.bodies.last_mut().expect("body").pending.drain(mark..).collect();
+        Some((evals, pending_binds, SExpr::CallWorker(gi, aa)))
+    }
+
+    /// An exact call of a function with a worker: each raw parameter's argument is a raw slot or a
+    /// number literal, evaluated first (into a fresh raw slot) otherwise; every raw parameter is
+    /// either strict or receives a guaranteed-WHNF argument (checked by `can_invoke_worker`).
+    fn worker_call(&mut self, f: &Core, args: &[&Core]) -> Option<SExpr> {
+        let (evals, pending_binds, mut e) = self.worker_call_parts(f, args)?;
+        if !pending_binds.is_empty() {
+            e = SExpr::Let(pending_binds, Box::new(e));
+        }
         for (slot, scrut) in evals.into_iter().rev() {
             e = SExpr::Case(Box::new(scrut), slot, vec![SAlt::Default(e)]);
         }
@@ -3117,7 +4312,11 @@ mod raw_slot_tests {
 
     /// Every parameter typed as an Int (the types themselves are not under test here).
     fn numeric_all(binds: &[TopBind]) -> NumericParams {
-        NumericParams { params: binds.iter().map(|b| (b.name.clone(), vec![NUM_INT; 8])).collect(), results: HashMap::new() }
+        NumericParams {
+            params: binds.iter().map(|b| (b.name.clone(), vec![NUM_INT; 8])).collect(),
+            results: HashMap::new(),
+            ..Default::default()
+        }
     }
 
     fn case(s: Core, b: &str, body: Core) -> Core {
@@ -3229,7 +4428,11 @@ mod raw_slot_tests {
             name: "Test.f".into(),
             body: Core::Lam("t".into(), Box::new(Core::Lam("x".into(), Box::new(body)))),
         }];
-        let untyped = NumericParams { params: [("Test.f".to_string(), vec![0, 0])].into_iter().collect(), results: HashMap::new() };
+        let untyped = NumericParams {
+            params: [("Test.f".to_string(), vec![0, 0])].into_iter().collect(),
+            results: HashMap::new(),
+            ..Default::default()
+        };
         assert!(workers(&binds, &untyped).is_empty());
     }
 
@@ -3358,6 +4561,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.size".to_string(), vec![0])].into_iter().collect(),
             results: [("Test.size".to_string(), (1, NUM_INT))].into_iter().collect(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (worker, raw) = prog.globals[0].worker.as_ref().expect("0-raw-param raw-returning worker");
@@ -3454,6 +4658,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.member".to_string(), vec![NUM_INT, 0])].into_iter().collect(),
             results: [("Test.member".to_string(), (2, NUM_INT))].into_iter().collect(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (worker, raw) = prog.globals[0].worker.as_ref().expect("WHNF-guarded worker");
@@ -3679,6 +4884,7 @@ mod raw_slot_tests {
             .into_iter()
             .collect(),
             results: HashMap::new(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (go_worker, go_raw) = prog.globals[1].worker.as_ref().expect("go should get raw worker");
@@ -3738,6 +4944,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.fib".to_string(), vec![NUM_INT])].into_iter().collect(),
             results: [("Test.fib".to_string(), (1, NUM_INT))].into_iter().collect(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (worker, _) = prog.globals[0].worker.as_ref().expect("fib worker");
@@ -3787,6 +4994,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.go".to_string(), vec![NUM_INT, NUM_INT])].into_iter().collect(),
             results: HashMap::new(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (worker, _) = prog.globals[0].worker.as_ref().expect("go should get raw worker");
@@ -3853,6 +5061,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.clearBit".to_string(), vec![0, NUM_INT, 0])].into_iter().collect(),
             results: HashMap::new(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (worker, _) = prog.globals[0].worker.as_ref().expect("clearBit should get raw-index worker");
@@ -3908,6 +5117,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.f".to_string(), vec![NUM_INT])].into_iter().collect(),
             results: HashMap::new(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (worker, raw) = prog.globals[0].worker.as_ref().expect("Test.f should get raw worker");
@@ -3966,6 +5176,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.loop".to_string(), vec![NUM_INT, NUM_INT])].into_iter().collect(),
             results: HashMap::new(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (_, raw) = prog.globals[0].worker.as_ref().expect("Test.loop should get worker");
@@ -4041,6 +5252,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.sumSq".to_string(), vec![NUM_DOUBLE, NUM_DOUBLE])].into_iter().collect(),
             results: [("Test.sumSq".to_string(), (2, NUM_DOUBLE))].into_iter().collect(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (worker, raw) = prog.globals[0].worker.as_ref().expect("Test.sumSq should get worker");
@@ -4130,6 +5342,7 @@ mod raw_slot_tests {
         let numeric = NumericParams {
             params: [("Test.build".to_string(), vec![NUM_INT, NUM_INT])].into_iter().collect(),
             results: HashMap::new(),
+            ..Default::default()
         };
         let prog = Lowering::program(&binds, &numeric);
         let (worker, raw) = prog.globals[1].worker.as_ref().expect("Test.build should get a worker");
@@ -4170,6 +5383,113 @@ mod raw_slot_tests {
             assert_eq!(th.raw_free.len(), 2);
             assert!(!th.uses_closure, "raw-only child thunk should not save slot 0");
         }
+    }
+
+    #[test]
+    fn pair_returns_unboxes_monomorphic_pair_field_and_guards_non_unpacking_calls() {
+        let eval_body = Core::Lam(
+            "e".into(),
+            Box::new(Core::Lam(
+                "s".into(),
+                Box::new(Core::Case(
+                    Box::new(var("e")),
+                    "eb".into(),
+                    vec![
+                        Alt::Con(
+                            "Test.Lit".into(),
+                            vec!["n".into()],
+                            case(
+                                var("n"),
+                                "r",
+                                Core::Con("Builtin.(,)".into(), vec![var("r"), var("s")]),
+                            ),
+                        ),
+                        Alt::Con(
+                            "Test.Add".into(),
+                            vec!["a".into(), "b".into()],
+                            Core::Case(
+                                Box::new(app(app(var("Test.eval"), var("a")), var("s"))),
+                                "p1".into(),
+                                vec![Alt::Con(
+                                    "Builtin.(,)".into(),
+                                    vec!["v1".into(), "s1".into()],
+                                    Core::Case(
+                                        Box::new(app(app(var("Test.eval"), var("b")), var("s1"))),
+                                        "p2".into(),
+                                        vec![Alt::Con(
+                                            "Builtin.(,)".into(),
+                                            vec!["v2".into(), "s2".into()],
+                                            case(
+                                                prim("+#", vec![var("v1"), var("v2")]),
+                                                "r2",
+                                                Core::Con("Builtin.(,)".into(), vec![var("r2"), var("s2")]),
+                                            ),
+                                        )],
+                                    ),
+                                )],
+                            ),
+                        ),
+                    ],
+                )),
+            )),
+        );
+        let run_body = Core::Lam(
+            "e".into(),
+            Box::new(Core::Lam(
+                "s".into(),
+                Box::new(Core::Case(
+                    Box::new(app(app(var("Test.eval"), var("e")), var("s"))),
+                    "pm".into(),
+                    vec![Alt::Con(
+                        "Builtin.(,)".into(),
+                        vec!["v".into(), "st".into()],
+                        prim("+#", vec![var("v"), Core::Lit(Lit::Int(1))]),
+                    )],
+                )),
+            )),
+        );
+        let escape_body = Core::Lam(
+            "e".into(),
+            Box::new(Core::Lam(
+                "s".into(),
+                Box::new(app(app(var("Test.eval"), var("e")), var("s"))),
+            )),
+        );
+        let binds = vec![
+            TopBind { name: "Test.eval".into(), body: eval_body },
+            TopBind { name: "Test.run".into(), body: run_body },
+            TopBind { name: "Test.escape".into(), body: escape_body },
+        ];
+        let numeric = NumericParams {
+            params: [("Test.eval".to_string(), vec![0, 0])].into_iter().collect(),
+            results: HashMap::new(),
+            monomorphic_ret: ["Test.eval".to_string()].into_iter().collect(),
+        };
+        let prog = Lowering::program(&binds, &numeric);
+        let (worker, raw) = prog.globals[0].worker.as_ref().expect("Test.eval should get PairRet worker");
+        assert_eq!(raw, &vec![false, false]);
+        assert_eq!(worker.ret_pair, Some((true, false)), "field 0 should be returned raw, field 1 boxed");
+        match &prog.globals[1].closure.body {
+            SExpr::Case(scrut, bslot, alts) => {
+                assert!(matches!(scrut.as_ref(), SExpr::CallWorker(0, _)), "expected CallWorker in run: {scrut:?}");
+                assert_eq!(*bslot, UNUSED_SLOT);
+                match &alts[..] {
+                    [SAlt::Con(con, slots, _)] => {
+                        assert_eq!(con, "Builtin.(,)");
+                        assert_eq!(slots.len(), 2);
+                        assert!(slots[0] & RAW != 0, "unpacked field 0 should be raw: {:x}", slots[0]);
+                        assert_eq!(slots[1], UNUSED_SLOT);
+                    }
+                    other => panic!("expected single Con alt, got {other:?}"),
+                }
+            }
+            other => panic!("expected Case(CallWorker) in run, got {other:?}"),
+        }
+        assert!(
+            matches!(&prog.globals[2].closure.body, SExpr::App(Atom::Global(0), _)),
+            "boxed closure of escape must call boxed App, got {:?}",
+            prog.globals[2].closure.body
+        );
     }
 }
 
