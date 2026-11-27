@@ -153,6 +153,15 @@ impl Pos {
     }
 }
 
+#[derive(Clone)]
+struct WorkerInfo {
+    label: String,
+    raw: Vec<bool>,
+    ret_raw: bool,
+    ret_pair: Option<(bool, bool)>,
+    uses_closure: bool,
+}
+
 pub struct Gen {
     out: String,
     labels: u64,
@@ -206,10 +215,12 @@ pub struct Gen {
     live: Vec<std::collections::HashSet<u32>>,
     /// The slots each join point's code uses (a jump to it uses them).
     join_uses: HashMap<u32, std::collections::HashSet<u32>>,
-    /// The worker entries (label, raw parameters, returns raw, uses_closure) in program-global index order.
-    workers: Vec<Option<(String, Vec<bool>, bool, bool)>>,
+    /// The worker entries in program-global index order.
+    workers: Vec<Option<WorkerInfo>>,
     /// The body being generated returns its result raw (see `stg::raw_returns`).
     ret_raw: bool,
+    /// The body being generated returns a 2-field constructor unboxed in `(%r14, %rax)` (`(raw0, raw1)`).
+    ret_pair: Option<(bool, bool)>,
     /// The raw slot an inline primitive's number goes to (a case binder kept unboxed).
     raw_dest: Option<u32>,
     /// Where an inline primitive's value goes when it is a case scrutinee computed in place.
@@ -546,6 +557,7 @@ impl Gen {
             raw_dest: None,
             workers: Vec::new(),
             ret_raw: false,
+            ret_pair: None,
             live: Vec::new(),
             join_uses: HashMap::new(),
             cache: Vec::new(),
@@ -789,7 +801,13 @@ impl Gen {
                 gl.worker.as_ref().map(|(c, raw)| {
                     let wl = g.label("w");
                     g.pending.push((wl.clone(), c.clone(), format!("{}/worker", gl.name)));
-                    (wl, raw.clone(), c.ret_raw, c.uses_closure)
+                    WorkerInfo {
+                        label: wl,
+                        raw: raw.clone(),
+                        ret_raw: c.ret_raw,
+                        ret_pair: c.ret_pair,
+                        uses_closure: c.uses_closure,
+                    }
                 })
             } else {
                 None
@@ -1169,7 +1187,13 @@ impl Gen {
     /// call using only captured/global/static atoms: reads captures straight from `%r14`, pushes
     /// arguments below the update frame, and tail-jumps without allocating or sliding a frame.
     fn direct_thunk_tail_call(&mut self, label: &str, c: &SClosure) -> bool {
-        if c.arity != 0 || c.nraw != 0 || !c.uses_closure || c.ret_raw || !c.raw_free.is_empty() {
+        if c.arity != 0
+            || c.nraw != 0
+            || !c.uses_closure
+            || c.ret_raw
+            || c.ret_pair.is_some()
+            || !c.raw_free.is_empty()
+        {
             return false;
         }
         match &c.body {
@@ -1201,7 +1225,14 @@ impl Gen {
                 true
             }
             SExpr::CallWorker(g, args) => {
-                let Some((entry, raw_pos, false, uc)) = self.workers.get(*g as usize).cloned().flatten() else {
+                let Some(WorkerInfo {
+                    label: entry,
+                    raw: raw_pos,
+                    ret_raw: false,
+                    ret_pair: None,
+                    uses_closure: uc,
+                }) = self.workers.get(*g as usize).cloned().flatten()
+                else {
                     return false;
                 };
                 if raw_pos.len() != args.len() {
@@ -1488,7 +1519,7 @@ impl Gen {
                     }
                 }
                 SExpr::CallWorker(w, args) => {
-                    if let Some(Some((l, raw_pos, _, _))) = g.workers.get(*w as usize) {
+                    if let Some(Some(WorkerInfo { label: l, raw: raw_pos, .. })) = g.workers.get(*w as usize) {
                         let mut reg_raw = 0usize;
                         let mut stack_args = Vec::new();
                         for (i, a) in args.iter().enumerate() {
@@ -1668,7 +1699,7 @@ impl Gen {
                     }
                 }
                 SExpr::CallWorker(w, args) => {
-                    if let Some(Some((l, raw_pos, _, _))) = g.workers.get(*w as usize) {
+                    if let Some(Some(WorkerInfo { label: l, raw: raw_pos, .. })) = g.workers.get(*w as usize) {
                         let mut reg_raw = 0usize;
                         let mut stack_args = Vec::new();
                         for (i, a) in args.iter().enumerate() {
@@ -1996,6 +2027,7 @@ impl Gen {
         let ptr_slots = if has_closure { c.nslots } else { c.nslots - 1 };
         let f = Frame { s: ptr_slots + c.nraw, a: c.arity, r: c.nraw, has_closure };
         self.ret_raw = c.ret_raw;
+        self.ret_pair = c.ret_pair;
         let has_params = c.arity > 0 || !c.raw_args.is_empty();
         let (reaches_self, loop_written, loop_has_hot_zero) =
             if has_params && c.raw_args.iter().all(|(a, _)| *a == 0) {
@@ -2043,7 +2075,7 @@ impl Gen {
         }
         // Frameless fast-exits before frame allocation & preemption check.
         let mut body_to_emit = &c.body;
-        if sel_info.is_none() && loop_lbl.is_none() {
+        if sel_info.is_none() && loop_lbl.is_none() && c.ret_pair.is_none() {
             if let Some(rest) = self.try_raw_cmp_fast_exit(c) {
                 body_to_emit = rest;
             } else {
@@ -4179,11 +4211,48 @@ impl Gen {
             SExpr::CallWorker(g, args) => {
                 let func = Atom::Global(*g);
                 let worker = self.workers.get(*g as usize).cloned().flatten();
-                assert!(worker.as_ref().is_some_and(|(_, r, _, _)| r.len() == args.len()), "internal: no worker for call");
+                assert!(worker.as_ref().is_some_and(|w| w.raw.len() == args.len()), "internal: no worker for call");
                 self.call(&func, args, worker, p);
             }
             SExpr::App(func, args) => self.call(func, args, None, p),
             SExpr::Con(name, args) => {
+                if p.mode == Mode::Tail {
+                    if let Some((r0, r1)) = self.ret_pair {
+                        assert_eq!(args.len(), 2, "internal: pair worker Con arity mismatch");
+                        let load_field = |g: &mut Self, a: &Atom, is_raw_field: bool, dst: &str| {
+                            if is_raw_field {
+                                match a {
+                                    Atom::Slot(k) if *k & RAW != 0 => {
+                                        if let Some(r) = g.cached(*k) {
+                                            if r != dst {
+                                                g.emit(&format!("movq {r}, {dst}"));
+                                            }
+                                        } else {
+                                            g.emit(&format!("movq {}, {dst}", p.slot(*k)));
+                                        }
+                                    }
+                                    Atom::Lit(SLit::Int(v)) => g.mov_src(Src::Imm(*v), dst),
+                                    Atom::Lit(SLit::Char(ch)) => {
+                                        g.mov_src(Src::Imm(crate::syntax::lexer::char_code(*ch) as i64), dst);
+                                    }
+                                    Atom::Lit(SLit::Double(d)) => {
+                                        g.mov_src(Src::Imm(d.to_bits() as i64), dst);
+                                    }
+                                    _ => panic!(
+                                        "internal: non-raw atom in raw PairRet field in {}",
+                                        g.current_name
+                                    ),
+                                }
+                            } else {
+                                g.load(a, p, dst);
+                            }
+                        };
+                        load_field(self, &args[0], r0, "%r14");
+                        load_field(self, &args[1], r1, "%rax");
+                        self.ret(p);
+                        return;
+                    }
+                }
                 let id = self.con_id(name);
                 let empty_static = HashMap::new();
                 if args.is_empty() {
@@ -4246,8 +4315,11 @@ impl Gen {
                     }
                     static_binds.push(None);
                 }
+                let allow_con_shortcut = !(p.mode == Mode::Tail && self.ret_pair.is_some());
                 let static_body_con = match body.as_ref() {
-                    SExpr::Con(name, args) if args.iter().all(|a| self.is_static_atom(a, &local_static)) => {
+                    SExpr::Con(name, args)
+                        if allow_con_shortcut && args.iter().all(|a| self.is_static_atom(a, &local_static)) =>
+                    {
                         let id = self.con_id(name);
                         let lbl = if args.is_empty() {
                             self.nullary_con(id)
@@ -4263,7 +4335,7 @@ impl Gen {
                     SExpr::Atom(Atom::Slot(s)) => local_static.get(s).cloned(),
                     _ => None,
                 };
-                let fuse_con = if static_body_con.is_some() {
+                let fuse_con = if static_body_con.is_some() || !allow_con_shortcut {
                     None
                 } else {
                     match body.as_ref() {
@@ -5571,6 +5643,28 @@ impl Gen {
                 if !live.contains(&ALL_LIVE) {
                     self.known_kind.retain(|k, _| live.contains(k));
                 }
+                if let Some((_r0, _r1)) = self.returns_pair(scrut) {
+                    let [SAlt::Con(_, slots, body)] = &alts[..] else {
+                        panic!("internal: pair worker case must have single Con alt")
+                    };
+                    let [s0, s1] = [slots[0], slots[1]];
+                    self.known_kind.remove(&s0);
+                    self.known_kind.remove(&s1);
+                    let mut reg_i = 0usize;
+                    if s0 != UNUSED_SLOT {
+                        let reg = CACHE_REGS[reg_i];
+                        reg_i += 1;
+                        let _ = writeln!(self.out, "    movq %r14, {reg}");
+                        self.cache_put(s0, reg, true);
+                    }
+                    if s1 != UNUSED_SLOT {
+                        let reg = CACHE_REGS[reg_i];
+                        let _ = writeln!(self.out, "    movq %rax, {reg}");
+                        self.cache_put(s1, reg, true);
+                    }
+                    self.expr(body, p);
+                    return;
+                }
                 if raw_binder {
                     let [SAlt::Default(body)] = &alts[..] else {
                         panic!("internal: raw binder with alternatives")
@@ -5821,7 +5915,7 @@ impl Gen {
                 }
                 let _ = writeln!(self.out, "    cmpq ${span}, %rcx");
                 let _ = writeln!(self.out, "    jae {miss_high}");
-                let static_vals: Option<Vec<String>> = if p.mode == Mode::Tail && !self.ret_raw {
+                let static_vals: Option<Vec<String>> = if p.mode == Mode::Tail && !self.ret_raw && self.ret_pair.is_none() {
                     entries[..prefix_len]
                         .iter()
                         .map(|&(_, idx)| match &alts[idx] {
@@ -7271,14 +7365,15 @@ impl Gen {
 
     /// A call: the ordinary entry of `func`, or (an exact call) a global's worker, which takes its
     /// first `MAX_REG_RAW_ARGS` raw parameters in `CACHE_REGS` and any further parameters on the stack.
-    fn call(&mut self, func: &Atom, args: &[Atom], worker: Option<(String, Vec<bool>, bool, bool)>, p: Pos) {
+    fn call(&mut self, func: &Atom, args: &[Atom], worker: Option<WorkerInfo>, p: Pos) {
         let direct = match &worker {
-            Some((l, _, _, uc)) => Some((l.clone(), *uc)),
+            Some(w) => Some((w.label.clone(), w.uses_closure)),
             None => self.known_global_entry(func, args.len()).map(|(l, uc)| (l.to_owned(), uc)),
         };
         let mut reg_raw_args: Vec<&Atom> = Vec::new();
         let mut stack_args: Vec<(&Atom, bool)> = Vec::new();
-        if let Some((_, ref raw_pos, _, _)) = worker {
+        if let Some(ref w) = worker {
+            let raw_pos = &w.raw;
             for (i, a) in args.iter().enumerate() {
                 if raw_pos.get(i).copied().unwrap_or(false) {
                     if reg_raw_args.len() < MAX_REG_RAW_ARGS {
@@ -7644,11 +7739,24 @@ impl Gen {
     /// under the lets and argument evaluations that lowering wraps it in.
     fn returns_raw(&self, e: &SExpr) -> bool {
         match e {
-            SExpr::CallWorker(g, _) => matches!(self.workers.get(*g as usize), Some(Some((_, _, true, _)))),
+            SExpr::CallWorker(g, _) => matches!(self.workers.get(*g as usize), Some(Some(WorkerInfo { ret_raw: true, .. }))),
             // The thunks of the call's arguments, and the evaluation of its raw arguments.
             SExpr::Let(_, body) => self.returns_raw(body),
             SExpr::Case(_, k, alts) if k & RAW != 0 => matches!(&alts[..], [SAlt::Default(b)] if self.returns_raw(b)),
             _ => false,
+        }
+    }
+
+    /// Whether an expression is an exact call of a worker returning a 2-field constructor unboxed
+    /// in `(%r14, %rax)`, returning its `(raw0, raw1)` convention.
+    fn returns_pair(&self, e: &SExpr) -> Option<(bool, bool)> {
+        match e {
+            SExpr::CallWorker(g, _) => self
+                .workers
+                .get(*g as usize)
+                .and_then(|w| w.as_ref())
+                .and_then(|w| w.ret_pair),
+            _ => None,
         }
     }
 
@@ -8104,7 +8212,9 @@ impl Gen {
                     true
                 }
             }
-            SExpr::Con(_, args) => args.is_empty(),
+            SExpr::Con(_, args) => {
+                args.is_empty() || (self.ret_pair.is_some() && args.iter().all(static_atom))
+            }
             SExpr::App(_, args) | SExpr::CallWorker(_, args) => args.iter().all(static_atom),
             SExpr::Fail(_) => true,
             SExpr::Prim(name, args) => {
@@ -8358,7 +8468,7 @@ impl Gen {
                     }
                 }
                 SExpr::CallWorker(w, args) => {
-                    if let Some(Some((l, raw_pos, _, _))) = g.workers.get(*w as usize) {
+                    if let Some(Some(WorkerInfo { label: l, raw: raw_pos, .. })) = g.workers.get(*w as usize) {
                         let mut reg_raw = 0usize;
                         let mut stack_n = 0u32;
                         for i in 0..args.len() {
@@ -9296,8 +9406,8 @@ mod known_global_call_tests {
     #[test]
     fn forward_and_mutual_entries_are_registered_before_body_generation() {
         let globals = vec![
-            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), raw_captures: 0, nslots: 2, nraw: 0, raw_args: Vec::new(), raw_free: Vec::new(), ret_raw: false, uses_closure: false, body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) }, worker: None },
-            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), raw_captures: 0, nslots: 2, nraw: 0, raw_args: Vec::new(), raw_free: Vec::new(), ret_raw: false, uses_closure: false, body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) }, worker: None },
+            SGlobal { name: "Main.main".into(), closure: SClosure { arity: 1, captures: Vec::new(), raw_captures: 0, nslots: 2, nraw: 0, raw_args: Vec::new(), raw_free: Vec::new(), ret_raw: false, ret_pair: None, uses_closure: false, body: SExpr::App(Atom::Global(1), vec![Atom::Slot(1)]) }, worker: None },
+            SGlobal { name: "Test.other".into(), closure: SClosure { arity: 1, captures: Vec::new(), raw_captures: 0, nslots: 2, nraw: 0, raw_args: Vec::new(), raw_free: Vec::new(), ret_raw: false, ret_pair: None, uses_closure: false, body: SExpr::App(Atom::Global(0), vec![Atom::Slot(1)]) }, worker: None },
         ];
         let index = [("Main.main".to_string(), 0), ("Test.other".to_string(), 1)].into_iter().collect();
         let asm = Gen::program(&SProgram { globals, index });
@@ -9322,6 +9432,7 @@ mod known_global_call_tests {
             raw_args: vec![(0, r0), (0, r1)],
             raw_free: Vec::new(),
             ret_raw: true,
+            ret_pair: None,
             uses_closure: false,
             body: SExpr::CallWorker(0, vec![Atom::Slot(r1), Atom::Slot(r0)]),
         };
@@ -9336,6 +9447,7 @@ mod known_global_call_tests {
                 raw_args: Vec::new(),
                 raw_free: Vec::new(),
                 ret_raw: false,
+                ret_pair: None,
                 uses_closure: false,
                 body: SExpr::Atom(Atom::Slot(1)),
             },
@@ -9360,6 +9472,7 @@ mod known_global_call_tests {
             raw_args: vec![(0, r0)],
             raw_free: Vec::new(),
             ret_raw: false,
+            ret_pair: None,
             uses_closure: false,
             body: SExpr::Atom(Atom::Lit(SLit::Int(999))),
         };
@@ -9374,6 +9487,7 @@ mod known_global_call_tests {
                 raw_args: Vec::new(),
                 raw_free: Vec::new(),
                 ret_raw: false,
+                ret_pair: None,
                 uses_closure: false,
                 body: SExpr::Atom(Atom::Slot(1)),
             },
@@ -9442,6 +9556,7 @@ mod known_global_call_tests {
             raw_args: Vec::new(),
             raw_free: Vec::new(),
             ret_raw: false,
+            ret_pair: None,
             uses_closure: true,
             body: SExpr::App(Atom::Global(0), vec![Atom::Free(0), Atom::Free(1)]),
         };
@@ -9474,6 +9589,7 @@ mod known_global_call_tests {
             raw_args: Vec::new(),
             raw_free: Vec::new(),
             ret_raw: false,
+            ret_pair: None,
             uses_closure: false,
             body: SExpr::Atom(Atom::Slot(1)),
         };
@@ -9602,6 +9718,7 @@ mod sprint6_codegen_tests {
             raw_free: Vec::new(),
             body,
             ret_raw: false,
+            ret_pair: None,
             uses_closure: false,
         }
     }
@@ -11485,6 +11602,75 @@ mod sprint6_codegen_tests {
         assert!(
             thunk_asm.contains("jmp .Lw"),
             "raw-capture thunk should tail-jump directly to worker:\n{thunk_asm}"
+        );
+    }
+
+    #[test]
+    fn pair_worker_returns_in_r14_rax_without_allocation_and_unpacks_into_cache_regs() {
+        let r0 = RAW | 0;
+        let r1 = RAW | 1;
+        // PairRet worker returning `(r0, Slot(1))` with `(raw0=true, raw1=false)`.
+        let mut worker = simple_closure(
+            1,
+            2,
+            1,
+            SExpr::Con("Builtin.(,)".into(), vec![Atom::Slot(r0), Atom::Slot(1)]),
+        );
+        worker.raw_args = vec![(0, r0)];
+        worker.ret_pair = Some((true, false));
+
+        let entry = simple_closure(2, 3, 0, SExpr::Atom(Atom::Slot(1)));
+        // Caller unpacks the pair worker call `(v, st)` and returns `v +# 1` boxed (or returns st).
+        let caller = simple_closure(
+            1,
+            3,
+            1,
+            SExpr::Case(
+                Box::new(SExpr::CallWorker(0, vec![Atom::Lit(SLit::Int(41)), Atom::Slot(1)])),
+                UNUSED_SLOT,
+                vec![SAlt::Con(
+                    "Builtin.(,)".into(),
+                    vec![r1, 2],
+                    SExpr::Atom(Atom::Slot(2)),
+                )],
+            ),
+        );
+        let prog = make_prog(vec![
+            SGlobal { name: "Test.mkPair".into(), closure: entry, worker: Some((worker, vec![true, false])) },
+            SGlobal { name: "Main.main".into(), closure: caller, worker: None },
+        ]);
+        let asm = Gen::program(&prog);
+        let w_start = asm.find("\n.Lw").expect("worker label") + 1;
+        let w_end = asm[w_start + 1..]
+            .find("\n.Lf")
+            .or_else(|| asm[w_start + 1..].find("\n    .section"))
+            .map(|i| w_start + 1 + i)
+            .unwrap_or(asm.len());
+        let worker_asm = &asm[w_start..w_end];
+        assert!(
+            !worker_asm.contains("hsc_gc") && !worker_asm.contains("cmpq %r13"),
+            "PairRet worker should return without allocating:\n{worker_asm}"
+        );
+        assert!(
+            worker_asm.contains(", %r14") && worker_asm.contains(", %rax"),
+            "PairRet worker should populate both %r14 and %rax:\n{worker_asm}"
+        );
+        // Caller continuation `.Lk...` should unpack %r14 and %rax directly into cache registers
+        // without dereferencing a heap pair (`8(%r14)` / `16(%r14)`).
+        let k_start = asm.find("\n.Lk").expect("continuation label") + 1;
+        let k_end = asm[k_start + 1..]
+            .find("\n.L")
+            .or_else(|| asm[k_start + 1..].find("\n    .section"))
+            .map(|i| k_start + 1 + i)
+            .unwrap_or(asm.len());
+        let cont_asm = &asm[k_start..k_end];
+        assert!(
+            cont_asm.contains("movq %r14, %rsi") && cont_asm.contains("movq %rax, %rdi"),
+            "PairRet continuation should unpack %r14 and %rax into CACHE_REGS:\n{cont_asm}"
+        );
+        assert!(
+            !cont_asm.contains("8(%r14)") && !cont_asm.contains("16(%r14)"),
+            "PairRet continuation must not dereference heap pair fields:\n{cont_asm}"
         );
     }
 }
