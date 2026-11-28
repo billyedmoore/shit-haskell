@@ -430,7 +430,11 @@ fn mentions(e: &Core, x: &str) -> bool {
 
 /// Mirrors `stg::tail_calls` so we never lift a non-recursive STG join point.
 fn is_join_point(j: &str, arity: usize, body: &Core) -> bool {
-    fn tail_calls(e: &Core, j: &str, n: usize) -> bool {
+    fn tail_calls(e: &Core, j: &str, n: usize, fuel: &mut usize) -> bool {
+        if *fuel == 0 {
+            return false;
+        }
+        *fuel -= 1;
         match e {
             Core::Var(v) => v != j || n == 0,
             Core::Lit(_) | Core::Fail(_) => true,
@@ -448,32 +452,38 @@ fn is_join_point(j: &str, arity: usize, body: &Core) -> bool {
                 }
                 if let [(jn, jrhs)] = &binds[..] {
                     let (jps, jcode) = split_lambdas(jrhs);
-                    if !mentions(jrhs, jn) && tail_calls(body, jn, jps.len()) {
+                    if !mentions(jrhs, jn) && tail_calls(body, jn, jps.len(), fuel) {
                         let shadowed = jps.iter().any(|p| *p == j);
-                        return (shadowed || tail_calls(jcode, j, n)) && tail_calls(body, j, n);
+                        return (shadowed || tail_calls(jcode, j, n, fuel)) && tail_calls(body, j, n, fuel);
                     }
                 }
-                binds.iter().all(|(_, r)| !mentions(r, j)) && tail_calls(body, j, n)
+                binds.iter().all(|(_, r)| !mentions(r, j)) && tail_calls(body, j, n, fuel)
             }
             Core::Case(s, b, alts) => {
                 !mentions(s, j)
                     && (b == j
                         || alts.iter().all(|a| match a {
-                            Alt::Con(_, fs, body) => fs.iter().any(|f| f == j) || tail_calls(body, j, n),
-                            Alt::Lit(_, body) | Alt::Default(body) => tail_calls(body, j, n),
+                            Alt::Con(_, fs, body) => fs.iter().any(|f| f == j) || tail_calls(body, j, n, fuel),
+                            Alt::Lit(_, body) | Alt::Default(body) => tail_calls(body, j, n, fuel),
                         }))
             }
             Core::Prim(p, args) if p == "seq" && args.len() == 2 => {
-                !mentions(&args[0], j) && tail_calls(&args[1], j, n)
+                !mentions(&args[0], j) && tail_calls(&args[1], j, n, fuel)
             }
             Core::Prim(p, args) if SAFE_IDENTITY_PRIMS.contains(&p.as_str()) && args.len() == 1 => {
-                tail_calls(&args[0], j, n)
+                tail_calls(&args[0], j, n, fuel)
             }
             Core::Con(_, args) | Core::Prim(_, args) => args.iter().all(|a| !mentions(a, j)),
         }
     }
-    tail_calls(body, j, arity)
+    let mut fuel = JOIN_CHECK_FUEL;
+    tail_calls(body, j, arity, &mut fuel)
 }
+
+/// Work allowed for one `is_join_point` check (nodes visited); past it the binding is not taken
+/// for a join point. A nested single `let` walks its body twice, so deep chains of them would
+/// otherwise cost twice as much per level (ShellCheck's parser).
+const JOIN_CHECK_FUEL: usize = 1 << 16;
 
 /// Free local variables of `e`, excluding `self_name` and `globals`, in deterministic order.
 fn free_locals(e: &Core, self_name: &str, globals: &HashSet<String>) -> Vec<String> {
