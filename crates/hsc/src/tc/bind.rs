@@ -419,7 +419,47 @@ impl Checker {
         // whose body is a local recursive group with monomorphic recursion.
         let mut group = cores.clone();
         group.extend(ev_binds);
-        let mut out = Vec::with_capacity(cores.len());
+        let mut out = Vec::with_capacity(cores.len() + 1);
+        // A large group is built once, as a tuple of its members that each member selects from
+        // (GHC's AbsBinds): a copy of the group in every member is quadratic in the group's size
+        // (ShellCheck's parser, a `NoMonomorphismRestriction` group of dozens of parsers).
+        let group_size: usize = group.iter().map(|(_, c)| core_nodes(c)).sum();
+        if cores.len() > 1 && cores.len() <= GROUP_TUPLE_MAX * GROUP_TUPLE_MAX && group_size * (cores.len() - 1) > SHARED_GROUP_MIN {
+            let members: Vec<String> = cores.iter().map(|(k, _)| k.clone()).collect();
+            let grp = format!("{}$grp", members[0]);
+            if debug_groups {
+                eprintln!("shared group {grp}: {} members, {group_size} nodes", members.len());
+            }
+            // Up to GROUP_TUPLE_MAX members, one tuple; more, a tuple of tuples of that many.
+            let chunks: Vec<&[String]> = if members.len() <= GROUP_TUPLE_MAX {
+                vec![&members[..]]
+            } else {
+                members.chunks(GROUP_TUPLE_MAX).collect()
+            };
+            let tuple_of = |xs: Vec<Core>| if xs.len() == 1 { xs.into_iter().next().unwrap() } else { Core::Con(Ty::tuple_con(xs.len()), xs) };
+            let inner: Vec<Core> = chunks.iter().map(|c| tuple_of(c.iter().map(|k| Core::Var(k.clone())).collect())).collect();
+            let body = Core::Let(group, Box::new(tuple_of(inner)));
+            let lam = dparams.iter().rev().fold(body, |acc, d| Core::Lam(d.clone(), Box::new(acc)));
+            out.push((grp.clone(), lam));
+            // `case e of (f0, .., fn) -> fi`, or `e` itself for a one-element "tuple".
+            let select = |e: Core, n: usize, i: usize, k: &str, level: usize| -> Core {
+                if n == 1 {
+                    return e;
+                }
+                let fields: Vec<String> = (0..n).map(|j| format!("{k}$f{level}_{j}")).collect();
+                let pick = Core::Var(fields[i].clone());
+                Core::Case(Box::new(e), format!("{k}$t{level}"), vec![crate::core::Alt::Con(Ty::tuple_con(n), fields, pick)])
+            };
+            for (ci, chunk) in chunks.iter().enumerate() {
+                for (i, k) in chunk.iter().enumerate() {
+                    let call = dparams.iter().fold(Core::Var(grp.clone()), |acc, d| Core::App(Box::new(acc), Box::new(Core::Var(d.clone()))));
+                    let sel = select(select(call, chunks.len(), ci, k, 0), chunk.len(), i, k, 1);
+                    let lam = dparams.iter().rev().fold(sel, |acc, d| Core::Lam(d.clone(), Box::new(acc)));
+                    out.push((k.clone(), lam));
+                }
+            }
+            return Ok(out);
+        }
         for (k, _) in &cores {
             let body = Core::Let(group.clone(), Box::new(Core::Var(k.clone())));
             let lam = dparams.iter().rev().fold(body, |acc, d| Core::Lam(d.clone(), Box::new(acc)));
@@ -1099,5 +1139,33 @@ fn mentions_skolem(t: &Ty) -> bool {
         Ty::App(f, x) => mentions_skolem(f) || mentions_skolem(x),
         Ty::Qual(ps, b) | Ty::Forall(_, ps, b) => mentions_skolem(b) || ps.iter().any(|p| p.args.iter().any(mentions_skolem)),
         _ => false,
+    }
+}
+
+/// The group size (nodes, summed over the members, times the members less one) above which a
+/// dictionary-abstracted recursive group is shared through a tuple instead of copied per member.
+const SHARED_GROUP_MIN: usize = 4000;
+
+/// The members of one tuple of a shared group (GHC's tuples stop at 64).
+const GROUP_TUPLE_MAX: usize = 62;
+
+/// The nodes of a Core expression.
+fn core_nodes(e: &Core) -> usize {
+    use crate::core::Alt;
+    1 + match e {
+        Core::Var(_) | Core::Lit(_) | Core::Fail(_) => 0,
+        Core::App(f, a) => core_nodes(f) + core_nodes(a),
+        Core::Lam(_, b) => core_nodes(b),
+        Core::Let(bs, b) => bs.iter().map(|(_, c)| core_nodes(c)).sum::<usize>() + core_nodes(b),
+        Core::Case(s, _, alts) => {
+            core_nodes(s)
+                + alts
+                    .iter()
+                    .map(|a| match a {
+                        Alt::Con(_, _, b) | Alt::Lit(_, b) | Alt::Default(b) => core_nodes(b),
+                    })
+                    .sum::<usize>()
+        }
+        Core::Con(_, args) | Core::Prim(_, args) => args.iter().map(core_nodes).sum(),
     }
 }
