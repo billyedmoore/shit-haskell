@@ -73,14 +73,21 @@ impl SelectorTable {
 /// (and a quarter of its size more), growing if the live data leaves too little.
 pub fn collect(heap: &mut Heap, roots: &mut [Word], need: usize) {
     let empty = SelectorTable::default();
-    collect_with_selectors(heap, roots, need, &empty, (0, 0), (0, 0));
+    let slots = slots_of(roots);
+    collect_with_selectors(heap, &slots, need, &empty, (0, 0), (0, 0));
+}
+
+/// The location of each word of `roots`, as the collector takes them.
+pub fn slots_of(roots: &mut [Word]) -> Vec<*mut Word> {
+    roots.iter_mut().map(|r| r as *mut Word).collect()
 }
 
 /// Like `collect`, additionally short-circuiting selector thunks listed in `selectors` when their
 /// captured scrutinee is already evaluated to the matching constructor (avoiding Wadler space leaks).
+/// The roots are given by location (each a valid word the caller holds), and updated in place.
 pub fn collect_with_selectors(
     heap: &mut Heap,
-    roots: &mut [Word],
+    roots: &[*mut Word],
     need: usize,
     selectors: &SelectorTable,
     nursery: (Word, Word),
@@ -152,7 +159,7 @@ fn copy(
     src: &mut [Word],
     extra: (Word, Word),
     extra2: (Word, Word, usize),
-    roots: &mut [Word],
+    roots: &[*mut Word],
     capacity: usize,
     pinned: &std::collections::HashMap<Word, (usize, std::alloc::Layout)>,
     bounds: (Word, Word),
@@ -185,7 +192,7 @@ fn copy(
 unsafe fn copy_into(
     sources: [(Word, Word, usize); 3],
     targets: [Target; 2],
-    roots: &mut [Word],
+    roots: &[*mut Word],
     remembered: &[Word],
     young: (Word, Word),
     still_young: &mut Vec<Word>,
@@ -205,7 +212,7 @@ unsafe fn copy_into(
         selectors,
     };
     let is_young = |v: Word| v.wrapping_sub(young.0) < young.1;
-    for r in roots.iter_mut() {
+    for &r in roots {
         *r = c.evacuate(*r);
     }
     // The remembered objects are old: what they reach is promoted directly (when the two
@@ -273,7 +280,7 @@ pub fn collect_minor(
     from_surv: (Word, Word),
     to_surv: (*mut Word, usize),
     young: (Word, Word),
-    roots: &mut [Word],
+    roots: &[*mut Word],
     remembered: &[Word],
     still_young: &mut Vec<Word>,
     selectors: &SelectorTable,
@@ -631,7 +638,7 @@ mod tests {
         let mut still = Vec::new();
         let to = (heap.surv_base(1) as *mut Word, 256);
         let s0 = heap.surv_base(0);
-        let surv = collect_minor(&mut heap, (lo, (at as Word) * 8), (s0, 0), to, young, &mut roots, &[old_ref], &mut still, &SelectorTable::default()).unwrap();
+        let surv = collect_minor(&mut heap, (lo, (at as Word) * 8), (s0, 0), to, young, &slots_of(&mut roots), &[old_ref], &mut still, &SelectorTable::default()).unwrap();
         // The remembered object's referents are promoted eagerly (into the old space); the
         // rooted cell ages in the survivor space; the garbage is gone.
         let kept2 = heap.word(old_ref, 1);
@@ -643,7 +650,7 @@ mod tests {
         let mut still = Vec::new();
         let to = (heap.surv_base(0) as *mut Word, 256);
         let s1 = heap.surv_base(1);
-        let surv = collect_minor(&mut heap, (lo, 0), (s1, (surv as Word) * 8), to, young, &mut roots, &[], &mut still, &SelectorTable::default()).unwrap();
+        let surv = collect_minor(&mut heap, (lo, 0), (s1, (surv as Word) * 8), to, young, &slots_of(&mut roots), &[], &mut still, &SelectorTable::default()).unwrap();
         assert_eq!(surv, 0);
         assert!(heap.contains(roots[0]), "aged cell promoted");
     }
@@ -737,7 +744,7 @@ mod tests {
 
         let _ = outer_sel;
         let mut roots = [sel2];
-        collect_with_selectors(&mut heap, &mut roots, 0, &table, (0, 0), (0, 0));
+        collect_with_selectors(&mut heap, &slots_of(&mut roots), 0, &table, (0, 0), (0, 0));
         let r = roots[0];
         assert_eq!(heap::kind_of(heap.word(r, 0)), kind::INT);
         assert_eq!(heap.word(r, 1), 99);
@@ -768,7 +775,7 @@ mod tests {
 
         let table = SelectorTable::new(&[(sel_code, 1, 1)]);
         let mut roots = [cyc_sel, wrong_sel];
-        collect_with_selectors(&mut heap, &mut roots, 0, &table, (0, 0), (0, 0));
+        collect_with_selectors(&mut heap, &slots_of(&mut roots), 0, &table, (0, 0), (0, 0));
         assert_eq!(heap::kind_of(heap.word(roots[0], 0)), kind::THUNK);
         assert_eq!(heap::kind_of(heap.word(roots[1], 0)), kind::THUNK);
     }

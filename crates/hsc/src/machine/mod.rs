@@ -117,6 +117,8 @@ pub struct Machine {
     pub selectors: gc::SelectorTable,
     pub(super) selectors_raw: (*const [u32; 3], usize),
     pub(super) selectors_loaded: bool,
+    /// The root locations of the last collection (the buffer is reused).
+    root_buf: Vec<*mut Word>,
 }
 
 /// Cached dispatch target for one program-local primitive ID (classified on first call).
@@ -243,6 +245,7 @@ impl Machine {
             selectors: gc::SelectorTable::default(),
             selectors_raw: (std::ptr::null(), 0),
             selectors_loaded: false,
+            root_buf: Vec::new(),
             bodies: entry::DiagnosticBodies::default(),
         });
         m.stack = stack;
@@ -447,7 +450,9 @@ impl Machine {
         }
         // Roots: the stack (walked from sp), the globals, the record's arguments and registers,
         // the exception, and the stable pointers.
-        let mut locs: Vec<*mut Word> = Vec::new();
+        // The buffer is kept between collections: a deep stack gives millions of roots.
+        let mut locs = std::mem::take(&mut self.root_buf);
+        locs.clear();
         stack_roots(self.sp, self.top, &mut locs);
         for i in 0..self.prog.nglobals {
             // SAFETY: the globals table has one slot per global, allocated with the machine.
@@ -475,11 +480,11 @@ impl Machine {
         for v in self.named.values_mut() {
             locs.push(v as *mut Word);
         }
-        // Copy the heap pointers into the collector's root vector and back.
-        let mut roots: Vec<Word> = locs.iter().map(|&p| unsafe { *p }).collect();
+        // The collector updates the root locations in place.
+        let roots = &locs[..];
         if self.heap.nursery.is_empty() {
             self.heap.hp = ((self.hp - self.heap.addr(0)) / 8) as usize;
-            gc::collect_with_selectors(&mut self.heap, &mut roots, need, &self.selectors, (0, 0), (0, 0));
+            gc::collect_with_selectors(&mut self.heap, roots, need, &self.selectors, (0, 0), (0, 0));
         } else {
             let lo = self.heap.nursery.as_ptr() as Word;
             let used = (lo, self.hp - lo);
@@ -496,7 +501,7 @@ impl Machine {
             let minor = if self.heap.pinned_since_gc > budget || need > self.heap.nursery_max / 2 {
                 None
             } else {
-                gc::collect_minor(&mut self.heap, used, from_surv, to_surv, young, &mut roots, &remembered, &mut still_young, &self.selectors)
+                gc::collect_minor(&mut self.heap, used, from_surv, to_surv, young, roots, &remembered, &mut still_young, &self.selectors)
             };
             match minor {
                 Some(surv) => {
@@ -512,7 +517,7 @@ impl Machine {
                 None => {
                     // Room after it for a whole nursery of promotions (and the request).
                     let reserve = self.heap.nursery_words.max(need) + need;
-                    gc::collect_with_selectors(&mut self.heap, &mut roots, reserve, &self.selectors, used, from_surv);
+                    gc::collect_with_selectors(&mut self.heap, roots, reserve, &self.selectors, used, from_surv);
                     self.heap.surv_used = 0;
                     still_young.clear();
                 }
@@ -535,10 +540,11 @@ impl Machine {
                 }
             }
         }
-        for (p, v) in locs.iter().zip(roots) {
-            // SAFETY: each location is a live slot the collector was given.
-            unsafe { **p = v };
+        // Given back once the stack is much shallower than at its deepest.
+        if locs.capacity() > 4 * locs.len().max(1 << 16) {
+            locs.shrink_to(2 * locs.len());
         }
+        self.root_buf = locs;
         if self.heap.nursery.is_empty() {
             self.hp = self.heap.addr(self.heap.hp);
             self.hplim = self.heap.addr(self.heap.from.len());
