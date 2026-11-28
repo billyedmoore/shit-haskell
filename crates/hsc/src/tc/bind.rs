@@ -446,7 +446,7 @@ impl Checker {
                 if n == 1 {
                     return e;
                 }
-                let fields: Vec<String> = (0..n).map(|j| format!("{k}$f{level}_{j}")).collect();
+                let fields: Vec<String> = (0..n).map(|j| format!("{k}$sel{level}_{j}")).collect();
                 let pick = Core::Var(fields[i].clone());
                 Core::Case(Box::new(e), format!("{k}$t{level}"), vec![crate::core::Alt::Con(Ty::tuple_con(n), fields, pick)])
             };
