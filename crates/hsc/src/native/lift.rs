@@ -428,7 +428,8 @@ fn mentions(e: &Core, x: &str) -> bool {
     }
 }
 
-/// Mirrors `stg::tail_calls` so we never lift a non-recursive STG join point.
+/// Mirrors `stg::tail_calls` so we never lift a non-recursive STG join point. Past
+/// `JOIN_CHECK_FUEL` nodes it gives up and answers false: the binding is lifted like any other.
 fn is_join_point(j: &str, arity: usize, body: &Core) -> bool {
     fn tail_calls(e: &Core, j: &str, n: usize, fuel: &mut usize) -> bool {
         if *fuel == 0 {
