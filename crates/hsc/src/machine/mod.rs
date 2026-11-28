@@ -540,6 +540,10 @@ impl Machine {
                 }
             }
         }
+        // Given back once the stack is much shallower than at its deepest.
+        if locs.capacity() > 4 * locs.len().max(1 << 16) {
+            locs.shrink_to(2 * locs.len());
+        }
         self.root_buf = locs;
         if self.heap.nursery.is_empty() {
             self.hp = self.heap.addr(self.heap.hp);
