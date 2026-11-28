@@ -430,6 +430,12 @@ impl Copier<'_> {
                 *to.add(1) = *from.add(1);
                 *to.add(2) = *from.add(2);
             }
+            // Small objects are copied inline: a `memcpy` call costs more than the copy.
+            4 => *(to as *mut [Word; 4]) = *(from as *const [Word; 4]),
+            5 => *(to as *mut [Word; 5]) = *(from as *const [Word; 5]),
+            6 => *(to as *mut [Word; 6]) = *(from as *const [Word; 6]),
+            7 => *(to as *mut [Word; 7]) = *(from as *const [Word; 7]),
+            8 => *(to as *mut [Word; 8]) = *(from as *const [Word; 8]),
             _ => std::ptr::copy_nonoverlapping(from, to, total),
         }
         t.free = at + total;
